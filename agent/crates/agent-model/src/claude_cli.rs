@@ -51,7 +51,16 @@ impl ModelClient for ClaudeCliClient {
         });
 
         let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
+        let mut stderr = child.stderr.take().expect("stderr piped");
+
+        // Drain stderr concurrently so a child that writes more than one pipe
+        // buffer (~64 KiB) to stderr after closing stdout cannot deadlock
+        // child.wait().
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = String::new();
+            let _ = stderr.read_to_string(&mut buf).await;
+            buf
+        });
 
         let stream = async_stream::stream! {
             let mut lines = BufReader::new(stdout).lines();
@@ -80,8 +89,7 @@ impl ModelClient for ClaudeCliClient {
             match child.wait().await {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
-                    let mut buf = String::new();
-                    let _ = BufReader::new(stderr).read_to_string(&mut buf).await;
+                    let buf = stderr_task.await.unwrap_or_default();
                     yield Err(ModelError::Process(
                         format!("claude exited ({status}): {}", buf.trim())));
                 }
@@ -224,6 +232,28 @@ mod proc_tests {
         let client = ClaudeCliClient::new("/nonexistent/claude-binary-xyz", "sonnet");
         let res = client.stream(req()).await;
         assert!(matches!(res, Err(ModelError::Process(_))));
+    }
+
+    #[tokio::test]
+    async fn large_stderr_on_failure_does_not_deadlock() {
+        // Emit ~256 KiB to stderr (far past the ~64 KiB pipe buffer) after
+        // closing stdout, then fail. Must not hang; must surface Process error.
+        let script = "#!/usr/bin/env bash\ncat >/dev/null\n\
+            yes 'errline' | head -c 262144 >&2\nexit 1\n";
+        let fake = write_fake(script);
+        let client = ClaudeCliClient::new(fake.to_str().unwrap(), "sonnet");
+        let mut stream = client.stream(req()).await.unwrap();
+        let collect = async {
+            let mut err = None;
+            while let Some(item) = stream.next().await {
+                if let Err(e) = item { err = Some(e); }
+            }
+            err
+        };
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), collect)
+            .await
+            .expect("stream must not deadlock on large stderr");
+        assert!(matches!(err, Some(ModelError::Process(_))), "expected Process error, got {err:?}");
     }
 }
 
