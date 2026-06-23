@@ -55,7 +55,9 @@ your way around before reading files top-to-bottom:
 - The graph is the map, NOT the authority — the docs below and the code are ground truth.
   `.graphifyignore` excludes the SDD task ledger (`.superpowers/sdd/`) and generated Wrangler
   artifacts (`.wrangler/`), so the graph reflects authored architecture, not build output.
-- After you land code, refresh it: `/graphify . --update` (re-extracts only changed files).
+- Refresh the graph with `/graphify . --update` (re-extracts only changed files) ONCE after
+  ALL tasks of the subsystem are complete — not per task. Run it after the subsystem is
+  finished (e.g. just before/after merge) so a single update captures the whole subsystem.
 
 ## Read these first (authoritative context)
 - Deferred-subsystem primers + build order + what's already built:
