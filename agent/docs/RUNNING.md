@@ -48,7 +48,7 @@ docker run -d --name llama-agent --gpus all -p 8080:8080 \
   ghcr.io/ggml-org/llama.cpp:server-cuda \
   -m /models/qwen3.6-35b-a3b-gguf/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf \
   -a qwen3.6-35b-a3b \
-  -ngl 99 -c 32768 -fa on \
+  -ngl 99 -np 1 -c 262144 -fa on \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --host 0.0.0.0 --port 8080 --jinja
 ```
@@ -57,9 +57,25 @@ Key flags:
 - `--jinja` — **required** for native tool-calling (activates the model's
   tool-capable chat template; without it the agent's `--protocol native` won't work).
 - `-ngl 99` — all layers on GPU. `-a` sets the served model id (used as `--model` below).
-- `-fa on --cache-type-k q8_0 --cache-type-v q8_0` — flash attention + quantized KV
-  cache. Lets 32k context fit in ~19 GB on a 24 GB card (RTX 3090). This model is
-  natively trained to 256k, so 32k needs no rope/YaRN scaling.
+- `-np 1` — a single sequence slot (the agent only needs one), so the full context
+  is dedicated to one conversation.
+- `-c 262144` — context window. This is the model's full native maximum
+  (`n_ctx_train = 262144`); no rope/YaRN scaling needed, so no quality penalty.
+- `-fa on --cache-type-k q8_0 --cache-type-v q8_0` — flash attention + q8_0-quantized
+  KV cache. This model uses grouped-query attention, so KV is tiny (~11 MB per 1k
+  tokens at q8_0) and large contexts are nearly free.
+
+Measured VRAM on a 24 GB RTX 3090 (KV pre-allocated at load — it does **not** grow as
+the context fills, so these are steady-state ceilings):
+
+| `-c` | VRAM used |
+|------|-----------|
+| 32768 (32k)   | ~19.3 GB |
+| 131072 (128k) | ~20.4 GB |
+| **262144 (256k)** | **~22.2 GB** |
+
+256k fits with ~2.4 GB to spare — comfortable on a dedicated/headless GPU. If the card
+also drives a display (or you want a wider safety margin), drop to `-c 131072`.
 
 Verify it's up (the model loads in a few seconds):
 
@@ -79,8 +95,15 @@ cargo run -p agent-cli -- \
   --model qwen3.6-35b-a3b \
   --protocol native \
   --workspace /path/to/your/project \
-  --context-limit 32768                 # match the server's -c to use the full window
+  --context-limit 32768                 # how much the agent actually fills (see note)
 ```
+
+**Server `-c` vs agent `--context-limit`:** `-c` is the server's *capacity* (set high,
+262144, so it's never the bottleneck). `--context-limit` is how many tokens the agent
+actually fills per turn before its sliding window evicts old history. Keep it **well
+below** `-c` for latency — prefilling a 256k-token prompt is slow even when it fits, and
+a coding agent rarely needs it. Run at `--context-limit 32768` (or `65536`) day-to-day
+and raise it only for a task that genuinely needs a giant context.
 
 At the `›` prompt, type a task. The agent streams its work and calls tools:
 - Read-only tools inside the workspace (`read_file`, `list_directory`, `git_status`)
