@@ -35,6 +35,10 @@ pub struct RuntimeConfig {
     pub enable_thinking: bool,
     #[serde(default)]
     pub preserve_thinking: bool,
+    #[serde(default)]
+    pub skills_dirs: Vec<String>,
+    #[serde(default)]
+    pub active_skills: Vec<String>,
 }
 
 /// All-optional mirror used only for on-disk merge: a file written by an older
@@ -59,6 +63,8 @@ struct PartialRuntimeConfig {
     repeat_penalty: Option<f32>,
     enable_thinking: Option<bool>,
     preserve_thinking: Option<bool>,
+    skills_dirs: Option<Vec<String>>,
+    active_skills: Option<Vec<String>>,
 }
 
 fn default_true() -> bool { true }
@@ -84,6 +90,8 @@ impl RuntimeConfig {
             repeat_penalty: None,
             enable_thinking: true,
             preserve_thinking: false,
+            skills_dirs: Vec::new(),
+            active_skills: Vec::new(),
         }
     }
 
@@ -165,6 +173,8 @@ impl RuntimeConfig {
         if let Some(v) = p.repeat_penalty { self.repeat_penalty = Some(v); }
         if let Some(v) = p.enable_thinking { self.enable_thinking = v; }
         if let Some(v) = p.preserve_thinking { self.preserve_thinking = v; }
+        if let Some(v) = p.skills_dirs { self.skills_dirs = v; }
+        if let Some(v) = p.active_skills { self.active_skills = v; }
         self
     }
 
@@ -407,6 +417,31 @@ mod tests {
         c.top_k = Some(40);
         c.repeat_penalty = Some(1.1);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn skills_fields_default_empty_and_round_trip() {
+        let c = base();
+        assert!(c.skills_dirs.is_empty());
+        assert!(c.active_skills.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.json");
+        let mut c = base();
+        c.skills_dirs = vec!["/ws/.agent/skills".into()];
+        c.active_skills = vec!["greeter".into()];
+        c.save(&path).unwrap();
+
+        // A different base proves the file wins; a partial file falls back per-field.
+        let loaded = RuntimeConfig::load_over(base(), &path);
+        assert_eq!(loaded.skills_dirs, vec!["/ws/.agent/skills".to_string()]);
+        assert_eq!(loaded.active_skills, vec!["greeter".to_string()]);
+
+        std::fs::write(&path, r#"{"model":"only-model"}"#).unwrap();
+        let loaded = RuntimeConfig::load_over(base(), &path);
+        assert_eq!(loaded.model, "only-model");
+        assert!(loaded.skills_dirs.is_empty());   // absent field falls back to base
+        assert!(loaded.active_skills.is_empty());
     }
 
     #[test]
