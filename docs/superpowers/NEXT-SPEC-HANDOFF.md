@@ -99,10 +99,11 @@ Open tech-debt items from shipped work. Canonical, always-current list (detail, 
 refs, Resolved/Accepted history): docs/superpowers/context/claude-cli-inference.md
 → "Follow-ups / known limitations". Keep that file as the source of truth; the boxes
 below are a pointer, not a second copy.
-   [ ] P1  AgentLoop has no timeout around model-stream consumption
-           (agent-core/src/loop_.rs:54-58) — a hung backend blocks a turn forever;
-           affects BOTH the SGLang and claude-cli paths. Touches the core loop, so
-           brainstorm→spec it (don't hack the loop). Highest value.
+   [x] P1  RESOLVED — AgentLoop now enforces a per-turn idle (inter-chunk) timeout in
+           one_completion (wraps stream-open + each chunk in tokio::time::timeout →
+           retryable ModelError::Timeout). Config: LoopConfig.stream_idle_timeout
+           (default 120s) / CLI --stream-timeout-secs. Covers SGLang + claude-cli.
+           specs/2026-06-23-agent-loop-stream-timeout-design.md (merged 2026-06-23).
    [ ] P2  claude-cli: rate-limit strategy for the 5-hour subscription cap (detect
            rate_limit_event → typed ModelError + backoff) before sustained loops.
    [ ] P2  claude-cli: pin the subprocess CWD (Command::current_dir to an empty scratch
