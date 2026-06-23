@@ -37,6 +37,9 @@ struct Cli {
     /// Approx context token limit
     #[arg(long, default_value_t = 8192)]
     context_limit: usize,
+    /// Idle timeout (seconds) for model-stream consumption before a stalled turn fails
+    #[arg(long, default_value_t = 120)]
+    stream_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -74,7 +77,7 @@ async fn main() {
         sink, LoopConfig {
             model_limit: cli.context_limit, max_turns: 25, max_retries: 3, temperature: 0.2,
             max_tokens: Some(2048), workspace, tool_timeout: Duration::from_secs(120),
-            stream_idle_timeout: agent_core::DEFAULT_STREAM_IDLE_TIMEOUT,
+            stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
         });
 
     let mut ctx = WindowContext::new(Message::system(
