@@ -19,7 +19,7 @@ testkit = []
 e2e = []
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = { version = "3" }
 agent-model = { path = "../agent-model" }
 agent-tools = { path = "../agent-tools" }

@@ -58,15 +58,24 @@ impl AgentLoop {
 
     /// Drive one streamed completion to an `AssistantTurn`, emitting tokens as they arrive.
     async fn one_completion(&self, req: CompletionRequest) -> Result<AssistantTurn, ModelError> {
-        let mut stream = self.model.stream(req).await?;
+        let idle = self.config.stream_idle_timeout;
+        let mut stream = match tokio::time::timeout(idle, self.model.stream(req)).await {
+            Err(_) => return Err(ModelError::Timeout(idle)),
+            Ok(opened) => opened?,
+        };
         let mut text = String::new();
         let mut raw_tool_calls: Vec<RawToolCall> = Vec::new();
         let mut stop = StopReason::Stop;
-        while let Some(item) = stream.next().await {
-            match item? {
-                Chunk::Text(t) => { self.sink.emit(AgentEvent::Token(t.clone())); text.push_str(&t); }
-                Chunk::ToolCallDelta(rc) => merge_tool_call(&mut raw_tool_calls, rc),
-                Chunk::Done(r) => stop = r,
+        loop {
+            match tokio::time::timeout(idle, stream.next()).await {
+                // Stalled: dropping `stream` on return fires kill_on_drop / tears down the connection.
+                Err(_) => return Err(ModelError::Timeout(idle)),
+                Ok(None) => break,
+                Ok(Some(item)) => match item? {
+                    Chunk::Text(t) => { self.sink.emit(AgentEvent::Token(t.clone())); text.push_str(&t); }
+                    Chunk::ToolCallDelta(rc) => merge_tool_call(&mut raw_tool_calls, rc),
+                    Chunk::Done(r) => stop = r,
+                },
             }
         }
         Ok(AssistantTurn { text, raw_tool_calls, stop })
@@ -305,6 +314,106 @@ mod tests {
         // 3 turns, each a tool call, then done (BudgetExhausted).
         let events = sink.events.lock().unwrap().clone();
         assert_eq!(events.iter().filter(|e| *e == "tool_start:read_file").count(), 3);
+        assert_eq!(events.last().unwrap(), "done");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_stall_times_out_and_fails_after_retries() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Hang, Scripted::Hang, Scripted::Hang]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
+                stream_idle_timeout: Duration::from_secs(10) });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        // Guard >> the loop's 10s idle timeout so the loop terminates first.
+        let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
+            .await
+            .expect("loop must terminate on a stalled stream, not hang");
+        assert!(matches!(result, Err(AgentError::Model(_))));
+        let events = sink.events.lock().unwrap().clone();
+        assert!(events.iter().any(|e| e.starts_with("error:")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_open_stall_times_out() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::HangOpen, Scripted::HangOpen]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
+                stream_idle_timeout: Duration::from_secs(10) });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
+            .await
+            .expect("loop must terminate when the stream never opens, not hang");
+        assert!(matches!(result, Err(AgentError::Model(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_then_success_recovers_via_retry() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Hang,
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 3, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
+                stream_idle_timeout: Duration::from_secs(10) });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
+            .await
+            .expect("loop must terminate, not hang");
+        assert!(result.is_ok());
+        assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
+    }
+
+    struct SlowModel { gap: Duration }
+    #[async_trait::async_trait]
+    impl agent_model::ModelClient for SlowModel {
+        async fn stream(&self, _req: CompletionRequest)
+            -> Result<futures::stream::BoxStream<'static, Result<Chunk, ModelError>>, ModelError> {
+            let gap = self.gap;
+            let chunks = vec![
+                Ok(Chunk::Text("hel".into())),
+                Ok(Chunk::Text("lo".into())),
+                Ok(Chunk::Done(StopReason::Stop)),
+            ];
+            Ok(futures::stream::iter(chunks)
+                .then(move |c| async move { tokio::time::sleep(gap).await; c })
+                .boxed())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_but_progressing_stream_does_not_trip() {
+        let ws = std::env::temp_dir();
+        // gap (5s) < idle timeout (10s): healthy progress must NOT trip the timeout.
+        let model = Arc::new(SlowModel { gap: Duration::from_secs(5) });
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
+                stream_idle_timeout: Duration::from_secs(10) });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
+            .await
+            .expect("loop must terminate, not hang");
+        assert!(result.is_ok());
+        let events = sink.events.lock().unwrap().clone();
+        assert!(!events.iter().any(|e| e.starts_with("error:")));
         assert_eq!(events.last().unwrap(), "done");
     }
 }
