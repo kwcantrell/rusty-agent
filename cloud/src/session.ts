@@ -104,7 +104,13 @@ export class AgentSession extends DurableObject<Env> {
 
   private async persist(sessionId: string, frame: string): Promise<void> {
     const key = `sessions/${sessionId}/${String(this.nextSeq(sessionId)).padStart(8, "0")}.json`;
-    await this.env.LOGS.put(key, frame);
+    try {
+      await this.env.LOGS.put(key, frame);
+    } catch (e) {
+      console.error(JSON.stringify({
+        level: "error", at: "AgentSession.persist", key,
+        message: e instanceof Error ? e.message : String(e) }));
+    }
   }
 
   private async replayFromR2(sessionId: string, ws: WebSocket): Promise<void> {
