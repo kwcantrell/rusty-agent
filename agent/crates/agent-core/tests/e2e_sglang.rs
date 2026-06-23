@@ -38,7 +38,8 @@ async fn reads_a_file_against_real_server() {
             command_denylist: vec![] }),
         Arc::new(AutoApprove), sink.clone(),
         LoopConfig { model_limit: 8192, max_turns: 8, max_retries: 2, temperature: 0.0,
-            max_tokens: Some(512), workspace: ws, tool_timeout: Duration::from_secs(60) });
+            max_tokens: Some(512), workspace: ws, tool_timeout: Duration::from_secs(60),
+            stream_idle_timeout: Duration::from_secs(120) });
 
     let mut ctx = WindowContext::new(Message::system(
         "You are a coding agent. Use read_file to answer questions about files."));

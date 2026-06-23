@@ -15,6 +15,10 @@ pub enum AgentError {
     Model(String),
 }
 
+/// Default idle timeout for model-stream consumption. Generous enough to cover
+/// claude-cli cold-start + `thinking` blocks before the first token.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub struct LoopConfig {
     pub model_limit: usize,
     pub max_turns: usize,
@@ -23,6 +27,9 @@ pub struct LoopConfig {
     pub max_tokens: Option<u32>,
     pub workspace: PathBuf,
     pub tool_timeout: Duration,
+    /// Max time with no stream progress (stream-open or inter-chunk) before a turn
+    /// is treated as a stalled-backend `ModelError::Timeout`.
+    pub stream_idle_timeout: Duration,
 }
 
 pub struct AgentLoop {
@@ -214,7 +221,8 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2,
                 temperature: 0.0, max_tokens: None, workspace: ws,
-                tool_timeout: std::time::Duration::from_secs(5) });
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60) });
 
         let mut ctx = WindowContext::new(Message::system("you are a test agent"));
         agent.run(&mut ctx, "read a.txt".into()).await.unwrap();
@@ -247,7 +255,8 @@ mod tests {
             model, Arc::new(PassthroughProtocol), registry(), Arc::new(DenyAll),
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5) });
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60) });
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         let events = sink.events.lock().unwrap().clone();
@@ -268,7 +277,8 @@ mod tests {
             model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 3, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5) });
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60) });
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
@@ -288,7 +298,8 @@ mod tests {
             model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 3, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5) });
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60) });
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "loop forever".into()).await.unwrap();
         // 3 turns, each a tool call, then done (BudgetExhausted).

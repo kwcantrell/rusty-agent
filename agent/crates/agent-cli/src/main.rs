@@ -74,6 +74,7 @@ async fn main() {
         sink, LoopConfig {
             model_limit: cli.context_limit, max_turns: 25, max_retries: 3, temperature: 0.2,
             max_tokens: Some(2048), workspace, tool_timeout: Duration::from_secs(120),
+            stream_idle_timeout: agent_core::DEFAULT_STREAM_IDLE_TIMEOUT,
         });
 
     let mut ctx = WindowContext::new(Message::system(
