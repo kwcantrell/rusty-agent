@@ -16,7 +16,11 @@ tracing.workspace = true
 
 [features]
 testkit = []
+e2e = []
 
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { version = "3" }
+agent-model = { path = "../agent-model" }
+agent-tools = { path = "../agent-tools" }
+agent-policy = { path = "../agent-policy" }
