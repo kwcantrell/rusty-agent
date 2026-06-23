@@ -13,6 +13,7 @@ fn message_tokens(m: &Message) -> usize {
 pub trait ContextManager: Send + Sync {
     fn append(&mut self, msg: Message);
     fn build(&self, model_limit: usize) -> Vec<Message>;
+    fn set_system(&mut self, system: Message);
 }
 
 /// Sliding-window context: always keeps the system prompt; evicts oldest
@@ -31,6 +32,10 @@ impl WindowContext {
 impl ContextManager for WindowContext {
     fn append(&mut self, msg: Message) {
         self.history.push(msg);
+    }
+
+    fn set_system(&mut self, system: Message) {
+        self.system = system;
     }
 
     fn build(&self, model_limit: usize) -> Vec<Message> {
@@ -87,5 +92,16 @@ mod tests {
         ctx.append(Message::user("hello"));
         let built = ctx.build(100_000);
         assert_eq!(built.len(), 2);
+    }
+
+    #[test]
+    fn set_system_replaces_prompt_and_keeps_history() {
+        let mut ctx = WindowContext::new(Message::system("OLD"));
+        ctx.append(Message::user("u1"));
+        ctx.set_system(Message::system("NEW"));
+        let built = ctx.build(100_000);
+        assert!(matches!(built[0].role, Role::System)); // system still first
+        assert_eq!(built[0].content, "NEW");            // and replaced
+        assert!(built.iter().any(|m| m.content == "u1")); // history intact
     }
 }
