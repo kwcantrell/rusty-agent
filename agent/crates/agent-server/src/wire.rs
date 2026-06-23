@@ -1,6 +1,7 @@
 use agent_core::AgentEvent;
 use agent_model::StopReason;
 use agent_policy::ApprovalResponse;
+use agent_runtime_config::RuntimeConfig;
 use agent_tools::Display;
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,19 @@ pub enum WireBody {
     Presence { online: bool },
     UserInput { text: String },
     ApprovalResponse { decision: WireDecision },
+    SettingsGet,
+    SettingsUpdate {
+        settings: RuntimeConfig,
+    },
+    SettingsState {
+        settings: RuntimeConfig,
+        workspace: String,
+        api_key_set: bool,
+        hard_floor: Vec<String>,
+    },
+    SettingsError {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,5 +146,62 @@ mod tests {
             display: None,
         };
         assert!(wire_event_from(AgentEvent::Approval(req)).is_none());
+    }
+
+    #[test]
+    fn settings_get_round_trips() {
+        let env = WireEnvelope {
+            v: PROTOCOL_VERSION, session_id: "s".into(), id: None,
+            body: WireBody::SettingsGet,
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"kind\":\"settings_get\""));
+        let back: WireEnvelope = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.body, WireBody::SettingsGet));
+    }
+
+    #[test]
+    fn settings_update_carries_a_config() {
+        use agent_runtime_config::RuntimeConfig;
+        let cfg = RuntimeConfig::from_launch(
+            "openai".into(), "http://x".into(), "m".into(), "native".into(), 8192);
+        let env = WireEnvelope {
+            v: PROTOCOL_VERSION, session_id: "s".into(), id: None,
+            body: WireBody::SettingsUpdate { settings: cfg.clone() },
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"kind\":\"settings_update\""));
+        let back: WireEnvelope = serde_json::from_str(&json).unwrap();
+        match back.body {
+            WireBody::SettingsUpdate { settings } => assert_eq!(settings, cfg),
+            _ => panic!("wrong body"),
+        }
+    }
+
+    #[test]
+    fn settings_state_and_error_serialize() {
+        use agent_runtime_config::RuntimeConfig;
+        let cfg = RuntimeConfig::from_launch(
+            "openai".into(), "http://x".into(), "m".into(), "native".into(), 8192);
+        let state = WireEnvelope {
+            v: PROTOCOL_VERSION, session_id: "s".into(), id: None,
+            body: WireBody::SettingsState {
+                settings: cfg, workspace: "/w".into(), api_key_set: true,
+                hard_floor: vec!["sudo".into()] },
+        };
+        let j = serde_json::to_string(&state).unwrap();
+        assert!(j.contains("\"kind\":\"settings_state\""));
+        assert!(j.contains("\"api_key_set\":true"));
+        let back: WireEnvelope = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back.body, WireBody::SettingsState { .. }));
+
+        let err = WireEnvelope {
+            v: PROTOCOL_VERSION, session_id: "s".into(), id: None,
+            body: WireBody::SettingsError { message: "bad".into() },
+        };
+        let j = serde_json::to_string(&err).unwrap();
+        assert!(j.contains("\"kind\":\"settings_error\""));
+        let back: WireEnvelope = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back.body, WireBody::SettingsError { .. }));
     }
 }

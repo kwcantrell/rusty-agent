@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseInbound } from "../src/wire";
+import { parseInbound, type RuntimeSettings } from "../src/wire";
 
 describe("parseInbound", () => {
   it("parses a token event", () => {
@@ -34,5 +34,33 @@ describe("parseInbound", () => {
   it("returns null on malformed json or unknown kind", () => {
     expect(parseInbound("{not json")).toBeNull();
     expect(parseInbound(JSON.stringify({ v: 1, session_id: "s", kind: "mystery" }))).toBeNull();
+  });
+});
+
+const sampleSettings: RuntimeSettings = {
+  backend: "openai", base_url: "http://localhost:8080", model: "qwen", protocol: "native",
+  command_allowlist: ["ls", "git"], command_denylist: [], temperature: 0.2,
+  max_tokens: 2048, max_turns: 25, context_limit: 8192,
+};
+
+describe("settings frames", () => {
+  it("parses a settings_state frame", () => {
+    const raw = JSON.stringify({
+      v: 1, session_id: "s", kind: "settings_state", settings: sampleSettings,
+      workspace: "/w", api_key_set: true, hard_floor: ["sudo"],
+    });
+    const f = parseInbound(raw);
+    expect(f?.kind).toBe("settings_state");
+    if (f?.kind === "settings_state") {
+      expect(f.settings.model).toBe("qwen");
+      expect(f.api_key_set).toBe(true);
+      expect(f.hard_floor).toContain("sudo");
+    }
+  });
+
+  it("parses a settings_error frame", () => {
+    const raw = JSON.stringify({ v: 1, session_id: "s", kind: "settings_error", message: "bad" });
+    const f = parseInbound(raw);
+    expect(f?.kind).toBe("settings_error");
   });
 });

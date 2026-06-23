@@ -1,5 +1,9 @@
 //! Shared agent loop wiring (tool registry, protocol picker, command lists)
 //! used by both the CLI (`agent-cli`) and the daemon (`agent-server`).
+
+mod runtime_config;
+pub use runtime_config::{RuntimeConfig, HARD_FLOOR_DENYLIST};
+
 use agent_model::{ClaudeCliClient, ModelClient, NativeProtocol, OpenAiCompatClient,
                   PromptedJsonProtocol, ToolCallProtocol};
 use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
