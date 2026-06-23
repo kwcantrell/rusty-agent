@@ -1,4 +1,3 @@
-#[allow(unused_imports)]
 use crate::guard::resolve_in_dir;
 #[allow(unused_imports)]
 use crate::registry::sanitize_slug;
@@ -135,9 +134,66 @@ impl Tool for UseSkill {
     }
 }
 
-// Stubs for Tasks 5-6 (re-exported from lib.rs; implemented in those tasks).
+// Stub for Task 6 (re-exported from lib.rs; implemented in that task).
 pub struct CreateSkill;
-pub struct ReadSkillFile;
+
+/// Read one bundled file from a skill's own directory (read-only, dir-confined).
+pub struct ReadSkillFile {
+    registry: Arc<SkillRegistry>,
+}
+
+impl ReadSkillFile {
+    pub fn new(registry: Arc<SkillRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl Tool for ReadSkillFile {
+    fn name(&self) -> &str {
+        "read_skill_file"
+    }
+    fn description(&self) -> &str {
+        "Read a bundled file belonging to a skill (e.g. a script or reference), so you can inspect it before acting."
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name().into(),
+            description: self.description().into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "skill": { "type": "string", "description": "Skill name." },
+                    "path": { "type": "string", "description": "File path relative to the skill directory." }
+                },
+                "required": ["skill", "path"]
+            }),
+        }
+    }
+    fn intent(&self, args: &Value) -> Result<ToolIntent, ToolError> {
+        let skill = name_arg(args, "skill")?;
+        let path = name_arg(args, "path")?;
+        Ok(ToolIntent {
+            tool: "read_skill_file".into(),
+            access: Access::Read,
+            paths: vec![],
+            command: None,
+            summary: format!("read skill file {skill}/{path}"),
+        })
+    }
+    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        let skill_name = name_arg(&args, "skill")?;
+        let rel = name_arg(&args, "path")?;
+        let skill = self
+            .registry
+            .find(&skill_name)
+            .ok_or_else(|| ToolError::NotFound(format!("skill '{skill_name}' not found")))?;
+        let full = resolve_in_dir(&skill.dir, &rel).map_err(ToolError::Denied)?;
+        let content = std::fs::read_to_string(&full)
+            .map_err(|e| ToolError::NotFound(format!("{}: {e}", full.display())))?;
+        Ok(ToolOutput { content, display: None })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -196,6 +252,36 @@ mod tests {
     async fn use_skill_unknown_is_not_found() {
         let (reg, _d) = reg_with_skill("alpha", "body", &[]);
         let err = UseSkill::new(reg).execute(json!({"name": "missing"}), &ctx()).await.unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn read_skill_file_returns_contents() {
+        let (reg, _d) = reg_with_skill("alpha", "body", &[("notes.txt", "hello notes")]);
+        let out = ReadSkillFile::new(reg)
+            .execute(json!({"skill": "alpha", "path": "notes.txt"}), &ctx())
+            .await
+            .unwrap();
+        assert!(out.content.contains("hello notes"));
+    }
+
+    #[tokio::test]
+    async fn read_skill_file_rejects_escape() {
+        let (reg, _d) = reg_with_skill("alpha", "body", &[]);
+        let err = ReadSkillFile::new(reg)
+            .execute(json!({"skill": "alpha", "path": "../../etc/passwd"}), &ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn read_skill_file_unknown_skill_is_not_found() {
+        let (reg, _d) = reg_with_skill("alpha", "body", &[]);
+        let err = ReadSkillFile::new(reg)
+            .execute(json!({"skill": "nope", "path": "x"}), &ctx())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
     }
 }
