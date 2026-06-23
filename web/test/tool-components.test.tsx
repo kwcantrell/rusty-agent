@@ -13,8 +13,8 @@ describe("tool components", () => {
   });
   it("TerminalBlock shows the command, output, and exit code", () => {
     render(<TerminalBlock command="echo hi" stdout={"hi\n"} stderr="" exitCode={0} />);
-    expect(screen.getByText(/echo hi/)).toBeInTheDocument();
-    expect(screen.getAllByText(/hi/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/echo hi/)).toBeInTheDocument();              // command span
+    expect(screen.getByText(/hi/, { selector: "pre" })).toBeInTheDocument(); // stdout in <pre>
     expect(screen.getByText(/exit 0/)).toBeInTheDocument();
   });
   it("ToolCall renders a Terminal display for execute_command", () => {
