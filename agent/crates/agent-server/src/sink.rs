@@ -41,7 +41,7 @@ mod tests {
         sink.emit(AgentEvent::Token("hello".into()));
         let env = rx.try_recv().expect("one envelope");
         assert_eq!(env.session_id, "sess-1");
-        matches!(env.body, WireBody::Event { .. });
+        assert!(matches!(env.body, WireBody::Event { .. }));
     }
 
     #[test]
