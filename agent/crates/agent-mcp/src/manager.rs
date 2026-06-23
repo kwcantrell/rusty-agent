@@ -131,8 +131,9 @@ where
     let handles: Vec<_> = futs.into_iter().map(tokio::spawn).collect();
     let mut out = Vec::with_capacity(handles.len());
     for h in handles {
-        if let Ok(v) = h.await {
-            out.push(v);
+        match h.await {
+            Ok(v) => out.push(v),
+            Err(e) => tracing::error!(target: "mcp", error = %e, "connect task panicked"),
         }
     }
     out
