@@ -25,6 +25,9 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
 
   const save = () => onSave({ ...form, command_allowlist: fromLines(allow), command_denylist: fromLines(deny) });
 
+  const floor = meta?.hardFloor ?? [];
+  const redundant = fromLines(deny).filter((d) => floor.includes(d));
+
   const field = "w-full rounded bg-zinc-800 px-2 py-1 text-sm text-zinc-100";
   const label = "block text-xs uppercase tracking-wide text-zinc-400 mb-1";
 
@@ -83,6 +86,11 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
           {meta && (
             <p className="text-xs text-zinc-500">
               Always blocked (hard floor): {meta.hardFloor.join(", ")}
+            </p>
+          )}
+          {redundant.length > 0 && (
+            <p className="text-xs text-amber-400/80">
+              Redundant — already in the hard floor: {redundant.join(", ")}
             </p>
           )}
         </section>

@@ -43,6 +43,22 @@ test("shows an error message", () => {
   expect(screen.getByText("bad base_url")).toBeInTheDocument();
 });
 
+test("flags denylist entries that are redundant with the hard floor", () => {
+  const overlapping: RuntimeSettings = { ...settings, command_denylist: ["sudo", "mine"] };
+  render(<SettingsPanel settings={overlapping} meta={meta} error={null} disabled={false}
+    onSave={() => {}} onClose={() => {}} />);
+  // "sudo" is in meta.hardFloor → redundant; "mine" is not → no warning about it.
+  const note = screen.getByText(/already in the hard floor/i);
+  expect(note).toHaveTextContent("sudo");
+  expect(note).not.toHaveTextContent("mine");
+});
+
+test("shows no redundancy note when the denylist and hard floor are disjoint", () => {
+  render(<SettingsPanel settings={settings} meta={meta} error={null} disabled={false}
+    onSave={() => {}} onClose={() => {}} />);
+  expect(screen.queryByText(/already in the hard floor/i)).not.toBeInTheDocument();
+});
+
 test("save is disabled when offline", () => {
   render(<SettingsPanel settings={settings} meta={meta} error={null} disabled={true}
     onSave={() => {}} onClose={() => {}} />);

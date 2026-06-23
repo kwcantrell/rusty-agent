@@ -17,12 +17,15 @@ Plan: [`../plans/2026-06-23-settings-capability.md`](../plans/2026-06-23-setting
 Merged to `main` at `6133ff4`. Final whole-branch review (opus): "Ready to merge, with fixes" — all findings Minor, no Critical/Important.
 
 ### Accepted (won't-fix / deferred)
-- **`effective_denylist` dedup is O(n²)** — `agent/crates/agent-runtime-config/src/runtime_config.rs` (`effective_denylist`). Uses `Vec::contains` per insert; fine for config-size lists, not a hot path. Reason: not worth an `IndexSet` for a handful of entries.
-- **`validate()` doesn't independently reject `claude-cli` + `native`** — `agent/crates/agent-runtime-config/src/runtime_config.rs` (`validate`). Relies on the documented `normalized()`-first contract (`apply`/`new` always normalize before validating). Reason: contract is enforced at the only call sites + doc-commented.
-- **`load_over` swallows all I/O errors like a missing file** — `agent/crates/agent-runtime-config/src/runtime_config.rs` (`load_over`). Permission/other I/O errors return the flag base, same as ENOENT (brief-mandated). Reason: acceptable; a future hardening pass could split `ErrorKind::NotFound` from other errors.
-- **`SettingsPanel` keeps its opened snapshot if the server pushes a new `settings_state` while open** — `web/src/components/SettingsPanel.tsx` (`useState(settings)` init, no re-sync effect). Reason: closing and reopening the panel refreshes; standard modal-form pattern; not a spec requirement.
-- **`App.tsx` uses an inline `import("./wire").RuntimeSettings` type** — `web/src/App.tsx` (`saveSettings` param). Reason: style only; a top-level `import type` would be cleaner; tsc accepts it, no runtime difference.
-- **Hard-floor / user-denylist overlap not visually flagged** — `web/src/components/SettingsPanel.tsx` (hard-floor display). If a user denylist entry also appears in the hard floor, there's no visual indication of overlap. Reason: cosmetic; not a spec requirement.
+- **`effective_denylist` dedup is O(n²)** — `agent/crates/agent-runtime-config/src/runtime_config.rs` (`effective_denylist`). Uses `Vec::contains` per insert; fine for config-size lists, not a hot path. Reason: not worth an `IndexSet` for a handful of entries. (Reviewed again in the 2026-06-23 follow-up pass — deliberately kept.)
+- **`SettingsPanel` keeps its opened snapshot if the server pushes a new `settings_state` while open** — `web/src/components/SettingsPanel.tsx` (`useState(settings)` init, no re-sync effect). Reason: closing and reopening the panel refreshes; standard modal-form pattern; not a spec requirement. The naive re-sync effect would clobber in-progress edits; a non-destructive "settings changed — reload?" banner is the correct fix and out of scope for the follow-up pass. (Reviewed again 2026-06-23 — deliberately kept.)
+
+### Resolved (2026-06-23 follow-up pass, commit `6be8bb5`)
+Four of the originally-accepted Minors resolved directly (TDD; 5 new Rust tests, 2 new web tests; `cargo test --workspace` + clippy `-D warnings` + web 42 tests + `npm run build` all green).
+- **`validate()` now independently rejects `claude-cli` + non-`prompted`** — `agent/crates/agent-runtime-config/src/runtime_config.rs` (`validate`). Defense-in-depth for a future caller that skips `normalized()`; the happy path still normalizes first so it never fires there.
+- **`load_over` splits `ErrorKind::NotFound` from other read errors** — same file. A missing file stays silent; an unreadable or malformed config now falls back to the launch base *and* warns to stderr, via an extracted, unit-tested pure `resolve_load` classifier.
+- **`App.tsx` inline `import("./wire").RuntimeSettings` hoisted** — `web/src/App.tsx`. Now a top-level `import type { Decision, RuntimeSettings }`.
+- **Hard-floor / user-denylist overlap now flagged** — `web/src/components/SettingsPanel.tsx`. A live "Redundant — already in the hard floor: …" note lists denylist entries already covered by the floor.
 
 ### Resolved (during the cycle, kept for context)
 - **Daemon `user_input` arm lost integration coverage** after the forced `daemon_roundtrip.rs` rewrite → added a model-free `user_input` smoke test (fail-fast base_url + then `settings_get`→`settings_state` proves the read loop survived). Commit `c9a6e5a`.
