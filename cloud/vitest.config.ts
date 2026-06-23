@@ -1,14 +1,16 @@
-import { defineWorkersConfig } from "@cloudflare/vitest-pool-workers/config";
+import { defineConfig } from "vitest/config";
+import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 
-export default defineWorkersConfig({
-  test: {
-    poolOptions: {
-      workers: {
-        wrangler: { configPath: "./wrangler.toml" },
-        miniflare: {
-          compatibilityDate: "2025-01-01",
-        },
+export default defineConfig({
+  plugins: [
+    cloudflareTest({
+      wrangler: { configPath: "./wrangler.jsonc" },
+      miniflare: {
+        compatibilityDate: "2026-06-01",
+        // Tests read env.BOOTSTRAP_SECRET and send it as the enroll auth header,
+        // so the suite is self-consistent for any fixed value.
+        bindings: { BOOTSTRAP_SECRET: "test-secret" },
       },
-    },
-  },
+    }),
+  ],
 });

@@ -98,4 +98,4 @@ export default {
   },
 };
 
-export { AgentSession } from "./session"; // AgentSession placeholder — real DO logic added in Task 8
+export { AgentSession } from "./session";

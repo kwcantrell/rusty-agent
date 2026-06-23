@@ -1,0 +1,21 @@
+{
+  "name": "agent-control-plane",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [
+      { "name": "AGENT", "class_name": "AgentSession" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AgentSession"] }
+  ],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "agent-cp", "database_id": "local" }
+  ],
+  "r2_buckets": [
+    { "binding": "LOGS", "bucket_name": "agent-logs" }
+  ]
+}
