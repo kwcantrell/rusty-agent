@@ -5,16 +5,13 @@
   "scripts": {
     "dev": "wrangler dev",
     "test": "vitest run",
-    "db:init": "wrangler d1 execute agent-cp --local --file=./schema.sql",
-    "postinstall": "patch-package"
+    "db:init": "wrangler d1 execute agent-cp --local --file=./schema.sql"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.5.0",
+    "@cloudflare/vitest-pool-workers": "^0.16.0",
     "@cloudflare/workers-types": "^4.20250101.0",
-    "patch-package": "^8.0.1",
-    "postinstall-postinstall": "^2.1.0",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0",
-    "wrangler": "^3.90.0"
+    "vitest": "^4.1.0",
+    "wrangler": "^4.0.0"
   }
 }

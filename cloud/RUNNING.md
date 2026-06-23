@@ -2,9 +2,10 @@
 
 ## 1. Start the cloud (terminal A)
 cd cloud
-npm install
-npm run db:init           # apply schema.sql to local D1
-npx wrangler dev          # Worker on http://localhost:8787 (DO/D1/R2 emulated)
+npm install                       # applies no patches now; clean install
+echo 'BOOTSTRAP_SECRET=dev-secret-change-me' > .dev.vars   # gitignored; only if missing
+npm run db:init                   # apply schema.sql to local D1
+npx wrangler dev                  # Worker on http://localhost:8787 (DO/D1/R2 emulated)
 
 ## 2. Enroll + run the daemon (terminal B)
 cd agent
@@ -28,3 +29,4 @@ cd cloud/testpage && python3 -m http.server 8081
 - [ ] Stop the daemon → browser shows `[presence online=false]`.
 - [ ] `npx wrangler d1 execute agent-cp --local --command "SELECT id,online FROM agents"` shows the row.
 - [ ] R2 objects exist: `ls .wrangler/state/**/r2/**` (or inspect via the dashboard emulator).
+- [ ] `.dev.vars` is gitignored — for a real deploy use `npx wrangler secret put BOOTSTRAP_SECRET`.
