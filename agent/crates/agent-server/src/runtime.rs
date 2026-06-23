@@ -193,8 +193,16 @@ fn build_loop(
         }
     }
     // All names in `presets` are known, so compose cannot error here.
-    let system_prompt = compose_system_prompt(base_system_prompt, &skill_registry, &presets)
-        .unwrap_or_else(|_| base_system_prompt.to_string());
+    let system_prompt = match compose_system_prompt(base_system_prompt, &skill_registry, &presets) {
+        Ok(p) => p,
+        Err(e) => {
+            // Unreachable today (presets are pre-filtered against scan()), but surface it
+            // rather than silently dropping all presets if that ever changes. Never panic
+            // here — startup must stay lenient.
+            tracing::error!(error = %e, "compose_system_prompt failed unexpectedly; using base prompt");
+            base_system_prompt.to_string()
+        }
+    };
 
     let loop_ = Arc::new(AgentLoop::new(
         model,

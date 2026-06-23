@@ -50,7 +50,7 @@ describe("settings frames", () => {
   it("parses a settings_state frame", () => {
     const raw = JSON.stringify({
       v: 1, session_id: "s", kind: "settings_state", settings: sampleSettings,
-      workspace: "/w", api_key_set: true, hard_floor: ["sudo"],
+      workspace: "/w", api_key_set: true, hard_floor: ["sudo"], discovered_skills: [],
     });
     const f = parseInbound(raw);
     expect(f?.kind).toBe("settings_state");
