@@ -55,3 +55,32 @@ Four of the originally-accepted Minors resolved directly (TDD; 5 new Rust tests,
 - **Test-coverage gaps in normalization/branches** — `agent-mcp` — Accepted. Unasserted/untested: multi-part `content[]` text join, non-text-content `[… omitted]` fallback, `list_tools` `description` field, `McpClient::close`, config "unreadable" branch. Load-bearing paths are covered by the hermetic suite + the live DoD test (14 tools); these are low-risk normalization branches. Backfill candidate.
 - **`McpManager::from_parts` (test-only) bypasses status sort; `summary_line` "error" fallback only reachable via it** — `agent/crates/agent-mcp/src/manager.rs` — Accepted. Test helper only; no production reachability.
 - **Cosmetics** — Accepted: redundant `text.clone()` in `execute` success path (`tool.rs`); `notify` always emits `params: {}` (`client.rs`); verbose fully-qualified type annotation in `agent-server/src/main.rs`; CLI `let _ = &mcp_manager;` keep-alive is a no-op-for-lifetime (binding already lives to end-of-`main`; comment overstates the mechanism) (`agent-cli/src/main.rs`).
+
+---
+
+## 2026-06-23 http-tool
+
+New `agent-http` crate: read-only `fetch_url` web-fetch tool. Built subagent-driven (6 tasks).
+Final whole-branch review (opus): **Ready to merge — Yes.** No Critical, no Important. All three
+security invariants (zero core change; non-overridable SSRF floor; DNS-rebinding pin) verified
+against the real core crates + `RulePolicy`. Live DoD validated against the real qwen3.6-35b-a3b
+model (allowlisted no-prompt fetch; metadata-IP hard-denied even when allowlisted; non-allowlisted
+approval prompt).
+
+### Deferred scope (intentional, from the spec's "Out of scope")
+- In-session response caching — Open — deferred; not needed for the slice.
+- Headless browser (Playwright/chromiumoxide) — Open — separate, larger follow-up.
+- POST / custom headers / general `http_request` — Open — `fetch_url` is GET-only by design.
+- Overriding the SSRF floor for an explicitly-allowed private host — Open — floor is non-overridable
+  in this slice; an opt-in escape hatch (e.g. for an internal docs host) is a future config addition.
+
+### Resolved during the cycle
+- **Redirect security boundaries were coded-correct but untested** — `agent/crates/agent-http/src/tool.rs` (test mod) — Resolved (commit `d0efc86`). Added `redirect_to_non_http_scheme_is_denied` (302→`file://` Location → `Denied`) and `too_many_redirects_is_failed` (7-hop chain → `Failed`). (Only Important finding of the cycle; raised in the Task 4 review.)
+
+### Accepted (Minor, won't-fix now)
+- **Per-hop redirect timeout multiplies the overall budget** — `agent/crates/agent-http/src/tool.rs` (`execute`, the per-hop `reqwest::Client::builder().timeout(ctx.timeout)`) — Open. Each redirect hop builds a fresh client with the FULL `ctx.timeout`, so a 5-hop chain can run up to ~6× the intended wall-clock before failing; the spec §5 says "overall timeout." Bounded externally by `ctx.cancel` (no hang risk). Partly a plan-level omission. Fix: compute a single `deadline = Instant::now() + ctx.timeout` before the loop and set each hop's timeout to the remaining budget (error if exhausted). Worth doing; non-blocking.
+- **No test exercises SSRF re-validation on a redirect hop to a blocked IP** — `agent/crates/agent-http/src/tool.rs` (test mod) — Open. The spec DoD lists "redirect chain re-validation"; the per-hop `guard.check` is the identical path proven by `strict_guard_blocks_loopback_target` at hop 0, but no test shows a mid-chain redirect→blocked-IP being denied. Hard to test cleanly (the mock server is itself on loopback, requiring the permissive guard to reach). Backfill with a second mock or a stub resolver.
+- **`human()` displays "2048.0 KB" instead of "2.0 MB" at the 2 MiB cap** — `agent/crates/agent-http/src/tool.rs` (`human`) — Accepted. Display-only; KB is accurate, just unrolled. Add an MB arm when convenient.
+- **Truncation marker reworded from the plan's literal** — `agent/crates/agent-http/src/content.rs` (`truncate`) — Accepted. The plan's verbose marker (~82 chars) would have exceeded the plan's OWN `<= MAX_RETURN + 64` test bound — a plan-internal contradiction the implementer resolved by shortening to `[truncated: <n> bytes downloaded]`; spec intent (signal truncation + size) preserved. An explanatory comment at the marker would close the loop.
+- **Cancellation maps to `ToolError::Timeout`** — `agent/crates/agent-http/src/tool.rs` (`resolve`/`execute`/`read_capped` select arms) — Accepted. `ctx.cancel` firing and a network timeout both surface as `Timeout`; the error taxonomy has no distinct cancel variant (matches the plan and the rest of the codebase). Revisit only if upstream retry logic must distinguish them.
+- **Cosmetics** — Accepted: redundant `use agent_tools::Access;` in the `tool.rs` test module (harmless — explicit `use` shadows the `super::*` glob, compiles clean); content-type binary-refusal message shows the bare mime (`unknown` when empty) without quotes; a `agent-runtime-config` registry test could use a one-line "always registered; `NetworkPolicy` gates which hosts are permitted" comment.
