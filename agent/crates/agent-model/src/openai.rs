@@ -5,6 +5,62 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
+/// Splits a streamed `content` channel into answer text and `<think>…</think>`
+/// reasoning, buffering a partial tag that straddles a chunk boundary.
+#[derive(Default)]
+pub(crate) struct ThinkingSplitter {
+    in_think: bool,
+    buf: String,
+}
+
+impl ThinkingSplitter {
+    fn emit(out: &mut Vec<Chunk>, in_think: bool, s: &str) {
+        if s.is_empty() { return; }
+        out.push(if in_think { Chunk::Reasoning(s.to_string()) } else { Chunk::Text(s.to_string()) });
+    }
+
+    pub(crate) fn push(&mut self, content: &str) -> Vec<Chunk> {
+        let mut out = Vec::new();
+        self.buf.push_str(content);
+        loop {
+            let tag: &str = if self.in_think { "</think>" } else { "<think>" };
+            if let Some(idx) = self.buf.find(tag) {
+                let before = self.buf[..idx].to_string();
+                Self::emit(&mut out, self.in_think, &before);
+                self.buf.drain(..idx + tag.len());
+                self.in_think = !self.in_think;
+                continue;
+            }
+            let keep = partial_prefix_len(tag, &self.buf);
+            let flush_to = self.buf.len() - keep;
+            let flush = self.buf[..flush_to].to_string();
+            Self::emit(&mut out, self.in_think, &flush);
+            self.buf.drain(..flush_to);
+            break;
+        }
+        out
+    }
+
+    pub(crate) fn flush(&mut self) -> Vec<Chunk> {
+        let mut out = Vec::new();
+        let rest = std::mem::take(&mut self.buf);
+        Self::emit(&mut out, self.in_think, &rest);
+        out
+    }
+}
+
+/// Length of the longest suffix of `buf` that is a proper prefix of `tag`.
+fn partial_prefix_len(tag: &str, buf: &str) -> usize {
+    let max = tag.len().saturating_sub(1).min(buf.len());
+    for k in (1..=max).rev() {
+        let start = buf.len() - k;
+        if buf.is_char_boundary(start) && buf[start..] == tag[..k] {
+            return k;
+        }
+    }
+    0
+}
+
 /// Trait for streaming chat-completion clients.
 #[async_trait]
 pub trait ModelClient: Send + Sync {
@@ -68,7 +124,7 @@ impl OpenAiCompatClient {
     }
 }
 
-fn parse_sse_line(line: &str) -> Option<Result<Vec<Chunk>, ModelError>> {
+fn parse_sse_line(line: &str, splitter: &mut ThinkingSplitter) -> Option<Result<Vec<Chunk>, ModelError>> {
     let data = line.strip_prefix("data:")?.trim();
     if data == "[DONE]" {
         return Some(Ok(vec![]));
@@ -79,9 +135,14 @@ fn parse_sse_line(line: &str) -> Option<Result<Vec<Chunk>, ModelError>> {
     };
     let choice = &v["choices"][0];
     let mut out = Vec::new();
+    if let Some(reasoning) = choice["delta"]["reasoning_content"].as_str() {
+        if !reasoning.is_empty() {
+            out.push(Chunk::Reasoning(reasoning.to_string()));
+        }
+    }
     if let Some(content) = choice["delta"]["content"].as_str() {
         if !content.is_empty() {
-            out.push(Chunk::Text(content.to_string()));
+            out.extend(splitter.push(content));
         }
     }
     if let Some(calls) = choice["delta"]["tool_calls"].as_array() {
@@ -129,6 +190,7 @@ impl ModelClient for OpenAiCompatClient {
         let mut byte_stream = resp.bytes_stream();
         let stream = async_stream::stream! {
             let mut buf = String::new();
+            let mut splitter = ThinkingSplitter::default();
             loop {
                 // Drain any complete lines from buf before fetching more bytes.
                 if let Some(idx) = buf.find('\n') {
@@ -137,7 +199,7 @@ impl ModelClient for OpenAiCompatClient {
                     if line.is_empty() {
                         continue;
                     }
-                    match parse_sse_line(&line) {
+                    match parse_sse_line(&line, &mut splitter) {
                         None => continue,
                         Some(Err(e)) => {
                             yield Err(e);
@@ -149,6 +211,7 @@ impl ModelClient for OpenAiCompatClient {
                                 yield Ok(chunk);
                             }
                             if is_done {
+                                for chunk in splitter.flush() { yield Ok(chunk); }
                                 return;
                             }
                             continue;
@@ -162,7 +225,10 @@ impl ModelClient for OpenAiCompatClient {
                         yield Err(ModelError::Stream(e.to_string()));
                         return;
                     }
-                    None => return,
+                    None => {
+                        for chunk in splitter.flush() { yield Ok(chunk); }
+                        return;
+                    }
                 }
             }
         };
@@ -177,6 +243,46 @@ mod tests {
     use futures::StreamExt;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn collect(s: &mut ThinkingSplitter, parts: &[&str]) -> (String, String) {
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut chunks: Vec<Chunk> = Vec::new();
+        for p in parts { chunks.extend(s.push(p)); }
+        chunks.extend(s.flush());
+        for c in chunks {
+            match c {
+                Chunk::Text(t) => text.push_str(&t),
+                Chunk::Reasoning(r) => reasoning.push_str(&r),
+                _ => {}
+            }
+        }
+        (text, reasoning)
+    }
+
+    #[test]
+    fn splitter_routes_think_block() {
+        let mut s = ThinkingSplitter::default();
+        let (text, reasoning) = collect(&mut s, &["<think>plan</think>answer"]);
+        assert_eq!(reasoning, "plan");
+        assert_eq!(text, "answer");
+    }
+
+    #[test]
+    fn splitter_handles_tag_split_across_chunks() {
+        let mut s = ThinkingSplitter::default();
+        let (text, reasoning) = collect(&mut s, &["<thi", "nk>deep", " thought</thi", "nk>done"]);
+        assert_eq!(reasoning, "deep thought");
+        assert_eq!(text, "done");
+    }
+
+    #[test]
+    fn splitter_passes_through_plain_text() {
+        let mut s = ThinkingSplitter::default();
+        let (text, reasoning) = collect(&mut s, &["hello ", "world"]);
+        assert_eq!(text, "hello world");
+        assert!(reasoning.is_empty());
+    }
 
     #[tokio::test]
     async fn streams_text_chunks_then_done() {
@@ -209,6 +315,7 @@ mod tests {
                 Chunk::Text(t) => text.push_str(&t),
                 Chunk::Done(r) => done = Some(r),
                 Chunk::ToolCallDelta(_) => {}
+                Chunk::Reasoning(_) => {}
             }
         }
         assert_eq!(text, "Hello");

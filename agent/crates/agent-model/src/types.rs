@@ -43,8 +43,8 @@ pub struct CompletionRequest {
     pub enable_thinking: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopReason { Stop, ToolCalls, Length, BudgetExhausted }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopReason { #[default] Stop, ToolCalls, Length, BudgetExhausted }
 
 #[derive(Debug, Clone, Default)]
 pub struct RawToolCall {
@@ -54,13 +54,14 @@ pub struct RawToolCall {
 }
 
 #[derive(Debug, Clone)]
-pub enum Chunk { Text(String), ToolCallDelta(RawToolCall), Done(StopReason) }
+pub enum Chunk { Text(String), Reasoning(String), ToolCallDelta(RawToolCall), Done(StopReason) }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AssistantTurn {
     pub text: String,
     pub raw_tool_calls: Vec<RawToolCall>,
     pub stop: StopReason,
+    pub reasoning: String,
 }
 
 #[derive(Debug, Clone)]

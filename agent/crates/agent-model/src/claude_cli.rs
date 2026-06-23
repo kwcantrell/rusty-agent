@@ -222,6 +222,7 @@ mod proc_tests {
                 Chunk::Text(t) => text.push_str(&t),
                 Chunk::Done(r) => done = Some(r),
                 Chunk::ToolCallDelta(_) => {}
+                Chunk::Reasoning(_) => {}
             }
         }
         assert_eq!(text, "hello from fake");
@@ -278,6 +279,7 @@ mod proc_tests {
                 Chunk::Text(t) => text.push_str(&t),
                 Chunk::Done(r) => done = Some(r),
                 Chunk::ToolCallDelta(_) => {}
+                Chunk::Reasoning(_) => {}
             }
         }
         assert_eq!(text, "ok");

@@ -46,6 +46,7 @@ mod tests {
                 id: Some("c1".into()), name: Some("read_file".into()),
                 args_fragment: r#"{"path":"a.txt"}"#.into() }],
             stop: StopReason::ToolCalls,
+            reasoning: String::new(),
         };
         let parsed = NativeProtocol.parse(&turn).unwrap();
         assert_eq!(parsed.text, "ok");
@@ -59,7 +60,7 @@ mod tests {
         let turn = AssistantTurn { text: "".into(),
             raw_tool_calls: vec![RawToolCall { id: Some("c1".into()),
                 name: Some("x".into()), args_fragment: "{not json".into() }],
-            stop: StopReason::ToolCalls };
+            stop: StopReason::ToolCalls, reasoning: String::new() };
         assert!(NativeProtocol.parse(&turn).is_err());
     }
 

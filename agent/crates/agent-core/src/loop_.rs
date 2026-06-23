@@ -72,6 +72,7 @@ impl AgentLoop {
             Ok(opened) => opened?,
         };
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut raw_tool_calls: Vec<RawToolCall> = Vec::new();
         let mut stop = StopReason::Stop;
         loop {
@@ -81,12 +82,13 @@ impl AgentLoop {
                 Ok(None) => break,
                 Ok(Some(item)) => match item? {
                     Chunk::Text(t) => { self.sink.emit(AgentEvent::Token(t.clone())); text.push_str(&t); }
+                    Chunk::Reasoning(r) => { reasoning.push_str(&r); }
                     Chunk::ToolCallDelta(rc) => merge_tool_call(&mut raw_tool_calls, rc),
                     Chunk::Done(r) => stop = r,
                 },
             }
         }
-        Ok(AssistantTurn { text, raw_tool_calls, stop })
+        Ok(AssistantTurn { text, raw_tool_calls, stop, reasoning })
     }
 
     /// Stream with retry/backoff on transport errors.
