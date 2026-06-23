@@ -160,6 +160,8 @@ mod proc_tests {
     fn write_fake(script: &str) -> tempfile::TempPath {
         let mut f = tempfile::Builder::new().prefix("fake-claude-").tempfile().unwrap();
         write!(f, "{script}").unwrap();
+        f.flush().unwrap();
+        f.as_file().sync_all().unwrap(); // settle the executable before exec() to avoid ETXTBSY under parallel test runs
         let path = f.into_temp_path();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
