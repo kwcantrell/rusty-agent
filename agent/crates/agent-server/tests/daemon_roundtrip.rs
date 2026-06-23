@@ -4,9 +4,10 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// The daemon connects to a fake Worker, honours a settings_get query, and
-/// does not crash when a user_input arrives (the in-flight run fails cleanly
-/// because there is no real model endpoint, but the daemon loop keeps running).
+/// The daemon connects to a fake Worker, exercises the `user_input` read-loop
+/// arm (spawns an `agent.run` that fails fast against a closed port — the daemon
+/// loop must survive), then honours a `settings_get` query and returns a
+/// `settings_state` frame, confirming the daemon is still alive and responsive.
 #[tokio::test]
 async fn settings_get_round_trips_over_websocket() {
     // 1. Fake Worker: accept one daemon connection.
@@ -17,13 +18,22 @@ async fn settings_get_round_trips_over_websocket() {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
 
-        // Send a settings_get frame.
+        // Send a user_input frame first. The spawned agent.run() will fail fast
+        // because the model base_url points at a closed port (127.0.0.1:1). The
+        // daemon must not crash — the read loop should keep running.
+        let user_input_frame = serde_json::json!({
+            "v": 1, "session_id": "s1", "kind": "user_input", "text": "hello"
+        });
+        ws.send(WsMessage::Text(user_input_frame.to_string())).await.unwrap();
+
+        // Now send a settings_get frame to verify the daemon loop is still alive.
         let get_frame = serde_json::json!({
             "v": 1, "session_id": "s1", "kind": "settings_get"
         });
         ws.send(WsMessage::Text(get_frame.to_string())).await.unwrap();
 
-        // Expect a settings_state response.
+        // Expect a settings_state response, proving the read loop survived the
+        // user_input arm's background spawn erroring out.
         let mut saw_state = false;
         while let Some(Ok(msg)) = ws.next().await {
             let WsMessage::Text(t) = msg else { continue };
