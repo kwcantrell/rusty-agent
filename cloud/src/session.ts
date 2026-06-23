@@ -57,10 +57,24 @@ export class AgentSession {
     });
   }
 
+  private async replayFromR2(sessionId: string, ws: WebSocket) {
+    const list = await this.env.LOGS.list({ prefix: `sessions/${sessionId}/` });
+    const keys = list.objects.map((o) => o.key).sort();
+    for (const key of keys) {
+      const obj = await this.env.LOGS.get(key);
+      if (obj) ws.send(await obj.text());
+    }
+  }
+
   private attachBrowser(ws: WebSocket, sessionId: string) {
     this.browsers.add(ws);
-    // Replay buffered events for this session.
-    for (const frame of this.buffer.get(sessionId) ?? []) ws.send(frame);
+    // Replay buffered events for this session, falling back to R2 when the buffer is empty.
+    const buffered = this.buffer.get(sessionId);
+    if (buffered && buffered.length > 0) {
+      for (const frame of buffered) ws.send(frame);
+    } else {
+      void this.replayFromR2(sessionId, ws);
+    }
     ws.send(JSON.stringify({ v: 1, session_id: sessionId, kind: "presence",
       online: this.daemon !== null }));
     ws.addEventListener("message", (ev) => {

@@ -65,4 +65,28 @@ describe("relay", () => {
       .first<{ online: number }>();
     expect(row?.online).toBe(1);
   });
+
+  it("replays the event log from R2 to a freshly attached browser", async () => {
+    // Pre-seed R2 with two events for a session, bypassing the live buffer.
+    await env.LOGS.put("sessions/sess-1/00000000.json", JSON.stringify({
+      v: 1, session_id: "sess-1", kind: "event", payload: { type: "token", text: "one" } }));
+    await env.LOGS.put("sessions/sess-1/00000001.json", JSON.stringify({
+      v: 1, session_id: "sess-1", kind: "event", payload: { type: "token", text: "two" } }));
+
+    // A new DO instance has an empty buffer, so it must read R2.
+    const ctx = createExecutionContext();
+    const browserRes = await worker.fetch(
+      wsReq(`/browser?token=${toks.sessTok}`), env, ctx);
+    const browserWs = browserRes.webSocket!;
+    const received: string[] = [];
+    browserWs.addEventListener("message", (e) => received.push(e.data as string));
+    browserWs.accept();
+
+    await new Promise((r) => setTimeout(r, 80));
+    await waitOnExecutionContext(ctx);
+
+    const joined = received.join("\n");
+    expect(joined).toContain("one");
+    expect(joined).toContain("two");
+  });
 });
