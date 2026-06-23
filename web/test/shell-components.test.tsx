@@ -41,5 +41,38 @@ describe("shell components", () => {
     expect(onSend).toHaveBeenCalledWith("do it");
     rerender(<Composer disabled={true} onSend={onSend} />);
     expect(screen.getByRole("button", { name: /send/i })).toBeDisabled();
+    expect(screen.getByRole("textbox")).toBeDisabled();
+  });
+
+  it("Composer submits on Enter but not on Shift+Enter", async () => {
+    const onSend = vi.fn();
+    render(<Composer disabled={false} onSend={onSend} />);
+    const box = screen.getByRole("textbox");
+    await userEvent.type(box, "via enter{Enter}");
+    expect(onSend).toHaveBeenCalledWith("via enter");
+    onSend.mockClear();
+    await userEvent.type(box, "no submit{Shift>}{Enter}{/Shift}");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("Composer trims text and ignores whitespace-only input", async () => {
+    const onSend = vi.fn();
+    render(<Composer disabled={false} onSend={onSend} />);
+    const box = screen.getByRole("textbox");
+    await userEvent.type(box, "  trimmed  ");
+    await userEvent.click(screen.getByRole("button", { name: /send/i }));
+    expect(onSend).toHaveBeenCalledWith("trimmed");
+    onSend.mockClear();
+    await userEvent.type(box, "   ");
+    await userEvent.click(screen.getByRole("button", { name: /send/i }));
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("MessageList renders a tool item", () => {
+    render(<MessageList items={[
+      { kind: "tool", name: "execute_command", args: {}, status: "done", content: "exit=0",
+        display: { Terminal: { command: "ls", stdout: "f\n", stderr: "", exit_code: 0 } } },
+    ]} />);
+    expect(screen.getByText(/execute_command/)).toBeInTheDocument();
   });
 });
