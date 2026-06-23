@@ -79,6 +79,7 @@ dependencies = [
  "agent-core",
  "agent-model",
  "agent-policy",
+ "agent-runtime-config",
  "agent-tools",
  "async-trait",
  "clap",

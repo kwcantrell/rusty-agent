@@ -2,6 +2,10 @@
 name = "agent-server"
 edition.workspace = true
 
+[lib]
+name = "agent_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "agent-serverd"
 path = "src/main.rs"
@@ -11,6 +15,7 @@ agent-core = { path = "../agent-core" }
 agent-tools = { path = "../agent-tools" }
 agent-policy = { path = "../agent-policy" }
 agent-model = { path = "../agent-model" }
+agent-runtime-config = { path = "../agent-runtime-config" }
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 async-trait.workspace = true
