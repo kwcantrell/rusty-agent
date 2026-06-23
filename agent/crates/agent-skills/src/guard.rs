@@ -10,6 +10,9 @@ pub fn resolve_in_dir(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     let candidate = base_dir.join(rel);
     let normalized = normalize(&candidate);
     let base_norm = normalize(base_dir);
+    if base_norm.as_os_str().is_empty() {
+        return Err(format!("invalid base directory: {}", base_dir.display()));
+    }
     if normalized.starts_with(&base_norm) {
         Ok(normalized)
     } else {
@@ -54,5 +57,11 @@ mod tests {
         let base = PathBuf::from("/skills/foo");
         let err = resolve_in_dir(&base, "../bar/secret").unwrap_err();
         assert!(err.contains("escapes"));
+    }
+
+    #[test]
+    fn rejects_empty_base_dir() {
+        let err = resolve_in_dir(Path::new(""), "anything").unwrap_err();
+        assert!(err.contains("invalid base"));
     }
 }
