@@ -73,3 +73,29 @@ Reading `a.txt` now.
    a local dev backend; each turn is a fresh process so there is no warm reuse.
 5. **Rate limits:** the run reported `rate_limit_event` with `five_hour` window —
    the subscription cap, as expected. Heavy loop use will hit it.
+
+## Follow-ups / known limitations
+
+Captured from the final whole-branch review (opus, 2026-06-23). None block the
+local-dev use the design scoped for; all are out of scope for the initial
+backend and tracked here so they survive the merge.
+
+1. **Operator docs for the new flags.** Nothing user-facing documents
+   `--backend {openai|claude-cli}` or `--claude-binary` (e.g. in a `RUNNING.md`).
+   A short stanza should cover: the authenticated-CLI prerequisite, the
+   `sonnet`/`opus` model values, and the rate-limit caveat (risk #5).
+2. **Production risks to track before non-dev use** (already noted as risks #1
+   and #5 above): the SessionStart-hook context pollution (every nested turn
+   ingests the user's `using-superpowers` injection, burning tokens and leaking
+   into `thinking`) and the 5-hour subscription rate cap. Investigate
+   `--settings` / hook-suppression and a backoff/limit strategy before driving
+   sustained loops.
+3. **`AgentLoop` has no timeout around model-stream consumption**
+   (`agent-core/src/loop_.rs:54-58` — bare `while let Some(item) = stream.next().await`;
+   `tool_timeout` wraps only tool execution at ~line 167). A hung backend blocks
+   the turn indefinitely. **Pre-existing** — it affects the `OpenAiCompatClient`
+   /SGLang path identically and lives in the FIXED `AgentLoop`, so it was out of
+   scope for this branch. `ClaudeCliClient`'s `kill_on_drop(true)` already cleans
+   up the subprocess *if* the stream is dropped; adding a per-turn deadline in the
+   loop would make that path actually trigger on a stall. Fix belongs to a
+   loop-level change, not this backend.
