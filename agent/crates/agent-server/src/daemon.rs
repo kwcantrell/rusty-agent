@@ -105,11 +105,11 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
                     approval.resolve(&id, decision.into());
                 }
             }
-            other => {
-                // settings_get / settings_update handled here; anything else is ignored.
+            other @ (WireBody::SettingsGet | WireBody::SettingsUpdate { .. }) => {
                 *session.lock().unwrap() = env.session_id.clone();
                 runtime.handle(&other);
             }
+            _ => {}
         }
     }
     writer.abort();

@@ -63,7 +63,7 @@ export default function App() {
   const connected = state.status === "open";
   return (
     <div className="flex h-screen flex-col bg-zinc-950">
-      <StatusBar online={state.online} status={state.status} onSignOut={signOut} onOpenSettings={openSettings} />
+      <StatusBar online={state.online} status={state.status} onSignOut={signOut} onOpenSettings={openSettings} settingsDisabled={!(connected && state.online)} />
       {showSettings && state.settings && (
         <SettingsPanel
           settings={state.settings}

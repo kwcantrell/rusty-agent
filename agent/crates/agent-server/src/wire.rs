@@ -192,6 +192,8 @@ mod tests {
         let j = serde_json::to_string(&state).unwrap();
         assert!(j.contains("\"kind\":\"settings_state\""));
         assert!(j.contains("\"api_key_set\":true"));
+        let back: WireEnvelope = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back.body, WireBody::SettingsState { .. }));
 
         let err = WireEnvelope {
             v: PROTOCOL_VERSION, session_id: "s".into(), id: None,

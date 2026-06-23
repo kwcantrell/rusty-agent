@@ -72,6 +72,9 @@ version = "0.0.0"
 dependencies = [
  "agent-model",
  "agent-tools",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
