@@ -32,6 +32,27 @@ describe("socket", () => {
     expect(frames).toEqual([{ v: 1, session_id: "s", kind: "presence", online: true }]);
   });
 
+  it("doubles backoff on repeated closes and resets on open", () => {
+    vi.useFakeTimers();
+    FakeWS.instances = [];
+    connect("ws://x/browser?token=t", { onFrame: () => {}, onStatus: () => {} },
+      { WebSocketImpl: FakeWS as unknown as typeof WebSocket, backoffMs: 10 });
+    FakeWS.instances[0].open();        // backoff reset to 10
+    FakeWS.instances[0].close();       // unexpected -> reconnect in 10, next backoff 20
+    vi.advanceTimersByTime(10);
+    expect(FakeWS.instances.length).toBe(2);
+    FakeWS.instances[1].close();       // unexpected, no open -> reconnect in 20
+    vi.advanceTimersByTime(10);
+    expect(FakeWS.instances.length).toBe(2); // NOT yet: proves delay doubled to 20
+    vi.advanceTimersByTime(10);
+    expect(FakeWS.instances.length).toBe(3); // fired at 20
+    FakeWS.instances[2].open();        // resets backoff to 10
+    FakeWS.instances[2].close();       // reconnect in 10 again
+    vi.advanceTimersByTime(10);
+    expect(FakeWS.instances.length).toBe(4); // proves reset to base
+    vi.useRealTimers();
+  });
+
   it("reconnects on unexpected close but not after a deliberate close()", () => {
     vi.useFakeTimers();
     FakeWS.instances = [];

@@ -37,7 +37,7 @@ export function connect(url: string, handlers: Handlers, opts: Opts = {}) {
 
   return {
     send(o: Outbound) {
-      ws.send(JSON.stringify(o));
+      if (ws && ws.readyState === 1 /* OPEN */) ws.send(JSON.stringify(o));
     },
     close() {
       closed = true;
