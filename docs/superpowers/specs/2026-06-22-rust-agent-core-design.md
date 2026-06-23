@@ -33,6 +33,8 @@ That full platform is **8+ independently substantial subsystems**. This spec cov
 
 The core's interfaces are deliberately designed so these later pieces bolt on **additively** through two seams (`EventSink`, `ApprovalChannel`) without modifying the core.
 
+Each deferred subsystem has a high-level **context primer** in [`../context/`](../context/README.md) — enough for a fresh agent session to understand it and run its own `brainstorming` → spec → plan cycle.
+
 ---
 
 ## 2. Key decisions (and why)
