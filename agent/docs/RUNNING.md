@@ -158,6 +158,57 @@ allowlist **and** it contains no shell metacharacters. So `cargo build` runs
 unprompted, but `cargo build 2>&1` or `cmd && other` (redirects/operators) require
 approval — by design, since the whole string is passed to `sh -c`.
 
+### Web fetching: `fetch_url` tool and `--allow-host`
+
+The `fetch_url` tool lets the agent fetch URLs and returns readable text:
+- **GET-only** web fetch: makes HTTP GET requests and returns the response as text.
+- **Content rendering:** HTML is passed through a readability extractor to extract
+  main content; JSON and plain text pass through as-is; binary/non-text content
+  (images, archives, etc.) is refused with a tool error.
+- **Response bounds:** downloads are capped at ~2 MiB; the text returned to the model
+  is capped at ~8 KB.
+
+#### Controlling access: `--allow-host`
+
+Use the `--allow-host` flag (repeatable on both `agent-cli` and `agent-serverd run`)
+to name hosts that `fetch_url` may contact **without requiring an approval prompt**:
+
+```bash
+cargo run -p agent-cli -- \
+  --base-url http://localhost:8080 \
+  --model qwen3.6-35b-a3b \
+  --workspace . \
+  --allow-host docs.rs \
+  --allow-host .rust-lang.org
+```
+
+Matching is **case-insensitive**. An exact host (`--allow-host example.com`) matches
+only that host; a leading-dot suffix (`--allow-host .rust-lang.org`) matches the
+apex domain (`rust-lang.org`) and any subdomain (`docs.rust-lang.org`, etc.).
+
+#### Approval behavior
+
+- **Allowlisted hosts:** fetched immediately without any prompt.
+- **Non-allowlisted hosts:** trigger an interactive approval prompt:
+  ```
+  Allow: GET <url> ? [y]es / [n]o / [a]lways
+  ```
+  Choose `y` to allow once, `n` to deny, or `a` to allow this host for the rest of
+  the session.
+
+#### SSRF safety (non-overridable)
+
+Regardless of the allowlist, `fetch_url` **always blocks** requests that resolve to:
+- Loopback addresses (127.0.0.0/8, ::1)
+- Private ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7)
+- Link-local (169.254.0.0/16, fe80::/10)
+- Cloud metadata (169.254.169.254, fe80::a9fe:a9fe)
+- Other reserved ranges
+
+These are blocked with a `denied: ... (SSRF guard)` error, regardless of whether the
+host is allowlisted. The check is applied to the resolved IP and re-applied on every
+redirect, so redirects to unsafe IPs are also blocked.
+
 ### Manage the container
 
 ```bash
