@@ -1,4 +1,4 @@
-import type { Display, Inbound } from "./wire";
+import type { Display, Inbound, RuntimeSettings } from "./wire";
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
 
@@ -24,6 +24,9 @@ export interface ConversationState {
   userMsgs: string[]; // stored user messages for this session; index = turn
   turnIndex: number; // turns started so far
   inTurn: boolean; // has the current turn's user item been emitted?
+  settings: RuntimeSettings | null;
+  settingsMeta: { workspace: string; apiKeySet: boolean; hardFloor: string[] } | null;
+  settingsError: string | null;
 }
 
 export type Action =
@@ -34,7 +37,8 @@ export type Action =
   | { type: "status"; status: ConnectionStatus };
 
 export function initialState(userMsgs: string[]): ConversationState {
-  return { items: [], pendingApproval: null, online: false, status: "connecting", userMsgs, turnIndex: 0, inTurn: false };
+  return { items: [], pendingApproval: null, online: false, status: "connecting", userMsgs, turnIndex: 0, inTurn: false,
+    settings: null, settingsMeta: null, settingsError: null };
 }
 
 /** Emit the stored user message that heads the current turn, if not already emitted. */
@@ -64,6 +68,14 @@ export function reduce(state: ConversationState, action: Action): ConversationSt
 
 function reduceFrame(state: ConversationState, frame: Inbound): ConversationState {
   if (frame.kind === "presence") return { ...state, online: frame.online };
+  if (frame.kind === "settings_state") {
+    return { ...state, settings: frame.settings,
+      settingsMeta: { workspace: frame.workspace, apiKeySet: frame.api_key_set, hardFloor: frame.hard_floor },
+      settingsError: null };
+  }
+  if (frame.kind === "settings_error") {
+    return { ...state, settingsError: frame.message };
+  }
   if (frame.kind === "approval_request") {
     return { ...state, pendingApproval: { id: frame.id, summary: frame.summary, command: frame.command, display: frame.display } };
   }
