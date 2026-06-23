@@ -1,6 +1,7 @@
-import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { env, createExecutionContext, waitOnExecutionContext, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import worker from "../src/worker";
+import { AgentSession } from "../src/session";
 import { sha256hex, newToken } from "../src/util";
 
 async function seed() {
@@ -68,6 +69,10 @@ describe("relay", () => {
     const row = await env.DB.prepare("SELECT online FROM agents WHERE id='agent-1'")
       .first<{ online: number }>();
     expect(row?.online).toBe(1);
+    // Clean up open sockets so subsequent tests start with a clean presence state.
+    daemonWs.close(1000, "done");
+    browserWs.close(1000, "done");
+    await new Promise((r) => setTimeout(r, 30));
   });
 
   it("replays the event log from R2 to a freshly attached browser", async () => {
@@ -92,5 +97,66 @@ describe("relay", () => {
     const joined = received.join("\n");
     expect(joined).toContain("one");
     expect(joined).toContain("two");
+  });
+
+  it("persists a durable monotonic seq in DO SQLite and writes R2 keys in order", async () => {
+    const ctx = createExecutionContext();
+    const agentRes = await worker.fetch(
+      wsReq("/agent", { Authorization: `Bearer ${toks.agentTok}` }), env, ctx);
+    const daemonWs = agentRes.webSocket!;
+    daemonWs.accept();
+
+    for (const text of ["alpha", "beta"]) {
+      daemonWs.send(JSON.stringify({
+        v: 1, session_id: "sess-seq", kind: "event", payload: { type: "token", text } }));
+    }
+    await new Promise((r) => setTimeout(r, 80));
+    await waitOnExecutionContext(ctx);
+
+    // R2 keys are zero-padded and monotonic for this session.
+    const list = await env.LOGS.list({ prefix: "sessions/sess-seq/" });
+    const keys = list.objects.map((o: R2Object) => o.key).sort();
+    expect(keys).toEqual([
+      "sessions/sess-seq/00000000.json",
+      "sessions/sess-seq/00000001.json",
+    ]);
+
+    // The seq survives in DO SQLite (value = next seq to hand out = 2).
+    const id = env.AGENT.idFromName("agent-1");
+    const stub = env.AGENT.get(id);
+    const stored = await runInDurableObject(stub, async (_instance: AgentSession, state: DurableObjectState) => {
+      const rows = state.storage.sql.exec("SELECT v FROM meta WHERE k='seq:sess-seq'").toArray();
+      return rows.length ? Number((rows[0] as { v: number }).v) : 0;
+    });
+    expect(stored).toBe(2);
+    // Clean up: close the daemon socket so the next test sees a fresh presence state.
+    daemonWs.close(1000, "done");
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  it("flips presence offline when the daemon socket closes", async () => {
+    const ctx = createExecutionContext();
+    const agentRes = await worker.fetch(
+      wsReq("/agent", { Authorization: `Bearer ${toks.agentTok}` }), env, ctx);
+    const daemonWs = agentRes.webSocket!;
+    daemonWs.accept();
+
+    const browserRes = await worker.fetch(
+      wsReq(`/browser?token=${toks.sessTok}`), env, ctx);
+    const browserWs = browserRes.webSocket!;
+    const received: string[] = [];
+    browserWs.addEventListener("message", (e) => received.push(e.data as string));
+    browserWs.accept();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Daemon goes away.
+    daemonWs.close(1000, "bye");
+    await new Promise((r) => setTimeout(r, 50));
+    await waitOnExecutionContext(ctx);
+
+    const row = await env.DB.prepare("SELECT online FROM agents WHERE id='agent-1'")
+      .first<{ online: number }>();
+    expect(row?.online).toBe(0);
+    expect(received.some((m) => m.includes("\"presence\"") && m.includes("false"))).toBe(true);
   });
 });
