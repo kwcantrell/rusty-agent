@@ -64,6 +64,7 @@ async fn settings_get_round_trips_over_websocket() {
         claude_binary: "claude".into(),
         config_path,
         workspace: workspace.path().to_path_buf(),
+        mcp_tools: std::sync::Arc::from(Vec::<std::sync::Arc<dyn agent_tools::Tool>>::new()),
     };
 
     let daemon = tokio::spawn(async move {

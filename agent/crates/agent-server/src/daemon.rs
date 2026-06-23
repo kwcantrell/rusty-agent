@@ -5,6 +5,7 @@ use crate::wire::{WireBody, WireEnvelope};
 use agent_core::WindowContext;
 use agent_model::Message;
 use agent_runtime_config::RuntimeConfig;
+use agent_tools::Tool;
 use futures::{SinkExt, StreamExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,7 @@ pub struct DaemonParams {
     pub claude_binary: String,
     pub config_path: PathBuf,
     pub workspace: PathBuf,
+    pub mcp_tools: Arc<[Arc<dyn Tool>]>,
 }
 
 const SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided tools to inspect \
@@ -51,6 +53,7 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
         params.config_path.clone(),
         session.clone(),
         tx.clone(),
+        params.mcp_tools.clone(),
     ));
     let ctx = Arc::new(tokio::sync::Mutex::new(
         WindowContext::new(Message::system(SYSTEM_PROMPT))));

@@ -45,6 +45,9 @@ enum Cmd {
         /// above; overlaid by this file if present.
         #[arg(long, default_value = "agent-runtime.json")]
         runtime_config: PathBuf,
+        /// Optional MCP server config (mcp.json shape). If absent, MCP is disabled.
+        #[arg(long)]
+        mcp_config: Option<PathBuf>,
     },
 }
 
@@ -66,7 +69,7 @@ async fn main() {
             }
         }
         Cmd::Run { base_url, model, protocol, workspace, context_limit, backend, claude_binary,
-                   runtime_config } => {
+                   runtime_config, mcp_config } => {
             let cfg = DaemonConfig::load(&cli.config)
                 .expect("load config (run `enroll` first)");
             println!("pairing code: {}", cfg.pairing_code);
@@ -83,6 +86,19 @@ async fn main() {
                 eprintln!("invalid launch config: {e}");
                 std::process::exit(2);
             }
+            // Connect MCP once at process start; the manager owns server processes for the
+            // full lifetime of the binary (across all WebSocket reconnects below).
+            let mcp_manager = match &mcp_config {
+                Some(path) => {
+                    let mgr = agent_runtime_config::connect_mcp(path).await;
+                    println!("{}", mgr.summary_line());
+                    Some(mgr)
+                }
+                None => None,
+            };
+            let mcp_tools: std::sync::Arc<[std::sync::Arc<dyn agent_tools::Tool>]> =
+                mcp_manager.as_ref().map(|m| std::sync::Arc::from(m.tools()))
+                    .unwrap_or_else(|| std::sync::Arc::from(Vec::<std::sync::Arc<dyn agent_tools::Tool>>::new()));
             let params = daemon::DaemonParams {
                 ws_url: ws_url(&cfg.worker_url),
                 agent_token: cfg.agent_token,
@@ -91,6 +107,7 @@ async fn main() {
                 claude_binary,
                 config_path: runtime_config,
                 workspace,
+                mcp_tools,
             };
             // Reconnect with simple backoff.
             let mut backoff = 1u64;
@@ -121,5 +138,6 @@ fn params_clone(p: &daemon::DaemonParams) -> daemon::DaemonParams {
         claude_binary: p.claude_binary.clone(),
         config_path: p.config_path.clone(),
         workspace: p.workspace.clone(),
+        mcp_tools: p.mcp_tools.clone(),
     }
 }
