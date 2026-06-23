@@ -6,10 +6,15 @@
 #   3. agent-server daemon              (dials the Worker; the agent you pair with)
 #
 # Usage:
-#   scripts/launch-web-ui.sh [claude|local] [workspace]
+#   scripts/launch-web-ui.sh [claude|local] [workspace] [--runtime-config PATH]
 #     backend   claude  -> --backend claude-cli --model sonnet         (default; uses your subscription)
 #               local   -> --backend openai --base-url :8080 ...        (local llama.cpp on :8080)
 #     workspace defaults to /tmp/agent-ws
+#     --runtime-config PATH  persisted live-settings file the daemon overlays on its
+#                            launch defaults (sampling params, enable/preserve_thinking,
+#                            model/endpoint/policy). Editable from the browser Settings
+#                            panel; survives across runs when pointed at a stable path.
+#                            Omitted -> daemon default `agent-runtime.json` in the workspace.
 #
 # Ctrl-C tears down all three (and their child processes). Logs: /tmp/agent-web-ui/.
 set -euo pipefail
@@ -21,8 +26,32 @@ WORKER_URL="http://localhost:8787"
 BOOTSTRAP_SECRET="dev-secret-change-me"
 LOGDIR="/tmp/agent-web-ui"
 
-BACKEND="${1:-claude}"
-WORKSPACE="${2:-/tmp/agent-ws}"
+# Parse args: two optional positionals (backend, workspace) + an optional named
+# --runtime-config flag (accepted in any position).
+BACKEND=""
+WORKSPACE=""
+RUNTIME_CONFIG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --runtime-config) RUNTIME_CONFIG="${2:?--runtime-config needs a path}"; shift 2 ;;
+    --runtime-config=*) RUNTIME_CONFIG="${1#*=}"; shift ;;
+    -h|--help)
+      sed -n '8,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "unknown option '$1' (see --help)" >&2; exit 2 ;;
+    *)
+      if [[ -z "$BACKEND" ]]; then BACKEND="$1"
+      elif [[ -z "$WORKSPACE" ]]; then WORKSPACE="$1"
+      else echo "unexpected argument '$1' (see --help)" >&2; exit 2; fi
+      shift ;;
+  esac
+done
+BACKEND="${BACKEND:-claude}"
+WORKSPACE="${WORKSPACE:-/tmp/agent-ws}"
+# Resolve a relative --runtime-config against the invocation cwd (not the daemon's
+# cwd, which is the workspace) so the path means what the user typed.
+if [[ -n "$RUNTIME_CONFIG" && "$RUNTIME_CONFIG" != /* ]]; then
+  RUNTIME_CONFIG="$(pwd)/${RUNTIME_CONFIG#./}"
+fi
 
 case "$BACKEND" in
   claude) DAEMON_BACKEND=(--backend claude-cli --model sonnet) ;;
@@ -133,8 +162,10 @@ WEB_URL="$(wait_for_vite_url "$LOGDIR/web.log" || true)"
 # matches its --workspace and any relative artifact (e.g. agent-runtime.json) lands
 # in the workspace, not the launch dir. Tools are scoped to --workspace regardless.
 echo "▸ starting agent daemon (backend: $BACKEND) → $LOGDIR/daemon.log"
+DAEMON_RUNTIME_CFG=()
+[[ -n "$RUNTIME_CONFIG" ]] && DAEMON_RUNTIME_CFG=(--runtime-config "$RUNTIME_CONFIG")
 launch "$WORKSPACE" "$LOGDIR/daemon.log" \
-  "$BIN" --config "$CONFIG" run "${DAEMON_BACKEND[@]}" --workspace "$WORKSPACE" >/dev/null
+  "$BIN" --config "$CONFIG" run "${DAEMON_BACKEND[@]}" "${DAEMON_RUNTIME_CFG[@]}" --workspace "$WORKSPACE" >/dev/null
 
 # ---- summary --------------------------------------------------------------
 cat <<EOF
@@ -147,6 +178,7 @@ cat <<EOF
   Worker:        $WORKER_URL
   Workspace:     $WORKSPACE
   Backend:       $BACKEND
+  Runtime cfg:   ${RUNTIME_CONFIG:-$WORKSPACE/agent-runtime.json (daemon default)}
 
   Logs:  $LOGDIR/{worker,web,daemon}.log
   Press Ctrl-C to stop everything.
