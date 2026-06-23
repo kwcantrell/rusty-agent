@@ -21,6 +21,9 @@ cargo run -p agent-server -- --config ../agent-server.json \
 cargo run -p agent-server -- --config ../agent-server.json \
   run --base-url http://localhost:8080 --model qwen3.6-35b-a3b \
       --workspace /tmp/agent-ws --context-limit 32768
+# Or drive the daemon off your Claude subscription instead of an inference server
+# (same --backend claude-cli path as the CLI — see agent/docs/RUNNING.md §1):
+#   run --backend claude-cli --model sonnet --workspace /tmp/agent-ws
 
 ## 3. Open the test client (terminal C) — LEGACY throwaway harness (prefer §4)
 # This single-file HTML page predates the React UI (§4) and hits the cross-origin wall
