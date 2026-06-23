@@ -71,6 +71,10 @@ impl RuntimeConfig {
         if !protocol_name_is_valid(&self.protocol) {
             return Err(format!("unknown protocol '{}': use native | prompted", self.protocol));
         }
+        if self.backend == "claude-cli" && self.protocol != "prompted" {
+            return Err("claude-cli backend is prompted-only: protocol must be 'prompted' \
+                        (normalized() applies this automatically)".into());
+        }
         if self.backend == "openai" && self.base_url.trim().is_empty() {
             return Err("base_url is required for the openai backend".into());
         }
@@ -121,16 +125,33 @@ impl RuntimeConfig {
         Ok(())
     }
 
-    /// Flag-derived `base`, overlaid per-field by the file at `path` if it parses;
-    /// a missing or malformed file leaves `base` unchanged.
+    /// Flag-derived `base`, overlaid per-field by the file at `path` if it parses.
+    /// A missing file is silent (normal first run); an unreadable or malformed file
+    /// leaves `base` unchanged but warns to stderr so the operator isn't surprised
+    /// that an on-disk config was ignored.
     pub fn load_over(base: RuntimeConfig, path: &Path) -> RuntimeConfig {
-        match std::fs::read_to_string(path) {
-            Ok(text) => match serde_json::from_str::<PartialRuntimeConfig>(&text) {
-                Ok(p) => base.merge(p),
-                Err(_) => base,
-            },
-            Err(_) => base,
+        let (cfg, warning) = resolve_load(base, std::fs::read_to_string(path));
+        if let Some(w) = warning {
+            eprintln!("warning: runtime config at {} {w}; using launch defaults", path.display());
         }
+        cfg
+    }
+}
+
+/// Pure decision half of [`RuntimeConfig::load_over`]: given the result of reading the
+/// config file, return the config to use and an optional operator warning. A missing
+/// file (`NotFound`) is normal and yields no warning; any other read error or a
+/// malformed file falls back to `base` *with* a warning.
+fn resolve_load(
+    base: RuntimeConfig, read: std::io::Result<String>,
+) -> (RuntimeConfig, Option<String>) {
+    match read {
+        Ok(text) => match serde_json::from_str::<PartialRuntimeConfig>(&text) {
+            Ok(p) => (base.merge(p), None),
+            Err(e) => (base, Some(format!("is malformed JSON ({e})"))),
+        },
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => (base, None),
+        Err(e) => (base, Some(format!("could not be read ({e})"))),
     }
 }
 
@@ -189,6 +210,17 @@ mod tests {
         let mut c = base();
         c.context_limit = 16;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_claude_cli_with_native_protocol() {
+        // Defense-in-depth: a caller that skips normalized() must not slip a
+        // claude-cli + native config past validation.
+        let mut c = base();
+        c.backend = "claude-cli".into();
+        c.protocol = "native".into();
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("claude-cli"), "expected claude-cli protocol error, got: {err}");
     }
 
     #[test]
@@ -264,5 +296,34 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         let b = base();
         assert_eq!(RuntimeConfig::load_over(b.clone(), &path), b);
+    }
+
+    #[test]
+    fn resolve_load_is_silent_when_file_absent() {
+        let absent = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let (cfg, warn) = resolve_load(base(), absent);
+        assert_eq!(cfg, base());
+        assert!(warn.is_none(), "a missing file is normal, not a warning");
+    }
+
+    #[test]
+    fn resolve_load_warns_on_other_io_errors() {
+        let denied = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let (cfg, warn) = resolve_load(base(), denied);
+        assert_eq!(cfg, base(), "still falls back to the launch base");
+        assert!(warn.unwrap().contains("read"), "operator should be warned the file was unreadable");
+    }
+
+    #[test]
+    fn resolve_load_warns_on_malformed_json() {
+        let (cfg, warn) = resolve_load(base(), Ok("not json".into()));
+        assert_eq!(cfg, base());
+        assert!(warn.unwrap().contains("malformed"));
+    }
+
+    #[test]
+    fn resolve_load_is_silent_on_a_good_file() {
+        let (_cfg, warn) = resolve_load(base(), Ok(r#"{"model":"m"}"#.into()));
+        assert!(warn.is_none());
     }
 }

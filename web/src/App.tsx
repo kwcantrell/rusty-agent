@@ -1,7 +1,7 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { connect } from "./socket";
 import { initialState, reduce } from "./state";
-import type { Decision } from "./wire";
+import type { Decision, RuntimeSettings } from "./wire";
 import { PairingScreen } from "./components/PairingScreen";
 import { StatusBar } from "./components/StatusBar";
 import { MessageList } from "./components/MessageList";
@@ -56,7 +56,7 @@ export default function App() {
     setShowSettings(true);
     sock.current?.send({ v: 1, session_id: sessionId, kind: "settings_get" });
   };
-  const saveSettings = (s: import("./wire").RuntimeSettings) => {
+  const saveSettings = (s: RuntimeSettings) => {
     sock.current?.send({ v: 1, session_id: sessionId, kind: "settings_update", settings: s });
   };
 
