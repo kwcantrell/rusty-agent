@@ -3,6 +3,7 @@ mod types;
 mod tool;
 mod registry;
 pub mod fs;
+pub mod shell;
 pub use types::*;
 pub use tool::*;
 pub use registry::*;
