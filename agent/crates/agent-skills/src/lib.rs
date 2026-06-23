@@ -5,7 +5,7 @@ pub mod skill;
 pub use skill::Skill;
 
 // Uncommented as later tasks land:
-// pub mod guard;
+pub mod guard;
 // pub mod presets;
 // pub mod registry;
 // pub mod tools;
