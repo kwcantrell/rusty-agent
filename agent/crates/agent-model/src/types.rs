@@ -74,6 +74,8 @@ pub enum ModelError {
     Decode(String),
     #[error("stream error: {0}")]
     Stream(String),
+    #[error("process error: {0}")]
+    Process(String),
 }
 
 #[cfg(test)]

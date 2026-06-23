@@ -2,9 +2,10 @@ mod approval;
 mod render;
 
 use agent_core::{AgentLoop, LoopConfig, WindowContext};
-use agent_model::{Message, OpenAiCompatClient};
+use agent_model::Message;
 use agent_policy::RulePolicy;
-use agent_runtime_config::{build_registry, default_allowlist, default_denylist, pick_protocol};
+use agent_runtime_config::{backend_name_is_valid, build_registry, build_model,
+    default_allowlist, default_denylist, pick_protocol};
 use approval::TerminalApproval;
 use clap::Parser;
 use render::TerminalSink;
@@ -24,6 +25,12 @@ struct Cli {
     /// Tool-call protocol: native | prompted
     #[arg(long, default_value = "native")]
     protocol: String,
+    /// Inference backend: openai | claude-cli
+    #[arg(long, default_value = "openai")]
+    backend: String,
+    /// Path/name of the Claude Code CLI binary (claude-cli backend only)
+    #[arg(long, default_value = "claude")]
+    claude_binary: String,
     /// Workspace directory the agent may operate in
     #[arg(long, default_value = ".")]
     workspace: String,
@@ -40,9 +47,22 @@ async fn main() {
     let workspace = std::fs::canonicalize(&cli.workspace)
         .unwrap_or_else(|_| std::path::PathBuf::from(&cli.workspace));
 
+    if !backend_name_is_valid(&cli.backend) {
+        eprintln!("unknown --backend '{}': use openai | claude-cli", cli.backend);
+        std::process::exit(2);
+    }
     let api_key = std::env::var("AGENT_API_KEY").ok();
-    let model = Arc::new(OpenAiCompatClient::new(cli.base_url.clone(), cli.model.clone(), api_key));
-    let protocol = pick_protocol(&cli.protocol);
+    let model = build_model(&cli.backend, &cli.base_url, &cli.model, &cli.claude_binary, api_key);
+    // claude-cli is a pure text generator; tool calls must come via the prompted protocol.
+    let protocol_name = if cli.backend == "claude-cli" {
+        if cli.protocol != "prompted" {
+            eprintln!("note: forcing --protocol prompted for claude-cli backend");
+        }
+        "prompted"
+    } else {
+        cli.protocol.as_str()
+    };
+    let protocol = pick_protocol(protocol_name);
     let tools = Arc::new(build_registry());
     let policy = Arc::new(RulePolicy {
         workspace: workspace.clone(),

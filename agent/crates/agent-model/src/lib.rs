@@ -8,3 +8,5 @@ pub use prompted::*;
 mod wire;
 mod openai;
 pub use openai::*;
+mod claude_cli;
+pub use claude_cli::*;

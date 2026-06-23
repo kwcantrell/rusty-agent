@@ -16,18 +16,47 @@ python -m sglang.launch_server --model-path <hf-model> --port 30000
 vLLM (`--port 8000`) and llama.cpp's `llama-server` (`--port 8080`) expose the same
 `/v1/chat/completions` API and work identically — just change `--base-url`.
 
+### Alternative: the Claude Code CLI as backend (no server, uses your subscription)
+
+If you have an authenticated [Claude Code](https://docs.claude.com/en/docs/claude-code)
+CLI on this machine, you can skip the inference server entirely and let the agent drive
+`claude` as its model — piggybacking on your Claude subscription (no API key, no GPU):
+
+```bash
+cargo run -p agent-cli -- \
+  --backend claude-cli \
+  --model sonnet \
+  --workspace /path/to/project
+# --claude-binary <path>   # if `claude` isn't on PATH
+```
+
+How it works: `ClaudeCliClient` spawns `claude -p --output-format stream-json
+--allowedTools "" --model <model>` per turn as a **pure text generator** (its own tools
+are disabled), and the Rust loop owns tool execution through its policy engine as usual.
+Tool calls are produced/parsed via the **prompted** protocol, so `--protocol` is forced
+to `prompted` for this backend (you'll see a one-line note confirming it). `--base-url`
+and `AGENT_API_KEY` are ignored. `--model` takes a Claude model alias (`sonnet`, `opus`).
+
+Caveats (local-dev scope; see
+[`../../docs/superpowers/context/claude-cli-inference.md`](../../docs/superpowers/context/claude-cli-inference.md)
+for the full spike + follow-ups): each turn is a fresh `claude` process (~seconds of
+latency, no warm reuse), sustained loops hit the subscription's rolling rate cap, and the
+machine's `SessionStart` hooks fire inside the nested invocation (context pollution).
+
 ## 2. Run the CLI
 
 ```bash
 cd agent
 cargo run -p agent-cli -- \
+  --backend openai \
   --base-url http://localhost:30000 \
   --model <served-model-name> \
   --protocol native \
   --workspace /path/to/project
 ```
-Set `AGENT_API_KEY` if your endpoint requires a bearer token. Tune log output with
-`RUST_LOG=agent_core=debug`.
+`--backend` defaults to `openai` (the inference-server path above); pass
+`--backend claude-cli` for the subscription path. Set `AGENT_API_KEY` if your endpoint
+requires a bearer token. Tune log output with `RUST_LOG=agent_core=debug`.
 
 ## 3. End-to-end test against your server
 

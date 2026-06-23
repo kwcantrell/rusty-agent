@@ -1,9 +1,8 @@
-use agent_model::OpenAiCompatClient;
+use agent_runtime_config::{backend_name_is_valid, build_model};
 use agent_server::config::{ws_url, DaemonConfig};
 use agent_server::{config, daemon};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "agent-serverd", about = "Local agent daemon (Cloudflare control plane)")]
@@ -38,6 +37,10 @@ enum Cmd {
         workspace: String,
         #[arg(long, default_value_t = 8192)]
         context_limit: usize,
+        #[arg(long, default_value = "openai")]
+        backend: String,
+        #[arg(long, default_value = "claude")]
+        claude_binary: String,
     },
 }
 
@@ -58,14 +61,26 @@ async fn main() {
                 Err(e) => { eprintln!("enroll failed: {e}"); std::process::exit(1); }
             }
         }
-        Cmd::Run { base_url, model, protocol, workspace, context_limit } => {
+        Cmd::Run { base_url, model, protocol, workspace, context_limit, backend, claude_binary } => {
             let cfg = DaemonConfig::load(&cli.config)
                 .expect("load config (run `enroll` first)");
             println!("pairing code: {}", cfg.pairing_code);
             let workspace = std::fs::canonicalize(&workspace)
                 .unwrap_or_else(|_| PathBuf::from(&workspace));
+            if !backend_name_is_valid(&backend) {
+                eprintln!("unknown --backend '{backend}': use openai | claude-cli");
+                std::process::exit(2);
+            }
             let api_key = std::env::var("AGENT_API_KEY").ok();
-            let client = Arc::new(OpenAiCompatClient::new(base_url, model, api_key));
+            let client = build_model(&backend, &base_url, &model, &claude_binary, api_key);
+            let protocol = if backend == "claude-cli" {
+                if protocol != "prompted" {
+                    eprintln!("note: forcing --protocol prompted for claude-cli backend");
+                }
+                "prompted".to_string()
+            } else {
+                protocol
+            };
             let params = daemon::DaemonParams {
                 ws_url: ws_url(&cfg.worker_url),
                 agent_token: cfg.agent_token,

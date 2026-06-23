@@ -26,12 +26,14 @@ I want to brainstorm and spec the NEXT subsystem.
 A Cargo workspace under `agent/` of 7 trait-decoupled crates: the original 5 —
 agent-tools (Tool trait, registry, fs/shell/git tools with a workspace path guard +
 command allow/deny policy), agent-policy (PolicyEngine + ApprovalChannel), agent-model
-(OpenAI-compatible SSE streaming client + native & prompted tool-call protocols),
+(OpenAI-compatible SSE streaming client + native & prompted tool-call protocols, plus a
+`ClaudeCliClient` backend that drives an authenticated Claude Code CLI as a pure text
+generator — subscription-auth, prompted-only — selected via `--backend claude-cli`),
 agent-core (the ReAct loop, token-windowed ContextManager, EventSink/AgentEvent model),
 agent-cli (terminal renderer + approval + REPL) — plus two added by the control-plane
 work: agent-server (an outbound-WebSocket *daemon* that drives AgentLoop and bridges the
 core's seams over the wire) and agent-runtime-config (loop-wiring helpers shared by the
-CLI and the daemon). 58 Rust tests pass, clippy `-D warnings` clean.
+CLI and the daemon). 71 Rust tests pass, clippy `-D warnings` clean.
 
 Beyond the Rust workspace:
 - `cloud/` — the Cloudflare control plane: a Worker (`/enroll`,`/pair`,`/agent`,`/browser`)
@@ -63,6 +65,9 @@ R2 reconnect-replay → presence) all work live. Treat all three slices as prove
                        best-practices revision (…-bestpractices-revision-design.md / -revision.md)
 - React frontend (#6, built):           specs/2026-06-23-react-frontend-design.md
                        + plans/2026-06-23-react-frontend.md
+- Claude CLI inference backend (built):  specs/2026-06-23-claude-cli-inference-backend-design.md
+                       + plans/2026-06-23-claude-cli-inference-backend.md, spike +
+                       follow-ups in context/claude-cli-inference.md
 - How to run: agent/docs/RUNNING.md (the CLI + live model) and cloud/RUNNING.md
                        (the control plane, the chrome-driven E2E, and the web UI dev/build flow)
 
@@ -109,5 +114,6 @@ one at a time. Do NOT write code or scaffold anything until I approve the design
 - Drive the CLI: `cargo run -p agent-cli -- --base-url http://localhost:8080 --model
   qwen3.6-35b-a3b --workspace <dir> --context-limit 32768`. Keep --context-limit well
   below the server's capacity for latency (see RUNNING.md for the -c vs --context-limit
-  note).
+  note). To skip the model server entirely and use a Claude subscription instead, add
+  `--backend claude-cli --model sonnet` (no --base-url; see agent/docs/RUNNING.md §1).
 ```

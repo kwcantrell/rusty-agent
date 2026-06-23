@@ -40,3 +40,9 @@ After the agent core works end-to-end from the CLI, a sensible sequence (each is
 | 6 | [`react-frontend-design`](../specs/2026-06-23-react-frontend-design.md) | [plan](../plans/2026-06-23-react-frontend.md) | New top-level `web/` React+Vite+TS+Tailwind SPA, **served same-origin by the Worker via Workers static assets** (not Cloudflare Pages → no CORS). Pure WS client; daemon/wire-protocol unchanged. |
 
 > The primers for #5 and #6 below are kept as historical context, but they predate the build — where a primer and the shipped design differ (e.g. "Axum"→`tokio-tungstenite` client; "Cloudflare Pages"→Workers static assets), the **spec/plan above is the source of truth**.
+
+### Other shipped enhancements (not from the deferred list)
+
+| Enhancement | Spec | Plan | Notes |
+|---|---|---|---|
+| Claude CLI inference backend | [`claude-cli-inference-backend-design`](../specs/2026-06-23-claude-cli-inference-backend-design.md) | [plan](../plans/2026-06-23-claude-cli-inference-backend.md) | New `ClaudeCliClient` in `agent-model` (attaches via the **`ModelClient`** seam — core untouched) drives an authenticated Claude Code CLI as a pure text generator (tools disabled; **prompted** protocol). Selectable via `--backend claude-cli` on `agent-cli` + `agent-server`; default `openai` unchanged. Spike findings + follow-ups: [`claude-cli-inference.md`](./claude-cli-inference.md). |
