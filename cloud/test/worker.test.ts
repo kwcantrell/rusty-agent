@@ -34,6 +34,15 @@ describe("enroll + pair", () => {
     expect(res.status).toBe(401);
   });
 
+  it("rejects enroll with a wrong bootstrap secret", async () => {
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      post("/enroll", { name: "x" }, { "X-Bootstrap-Secret": "wrong-secret" }),
+      env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(401);
+  });
+
   it("enrolls then pairs", async () => {
     const ctx = createExecutionContext();
     const enrollRes = await worker.fetch(

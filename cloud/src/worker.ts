@@ -18,7 +18,13 @@ async function enroll(req: Request, env: Env): Promise<Response> {
   if (req.headers.get("X-Bootstrap-Secret") !== env.BOOTSTRAP_SECRET) {
     return json({ error: "unauthorized" }, 401);
   }
-  const { name } = (await req.json()) as { name?: string };
+  let body: { name?: string };
+  try {
+    body = (await req.json()) as { name?: string };
+  } catch {
+    return json({ error: "invalid body" }, 400);
+  }
+  const { name } = body;
   const agentId = crypto.randomUUID();
   const token = newToken();
   const tokenHash = await sha256hex(token);
@@ -31,7 +37,13 @@ async function enroll(req: Request, env: Env): Promise<Response> {
 }
 
 async function pair(req: Request, env: Env): Promise<Response> {
-  const { pairing_code } = (await req.json()) as { pairing_code?: string };
+  let body: { pairing_code?: string };
+  try {
+    body = (await req.json()) as { pairing_code?: string };
+  } catch {
+    return json({ error: "invalid body" }, 400);
+  }
+  const { pairing_code } = body;
   if (!pairing_code) return json({ error: "missing pairing_code" }, 400);
   const agent = await env.DB.prepare("SELECT id FROM agents WHERE pairing_code = ?")
     .bind(pairing_code).first<{ id: string }>();
@@ -54,4 +66,4 @@ export default {
   },
 };
 
-export { AgentSession } from "./session"; // added in Task 8
+export { AgentSession } from "./session"; // AgentSession placeholder — real DO logic added in Task 8
