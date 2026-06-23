@@ -333,7 +333,10 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
             .await
             .expect("loop must terminate on a stalled stream, not hang");
-        assert!(matches!(result, Err(AgentError::Model(_))));
+        let err = result.unwrap_err();
+        assert!(matches!(err, AgentError::Model(_)));
+        assert!(err.to_string().contains("timeout"),
+            "expected a timeout-caused failure, got: {err}");
         let events = sink.events.lock().unwrap().clone();
         assert!(events.iter().any(|e| e.starts_with("error:")));
     }
@@ -353,7 +356,10 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
             .await
             .expect("loop must terminate when the stream never opens, not hang");
-        assert!(matches!(result, Err(AgentError::Model(_))));
+        let err = result.unwrap_err();
+        assert!(matches!(err, AgentError::Model(_)));
+        assert!(err.to_string().contains("timeout"),
+            "expected a timeout-caused failure, got: {err}");
     }
 
     #[tokio::test(start_paused = true)]
