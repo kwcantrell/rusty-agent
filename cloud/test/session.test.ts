@@ -1,0 +1,68 @@
+import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { describe, it, expect, beforeAll } from "vitest";
+import worker from "../src/worker";
+import { sha256hex, newToken } from "../src/util";
+
+async function seed() {
+  const sql = `
+    CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, user_id TEXT, pairing_code TEXT NOT NULL,
+      last_seen INTEGER, online INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL);`;
+  for (const s of sql.split(";").map((x) => x.trim()).filter(Boolean)) {
+    await env.DB.prepare(s).run();
+  }
+  const agentTok = newToken();
+  const sessTok = newToken();
+  await env.DB.prepare(
+    "INSERT INTO agents (id,name,token_hash,pairing_code,online,created_at) VALUES (?,?,?,?,0,?)")
+    .bind("agent-1", "a", await sha256hex(agentTok), "111111", Date.now()).run();
+  await env.DB.prepare(
+    "INSERT INTO sessions (id,agent_id,token_hash,status,created_at) VALUES (?,?,?,'active',?)")
+    .bind("sess-1", "agent-1", await sha256hex(sessTok), Date.now()).run();
+  return { agentTok, sessTok };
+}
+
+function wsReq(path: string, headers: Record<string, string> = {}) {
+  return new Request(`http://x${path}`, { headers: { Upgrade: "websocket", ...headers } });
+}
+
+describe("relay", () => {
+  let toks: { agentTok: string; sessTok: string };
+  beforeAll(async () => { toks = await seed(); });
+
+  it("relays a daemon event to a connected browser and flips presence", async () => {
+    const ctx = createExecutionContext();
+    // Daemon connects.
+    const agentRes = await worker.fetch(
+      wsReq("/agent", { Authorization: `Bearer ${toks.agentTok}` }), env, ctx);
+    expect(agentRes.status).toBe(101);
+    const daemonWs = agentRes.webSocket!;
+    daemonWs.accept();
+
+    // Browser connects.
+    const browserRes = await worker.fetch(
+      wsReq(`/browser?token=${toks.sessTok}`), env, ctx);
+    expect(browserRes.status).toBe(101);
+    const browserWs = browserRes.webSocket!;
+    const received: string[] = [];
+    browserWs.addEventListener("message", (e) => received.push(e.data as string));
+    browserWs.accept();
+
+    // Daemon emits an event; expect the browser to receive it.
+    daemonWs.send(JSON.stringify({
+      v: 1, session_id: "sess-1", kind: "event",
+      payload: { type: "token", text: "hi" },
+    }));
+
+    await new Promise((r) => setTimeout(r, 50));
+    await waitOnExecutionContext(ctx);
+
+    expect(received.some((m) => m.includes("\"token\"") && m.includes("hi"))).toBe(true);
+    const row = await env.DB.prepare("SELECT online FROM agents WHERE id='agent-1'")
+      .first<{ online: number }>();
+    expect(row?.online).toBe(1);
+  });
+});

@@ -57,11 +57,43 @@ async function pair(req: Request, env: Env): Promise<Response> {
   return json({ session_id: sessionId, session_token: token, agent_id: agent.id });
 }
 
+async function routeAgent(req: Request, env: Env): Promise<Response> {
+  const auth = req.headers.get("Authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  if (!token) return json({ error: "missing token" }, 401);
+  const agent = await env.DB.prepare("SELECT id FROM agents WHERE token_hash = ?")
+    .bind(await sha256hex(token)).first<{ id: string }>();
+  if (!agent) return json({ error: "unknown agent" }, 401);
+  const id = env.AGENT.idFromName(agent.id);
+  const stub = env.AGENT.get(id);
+  const fwd = new Request(req.url, req);
+  fwd.headers.set("X-Role", "agent");
+  fwd.headers.set("X-Agent-Id", agent.id);
+  return stub.fetch(fwd);
+}
+
+async function routeBrowser(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const token = url.searchParams.get("token") ?? "";
+  if (!token) return json({ error: "missing token" }, 401);
+  const session = await env.DB.prepare(
+    "SELECT id, agent_id FROM sessions WHERE token_hash = ?")
+    .bind(await sha256hex(token)).first<{ id: string; agent_id: string }>();
+  if (!session) return json({ error: "unknown session" }, 401);
+  const stub = env.AGENT.get(env.AGENT.idFromName(session.agent_id));
+  const fwd = new Request(req.url, req);
+  fwd.headers.set("X-Role", "browser");
+  fwd.headers.set("X-Session-Id", session.id);
+  return stub.fetch(fwd);
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     if (url.pathname === "/enroll" && req.method === "POST") return enroll(req, env);
     if (url.pathname === "/pair" && req.method === "POST") return pair(req, env);
+    if (url.pathname === "/agent") return routeAgent(req, env);
+    if (url.pathname === "/browser") return routeBrowser(req, env);
     return json({ error: "not found" }, 404);
   },
 };

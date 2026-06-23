@@ -9,7 +9,7 @@ class_name = "AgentSession"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["AgentSession"]
+new_classes = ["AgentSession"]
 
 [[d1_databases]]
 binding = "DB"
