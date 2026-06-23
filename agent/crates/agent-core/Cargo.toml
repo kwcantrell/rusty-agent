@@ -14,5 +14,9 @@ tokio-util.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[features]
+testkit = []
+
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = { version = "3" }
