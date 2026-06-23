@@ -284,4 +284,14 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
     }
+
+    #[tokio::test]
+    async fn read_skill_file_missing_file_is_not_found() {
+        let (reg, _d) = reg_with_skill("alpha", "body", &[]);
+        let err = ReadSkillFile::new(reg)
+            .execute(json!({"skill": "alpha", "path": "absent.txt"}), &ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
 }
