@@ -12,11 +12,11 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
+tokio-util = { workspace = true }
 readability = "0.3"
 ipnet = "2"
 url = "2"
 
 [dev-dependencies]
 agent-policy = { path = "../agent-policy" }
-tokio-util = { workspace = true }
 wiremock = "0.6"
