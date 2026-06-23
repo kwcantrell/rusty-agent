@@ -161,6 +161,7 @@ mod proc_tests {
     use super::*;
     use crate::{CompletionRequest, Message, ModelClient};
     use futures::StreamExt;
+    use serial_test::serial;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
@@ -187,6 +188,7 @@ mod proc_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn streams_text_then_done_from_fake_cli() {
         let script = "#!/usr/bin/env bash\ncat >/dev/null\n\
             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"t\"}'\n\
@@ -209,6 +211,7 @@ mod proc_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn nonzero_exit_surfaces_process_error() {
         let script = "#!/usr/bin/env bash\ncat >/dev/null\n\
             echo 'not authenticated' >&2\nexit 1\n";
@@ -228,6 +231,7 @@ mod proc_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn missing_binary_is_process_error() {
         let client = ClaudeCliClient::new("/nonexistent/claude-binary-xyz", "sonnet");
         let res = client.stream(req()).await;
@@ -235,6 +239,7 @@ mod proc_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn large_stderr_on_failure_does_not_deadlock() {
         // Emit ~256 KiB to stderr (far past the ~64 KiB pipe buffer) after
         // closing stdout, then fail. Must not hang; must surface Process error.
