@@ -5,6 +5,7 @@ export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
 export type Item =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string; done?: string }
+  | { kind: "reasoning"; text: string }
   | { kind: "tool"; name: string; args: unknown; status: "running" | "done"; content?: string; display?: Display }
   | { kind: "error"; message: string };
 
@@ -90,6 +91,16 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
         items[items.length - 1] = { ...last, text: last.text + p.text };
       } else {
         items.push({ kind: "assistant", text: p.text });
+      }
+      return { ...s, items };
+    }
+    case "reasoning": {
+      const items = [...s.items];
+      const last = items[items.length - 1];
+      if (last && last.kind === "reasoning") {
+        items[items.length - 1] = { ...last, text: last.text + p.text };
+      } else {
+        items.push({ kind: "reasoning", text: p.text });
       }
       return { ...s, items };
     }

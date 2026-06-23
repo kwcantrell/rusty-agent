@@ -67,7 +67,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![agent_tools::ToolSchema { name: "read_file".into(),
                 description: "read".into(), parameters: serde_json::json!({"type":"object"}) }],
-            temperature: 0.0, max_tokens: None };
+            ..Default::default() };
         PromptedJsonProtocol.prepare(&mut req);
         assert!(req.tools.is_empty());
         let sys = req.messages.iter().find(|m| matches!(m.role, Role::System)).unwrap();
@@ -79,7 +79,7 @@ mod tests {
         let text = "Let me read it.\n```tool_call\n{\"name\":\"read_file\",\
                     \"arguments\":{\"path\":\"a.txt\"}}\n```";
         let turn = AssistantTurn { text: text.into(), raw_tool_calls: vec![],
-            stop: StopReason::Stop };
+            stop: StopReason::Stop, reasoning: String::new() };
         let parsed = PromptedJsonProtocol.parse(&turn).unwrap();
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "read_file");
@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn parse_returns_plain_text_when_no_block() {
         let turn = AssistantTurn { text: "all done".into(), raw_tool_calls: vec![],
-            stop: StopReason::Stop };
+            stop: StopReason::Stop, reasoning: String::new() };
         let parsed = PromptedJsonProtocol.parse(&turn).unwrap();
         assert!(parsed.tool_calls.is_empty());
         assert_eq!(parsed.text, "all done");
@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn parse_errors_on_malformed_block() {
         let turn = AssistantTurn { text: "```tool_call\n{bad}\n```".into(),
-            raw_tool_calls: vec![], stop: StopReason::Stop };
+            raw_tool_calls: vec![], stop: StopReason::Stop, reasoning: String::new() };
         assert!(PromptedJsonProtocol.parse(&turn).is_err());
     }
 }

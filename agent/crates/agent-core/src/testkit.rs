@@ -20,6 +20,8 @@ pub enum Scripted {
     Hang,
     /// The `stream()` call itself never resolves (stream-open stall).
     HangOpen,
+    /// Emits a reasoning chunk then a final answer (no tool calls): (reasoning, answer).
+    Reasoning(String, String),
 }
 
 pub struct ScriptedModel { turns: Mutex<std::collections::VecDeque<Scripted>> }
@@ -43,6 +45,9 @@ impl ModelClient for ScriptedModel {
                 Ok(Chunk::ToolCallDelta(RawToolCall { id: Some(id), name: Some(name),
                     args_fragment: args })),
                 Ok(Chunk::Done(StopReason::ToolCalls))]).boxed()),
+            Scripted::Reasoning(reasoning, answer) => Ok(stream::iter(vec![
+                Ok(Chunk::Reasoning(reasoning)), Ok(Chunk::Text(answer)),
+                Ok(Chunk::Done(StopReason::Stop))]).boxed()),
             Scripted::Hang => Ok(stream::pending().boxed()),
             Scripted::HangOpen => {
                 std::future::pending::<()>().await;
@@ -76,6 +81,7 @@ impl EventSink for CollectingSink {
     fn emit(&self, event: AgentEvent) {
         let label = match event {
             AgentEvent::Token(t) => format!("token:{t}"),
+            AgentEvent::Reasoning(r) => format!("reasoning:{r}"),
             AgentEvent::ToolStart { name, .. } => format!("tool_start:{name}"),
             AgentEvent::ToolResult { name, .. } => format!("tool_result:{name}"),
             AgentEvent::Approval(_) => "approval".into(),

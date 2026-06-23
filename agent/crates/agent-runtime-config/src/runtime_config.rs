@@ -21,6 +21,20 @@ pub struct RuntimeConfig {
     pub max_tokens: u32,
     pub max_turns: usize,
     pub context_limit: usize,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
+    #[serde(default = "default_true")]
+    pub enable_thinking: bool,
+    #[serde(default)]
+    pub preserve_thinking: bool,
 }
 
 /// All-optional mirror used only for on-disk merge: a file written by an older
@@ -38,7 +52,16 @@ struct PartialRuntimeConfig {
     max_tokens: Option<u32>,
     max_turns: Option<usize>,
     context_limit: Option<usize>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    repeat_penalty: Option<f32>,
+    enable_thinking: Option<bool>,
+    preserve_thinking: Option<bool>,
 }
+
+fn default_true() -> bool { true }
 
 impl RuntimeConfig {
     /// Seed a config from launch flags + sensible defaults for the rest.
@@ -54,6 +77,13 @@ impl RuntimeConfig {
             max_tokens: 2048,
             max_turns: 25,
             context_limit,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
+            repeat_penalty: None,
+            enable_thinking: true,
+            preserve_thinking: false,
         }
     }
 
@@ -93,6 +123,14 @@ impl RuntimeConfig {
         if self.context_limit < 1024 {
             return Err("context_limit must be >= 1024".into());
         }
+        if let Some(v) = self.top_p { if !(0.0..=1.0).contains(&v) {
+            return Err("top_p must be between 0.0 and 1.0".into()); } }
+        if let Some(v) = self.min_p { if !(0.0..=1.0).contains(&v) {
+            return Err("min_p must be between 0.0 and 1.0".into()); } }
+        if let Some(v) = self.presence_penalty { if !(-2.0..=2.0).contains(&v) {
+            return Err("presence_penalty must be between -2.0 and 2.0".into()); } }
+        if let Some(v) = self.repeat_penalty { if v <= 0.0 {
+            return Err("repeat_penalty must be > 0.0".into()); } }
         Ok(())
     }
 
@@ -120,6 +158,13 @@ impl RuntimeConfig {
         if let Some(v) = p.max_tokens { self.max_tokens = v; }
         if let Some(v) = p.max_turns { self.max_turns = v; }
         if let Some(v) = p.context_limit { self.context_limit = v; }
+        if let Some(v) = p.top_p { self.top_p = Some(v); }
+        if let Some(v) = p.top_k { self.top_k = Some(v); }
+        if let Some(v) = p.min_p { self.min_p = Some(v); }
+        if let Some(v) = p.presence_penalty { self.presence_penalty = Some(v); }
+        if let Some(v) = p.repeat_penalty { self.repeat_penalty = Some(v); }
+        if let Some(v) = p.enable_thinking { self.enable_thinking = v; }
+        if let Some(v) = p.preserve_thinking { self.preserve_thinking = v; }
         self
     }
 
@@ -331,5 +376,58 @@ mod tests {
     fn resolve_load_is_silent_on_a_good_file() {
         let (_cfg, warn) = resolve_load(base(), Ok(r#"{"model":"m"}"#.into()));
         assert!(warn.is_none());
+    }
+
+    #[test]
+    fn from_launch_seeds_thinking_and_sampling_defaults() {
+        let c = base();
+        assert!(c.enable_thinking);
+        assert!(!c.preserve_thinking);
+        assert!(c.top_p.is_none() && c.top_k.is_none() && c.min_p.is_none());
+        assert!(c.presence_penalty.is_none() && c.repeat_penalty.is_none());
+    }
+
+    #[test]
+    fn validate_enforces_sampling_bounds_only_when_set() {
+        let mut c = base();
+        c.top_p = Some(1.5);
+        assert!(c.validate().is_err());
+        let mut c = base();
+        c.min_p = Some(-0.1);
+        assert!(c.validate().is_err());
+        let mut c = base();
+        c.presence_penalty = Some(3.0);
+        assert!(c.validate().is_err());
+        let mut c = base();
+        c.repeat_penalty = Some(0.0);
+        assert!(c.validate().is_err());
+        // None and in-range Some both pass; top_k has no bound.
+        let mut c = base();
+        c.top_p = Some(0.9);
+        c.top_k = Some(40);
+        c.repeat_penalty = Some(1.1);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn sampling_round_trips_and_partial_file_keeps_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.json");
+        let mut c = base();
+        c.top_k = Some(20);
+        c.enable_thinking = false;
+        c.preserve_thinking = true;
+        c.save(&path).unwrap();
+        let loaded = RuntimeConfig::load_over(base(), &path);
+        assert_eq!(loaded.top_k, Some(20));
+        assert!(!loaded.enable_thinking);
+        assert!(loaded.preserve_thinking);
+
+        // A file missing the new keys leaves the base values intact.
+        std::fs::write(&path, r#"{"model":"only-model"}"#).unwrap();
+        let loaded = RuntimeConfig::load_over(base(), &path);
+        assert_eq!(loaded.model, "only-model");
+        assert!(loaded.enable_thinking); // base default preserved
+        assert!(loaded.top_k.is_none());
     }
 }

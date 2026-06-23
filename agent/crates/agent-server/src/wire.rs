@@ -50,6 +50,7 @@ pub enum WireBody {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WireEvent {
     Token { text: String },
+    Reasoning { text: String },
     ToolStart { name: String, args: serde_json::Value },
     ToolResult {
         name: String,
@@ -90,6 +91,7 @@ fn stop_reason_str(r: &StopReason) -> &'static str {
 pub fn wire_event_from(event: AgentEvent) -> Option<WireEvent> {
     Some(match event {
         AgentEvent::Token(t) => WireEvent::Token { text: t },
+        AgentEvent::Reasoning(t) => WireEvent::Reasoning { text: t },
         AgentEvent::ToolStart { name, args } => WireEvent::ToolStart { name, args },
         AgentEvent::ToolResult { name, output } => WireEvent::ToolResult {
             name,
@@ -176,6 +178,14 @@ mod tests {
             WireBody::SettingsUpdate { settings } => assert_eq!(settings, cfg),
             _ => panic!("wrong body"),
         }
+    }
+
+    #[test]
+    fn reasoning_event_maps_to_wire() {
+        let payload = wire_event_from(AgentEvent::Reasoning("thinking".into())).unwrap();
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"type\":\"reasoning\""));
+        assert!(json.contains("thinking"));
     }
 
     #[test]

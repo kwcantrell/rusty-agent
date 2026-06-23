@@ -29,16 +29,22 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSchema>,
     pub temperature: f32,
     pub max_tokens: Option<u32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub enable_thinking: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopReason { Stop, ToolCalls, Length, BudgetExhausted }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopReason { #[default] Stop, ToolCalls, Length, BudgetExhausted }
 
 #[derive(Debug, Clone, Default)]
 pub struct RawToolCall {
@@ -48,13 +54,14 @@ pub struct RawToolCall {
 }
 
 #[derive(Debug, Clone)]
-pub enum Chunk { Text(String), ToolCallDelta(RawToolCall), Done(StopReason) }
+pub enum Chunk { Text(String), Reasoning(String), ToolCallDelta(RawToolCall), Done(StopReason) }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AssistantTurn {
     pub text: String,
     pub raw_tool_calls: Vec<RawToolCall>,
     pub stop: StopReason,
+    pub reasoning: String,
 }
 
 #[derive(Debug, Clone)]

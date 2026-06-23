@@ -70,6 +70,37 @@ Four of the originally-accepted Minors resolved directly (TDD; 5 new Rust tests,
 
 ---
 
+## 2026-06-23 sampling-thinking-settings
+
+Spec: [`../specs/2026-06-23-sampling-thinking-settings-design.md`](../specs/2026-06-23-sampling-thinking-settings-design.md) ·
+Plan: [`../plans/2026-06-23-sampling-thinking-settings.md`](../plans/2026-06-23-sampling-thinking-settings.md).
+Seven inference controls end-to-end (5 optional sampling params + `enable_thinking` + `preserve_thinking`) plus a
+distinct reasoning channel (captured from `delta.reasoning_content` AND inline `<think>…</think>` via a streaming
+`ThinkingSplitter`, surfaced as `AgentEvent::Reasoning`/`WireEvent::Reasoning`, re-wrapped into or stripped from
+history per `preserve_thinking`). Built subagent-driven (8 tasks). Final whole-branch review (opus): **Ready to
+merge — With fixes (one process step; no code defects).** No Critical, no Important. Cross-cutting properties
+verified clean: claude-cli ignores all 7 (`ClaudeCliClient::stream` reads only `messages`); the
+`CompletionRequest::Default → enable_thinking=false` is genuinely unreachable in production (the only non-test
+construction, `loop_.rs` `run()`, sets it explicitly from `LoopConfig`); the splitter is constructed fresh per
+`stream()` and runs only on the live stream, so a `preserve_thinking=true` `<think>` re-sent in history is inert
+(never re-routed to reasoning, never leaks into a later answer); answer text stays reasoning-free so tool-call
+parsing is unaffected. The Cloudflare Worker is unchanged (relays opaquely). This slice intentionally modified the
+core crates `agent-model`/`agent-core` (additive: new optional fields + enum variants) — accepted per spec §9, since
+sampling and reasoning capture *are* the model/loop's job. Final: workspace tests green (incl. 2 splitter/SSE tests
+added post-review), clippy `-D warnings` clean; web 45 tests + build green.
+
+### Resolved during the cycle
+- **`reasoning_content` SSE path + unterminated-`<think>` flush were coded-correct but untested** — `agent/crates/agent-model/src/openai.rs` (test mod) — Resolved (commit `5a860cf`). The spec §10 list requires "reasoning_content delta path produces `Chunk::Reasoning`"; the original splitter tests covered only the inline-`<think>` branch. Added `streams_reasoning_content_separately` (wiremock SSE with a `reasoning_content` delta → asserts reasoning and answer accumulate on separate channels) and `splitter_flushes_unterminated_think` (an unterminated `<think>` at stream end flushes its buffer as reasoning, not lost/leaked). Raised by the final whole-branch review.
+
+### Accepted (Minor, won't-fix now — backfill candidates)
+- **Prompted-protocol tool-call fence inside `<think>` would be swallowed** — `agent/crates/agent-model/src/openai.rs` (`ThinkingSplitter`) interacting with `prompted.rs` parse — Open. If a model under `PromptedJsonProtocol` ever wrapped its ` ```tool_call ` fence inside `<think>…</think>`, the splitter would route the fence to the reasoning channel and `parse` would see a final answer (tool call lost). Model-misbehavior, not a pipeline bug; the live Qwen3 target uses the **native** protocol (`delta.tool_calls`), which is unaffected. Fix: a one-line comment near the splitter noting the assumption that tool calls don't appear inside `<think>`.
+- **Interleaved `reasoning → token → reasoning` renders multiple "Thinking" blocks** — `web/src/state.ts` (`reduceFrame` `"reasoning"` case) — Open. The reducer folds into the last item only when `last.kind === "reasoning"`, so an answer token between two reasoning runs splits them into two collapsible blocks straddling the answer. Cosmetic; coalescing adjacent reasoning is a small reducer change if observed in practice with the live backend.
+- **`save_then_load_over_round_trips_all_fields` not extended to all 4 new sampling fields** — `agent/crates/agent-runtime-config/src/runtime_config.rs` (test mod) — Open. The new `sampling_round_trips_and_partial_file_keeps_base` test does save+reload `top_k` (+ both bools), but `top_p`/`min_p`/`presence_penalty`/`repeat_penalty` are never round-tripped. Serde is mechanical so the risk is low; the "all fields" name is now a mild misnomer.
+- **`CompletionRequest::Default` gives `enable_thinking=false` vs the spec's "default true"** — `agent/crates/agent-model/src/types.rs` (`CompletionRequest`) — Accepted. Verified inert: the only non-test construction (`loop_.rs` `run()`) sets `enable_thinking` explicitly from `LoopConfig` (whose default is `true` via `RuntimeConfig`'s `default_true`, and the CLI sets `!cli.no_thinking`). A doc-comment noting "always populated from `LoopConfig` in production" would prevent a future direct-`Default` send from silently disabling thinking.
+- **Cosmetics** — Accepted: `PartialRuntimeConfig` merge arms re-wrap `if let Some(v) = p.top_p { self.top_p = Some(v); }` instead of `self.top_p = p.top_p` (`runtime_config.rs`); the `body()` `top_p` test uses an epsilon tolerance of `1e-6`, ~100× wider than the actual `f32(0.8)` rounding error of ~1.2e-8 (`openai.rs`, no false-pass risk); `import React, { useState }` added to type a `ChangeEvent` where `import type React` would suffice (`web/src/components/SettingsPanel.tsx`).
+
+---
+
 ## 2026-06-23 mcp-client
 
 - Streamable HTTP / remote MCP transport (+ auth) — Open — deferred; `McpTransport` seam is ready.

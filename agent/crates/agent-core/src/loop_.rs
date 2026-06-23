@@ -19,6 +19,7 @@ pub enum AgentError {
 /// claude-cli cold-start + `thinking` blocks before the first token.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[derive(Default)]
 pub struct LoopConfig {
     pub model_limit: usize,
     pub max_turns: usize,
@@ -30,6 +31,13 @@ pub struct LoopConfig {
     /// Max time with no stream progress (stream-open or inter-chunk) before a turn
     /// is treated as a stalled-backend `ModelError::Timeout`.
     pub stream_idle_timeout: Duration,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub enable_thinking: bool,
+    pub preserve_thinking: bool,
 }
 
 pub struct AgentLoop {
@@ -64,6 +72,7 @@ impl AgentLoop {
             Ok(opened) => opened?,
         };
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut raw_tool_calls: Vec<RawToolCall> = Vec::new();
         let mut stop = StopReason::Stop;
         loop {
@@ -73,12 +82,13 @@ impl AgentLoop {
                 Ok(None) => break,
                 Ok(Some(item)) => match item? {
                     Chunk::Text(t) => { self.sink.emit(AgentEvent::Token(t.clone())); text.push_str(&t); }
+                    Chunk::Reasoning(r) => { self.sink.emit(AgentEvent::Reasoning(r.clone())); reasoning.push_str(&r); }
                     Chunk::ToolCallDelta(rc) => merge_tool_call(&mut raw_tool_calls, rc),
                     Chunk::Done(r) => stop = r,
                 },
             }
         }
-        Ok(AssistantTurn { text, raw_tool_calls, stop })
+        Ok(AssistantTurn { text, raw_tool_calls, stop, reasoning })
     }
 
     /// Stream with retry/backoff on transport errors.
@@ -114,6 +124,12 @@ impl AgentLoop {
                 tools: self.tools.schemas(),
                 temperature: self.config.temperature,
                 max_tokens: self.config.max_tokens,
+                top_p: self.config.top_p,
+                top_k: self.config.top_k,
+                min_p: self.config.min_p,
+                presence_penalty: self.config.presence_penalty,
+                repeat_penalty: self.config.repeat_penalty,
+                enable_thinking: self.config.enable_thinking,
             };
             let assistant = self.completion_with_retry(&base).await?;
 
@@ -132,7 +148,12 @@ impl AgentLoop {
                 }
             };
 
-            ctx.append(Message::assistant(parsed.text.clone(),
+            let stored = if self.config.preserve_thinking && !assistant.reasoning.is_empty() {
+                format!("<think>{}</think>\n{}", assistant.reasoning, parsed.text)
+            } else {
+                parsed.text.clone()
+            };
+            ctx.append(Message::assistant(stored,
                 if parsed.tool_calls.is_empty() { None } else { Some(parsed.tool_calls.clone()) }));
 
             if parsed.tool_calls.is_empty() {
@@ -231,7 +252,7 @@ mod tests {
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2,
                 temperature: 0.0, max_tokens: None, workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60) });
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
 
         let mut ctx = WindowContext::new(Message::system("you are a test agent"));
         agent.run(&mut ctx, "read a.txt".into()).await.unwrap();
@@ -265,7 +286,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60) });
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         let events = sink.events.lock().unwrap().clone();
@@ -287,7 +308,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 3, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60) });
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
@@ -308,7 +329,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 3, max_retries: 1, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60) });
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "loop forever".into()).await.unwrap();
         // 3 turns, each a tool call, then done (BudgetExhausted).
@@ -327,7 +348,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10) });
+                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         // Guard >> the loop's 10s idle timeout so the loop terminates first.
         let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
@@ -351,7 +372,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10) });
+                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
             .await
@@ -375,7 +396,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 3, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10) });
+                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
             .await
@@ -401,6 +422,42 @@ mod tests {
         }
     }
 
+    async fn run_reasoning(preserve: bool) -> Vec<Message> {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Reasoning("secret plan".into(), "final answer".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink,
+            LoopConfig { model_limit: 100_000, max_turns: 5, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                preserve_thinking: preserve, ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        ctx.build(100_000)
+    }
+
+    #[tokio::test]
+    async fn preserve_thinking_keeps_reasoning_in_history() {
+        let msgs = run_reasoning(true).await;
+        let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
+        assert!(a.content.contains("<think>secret plan</think>"));
+        assert!(a.content.contains("final answer"));
+    }
+
+    #[tokio::test]
+    async fn default_strips_reasoning_from_history() {
+        let msgs = run_reasoning(false).await;
+        let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
+        assert!(!a.content.contains("secret plan"));
+        assert_eq!(a.content, "final answer");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn slow_but_progressing_stream_does_not_trip() {
         let ws = std::env::temp_dir();
@@ -412,7 +469,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10) });
+                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
             .await

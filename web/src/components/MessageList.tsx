@@ -1,5 +1,6 @@
 import type { Item } from "../state";
 import { AssistantMessage } from "./AssistantMessage";
+import { ReasoningMessage } from "./ReasoningMessage";
 import { ToolCall } from "./ToolCall";
 
 export function MessageList({ items }: { items: Item[] }) {
@@ -11,6 +12,8 @@ export function MessageList({ items }: { items: Item[] }) {
             return <div key={i} className="my-2 ml-auto max-w-[80%] rounded bg-zinc-800 px-3 py-2 text-zinc-100">{it.text}</div>;
           case "assistant":
             return <AssistantMessage key={i} item={it} />;
+          case "reasoning":
+            return <ReasoningMessage key={i} text={it.text} />;
           case "tool":
             return <ToolCall key={i} item={it} />;
           case "error":

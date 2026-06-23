@@ -41,6 +41,8 @@ const sampleSettings: RuntimeSettings = {
   backend: "openai", base_url: "http://localhost:8080", model: "qwen", protocol: "native",
   command_allowlist: ["ls", "git"], command_denylist: [], temperature: 0.2,
   max_tokens: 2048, max_turns: 25, context_limit: 8192,
+  top_p: null, top_k: null, min_p: null, presence_penalty: null, repeat_penalty: null,
+  enable_thinking: false, preserve_thinking: false,
 };
 
 describe("settings frames", () => {

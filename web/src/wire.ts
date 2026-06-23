@@ -16,10 +16,18 @@ export interface RuntimeSettings {
   max_tokens: number;
   max_turns: number;
   context_limit: number;
+  top_p: number | null;
+  top_k: number | null;
+  min_p: number | null;
+  presence_penalty: number | null;
+  repeat_penalty: number | null;
+  enable_thinking: boolean;
+  preserve_thinking: boolean;
 }
 
 export type WireEvent =
   | { type: "token"; text: string }
+  | { type: "reasoning"; text: string }
   | { type: "tool_start"; name: string; args: unknown }
   | { type: "tool_result"; name: string; content: string; display?: Display }
   | { type: "error"; message: string }
