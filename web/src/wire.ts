@@ -27,6 +27,7 @@ export interface RuntimeSettings {
 
 export type WireEvent =
   | { type: "token"; text: string }
+  | { type: "reasoning"; text: string }
   | { type: "tool_start"; name: string; args: unknown }
   | { type: "tool_result"; name: string; content: string; display?: Display }
   | { type: "error"; message: string }
