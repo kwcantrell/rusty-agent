@@ -5,3 +5,6 @@ mod protocol;
 pub use protocol::*;
 mod prompted;
 pub use prompted::*;
+mod wire;
+mod openai;
+pub use openai::*;
