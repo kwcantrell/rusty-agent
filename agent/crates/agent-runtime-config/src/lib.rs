@@ -10,6 +10,8 @@ use agent_model::{ClaudeCliClient, ModelClient, NativeProtocol, OpenAiCompatClie
 use agent_http::{FetchUrl, NetworkPolicy};
 use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
 use agent_tools::{git::{GitCommit, GitDiff, GitStatus}, shell::ExecuteCommand, ToolRegistry};
+use agent_tools::Tool;
+use agent_skills::{CreateSkill, ListSkills, ReadSkillFile, SkillRegistry, UseSkill};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +73,23 @@ pub fn build_registry(http_allow_hosts: &[String]) -> ToolRegistry {
     r
 }
 
+/// Build the shared skill registry (from `--skills-dir`, or defaults) and the four
+/// skill tools that wrap it. Register the returned tools into the `ToolRegistry`,
+/// and use the returned `SkillRegistry` to compose preset bodies into the system prompt.
+pub fn build_skills(
+    skills_dirs: &[String],
+    workspace: &Path,
+) -> (Arc<SkillRegistry>, Vec<Arc<dyn Tool>>) {
+    let registry = Arc::new(SkillRegistry::from_config(skills_dirs, workspace));
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(ListSkills::new(registry.clone())),
+        Arc::new(UseSkill::new(registry.clone())),
+        Arc::new(ReadSkillFile::new(registry.clone())),
+        Arc::new(CreateSkill::new(registry.clone())),
+    ];
+    (registry, tools)
+}
+
 pub fn default_allowlist() -> Vec<String> {
     ["ls","cat","pwd","echo","git","grep","find","rg","cargo","head","tail","wc"]
         .into_iter().map(String::from).collect()
@@ -100,6 +119,14 @@ mod tests {
         for name in ["read_file","write_file","edit_file","list_directory",
                      "execute_command","git_status","git_diff","git_commit","fetch_url"] {
             assert!(r.get(name).is_some(), "missing {name}");
+        }
+    }
+    #[test]
+    fn build_skills_returns_four_tools() {
+        let (_reg, tools) = build_skills(&[], std::path::Path::new("/tmp/ws"));
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        for expected in ["list_skills", "use_skill", "read_skill_file", "create_skill"] {
+            assert!(names.contains(&expected), "missing {expected}");
         }
     }
 }
