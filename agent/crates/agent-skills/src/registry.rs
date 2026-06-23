@@ -18,7 +18,11 @@ impl SkillRegistry {
     /// Explicit `--skills-dir` roots if any (writable = first); otherwise the
     /// defaults: `<workspace>/.agent/skills` (writable) + `~/.agent/skills`.
     pub fn from_config(skills_dirs: &[String], workspace: &Path) -> Self {
-        if let Some((first, rest)) = skills_dirs.split_first() {
+        let filtered: Vec<String> = skills_dirs.iter()
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .collect();
+        if let Some((first, rest)) = filtered.split_first() {
             let mut roots = vec![PathBuf::from(first)];
             roots.extend(rest.iter().map(PathBuf::from));
             Self::new(roots, PathBuf::from(first))
@@ -226,6 +230,14 @@ mod tests {
     #[test]
     fn from_config_defaults_to_workspace_dotagent() {
         let reg = SkillRegistry::from_config(&[], Path::new("/ws"));
+        assert_eq!(reg.writable_root(), Path::new("/ws/.agent/skills"));
+    }
+
+    #[test]
+    fn from_config_ignores_empty_skills_dir_entries() {
+        // An explicit but empty --skills-dir entry must not become a relative root;
+        // it falls through to the workspace default.
+        let reg = SkillRegistry::from_config(&["".to_string()], Path::new("/ws"));
         assert_eq!(reg.writable_root(), Path::new("/ws/.agent/skills"));
     }
 
