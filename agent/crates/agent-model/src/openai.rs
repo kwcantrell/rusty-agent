@@ -339,6 +339,68 @@ mod tests {
         assert!(matches!(err, ModelError::Status(500)));
     }
 
+    #[tokio::test]
+    async fn streams_reasoning_content_separately() {
+        let server = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard\"}}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"the answer\"}}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                    data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenAiCompatClient::new(server.uri(), "test-model".into(), None);
+        let req = CompletionRequest {
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        let mut stream = client.stream(req).await.unwrap();
+
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut done = None;
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                Chunk::Text(t) => text.push_str(&t),
+                Chunk::Reasoning(r) => reasoning.push_str(&r),
+                Chunk::Done(r) => done = Some(r),
+                Chunk::ToolCallDelta(_) => {}
+            }
+        }
+        assert_eq!(reasoning, "thinking hard");
+        assert_eq!(text, "the answer");
+        assert_eq!(done, Some(StopReason::Stop));
+    }
+
+    #[test]
+    fn splitter_flushes_unterminated_think() {
+        let mut s = ThinkingSplitter::default();
+        // Push an opening tag with content but no closing tag.
+        let chunks_from_push = s.push("<think>partial reasoning");
+        // The splitter may buffer the partial tag prefix; flush forces it out.
+        let mut chunks: Vec<Chunk> = chunks_from_push;
+        chunks.extend(s.flush());
+
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        for c in chunks {
+            match c {
+                Chunk::Text(t) => text.push_str(&t),
+                Chunk::Reasoning(r) => reasoning.push_str(&r),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "partial reasoning");
+        assert!(text.is_empty());
+    }
+
     #[test]
     fn body_serializes_sampling_and_thinking() {
         let client = OpenAiCompatClient::new("http://x".into(), "m".into(), None);
