@@ -20,6 +20,14 @@ cargo run -p agent-server -- --config ../agent-server.json \
 ## 3. Open the test client (terminal C)
 cd cloud/testpage && python3 -m http.server 8081
 # browse http://localhost:8081, enter the pairing code, Pair, send a prompt.
+#
+# CROSS-ORIGIN NOTE: the page is served from :8081 but the Worker is on :8787,
+# and the Worker sends no CORS headers, so the browser BLOCKS `fetch('/pair')`.
+# Work around it without changing the Worker by driving the flow from the Worker's
+# OWN origin: open http://localhost:8787/ (any path; the 404 body is irrelevant)
+# and run the pair + WebSocket from that page context (same-origin -> no CORS).
+# This is how the automated browser E2E is driven. The polished React frontend
+# (subsystem #6) will be served same-origin / with deliberate CORS, making this moot.
 
 ## Verify
 - [ ] Browser shows `[presence online=true]` once the daemon is running.
