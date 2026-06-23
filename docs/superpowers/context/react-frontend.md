@@ -1,5 +1,14 @@
 # Context Primer — React Frontend
 
+> ✅ **BUILT & MERGED (2026-06-23).** This primer is historical context. The authoritative design is
+> the spec + plan: [`../specs/2026-06-23-react-frontend-design.md`](../specs/2026-06-23-react-frontend-design.md)
+> and [`../plans/2026-06-23-react-frontend.md`](../plans/2026-06-23-react-frontend.md).
+> **Key divergences from this primer:** scoped to a "core chat client" (**Settings deferred** — editing
+> config would need a new daemon capability); served **same-origin by the existing Worker via Workers
+> static assets** (`run_worker_first` for the API routes) rather than a separate Cloudflare Pages origin —
+> so there is **no CORS**. Lives in a new top-level `web/` package (React + Vite + TS + Tailwind v4),
+> is a pure WS client (daemon + wire protocol unchanged), and was validated live end-to-end.
+
 **Status:** Not started. Context primer — run `brainstorming` before implementing.
 **Attaches via:** consumes the Cloudflare control plane's WebSocket/API — never touches the local machine directly.
 **Depends on:** the Cloudflare control plane primer (must exist first).

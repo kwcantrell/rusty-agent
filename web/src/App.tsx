@@ -1,0 +1,63 @@
+import { useEffect, useReducer, useRef, useState } from "react";
+import { connect } from "./socket";
+import { initialState, reduce } from "./state";
+import type { Decision } from "./wire";
+import { PairingScreen } from "./components/PairingScreen";
+import { StatusBar } from "./components/StatusBar";
+import { MessageList } from "./components/MessageList";
+import { ApprovalPrompt } from "./components/ApprovalPrompt";
+import { Composer } from "./components/Composer";
+import { appendUserMsg, clearSession, loadSessionId, loadToken, loadUserMsgs, saveSession } from "./storage";
+
+function wsUrl(token: string): string {
+  return `${location.origin.replace(/^http/, "ws")}/browser?token=${encodeURIComponent(token)}`;
+}
+
+export default function App() {
+  const [sessionId, setSessionId] = useState<string | null>(loadSessionId());
+  const [token, setToken] = useState<string | null>(loadToken());
+  const [state, dispatch] = useReducer(reduce, loadUserMsgs(sessionId ?? ""), initialState);
+  const sock = useRef<ReturnType<typeof connect> | null>(null);
+
+  useEffect(() => {
+    if (!token || !sessionId) return;
+    dispatch({ type: "reset", userMsgs: loadUserMsgs(sessionId) });
+    const WebSocketImpl = (window as unknown as { __WS__?: typeof WebSocket }).__WS__;
+    sock.current = connect(
+      wsUrl(token),
+      { onFrame: (f) => dispatch({ type: "frame", frame: f }), onStatus: (s) => dispatch({ type: "status", status: s }) },
+      WebSocketImpl ? { WebSocketImpl } : undefined,
+    );
+    return () => { sock.current?.close(); sock.current = null; };
+  }, [token, sessionId]);
+
+  if (!token || !sessionId) {
+    return (
+      <div className="h-screen bg-zinc-950">
+        <PairingScreen onPaired={({ sessionId, token }) => { saveSession(sessionId, token); setSessionId(sessionId); setToken(token); }} />
+      </div>
+    );
+  }
+
+  const send = (text: string) => {
+    appendUserMsg(sessionId, text);
+    dispatch({ type: "user_send", text });
+    sock.current?.send({ v: 1, session_id: sessionId, kind: "user_input", text });
+  };
+  const decide = (d: Decision) => {
+    if (!state.pendingApproval) return;
+    sock.current?.send({ v: 1, session_id: sessionId, id: state.pendingApproval.id, kind: "approval_response", decision: d });
+    dispatch({ type: "approval_sent" });
+  };
+  const signOut = () => { sock.current?.close(); clearSession(); setToken(null); setSessionId(null); };
+
+  const connected = state.status === "open";
+  return (
+    <div className="flex h-screen flex-col bg-zinc-950">
+      <StatusBar online={state.online} status={state.status} onSignOut={signOut} />
+      <MessageList items={state.items} />
+      {state.pendingApproval && <ApprovalPrompt approval={state.pendingApproval} onDecide={decide} />}
+      <Composer disabled={!connected} onSend={send} />
+    </div>
+  );
+}
