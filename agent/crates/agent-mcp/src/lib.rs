@@ -3,6 +3,8 @@
 
 mod config;
 mod error;
+mod transport;
 
 pub use config::{McpServerSpec, McpServersConfig, Trust};
 pub use error::McpError;
+pub use transport::{McpTransport, StdioTransport};
