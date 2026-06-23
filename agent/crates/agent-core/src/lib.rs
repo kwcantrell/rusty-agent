@@ -1,1 +1,5 @@
-//! Crate root. Modules added by later tasks.
+//! Agent loop, context manager, and event model.
+mod event;
+mod context;
+pub use context::*;
+pub use event::*;
