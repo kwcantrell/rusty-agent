@@ -43,7 +43,7 @@ cd cloud/testpage && python3 -m http.server 8081
 
 Dev (HMR, two processes):
 - terminal A: `cd cloud && npx wrangler dev`            # API + WS on :8787
-- terminal B: `cd web && npm run dev`                   # UI on :5173, proxies /pair,/agent,/browser to :8787
+- terminal B: `cd web && npm run dev`                   # UI on :5173, proxies /enroll,/pair,/agent,/browser to :8787
 - browse http://localhost:5173 — same-origin via the Vite proxy (no CORS). Enter the daemon's pairing code.
 
 Production-like (single origin, served by the Worker):
