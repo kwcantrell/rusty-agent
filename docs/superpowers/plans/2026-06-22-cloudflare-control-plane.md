@@ -99,6 +99,9 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Enable agent-core's `testkit` feature for the Task 4 integration test
+# (ScriptedModel/PassthroughProtocol live behind `#[cfg(any(test, feature = "testkit"))]`).
+agent-core = { path = "../agent-core", features = ["testkit"] }
 ```
 
 - [ ] **Step 3: Temporary main stub so the crate compiles**
