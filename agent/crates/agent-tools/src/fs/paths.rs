@@ -3,6 +3,15 @@ use std::path::{Path, PathBuf};
 
 /// Resolve `arg` against `workspace`, rejecting anything that escapes it.
 /// Works for non-existent files (for writes) by normalizing lexically.
+///
+/// # Limitations
+///
+/// This guard is **lexical only** — it normalises `.` and `..` components but
+/// does **not** call [`std::fs::canonicalize`] or otherwise resolve symlinks.
+/// A symlink that lives inside the workspace but whose target points outside it
+/// will pass this check undetected. OS-level sandboxing (e.g. `seccomp`,
+/// `landlock`, or a container) is required to close that gap; see
+/// `docs/superpowers/context/os-sandboxing.md` for the deferred plan.
 pub fn resolve_in_workspace(workspace: &Path, arg: &str) -> Result<PathBuf, ToolError> {
     let candidate = if Path::new(arg).is_absolute() {
         PathBuf::from(arg)

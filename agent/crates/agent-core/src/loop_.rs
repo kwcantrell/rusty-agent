@@ -160,6 +160,9 @@ impl AgentLoop {
         if !allowed {
             return Err(ToolError::Denied("user declined".into()));
         }
+        // NOTE: this token is currently inert — it is not wired to any external
+        // cancel source (e.g. Ctrl-C / SIGINT). Live cancellation is not yet
+        // functional; this is a stub for future wiring.
         let ctx = ToolCtx { workspace: self.config.workspace.clone(),
             timeout: self.config.tool_timeout, cancel: CancellationToken::new() };
         tool.execute(call.args, &ctx).await
