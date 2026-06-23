@@ -1,4 +1,4 @@
-use agent_runtime_config::{backend_name_is_valid, build_model};
+use agent_runtime_config::{backend_name_is_valid, RuntimeConfig};
 use agent_server::config::{ws_url, DaemonConfig};
 use agent_server::{config, daemon};
 use clap::{Parser, Subcommand};
@@ -41,6 +41,10 @@ enum Cmd {
         backend: String,
         #[arg(long, default_value = "claude")]
         claude_binary: String,
+        /// Path to the persisted runtime config (live settings). Seeded from the flags
+        /// above; overlaid by this file if present.
+        #[arg(long, default_value = "agent-runtime.json")]
+        runtime_config: PathBuf,
     },
 }
 
@@ -61,7 +65,8 @@ async fn main() {
                 Err(e) => { eprintln!("enroll failed: {e}"); std::process::exit(1); }
             }
         }
-        Cmd::Run { base_url, model, protocol, workspace, context_limit, backend, claude_binary } => {
+        Cmd::Run { base_url, model, protocol, workspace, context_limit, backend, claude_binary,
+                   runtime_config } => {
             let cfg = DaemonConfig::load(&cli.config)
                 .expect("load config (run `enroll` first)");
             println!("pairing code: {}", cfg.pairing_code);
@@ -72,22 +77,20 @@ async fn main() {
                 std::process::exit(2);
             }
             let api_key = std::env::var("AGENT_API_KEY").ok();
-            let client = build_model(&backend, &base_url, &model, &claude_binary, api_key);
-            let protocol = if backend == "claude-cli" {
-                if protocol != "prompted" {
-                    eprintln!("note: forcing --protocol prompted for claude-cli backend");
-                }
-                "prompted".to_string()
-            } else {
-                protocol
-            };
+            let base = RuntimeConfig::from_launch(backend, base_url, model, protocol, context_limit);
+            // Surface bad flags early (the persisted file is only ever written post-validation).
+            if let Err(e) = base.clone().normalized().validate() {
+                eprintln!("invalid launch config: {e}");
+                std::process::exit(2);
+            }
             let params = daemon::DaemonParams {
                 ws_url: ws_url(&cfg.worker_url),
                 agent_token: cfg.agent_token,
-                model: client,
-                protocol,
+                config: base,
+                api_key,
+                claude_binary,
+                config_path: runtime_config,
                 workspace,
-                context_limit,
             };
             // Reconnect with simple backoff.
             let mut backoff = 1u64;
@@ -108,14 +111,15 @@ async fn main() {
     }
 }
 
-// DaemonParams holds an Arc<dyn ModelClient> + plain fields; clone by hand for reconnect.
+// DaemonParams holds a RuntimeConfig + plain fields; clone by hand for reconnect.
 fn params_clone(p: &daemon::DaemonParams) -> daemon::DaemonParams {
     daemon::DaemonParams {
         ws_url: p.ws_url.clone(),
         agent_token: p.agent_token.clone(),
-        model: p.model.clone(),
-        protocol: p.protocol.clone(),
+        config: p.config.clone(),
+        api_key: p.api_key.clone(),
+        claude_binary: p.claude_binary.clone(),
+        config_path: p.config_path.clone(),
         workspace: p.workspace.clone(),
-        context_limit: p.context_limit,
     }
 }

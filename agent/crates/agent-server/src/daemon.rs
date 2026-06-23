@@ -1,11 +1,12 @@
 use crate::approval::WsApprovalChannel;
-use agent_runtime_config::{build_registry, default_allowlist, default_denylist, pick_protocol};
+use crate::runtime::RuntimeState;
 use crate::sink::WsEventSink;
 use crate::wire::{WireBody, WireEnvelope};
-use agent_core::{AgentLoop, LoopConfig, WindowContext};
-use agent_model::{Message, ModelClient};
-use agent_policy::RulePolicy;
+use agent_core::WindowContext;
+use agent_model::Message;
+use agent_runtime_config::RuntimeConfig;
 use futures::{SinkExt, StreamExt};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -15,12 +16,13 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 type DynErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct DaemonParams {
-    pub ws_url: String,        // ws://host/agent
+    pub ws_url: String, // ws://host/agent
     pub agent_token: String,
-    pub model: Arc<dyn ModelClient>,
-    pub protocol: String,
-    pub workspace: std::path::PathBuf,
-    pub context_limit: usize,
+    pub config: RuntimeConfig, // flag-derived base; the file at config_path overlays it
+    pub api_key: Option<String>,
+    pub claude_binary: String,
+    pub config_path: PathBuf,
+    pub workspace: PathBuf,
 }
 
 const SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided tools to inspect \
@@ -29,7 +31,7 @@ and no tool call.";
 
 pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
     // Shared session id (MVP: one active session per agent). The read loop sets it
-    // on each user_input; the sink and approval channel stamp outgoing frames with it.
+    // on each user_input; the sink, approval channel, and settings replies stamp it.
     let session = Arc::new(Mutex::new(String::new()));
     let (tx, mut rx) = mpsc::unbounded_channel::<WireEnvelope>();
 
@@ -37,24 +39,18 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
     let approval = Arc::new(WsApprovalChannel::new(tx.clone(), session.clone(),
         Duration::from_secs(300)));
 
-    let policy = Arc::new(RulePolicy {
-        workspace: params.workspace.clone(),
-        command_allowlist: default_allowlist(),
-        command_denylist: default_denylist(),
-    });
-    let agent = Arc::new(AgentLoop::new(
-        params.model,
-        pick_protocol(&params.protocol),
-        Arc::new(build_registry()),
-        policy,
-        approval.clone(),
+    // Live settings survive reconnect/restart: overlay the persisted file on the flag base.
+    let config = RuntimeConfig::load_over(params.config.clone(), &params.config_path);
+    let runtime = Arc::new(RuntimeState::new(
+        config,
         sink,
-        LoopConfig {
-            model_limit: params.context_limit, max_turns: 25, max_retries: 3,
-            temperature: 0.2, max_tokens: Some(2048), workspace: params.workspace.clone(),
-            tool_timeout: Duration::from_secs(120),
-            stream_idle_timeout: agent_core::DEFAULT_STREAM_IDLE_TIMEOUT,
-        },
+        approval.clone(),
+        params.workspace.clone(),
+        params.api_key.clone(),
+        params.claude_binary.clone(),
+        params.config_path.clone(),
+        session.clone(),
+        tx.clone(),
     ));
     let ctx = Arc::new(tokio::sync::Mutex::new(
         WindowContext::new(Message::system(SYSTEM_PROMPT))));
@@ -95,7 +91,7 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
         match env.body {
             WireBody::UserInput { text } => {
                 *session.lock().unwrap() = env.session_id.clone();
-                let agent = agent.clone();
+                let agent = runtime.current_loop();
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     let mut guard = ctx.lock().await;
@@ -109,7 +105,11 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
                     approval.resolve(&id, decision.into());
                 }
             }
-            _ => {}
+            other => {
+                // settings_get / settings_update handled here; anything else is ignored.
+                *session.lock().unwrap() = env.session_id.clone();
+                runtime.handle(&other);
+            }
         }
     }
     writer.abort();
