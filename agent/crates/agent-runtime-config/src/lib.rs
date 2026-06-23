@@ -1,6 +1,7 @@
 //! Shared agent loop wiring (tool registry, protocol picker, command lists)
 //! used by both the CLI (`agent-cli`) and the daemon (`agent-server`).
-use agent_model::{NativeProtocol, PromptedJsonProtocol, ToolCallProtocol};
+use agent_model::{ClaudeCliClient, ModelClient, NativeProtocol, OpenAiCompatClient,
+                  PromptedJsonProtocol, ToolCallProtocol};
 use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
 use agent_tools::{git::{GitCommit, GitDiff, GitStatus}, shell::ExecuteCommand, ToolRegistry};
 use std::sync::Arc;
@@ -13,6 +14,25 @@ pub fn pick_protocol(name: &str) -> Arc<dyn ToolCallProtocol> {
     match name {
         "prompted" => Arc::new(PromptedJsonProtocol),
         _ => Arc::new(NativeProtocol),
+    }
+}
+
+pub fn backend_name_is_valid(name: &str) -> bool {
+    matches!(name, "openai" | "claude-cli")
+}
+
+/// Build the model client for the selected backend.
+/// `claude-cli` ignores `base_url`/`api_key`; `openai` ignores `claude_binary`.
+pub fn build_model(
+    backend: &str,
+    base_url: &str,
+    model: &str,
+    claude_binary: &str,
+    api_key: Option<String>,
+) -> Arc<dyn ModelClient> {
+    match backend {
+        "claude-cli" => Arc::new(ClaudeCliClient::new(claude_binary, model)),
+        _ => Arc::new(OpenAiCompatClient::new(base_url.to_string(), model.to_string(), api_key)),
     }
 }
 
@@ -40,6 +60,12 @@ pub fn default_denylist() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn backend_validation() {
+        assert!(backend_name_is_valid("openai"));
+        assert!(backend_name_is_valid("claude-cli"));
+        assert!(!backend_name_is_valid("bogus"));
+    }
     #[test]
     fn pick_protocol_selects_by_name() {
         assert!(protocol_name_is_valid("native"));
