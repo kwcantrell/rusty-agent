@@ -67,7 +67,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![agent_tools::ToolSchema { name: "read_file".into(),
                 description: "read".into(), parameters: serde_json::json!({"type":"object"}) }],
-            temperature: 0.0, max_tokens: None };
+            ..Default::default() };
         PromptedJsonProtocol.prepare(&mut req);
         assert!(req.tools.is_empty());
         let sys = req.messages.iter().find(|m| matches!(m.role, Role::System)).unwrap();

@@ -38,10 +38,16 @@ impl OpenAiCompatClient {
             "messages": messages_to_json(&req.messages),
             "stream": true,
             "temperature": req.temperature,
+            "chat_template_kwargs": { "enable_thinking": req.enable_thinking },
         });
         if let Some(mt) = req.max_tokens {
             b["max_tokens"] = json!(mt);
         }
+        if let Some(v) = req.top_p { b["top_p"] = json!(v); }
+        if let Some(v) = req.top_k { b["top_k"] = json!(v); }
+        if let Some(v) = req.min_p { b["min_p"] = json!(v); }
+        if let Some(v) = req.presence_penalty { b["presence_penalty"] = json!(v); }
+        if let Some(v) = req.repeat_penalty { b["repeat_penalty"] = json!(v); }
         if !req.tools.is_empty() {
             b["tools"] = json!(req
                 .tools
@@ -192,9 +198,7 @@ mod tests {
         let client = OpenAiCompatClient::new(server.uri(), "test-model".into(), None);
         let req = CompletionRequest {
             messages: vec![Message::user("hi")],
-            tools: vec![],
-            temperature: 0.0,
-            max_tokens: None,
+            ..Default::default()
         };
         let mut stream = client.stream(req).await.unwrap();
 
@@ -222,11 +226,30 @@ mod tests {
         let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
         let req = CompletionRequest {
             messages: vec![],
-            tools: vec![],
-            temperature: 0.0,
-            max_tokens: None,
+            ..Default::default()
         };
         let err = client.stream(req).await.err().unwrap();
         assert!(matches!(err, ModelError::Status(500)));
+    }
+
+    #[test]
+    fn body_serializes_sampling_and_thinking() {
+        let client = OpenAiCompatClient::new("http://x".into(), "m".into(), None);
+        let req = CompletionRequest {
+            messages: vec![Message::user("hi")],
+            top_p: Some(0.8),
+            top_k: Some(30),
+            enable_thinking: false,
+            ..Default::default()
+        };
+        let b = client.body(&req);
+        // f32 0.8 serialises as an f64 approximation; compare via as_f64.
+        assert!((b["top_p"].as_f64().unwrap() - 0.8_f32 as f64).abs() < 1e-6);
+        assert_eq!(b["top_k"], serde_json::json!(30));
+        assert_eq!(b["chat_template_kwargs"]["enable_thinking"], serde_json::json!(false));
+        // Unset params are omitted entirely.
+        assert!(b.get("min_p").is_none());
+        assert!(b.get("presence_penalty").is_none());
+        assert!(b.get("repeat_penalty").is_none());
     }
 }

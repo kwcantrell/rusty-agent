@@ -29,12 +29,18 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSchema>,
     pub temperature: f32,
     pub max_tokens: Option<u32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub enable_thinking: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

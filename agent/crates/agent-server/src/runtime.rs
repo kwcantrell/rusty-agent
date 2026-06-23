@@ -147,6 +147,13 @@ fn build_loop(
             workspace: workspace.to_path_buf(),
             tool_timeout: Duration::from_secs(120),
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            top_p: cfg.top_p,
+            top_k: cfg.top_k,
+            min_p: cfg.min_p,
+            presence_penalty: cfg.presence_penalty,
+            repeat_penalty: cfg.repeat_penalty,
+            enable_thinking: cfg.enable_thinking,
+            preserve_thinking: cfg.preserve_thinking,
         },
     ))
 }

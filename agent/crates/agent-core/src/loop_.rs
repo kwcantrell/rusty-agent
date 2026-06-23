@@ -19,6 +19,7 @@ pub enum AgentError {
 /// claude-cli cold-start + `thinking` blocks before the first token.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[derive(Default)]
 pub struct LoopConfig {
     pub model_limit: usize,
     pub max_turns: usize,
@@ -30,6 +31,13 @@ pub struct LoopConfig {
     /// Max time with no stream progress (stream-open or inter-chunk) before a turn
     /// is treated as a stalled-backend `ModelError::Timeout`.
     pub stream_idle_timeout: Duration,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub enable_thinking: bool,
+    pub preserve_thinking: bool,
 }
 
 pub struct AgentLoop {
@@ -114,6 +122,12 @@ impl AgentLoop {
                 tools: self.tools.schemas(),
                 temperature: self.config.temperature,
                 max_tokens: self.config.max_tokens,
+                top_p: self.config.top_p,
+                top_k: self.config.top_k,
+                min_p: self.config.min_p,
+                presence_penalty: self.config.presence_penalty,
+                repeat_penalty: self.config.repeat_penalty,
+                enable_thinking: self.config.enable_thinking,
             };
             let assistant = self.completion_with_retry(&base).await?;
 
@@ -231,7 +245,7 @@ mod tests {
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2,
                 temperature: 0.0, max_tokens: None, workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60) });
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
 
         let mut ctx = WindowContext::new(Message::system("you are a test agent"));
         agent.run(&mut ctx, "read a.txt".into()).await.unwrap();
@@ -265,7 +279,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60) });
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         let events = sink.events.lock().unwrap().clone();
@@ -287,7 +301,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 3, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60) });
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
@@ -308,7 +322,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 3, max_retries: 1, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60) });
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "loop forever".into()).await.unwrap();
         // 3 turns, each a tool call, then done (BudgetExhausted).
@@ -327,7 +341,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10) });
+                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         // Guard >> the loop's 10s idle timeout so the loop terminates first.
         let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
@@ -351,7 +365,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10) });
+                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
             .await
@@ -375,7 +389,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 3, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10) });
+                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
             .await
@@ -412,7 +426,7 @@ mod tests {
             Arc::new(AlwaysApprove), sink.clone(),
             LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
                 max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10) });
+                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
         let mut ctx = WindowContext::new(Message::system("sys"));
         let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
             .await

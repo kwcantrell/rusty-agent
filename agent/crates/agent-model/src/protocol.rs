@@ -68,7 +68,7 @@ mod tests {
         let mut req = CompletionRequest { messages: vec![], tools: vec![
             agent_tools::ToolSchema { name: "t".into(), description: "d".into(),
                 parameters: serde_json::json!({}) }],
-            temperature: 0.0, max_tokens: None };
+            ..Default::default() };
         NativeProtocol.prepare(&mut req);
         assert_eq!(req.tools.len(), 1); // native leaves tools for the client to send
     }

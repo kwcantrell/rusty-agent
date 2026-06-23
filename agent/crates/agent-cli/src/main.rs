@@ -121,6 +121,9 @@ async fn main() {
             model_limit: cli.context_limit, max_turns: 25, max_retries: 3, temperature: 0.2,
             max_tokens: Some(2048), workspace, tool_timeout: Duration::from_secs(120),
             stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
+            top_p: None, top_k: None, min_p: None,
+            presence_penalty: None, repeat_penalty: None,
+            enable_thinking: true, preserve_thinking: false,
         });
 
     let mut ctx = WindowContext::new(Message::system(system_prompt));

@@ -201,9 +201,7 @@ mod proc_tests {
     fn req() -> CompletionRequest {
         CompletionRequest {
             messages: vec![Message::user("hi")],
-            tools: vec![],
-            temperature: 0.0,
-            max_tokens: None,
+            ..Default::default()
         }
     }
 
