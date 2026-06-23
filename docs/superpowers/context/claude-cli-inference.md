@@ -94,24 +94,46 @@ Reading `a.txt` now.
 
 ## Follow-ups / known limitations
 
-Captured from the final whole-branch review (opus, 2026-06-23). None block the
-local-dev use the design scoped for; all are out of scope for the initial
-backend and tracked here so they survive the merge.
+Open items deferred out of the initial backend. None block the local-dev use the
+design scoped for. Last reconciled 2026-06-23 after the branch merged to `main`.
 
-1. **Operator docs for the new flags.** Nothing user-facing documents
-   `--backend {openai|claude-cli}` or `--claude-binary` (e.g. in a `RUNNING.md`).
-   A short stanza should cover: the authenticated-CLI prerequisite, the
-   `sonnet`/`opus` model values, and the rate-limit caveat (risk #5).
-2. **Production risk to track before non-dev use** (risk #5 above): the 5-hour
-   subscription rate cap — investigate a backoff/limit strategy before driving
-   sustained loops. (The SessionStart-hook context pollution from risk #1 is now
-   resolved via `--setting-sources project`.)
-3. **`AgentLoop` has no timeout around model-stream consumption**
-   (`agent-core/src/loop_.rs:54-58` — bare `while let Some(item) = stream.next().await`;
-   `tool_timeout` wraps only tool execution at ~line 167). A hung backend blocks
-   the turn indefinitely. **Pre-existing** — it affects the `OpenAiCompatClient`
-   /SGLang path identically and lives in the FIXED `AgentLoop`, so it was out of
-   scope for this branch. `ClaudeCliClient`'s `kill_on_drop(true)` already cleans
-   up the subprocess *if* the stream is dropped; adding a per-turn deadline in the
-   loop would make that path actually trigger on a stall. Fix belongs to a
-   loop-level change, not this backend.
+### Open
+
+**P1 — reliability (cross-cutting, needs its own spec)**
+
+- [ ] **Add a per-turn timeout around model-stream consumption in `AgentLoop`**
+  (`agent-core/src/loop_.rs:54-58` — bare `while let Some(item) = stream.next().await`;
+  `tool_timeout` wraps only tool execution at ~line 167). A hung backend blocks the
+  turn indefinitely. **Pre-existing** — affects the `OpenAiCompatClient`/SGLang path
+  identically and lives in the core loop that's been kept untouched, so it needs a
+  brainstorm→spec cycle. `ClaudeCliClient`'s `kill_on_drop(true)` already kills the
+  subprocess once the stream is dropped, so a loop-level deadline would make that
+  fire on a stall.
+
+**P2 — `claude-cli` robustness (before sustained/automated use)**
+
+- [ ] **Rate-limit strategy for the 5-hour subscription cap** (risk #5). No backoff
+  today; detect `rate_limit_event` / surface a typed `ModelError` and back off before
+  driving sustained loops.
+- [ ] **Pin the subprocess CWD** to a known-empty scratch dir via
+  `Command::current_dir()` (`claude_cli.rs` `stream`). `--setting-sources project`
+  still loads project-local hooks from the launch dir; pinning fully isolates the
+  generator. Small.
+
+**P3 — monitoring / low priority**
+
+- [ ] **Guard `BARE_SYSTEM_PROMPT` acceptance** (`claude_cli.rs`). If CLI guardrails
+  ever reject the self-description prompt, the backend silently breaks. Optional: an
+  `#[ignore]`-gated integration test against the real CLI.
+
+### Resolved (kept for context)
+
+- [x] Operator docs for `--backend` / `--claude-binary` — `agent/docs/RUNNING.md` §1, `cloud/RUNNING.md` §2.
+- [x] SessionStart-hook context pollution (risk #1) — `--setting-sources project`.
+- [x] ETXTBSY parallel-test flake — `serial_test` `#[serial]` on the process-spawning tests.
+- [x] No flag-forwarding test — `forwards_bare_generator_flags` in `claude_cli.rs`.
+
+### Accepted (won't-fix)
+
+- Swallowed `stdin.write_all` result — benign; the real error surfaces via non-zero exit + stderr.
+- `stderr_task.await.unwrap_or_default()` swallowing `JoinError` — harmless resilience.
