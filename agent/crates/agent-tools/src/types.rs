@@ -1,0 +1,97 @@
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSchema {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema object describing the arguments.
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub args: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Access { Read, Write }
+
+#[derive(Debug, Clone)]
+pub struct ToolIntent {
+    pub tool: String,
+    pub access: Access,
+    pub paths: Vec<PathBuf>,
+    pub command: Option<String>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Display {
+    Text(String),
+    Diff { path: String, before: String, after: String },
+    Terminal { command: String, stdout: String, stderr: String, exit_code: i32 },
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    /// Text returned to the model.
+    pub content: String,
+    /// Optional richer payload for UI rendering.
+    pub display: Option<Display>,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ToolError {
+    #[error("denied: {0}")]
+    Denied(String),
+    #[error("timed out")]
+    Timeout,
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("failed: {message}")]
+    Failed { message: String, stderr: Option<String> },
+    #[error("invalid arguments: {0}")]
+    InvalidArgs(String),
+}
+
+/// Execution context handed to every tool.
+pub struct ToolCtx {
+    pub workspace: PathBuf,
+    pub timeout: Duration,
+    pub cancel: CancellationToken,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_schema_serializes_to_openai_function_shape() {
+        let s = ToolSchema {
+            name: "read_file".into(),
+            description: "Read a file".into(),
+            parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["name"], "read_file");
+        assert_eq!(v["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn tool_error_carries_context() {
+        let e = ToolError::Failed { message: "boom".into(), stderr: Some("trace".into()) };
+        match e {
+            ToolError::Failed { message, stderr } => {
+                assert_eq!(message, "boom");
+                assert_eq!(stderr.as_deref(), Some("trace"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+}
