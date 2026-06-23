@@ -260,6 +260,34 @@ mod proc_tests {
 
     #[tokio::test]
     #[serial]
+    async fn forwards_bare_generator_flags() {
+        // The fake CLI exits non-zero (→ Process error) unless every flag that
+        // makes it behave as a subscription-auth bare generator is present, so a
+        // future edit that drops one is caught by the clean-stream assertion.
+        let script = "#!/usr/bin/env bash\ncat >/dev/null\n\
+            for f in --system-prompt --setting-sources --strict-mcp-config --no-session-persistence --allowedTools; do\n\
+              case \" $* \" in *\" $f \"*) ;; *) echo \"missing $f\" >&2; exit 3;; esac\n\
+            done\n\
+            echo '{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]},\"session_id\":\"t\"}'\n\
+            echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"t\"}'\n";
+        let fake = write_fake(script);
+        let client = ClaudeCliClient::new(fake.to_str().unwrap(), "sonnet");
+        let mut stream = client.stream(req()).await.unwrap();
+        let mut text = String::new();
+        let mut done = None;
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                Chunk::Text(t) => text.push_str(&t),
+                Chunk::Done(r) => done = Some(r),
+                Chunk::ToolCallDelta(_) => {}
+            }
+        }
+        assert_eq!(text, "ok");
+        assert_eq!(done, Some(StopReason::Stop));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn large_stderr_on_failure_does_not_deadlock() {
         // Emit ~256 KiB to stderr (far past the ~64 KiB pipe buffer) after
         // closing stdout, then fail. Must not hang; must surface Process error.
