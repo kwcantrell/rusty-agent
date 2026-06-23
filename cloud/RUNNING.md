@@ -53,6 +53,11 @@ cd cloud/testpage && python3 -m http.server 8081
 
 Prereq: bring up §1 (cloud) + §2 (daemon) first so there's an agent to pair with.
 
+> **Shortcut:** `scripts/launch-web-ui.sh [claude|local]` brings up all three (Worker +
+> Vite + daemon) in one command, auto-enrolling if needed, and prints the URL + pairing
+> code. Ctrl-C tears it all down. Logs in `/tmp/agent-web-ui/`. The manual steps below
+> are still useful when you want each process in its own terminal.
+
 > If a previous `wrangler dev` is still running on :8787, **stop it first** — a stale
 > instance from before `web/dist` existed (or before the `assets` binding) serves the API
 > but 500s the SPA. `npx wrangler dev` won't bind a busy port; kill the old one.
