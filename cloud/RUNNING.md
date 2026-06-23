@@ -38,3 +38,17 @@ cd cloud/testpage && python3 -m http.server 8081
 - [ ] `npx wrangler d1 execute agent-cp --local --command "SELECT id,online FROM agents"` shows the row.
 - [ ] R2 objects exist: `ls .wrangler/state/**/r2/**` (or inspect via the dashboard emulator).
 - [ ] `.dev.vars` is gitignored — for a real deploy use `npx wrangler secret put BOOTSTRAP_SECRET`.
+
+## 4. The web UI (subsystem #6)
+
+Dev (HMR, two processes):
+- terminal A: `cd cloud && npx wrangler dev`            # API + WS on :8787
+- terminal B: `cd web && npm run dev`                   # UI on :5173, proxies /pair,/agent,/browser to :8787
+- browse http://localhost:5173 — same-origin via the Vite proxy (no CORS). Enter the daemon's pairing code.
+
+Production-like (single origin, served by the Worker):
+- `cd web && npm run build`                             # writes web/dist
+- `cd cloud && npx wrangler dev`                        # serves the SPA + API on :8787 (run_worker_first routes the API)
+- browse http://localhost:8787
+
+Deploy ships both together: `cd web && npm run build && cd ../cloud && npx wrangler deploy`.
