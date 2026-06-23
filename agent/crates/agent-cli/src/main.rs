@@ -40,6 +40,9 @@ struct Cli {
     /// Idle timeout (seconds) for model-stream consumption before a stalled turn fails
     #[arg(long, default_value_t = 120)]
     stream_timeout_secs: u64,
+    /// Optional MCP server config (mcp.json shape). If absent, MCP is disabled.
+    #[arg(long)]
+    mcp_config: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -66,7 +69,20 @@ async fn main() {
         cli.protocol.as_str()
     };
     let protocol = pick_protocol(protocol_name);
-    let tools = Arc::new(build_registry());
+    let mut registry = build_registry();
+    // Connect MCP servers (if configured), register their tools, keep the manager alive.
+    let mcp_manager = match &cli.mcp_config {
+        Some(path) => {
+            let mgr = agent_runtime_config::connect_mcp(path).await;
+            println!("{}", mgr.summary_line());
+            for t in mgr.tools() {
+                registry.register(t);
+            }
+            Some(mgr)
+        }
+        None => None,
+    };
+    let tools = Arc::new(registry);
     let policy = Arc::new(RulePolicy {
         workspace: workspace.clone(),
         command_allowlist: default_allowlist(),
@@ -99,4 +115,6 @@ async fn main() {
             eprintln!("\x1b[31mfatal: {e}\x1b[0m");
         }
     }
+    // Keep MCP manager alive for the entire REPL session (dropping it would kill server processes).
+    let _ = &mcp_manager;
 }

@@ -4,6 +4,7 @@ use crate::wire::{WireBody, WireEnvelope, PROTOCOL_VERSION};
 use agent_core::{AgentLoop, LoopConfig, DEFAULT_STREAM_IDLE_TIMEOUT};
 use agent_policy::RulePolicy;
 use agent_runtime_config::{build_model, build_registry, pick_protocol, RuntimeConfig, HARD_FLOOR_DENYLIST};
+use agent_tools::Tool;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +24,7 @@ pub struct RuntimeState {
     config_path: PathBuf,
     session: Arc<Mutex<String>>,
     tx: mpsc::UnboundedSender<WireEnvelope>,
+    mcp_tools: Arc<[Arc<dyn Tool>]>,
 }
 
 impl RuntimeState {
@@ -37,13 +39,14 @@ impl RuntimeState {
         config_path: PathBuf,
         session: Arc<Mutex<String>>,
         tx: mpsc::UnboundedSender<WireEnvelope>,
+        mcp_tools: Arc<[Arc<dyn Tool>]>,
     ) -> Self {
         let config = config.normalized();
-        let initial = build_loop(&config, &sink, &approval, &workspace, &api_key, &claude_binary);
+        let initial = build_loop(&config, &sink, &approval, &workspace, &api_key, &claude_binary, &mcp_tools);
         Self {
             loop_cell: Mutex::new(initial),
             config: Mutex::new(config),
-            sink, approval, workspace, api_key, claude_binary, config_path, session, tx,
+            sink, approval, workspace, api_key, claude_binary, config_path, session, tx, mcp_tools,
         }
     }
 
@@ -58,7 +61,8 @@ impl RuntimeState {
         cfg.validate()?;
         cfg.save(&self.config_path).map_err(|e| format!("persist failed: {e}"))?;
         let new_loop = build_loop(
-            &cfg, &self.sink, &self.approval, &self.workspace, &self.api_key, &self.claude_binary);
+            &cfg, &self.sink, &self.approval, &self.workspace, &self.api_key, &self.claude_binary,
+            &self.mcp_tools);
         *self.loop_cell.lock().unwrap() = new_loop;
         *self.config.lock().unwrap() = cfg;
         Ok(())
@@ -115,6 +119,7 @@ fn build_loop(
     workspace: &Path,
     api_key: &Option<String>,
     claude_binary: &str,
+    mcp_tools: &[Arc<dyn Tool>],
 ) -> Arc<AgentLoop> {
     let model = build_model(&cfg.backend, &cfg.base_url, &cfg.model, claude_binary, api_key.clone());
     let policy = Arc::new(RulePolicy {
@@ -122,10 +127,14 @@ fn build_loop(
         command_allowlist: cfg.command_allowlist.clone(),
         command_denylist: cfg.effective_denylist(),
     });
+    let mut registry = build_registry();
+    for t in mcp_tools {
+        registry.register(t.clone());
+    }
     Arc::new(AgentLoop::new(
         model,
         pick_protocol(&cfg.protocol),
-        Arc::new(build_registry()),
+        Arc::new(registry),
         policy,
         approval.clone(),
         sink.clone(),
@@ -163,7 +172,7 @@ mod tests {
         let cfg = RuntimeConfig::from_launch(
             "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
         let rs = RuntimeState::new(cfg, sink, approval, dir.path().to_path_buf(), None,
-            "claude".into(), path, session, tx);
+            "claude".into(), path, session, tx, Arc::from(Vec::<Arc<dyn Tool>>::new()));
         (rs, rx, dir)
     }
 

@@ -4,11 +4,27 @@
 mod runtime_config;
 pub use runtime_config::{RuntimeConfig, HARD_FLOOR_DENYLIST};
 
+use agent_mcp::McpServersConfig;
 use agent_model::{ClaudeCliClient, ModelClient, NativeProtocol, OpenAiCompatClient,
                   PromptedJsonProtocol, ToolCallProtocol};
 use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
 use agent_tools::{git::{GitCommit, GitDiff, GitStatus}, shell::ExecuteCommand, ToolRegistry};
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
+
+pub use agent_mcp::{McpManager, ServerStatus};
+
+/// Load `mcp.json` at `path` and connect its servers. A missing file yields an
+/// empty manager (MCP disabled); a malformed file warns and yields empty. The
+/// returned `McpManager` owns the server processes — keep it alive for the session.
+pub async fn connect_mcp(path: &Path) -> McpManager {
+    let (cfg, warning) = McpServersConfig::load_or_empty(path);
+    if let Some(w) = warning {
+        eprintln!("warning: {} ({}); MCP disabled", w, path.display());
+    }
+    McpManager::connect(&cfg, Duration::from_secs(15)).await
+}
 
 pub fn protocol_name_is_valid(name: &str) -> bool {
     matches!(name, "native" | "prompted")

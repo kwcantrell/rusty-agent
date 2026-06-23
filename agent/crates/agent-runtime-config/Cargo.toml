@@ -5,6 +5,7 @@ edition.workspace = true
 [dependencies]
 agent-tools = { path = "../agent-tools" }
 agent-model = { path = "../agent-model" }
+agent-mcp = { path = "../agent-mcp" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 
