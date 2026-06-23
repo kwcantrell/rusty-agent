@@ -42,6 +42,10 @@ impl EventSink for TerminalSink {
                 let _ = write!(out, "{t}");
                 let _ = out.flush();
             }
+            AgentEvent::Reasoning(r) => {
+                let _ = write!(out, "\x1b[2m{r}\x1b[0m");
+                let _ = out.flush();
+            }
             AgentEvent::ToolStart { name, args } => {
                 let _ = writeln!(out, "\n\x1b[36m⚙ {name}\x1b[0m {args}");
             }

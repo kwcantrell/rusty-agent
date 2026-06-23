@@ -82,7 +82,7 @@ impl AgentLoop {
                 Ok(None) => break,
                 Ok(Some(item)) => match item? {
                     Chunk::Text(t) => { self.sink.emit(AgentEvent::Token(t.clone())); text.push_str(&t); }
-                    Chunk::Reasoning(r) => { reasoning.push_str(&r); }
+                    Chunk::Reasoning(r) => { self.sink.emit(AgentEvent::Reasoning(r.clone())); reasoning.push_str(&r); }
                     Chunk::ToolCallDelta(rc) => merge_tool_call(&mut raw_tool_calls, rc),
                     Chunk::Done(r) => stop = r,
                 },

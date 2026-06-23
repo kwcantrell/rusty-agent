@@ -4,6 +4,7 @@ use agent_tools::ToolOutput;
 
 pub enum AgentEvent {
     Token(String),
+    Reasoning(String),
     ToolStart { name: String, args: serde_json::Value },
     ToolResult { name: String, output: ToolOutput },
     Approval(ApprovalRequest),
