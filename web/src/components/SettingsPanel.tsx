@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import type { RuntimeSettings } from "../wire";
 
-interface Meta { workspace: string; apiKeySet: boolean; hardFloor: string[] }
+interface Meta { workspace: string; apiKeySet: boolean; hardFloor: string[]; discoveredSkills: { name: string; description: string }[] }
 
 interface Props {
   settings: RuntimeSettings;
@@ -19,11 +19,18 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
   const [form, setForm] = useState<RuntimeSettings>(settings);
   const [allow, setAllow] = useState(toLines(settings.command_allowlist));
   const [deny, setDeny] = useState(toLines(settings.command_denylist));
+  const [skillsDirs, setSkillsDirs] = useState(toLines(settings.skills_dirs));
 
   const set = <K extends keyof RuntimeSettings>(k: K, v: RuntimeSettings[K]) =>
     setForm((f) => ({ ...f, [k]: v }));
 
-  const save = () => onSave({ ...form, command_allowlist: fromLines(allow), command_denylist: fromLines(deny) });
+  const toggleSkill = (name: string) =>
+    setForm((f) => ({ ...f, active_skills: f.active_skills.includes(name)
+      ? f.active_skills.filter((n) => n !== name)
+      : [...f.active_skills, name] }));
+
+  const save = () => onSave({ ...form, command_allowlist: fromLines(allow),
+    command_denylist: fromLines(deny), skills_dirs: fromLines(skillsDirs) });
 
   const num = (k: keyof RuntimeSettings) => (e: React.ChangeEvent<HTMLInputElement>) =>
     set(k, (e.target.value === "" ? null : Number(e.target.value)) as RuntimeSettings[typeof k]);
@@ -160,6 +167,38 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
               onChange={(e) => set("preserve_thinking", e.target.checked)} />
             Preserve thinking in history
           </label>
+        </section>
+
+        <section className="mb-4 space-y-3">
+          <h3 className="text-sm font-semibold text-zinc-300">Skills</h3>
+          <div>
+            <label className={label} htmlFor="skills_dirs">Skill directories (one per line)</label>
+            <textarea id="skills_dirs" rows={3} className={field} value={skillsDirs}
+              onChange={(e) => setSkillsDirs(e.target.value)} />
+            <p className="mt-1 text-xs text-zinc-500">
+              Save directories, then the skills they contain appear below to activate.
+            </p>
+          </div>
+          <div>
+            <span className={label}>Active skills</span>
+            {(meta?.discoveredSkills ?? []).length === 0 ? (
+              <p className="text-xs text-zinc-500">No skills found in the configured directories.</p>
+            ) : (
+              <ul className="space-y-1">
+                {meta!.discoveredSkills.map((s) => (
+                  <li key={s.name}>
+                    <label className="flex items-start gap-2 text-sm">
+                      <input type="checkbox" className="mt-1"
+                        checked={form.active_skills.includes(s.name)}
+                        onChange={() => toggleSkill(s.name)} />
+                      <span><span className="text-zinc-200">{s.name}</span>
+                        <span className="block text-xs text-zinc-500">{s.description}</span></span>
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         </section>
 
         {meta && (

@@ -8,8 +8,10 @@ const settings: RuntimeSettings = {
   max_tokens: 2048, max_turns: 25, context_limit: 8192,
   top_p: null, top_k: null, min_p: null, presence_penalty: null, repeat_penalty: null,
   enable_thinking: false, preserve_thinking: false,
+  skills_dirs: [], active_skills: [],
 };
-const meta = { workspace: "/home/me/proj", apiKeySet: true, hardFloor: ["sudo", "rm -rf /"] };
+const meta = { workspace: "/home/me/proj", apiKeySet: true, hardFloor: ["sudo", "rm -rf /"],
+  discoveredSkills: [] };
 
 test("renders fields and read-only metadata", () => {
   render(<SettingsPanel settings={settings} meta={meta} error={null} disabled={false}

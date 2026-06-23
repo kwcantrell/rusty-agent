@@ -26,7 +26,7 @@ export interface ConversationState {
   turnIndex: number; // turns started so far
   inTurn: boolean; // has the current turn's user item been emitted?
   settings: RuntimeSettings | null;
-  settingsMeta: { workspace: string; apiKeySet: boolean; hardFloor: string[] } | null;
+  settingsMeta: { workspace: string; apiKeySet: boolean; hardFloor: string[]; discoveredSkills: import("./wire").DiscoveredSkill[] } | null;
   settingsError: string | null;
 }
 
@@ -71,7 +71,8 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
   if (frame.kind === "presence") return { ...state, online: frame.online };
   if (frame.kind === "settings_state") {
     return { ...state, settings: frame.settings,
-      settingsMeta: { workspace: frame.workspace, apiKeySet: frame.api_key_set, hardFloor: frame.hard_floor },
+      settingsMeta: { workspace: frame.workspace, apiKeySet: frame.api_key_set,
+        hardFloor: frame.hard_floor, discoveredSkills: frame.discovered_skills },
       settingsError: null };
   }
   if (frame.kind === "settings_error") {
