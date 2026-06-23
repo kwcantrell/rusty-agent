@@ -10,6 +10,40 @@ claude-cli detail; this file is the project-wide index.
 
 ---
 
+## 2026-06-23 skills-subsystem
+
+New `agent-skills` crate: Claude-Code-style skill packages (discover, load-on-demand, author, presets),
+attaching only via the `Tool` seam + binary wiring. Built subagent-driven (11 tasks). Final whole-branch
+review (opus): **Ready to merge — Yes.** No Critical, no Important. All binding constraints verified clean
+(core crates agent-core/model/tools/policy untouched; no wire/web/cloud/RuntimeConfig changes; no process
+spawning — bundled scripts run via the existing `execute_command` + policy + approval; lexical guards;
+`runtime.rs` unchanged — skill tools ride the existing `mcp_tools` slice → registered per `build_loop`
+rebuild, surviving settings-reconfigure). Security chain (slug → guard → validate-before-write →
+approval-gated Write) verified airtight. 180 workspace tests pass, clippy `-D warnings` clean.
+
+### Deferred scope (intentional, from the spec's "Deferred")
+- **Persisting `skills_dirs`/`active_skills` into `RuntimeConfig`** + a browser Settings UI to edit them — Open — deferred to the Settings capability cycle. Persisting now (without matching web round-trip support) would let a browser settings-save silently wipe skill config, since `WireBody::SettingsUpdate` carries a full `RuntimeConfig`. `--skills-dir`/`--skill` are launch flags only this cycle.
+- **Sub-agent skills** (a skill that spawns a constrained sub-`AgentLoop`) — Open — needs nested-agent machinery (event streaming, approval propagation, context budgeting, recursion limits); composes later as a different execution strategy over this same registry.
+- **A dedicated skill-script runner / OS sandboxing** — Open — execution stays on the existing `execute_command` seam; os-sandboxing is subsystem #2.
+
+### Resolved during the cycle
+- **Path guard accepted any path when the base normalized to empty** — `agent/crates/agent-skills/src/guard.rs` (`resolve_in_dir`) — Resolved (commit `9f200f9`). `starts_with("")` is always true; added an empty-base rejection + `rejects_empty_base_dir` test. (Only Important finding of the cycle, raised in the Task 2 review.) Not reachable in current wiring, but a security-boundary guard must be robust regardless of caller.
+- **`read_skill_file` missing-file→`NotFound` branch untested** — `agent/crates/agent-skills/src/tools.rs` (test mod) — Resolved (commit `c8fd7aa`). Brief-required error branch; added `read_skill_file_missing_file_is_not_found`.
+- **Redundant non-dev `tokio` dependency + empty `--skills-dir ""` → relative writable root** — `agent/crates/agent-skills/Cargo.toml` + `src/registry.rs` (`from_config`) — Resolved (commit `8c09513`, from the final-review cleanup). Dropped the unused `[dependencies]` tokio (only `#[tokio::test]` needs it, covered by dev-deps; build confirms it was redundant); `from_config` now filters empty/whitespace `--skills-dir` entries (falling through to defaults) + `from_config_ignores_empty_skills_dir_entries` test. (Surfaced by the final whole-branch review.)
+
+### Accepted (won't-fix)
+- **`BASE_SYSTEM_PROMPT` (agent-cli) differs by ~1 space from the prior inline literal** — `agent/crates/agent-cli/src/main.rs` (`BASE_SYSTEM_PROMPT`) — Accepted. A whitespace normalization, not a regression; zero model-behavior impact (the new form is objectively cleaner). The spec's "no behavioral prompt change" wording was aspirational given the original literal's `\`-continuation artifact.
+
+### Accepted (Minor, won't-fix now — backfill candidates)
+- **`scan()` + `list_bundled_files` swallow non-`NotFound` `read_dir` errors silently** — `agent/crates/agent-skills/src/registry.rs` (`scan`, `list_bundled_files`) — Open. A root/subdir that exists but is unreadable (permissions) is treated identically to a missing one — no log. `scan` *does* `tracing::warn!` on malformed skills; only the IO-error path is silent. A matching `tracing::warn!` would aid ops debugging. Non-blocking.
+- **`SKILL.md` CRLF body leaves a trailing `\r` per line** — `agent/crates/agent-skills/src/skill.rs` (`parse_skill_md` body assembly) — Open. `str::lines()` strips `\n` not `\r`; a CRLF-authored skill body keeps `\r` per line. Cosmetic; affects only CRLF-authored skills. Also: `parse_skill_md` tolerates leading blank lines before the opening `---` fence (more permissive than the brief; non-defect).
+- **`create_skill` can orphan the target dir on a mid-write I/O fault** — `agent/crates/agent-skills/src/tools.rs` (`CreateSkill::execute`) — Open. If `create_dir_all` succeeds but the `SKILL.md` write fails (disk full / permissions), the empty dir remains and the no-overwrite guard then refuses retries until it's removed manually. NOT an input-validation hole (validate-before-write is airtight; bad *input* never writes). `scan()` skips the malformed dir so it's visible/recoverable. A cleanup-on-failure guard or an err-message note would help. v1-acceptable.
+- **`UseSkill` NotFound error path calls `scan()` twice** — `agent/crates/agent-skills/src/tools.rs` (`UseSkill::execute`) — Open. `find()` scans, then the error branch scans again to list available names. Error-only path; scan is cheap. Also: the message renders a trailing `"Available: "` when the registry is empty — guard with `"none"`.
+- **Coverage gaps** — `agent-skills` — Open. Untested: `intent()` bad-name (identical code path is tested via `execute()`); the 2-root default structure (only `writable_root` asserted, not that `~/.agent/skills` is added); a no-`name`-frontmatter skill (accepted using the dir name); `daemon_roundtrip.rs` uses the default `SYSTEM_PROMPT` rather than an overridden string to prove the param reaches `WindowContext`. Low-risk; load-bearing paths covered.
+- **Cosmetics** — Accepted: `presets.rs` uses `format!`+`push_str` where `write!` (or chained `push_str`) avoids an allocation; a couple of test helpers return `Arc<SkillRegistry>` wider than the `&SkillRegistry` needed; one weak `contains("greeter")` assertion (could pin `"## Skill: greeter"`); `agent-runtime-config/src/lib.rs` import ordering places `agent_skills` after `agent_tools` (rustfmt would sort it before).
+
+---
+
 ## 2026-06-23 — Settings capability (browser-driven live daemon reconfiguration)
 
 Spec: [`../specs/2026-06-23-settings-capability-design.md`](../specs/2026-06-23-settings-capability-design.md) ·
