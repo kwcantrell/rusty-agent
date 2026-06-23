@@ -33,3 +33,13 @@ Four of the originally-accepted Minors resolved directly (TDD; 5 new Rust tests,
 - **Daemon catch-all stamped the session id for every unhandled frame** → scoped stamp + `handle()` to `SettingsGet | SettingsUpdate`, `_ => {}` otherwise. Commit `b72c1fb`.
 - **`settings_state` wire test didn't round-trip-deserialize** → added deserialize + `matches!` assertion mirroring the error half. Commit `b72c1fb`.
 - **Duplicate `import` in `web/test/wire.test.ts`** (caused `tsc TS2300`, blocking `npm run build`) → merged the imports. Commit `45709d6`.
+
+---
+
+## 2026-06-23 mcp-client
+
+- Streamable HTTP / remote MCP transport (+ auth) — Open — deferred; `McpTransport` seam is ready.
+- MCP resources & prompts — Open — no core seam yet; deferred.
+- EventSink/UI MCP server-status — Open — would add an AgentEvent variant (core touch); deferred until a UI consumer exists.
+- Browser-side MCP management via Settings inbound channel — Open — pairs with the deferred Settings capability.
+- OS-sandboxed MCP server processes — Open — MCP servers are untrusted code; synergy with os-sandboxing primer.

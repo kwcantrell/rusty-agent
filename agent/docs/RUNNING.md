@@ -170,3 +170,19 @@ docker rm -f llama-agent        # remove entirely
 To serve a different local model, change `-m` (and `-a`); e.g. the dense
 `Qwen3.6-27B-UD-Q4_K_XL.gguf`. Models larger than ~20 GB (e.g. `gpt-oss-120b`,
 60 GB) exceed 24 GB VRAM and need CPU offload (slower).
+
+## MCP servers (optional)
+
+The agent can consume tools from external MCP servers over stdio. Copy
+`mcp.example.json` to `mcp.json`, edit the server list, and pass `--mcp-config`:
+
+    cargo run -p agent-cli -- --base-url http://localhost:8080 --model qwen3.6-35b-a3b \
+      --workspace . --mcp-config mcp.json
+
+On startup the CLI prints a one-line summary, e.g.
+`mcp: filesystem ✓ (11 tools)`. Each server's tools appear namespaced as
+`server__tool`. By default every MCP tool requires approval on each call; set a
+server's `"trust": "allow"` to auto-approve a server you operate yourself.
+
+A server that fails to start is skipped with a warning — it never blocks the agent.
+The daemon takes the same `--mcp-config` flag on its `run` subcommand.
