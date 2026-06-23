@@ -237,3 +237,26 @@ server's `"trust": "allow"` to auto-approve a server you operate yourself.
 
 A server that fails to start is skipped with a warning — it never blocks the agent.
 The daemon takes the same `--mcp-config` flag on its `run` subcommand.
+
+## Skills
+
+A *skill* is a directory containing a `SKILL.md` (YAML-style frontmatter with `name` + `description`, then a markdown body) and any bundled files. Skills are discovered from:
+
+- `<workspace>/.agent/skills` (project-local, writable — where `create_skill` writes), and
+- `~/.agent/skills` (user-global, read-only),
+
+or from explicit `--skills-dir <path>` flags (repeatable; the first is the writable root). Earlier roots win on a name conflict.
+
+The agent gets four tools:
+- `list_skills` — show the catalog (name + when-to-use).
+- `use_skill {name}` — load a skill's full body + the paths of its bundled files into context.
+- `read_skill_file {skill, path}` — read one bundled file (read-only, confined to the skill's directory).
+- `create_skill {name, description, body, files?}` — author a new skill under the writable root (a Write action → goes through approval).
+
+Bundled scripts are run with the ordinary `execute_command` tool, gated by the command allow/deny policy + approval — the skills subsystem never executes anything itself.
+
+Preload a skill as a **preset** (its body injected into the system prompt from the first turn):
+
+    cargo run -p agent-cli -- ... --skill code-review --skill changelog
+
+`--skills-dir` and `--skill` are accepted by both `agent-cli` and `agent-serverd run`.
