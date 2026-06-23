@@ -78,11 +78,16 @@ async fn main() {
             let mut backoff = 1u64;
             loop {
                 match daemon::run(params_clone(&params)).await {
-                    Ok(()) => { backoff = 1; }
-                    Err(e) => tracing::warn!(error=%e, "daemon disconnected"),
+                    Ok(()) => {
+                        backoff = 1;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "daemon disconnected");
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                        backoff = (backoff * 2).min(30);
+                    }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(30);
             }
         }
     }

@@ -72,5 +72,8 @@ mod tests {
         c.save(&p).unwrap();
         let back = DaemonConfig::load(&p).unwrap();
         assert_eq!(back.agent_id, "a1");
+        assert_eq!(back.worker_url, "http://localhost:8787");
+        assert_eq!(back.agent_token, "t");
+        assert_eq!(back.pairing_code, "123456");
     }
 }
