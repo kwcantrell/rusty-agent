@@ -16,13 +16,17 @@ async function seed() {
   }
   const agentTok = newToken();
   const sessTok = newToken();
+  const r2OnlyTok = newToken();
   await env.DB.prepare(
     "INSERT INTO agents (id,name,token_hash,pairing_code,online,created_at) VALUES (?,?,?,?,0,?)")
     .bind("agent-1", "a", await sha256hex(agentTok), "111111", Date.now()).run();
   await env.DB.prepare(
     "INSERT INTO sessions (id,agent_id,token_hash,status,created_at) VALUES (?,?,?,'active',?)")
     .bind("sess-1", "agent-1", await sha256hex(sessTok), Date.now()).run();
-  return { agentTok, sessTok };
+  await env.DB.prepare(
+    "INSERT INTO sessions (id,agent_id,token_hash,status,created_at) VALUES (?,?,?,'active',?)")
+    .bind("sess-r2-only", "agent-1", await sha256hex(r2OnlyTok), Date.now()).run();
+  return { agentTok, sessTok, r2OnlyTok };
 }
 
 function wsReq(path: string, headers: Record<string, string> = {}) {
@@ -30,7 +34,7 @@ function wsReq(path: string, headers: Record<string, string> = {}) {
 }
 
 describe("relay", () => {
-  let toks: { agentTok: string; sessTok: string };
+  let toks: { agentTok: string; sessTok: string; r2OnlyTok: string };
   beforeAll(async () => { toks = await seed(); });
 
   it("relays a daemon event to a connected browser and flips presence", async () => {
@@ -67,16 +71,16 @@ describe("relay", () => {
   });
 
   it("replays the event log from R2 to a freshly attached browser", async () => {
-    // Pre-seed R2 with two events for a session, bypassing the live buffer.
-    await env.LOGS.put("sessions/sess-1/00000000.json", JSON.stringify({
-      v: 1, session_id: "sess-1", kind: "event", payload: { type: "token", text: "one" } }));
-    await env.LOGS.put("sessions/sess-1/00000001.json", JSON.stringify({
-      v: 1, session_id: "sess-1", kind: "event", payload: { type: "token", text: "two" } }));
+    // Pre-seed R2 under a session that has NO live buffer entry, so the DO must read R2.
+    await env.LOGS.put("sessions/sess-r2-only/00000000.json", JSON.stringify({
+      v: 1, session_id: "sess-r2-only", kind: "event", payload: { type: "token", text: "one" } }));
+    await env.LOGS.put("sessions/sess-r2-only/00000001.json", JSON.stringify({
+      v: 1, session_id: "sess-r2-only", kind: "event", payload: { type: "token", text: "two" } }));
 
-    // A new DO instance has an empty buffer, so it must read R2.
+    // sess-r2-only has no buffer entry, so attachBrowser falls through to replayFromR2.
     const ctx = createExecutionContext();
     const browserRes = await worker.fetch(
-      wsReq(`/browser?token=${toks.sessTok}`), env, ctx);
+      wsReq(`/browser?token=${toks.r2OnlyTok}`), env, ctx);
     const browserWs = browserRes.webSocket!;
     const received: string[] = [];
     browserWs.addEventListener("message", (e) => received.push(e.data as string));

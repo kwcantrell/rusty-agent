@@ -58,12 +58,16 @@ export class AgentSession {
   }
 
   private async replayFromR2(sessionId: string, ws: WebSocket) {
-    const list = await this.env.LOGS.list({ prefix: `sessions/${sessionId}/` });
-    const keys = list.objects.map((o) => o.key).sort();
-    for (const key of keys) {
-      const obj = await this.env.LOGS.get(key);
-      if (obj) ws.send(await obj.text());
-    }
+    let cursor: string | undefined;
+    do {
+      const list = await this.env.LOGS.list({ prefix: `sessions/${sessionId}/`, cursor });
+      const keys = list.objects.map((o) => o.key).sort();
+      for (const key of keys) {
+        const obj = await this.env.LOGS.get(key);
+        if (obj) ws.send(await obj.text());
+      }
+      cursor = list.truncated ? list.cursor : undefined;
+    } while (cursor);
   }
 
   private attachBrowser(ws: WebSocket, sessionId: string) {
