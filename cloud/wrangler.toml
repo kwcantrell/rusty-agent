@@ -1,0 +1,24 @@
+name = "agent-control-plane"
+main = "src/worker.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "AgentSession"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentSession"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "agent-cp"
+database_id = "local"   # placeholder; `wrangler dev` uses local emulation
+
+[[r2_buckets]]
+binding = "LOGS"
+bucket_name = "agent-logs"
+
+[vars]
+BOOTSTRAP_SECRET = "dev-secret-change-me"
