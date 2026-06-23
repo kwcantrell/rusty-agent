@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>agent test client</title></head>
+<body>
+  <h3>agent test client</h3>
+  <div>
+    Pairing code: <input id="code" size="8">
+    <button id="pair">Pair</button>
+    <span id="status">disconnected</span>
+  </div>
+  <div>
+    <input id="msg" size="60" placeholder="message">
+    <button id="send" disabled>Send</button>
+  </div>
+  <pre id="log" style="border:1px solid #ccc;height:300px;overflow:auto"></pre>
+  <div id="approve" style="display:none">
+    <b>Approval:</b> <span id="aprompt"></span>
+    <button data-d="approve">Approve</button>
+    <button data-d="deny">Deny</button>
+  </div>
+<script>
+const base = "http://localhost:8787"; // Worker origin (wrangler dev)
+let ws = null, sessionId = null;
+const log = (s) => { document.getElementById("log").textContent += s + "\n"; };
+
+document.getElementById("pair").onclick = async () => {
+  const code = document.getElementById("code").value.trim();
+  const r = await fetch(base + "/pair", { method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pairing_code: code }) });
+  if (!r.ok) { log("pair failed: " + r.status); return; }
+  const { session_id, session_token } = await r.json();
+  sessionId = session_id;
+  const wsUrl = base.replace("http", "ws") + "/browser?token=" + session_token;
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => { document.getElementById("status").textContent = "connected";
+    document.getElementById("send").disabled = false; };
+  ws.onmessage = (e) => handle(JSON.parse(e.data));
+  ws.onclose = () => document.getElementById("status").textContent = "closed";
+};
+
+function handle(env) {
+  if (env.kind === "presence") { log("[presence online=" + env.online + "]"); return; }
+  if (env.kind === "approval_request") {
+    document.getElementById("approve").style.display = "block";
+    document.getElementById("aprompt").textContent = env.summary;
+    document.querySelectorAll("#approve button").forEach((b) => b.onclick = () => {
+      ws.send(JSON.stringify({ v:1, session_id: sessionId, id: env.id,
+        kind: "approval_response", decision: b.dataset.d }));
+      document.getElementById("approve").style.display = "none";
+    });
+    return;
+  }
+  if (env.kind === "event") {
+    const p = env.payload;
+    if (p.type === "token") document.getElementById("log").textContent += p.text;
+    else log("\n[" + p.type + "] " + (p.content || p.reason || p.message || p.name || ""));
+  }
+}
+
+document.getElementById("send").onclick = () => {
+  const text = document.getElementById("msg").value;
+  ws.send(JSON.stringify({ v:1, session_id: sessionId, kind: "user_input", text }));
+  document.getElementById("msg").value = "";
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+[package]
+name = "agent-runtime-config"
+edition.workspace = true
+
+[dependencies]
+agent-tools = { path = "../agent-tools" }
+agent-model = { path = "../agent-model" }

@@ -1,9 +1,13 @@
 [package]
-name = "agent-cli"
+name = "agent-server"
 edition.workspace = true
 
+[lib]
+name = "agent_server"
+path = "src/lib.rs"
+
 [[bin]]
-name = "agent"
+name = "agent-serverd"
 path = "src/main.rs"
 
 [dependencies]
@@ -13,10 +17,18 @@ agent-policy = { path = "../agent-policy" }
 agent-model = { path = "../agent-model" }
 agent-runtime-config = { path = "../agent-runtime-config" }
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+futures.workspace = true
+reqwest.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-similar.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# Enable agent-core's `testkit` feature for the Task 4 integration test
+# (ScriptedModel/PassthroughProtocol live behind `#[cfg(any(test, feature = "testkit"))]`).
+agent-core = { path = "../agent-core", features = ["testkit"] }

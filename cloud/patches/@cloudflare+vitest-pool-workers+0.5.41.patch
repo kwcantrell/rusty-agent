@@ -1,0 +1,22 @@
+diff --git a/node_modules/@cloudflare/vitest-pool-workers/dist/pool/index.mjs b/node_modules/@cloudflare/vitest-pool-workers/dist/pool/index.mjs
+index 7f2ca73..3711ba6 100644
+--- a/node_modules/@cloudflare/vitest-pool-workers/dist/pool/index.mjs
++++ b/node_modules/@cloudflare/vitest-pool-workers/dist/pool/index.mjs
+@@ -553,6 +553,8 @@ async function pushStackedStorage(intoDepth, persistPath) {
+       }
+       const namePath = path3.join(keyPath, name);
+       const stackFrameNamePath = path3.join(stackFrameKeyPath, name);
++      // Skip WAL mode temp files (.sqlite-shm, .sqlite-wal) that SQLite creates alongside .sqlite
++      if (name.endsWith(".sqlite-shm") || name.endsWith(".sqlite-wal")) { continue; }
+       assert2(name.endsWith(".sqlite"), `Expected .sqlite, got ${namePath}`);
+       await fs.copyFile(namePath, stackFrameNamePath);
+     }
+@@ -569,6 +571,8 @@ async function popStackedStorage(fromDepth, persistPath) {
+         break;
+       }
+       const namePath = path3.join(keyPath, name);
++      // Skip WAL mode temp files (.sqlite-shm, .sqlite-wal) that SQLite creates alongside .sqlite
++      if (name.endsWith(".sqlite-shm") || name.endsWith(".sqlite-wal")) { continue; }
+       assert2(name.endsWith(".sqlite"), `Expected .sqlite, got ${namePath}`);
+       await fs.unlink(namePath);
+     }

@@ -1,13 +1,12 @@
 mod approval;
-mod config;
 mod render;
 
 use agent_core::{AgentLoop, LoopConfig, WindowContext};
 use agent_model::{Message, OpenAiCompatClient};
 use agent_policy::RulePolicy;
+use agent_runtime_config::{build_registry, default_allowlist, default_denylist, pick_protocol};
 use approval::TerminalApproval;
 use clap::Parser;
-use config::{build_registry, default_allowlist, default_denylist, pick_protocol};
 use render::TerminalSink;
 use std::io::{BufRead, Write};
 use std::sync::Arc;

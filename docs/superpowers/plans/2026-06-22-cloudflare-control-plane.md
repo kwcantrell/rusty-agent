@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- **Core untouched:** add zero lines to `agent-core`, `agent-model`, `agent-tools`, `agent-policy`. All new code lives in `agent/crates/agent-server/` and `cloud/`. (Helpers in `agent-cli/src/config.rs` are a binary crate and not importable — they are duplicated into the daemon, noted in Task 5.)
+- **Core untouched:** add zero lines to `agent-core`, `agent-model`, `agent-tools`, `agent-policy`. New code lives in `agent/crates/agent-server/`, `agent/crates/agent-runtime-config/`, and `cloud/`. (`agent-cli` is intentionally modified once, in Task 4a, to share the extracted `agent-runtime-config` helpers — it is not part of the untouched core.)
 - **Local-first / offline:** everything runs under `wrangler dev` (Miniflare). No external IdP, no network dependency on the live path.
 - **Wire protocol owned by `agent-server`:** mirror DTOs + `From` conversions live in the daemon; core types stay serde-free. Envelope is versioned (`v: 1`).
 - **Cargo not on PATH:** every cargo command must be preceded by `source "$HOME/.cargo/env"`. Build/test from `agent/`.
@@ -27,8 +27,8 @@
 - `src/wire.rs` — `WireEnvelope`, `WireBody`, `WireEvent`, `WireDecision`, conversions from core types. Pure data + serde.
 - `src/sink.rs` — `WsEventSink` (sync `EventSink` → mpsc).
 - `src/approval.rs` — `WsApprovalChannel` (async `ApprovalChannel`, correlation map, timeout→Deny).
-- `src/runtime.rs` — duplicated loop-wiring helpers (`build_registry`, `pick_protocol`, `default_allowlist`, `default_denylist`).
-- `src/daemon.rs` — outbound WS connection, writer task, read loop, per-session run.
+- `src/daemon.rs` — outbound WS connection, writer task, read loop, per-session run. Uses loop-wiring helpers from the shared `agent-runtime-config` crate (extracted in Task 4a).
+- (Task 4a) `agent/crates/agent-runtime-config/` — new shared lib crate holding `build_registry`, `pick_protocol`, `default_allowlist`, `default_denylist`, `protocol_name_is_valid`; depended on by both `agent-cli` and `agent-server` (single source of truth, replaces the former duplication).
 - `src/config.rs` — `DaemonConfig` (persisted enrollment) + load/save + enrollment HTTP call.
 - `src/main.rs` — clap CLI: `enroll` and `run` (default) subcommands.
 
@@ -99,6 +99,9 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Enable agent-core's `testkit` feature for the Task 4 integration test
+# (ScriptedModel/PassthroughProtocol live behind `#[cfg(any(test, feature = "testkit"))]`).
+agent-core = { path = "../agent-core", features = ["testkit"] }
 ```
 
 - [ ] **Step 3: Temporary main stub so the crate compiles**
@@ -524,31 +527,51 @@ git commit -m "feat(agent-server): WsApprovalChannel with correlation + timeout-
 
 ---
 
-## Task 4: Daemon connection, session run, and integration test against a fake Worker
+## Task 4a: Extract `agent-runtime-config` shared crate; repoint `agent-cli`
+
+The loop-wiring helpers currently live in the `agent-cli` binary crate and so cannot be imported by `agent-server`. Extract them into a small shared library crate so both binaries import one source of truth (replaces the duplication the original plan called for).
 
 **Files:**
-- Create: `agent/crates/agent-server/src/runtime.rs` (duplicated loop-wiring helpers)
-- Create: `agent/crates/agent-server/src/daemon.rs`
-- Modify: `agent/crates/agent-server/src/main.rs` (add `mod runtime; mod daemon;`)
-- Test: `agent/crates/agent-server/tests/daemon_roundtrip.rs`
+- Create: `agent/crates/agent-runtime-config/Cargo.toml`
+- Create: `agent/crates/agent-runtime-config/src/lib.rs`
+- Delete: `agent/crates/agent-cli/src/config.rs`
+- Modify: `agent/crates/agent-cli/Cargo.toml` (add `agent-runtime-config` dependency)
+- Modify: `agent/crates/agent-cli/src/main.rs` (remove `mod config;`; import from the new crate)
+- Test: inline `#[cfg(test)]` in the new `src/lib.rs` (the tests move out of `agent-cli/src/config.rs`)
 
 **Interfaces:**
-- Consumes: `WsEventSink` (Task 2), `WsApprovalChannel` (Task 3), wire types (Task 1); `AgentLoop`, `LoopConfig`, `WindowContext` (core); `OpenAiCompatClient`, `Message` (model); `RulePolicy` (policy).
-- Produces: `runtime::build_registry()`, `runtime::pick_protocol(&str)`, `runtime::default_allowlist()`, `runtime::default_denylist()`; `daemon::DaemonParams { ws_url, agent_token, base_url, model, protocol, workspace, context_limit }`; `daemon::run(params) -> anyhow-free Result<(), Box<dyn std::error::Error>>`.
+- Consumes: `NativeProtocol`, `PromptedJsonProtocol`, `ToolCallProtocol` (model); fs/git/shell tools + `ToolRegistry` (tools).
+- Produces: `agent_runtime_config::{ pick_protocol(&str) -> Arc<dyn ToolCallProtocol>, build_registry() -> ToolRegistry, default_allowlist() -> Vec<String>, default_denylist() -> Vec<String>, protocol_name_is_valid(&str) -> bool }`.
 
-- [ ] **Step 1: Register modules**
+- [ ] **Step 1: Create the crate manifest**
 
-In `src/main.rs` add `mod runtime;` and `mod daemon;`.
+`agent/crates/agent-runtime-config/Cargo.toml`:
 
-- [ ] **Step 2: Duplicate the loop-wiring helpers**
+```toml
+[package]
+name = "agent-runtime-config"
+edition.workspace = true
 
-`agent/crates/agent-server/src/runtime.rs` (identical to `agent-cli/src/config.rs` helpers; duplicated because that lives in a binary crate — a future refactor could extract a shared lib crate):
+[dependencies]
+agent-tools = { path = "../agent-tools" }
+agent-model = { path = "../agent-model" }
+```
+
+- [ ] **Step 2: Move the helpers (and their tests) into the new crate**
+
+`agent/crates/agent-runtime-config/src/lib.rs` (verbatim move of the current `agent-cli/src/config.rs`, including its tests; `protocol_name_is_valid` keeps `#[allow(dead_code)]` removed since it is now part of a public library API):
 
 ```rust
+//! Shared agent loop wiring (tool registry, protocol picker, command lists)
+//! used by both the CLI (`agent-cli`) and the daemon (`agent-server`).
 use agent_model::{NativeProtocol, PromptedJsonProtocol, ToolCallProtocol};
 use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
 use agent_tools::{git::{GitCommit, GitDiff, GitStatus}, shell::ExecuteCommand, ToolRegistry};
 use std::sync::Arc;
+
+pub fn protocol_name_is_valid(name: &str) -> bool {
+    matches!(name, "native" | "prompted")
+}
 
 pub fn pick_protocol(name: &str) -> Arc<dyn ToolCallProtocol> {
     match name {
@@ -577,15 +600,83 @@ pub fn default_allowlist() -> Vec<String> {
 pub fn default_denylist() -> Vec<String> {
     ["rm -rf /","sudo",":(){","mkfs","dd if="].into_iter().map(String::from).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pick_protocol_selects_by_name() {
+        assert!(protocol_name_is_valid("native"));
+        assert!(protocol_name_is_valid("prompted"));
+        assert!(!protocol_name_is_valid("bogus"));
+    }
+    #[test]
+    fn registry_has_all_core_tools() {
+        let r = build_registry();
+        for name in ["read_file","write_file","edit_file","list_directory",
+                     "execute_command","git_status","git_diff","git_commit"] {
+            assert!(r.get(name).is_some(), "missing {name}");
+        }
+    }
+}
 ```
 
-- [ ] **Step 3: Implement the daemon (parametrised so tests can inject a model)**
+- [ ] **Step 3: Repoint `agent-cli`**
+
+In `agent/crates/agent-cli/Cargo.toml`, add under `[dependencies]`:
+
+```toml
+agent-runtime-config = { path = "../agent-runtime-config" }
+```
+
+Delete `agent/crates/agent-cli/src/config.rs`. In `agent/crates/agent-cli/src/main.rs`:
+- Remove the `mod config;` line.
+- Replace `use config::{build_registry, default_allowlist, default_denylist, pick_protocol};`
+  with `use agent_runtime_config::{build_registry, default_allowlist, default_denylist, pick_protocol};`.
+
+- [ ] **Step 4: Build + test both crates**
+
+Run: `source "$HOME/.cargo/env" && cargo test -p agent-runtime-config -p agent-cli && cargo clippy -p agent-runtime-config -p agent-cli --all-targets -- -D warnings`
+Expected: the two moved tests PASS under `agent-runtime-config`; `agent-cli` builds and its remaining tests pass; clippy clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add agent/Cargo.lock agent/crates/agent-runtime-config agent/crates/agent-cli
+git commit -m "refactor: extract agent-runtime-config shared crate; repoint agent-cli"
+```
+
+---
+
+## Task 4: Daemon connection, session run, and integration test against a fake Worker
+
+**Files:**
+- Create: `agent/crates/agent-server/src/daemon.rs`
+- Modify: `agent/crates/agent-server/Cargo.toml` (add `agent-runtime-config` dependency)
+- Modify: `agent/crates/agent-server/src/main.rs` (add `mod daemon;`)
+- Test: `agent/crates/agent-server/tests/daemon_roundtrip.rs`
+
+**Interfaces:**
+- Consumes: `WsEventSink` (Task 2), `WsApprovalChannel` (Task 3), wire types (Task 1); `agent_runtime_config::{build_registry, pick_protocol, default_allowlist, default_denylist}` (Task 4a); `AgentLoop`, `LoopConfig`, `WindowContext` (core); `OpenAiCompatClient`, `Message` (model); `RulePolicy` (policy).
+- Produces: `daemon::DaemonParams { ws_url, agent_token, model, protocol, workspace, context_limit }`; `daemon::run(params) -> Result<(), Box<dyn std::error::Error + Send + Sync>>`.
+
+- [ ] **Step 1: Add the shared-crate dependency and register the module**
+
+In `agent/crates/agent-server/Cargo.toml`, add under `[dependencies]`:
+
+```toml
+agent-runtime-config = { path = "../agent-runtime-config" }
+```
+
+In `src/main.rs` add `mod daemon;` (this is the Task 4 stub `main.rs` from Task 1; the real CLI arrives in Task 5).
+
+- [ ] **Step 2: Implement the daemon (parametrised so tests can inject a model)**
 
 `agent/crates/agent-server/src/daemon.rs`. The model client is boxed behind a constructor closure so the integration test can substitute a scripted model while production uses `OpenAiCompatClient`.
 
 ```rust
 use crate::approval::WsApprovalChannel;
-use crate::runtime::{build_registry, default_allowlist, default_denylist, pick_protocol};
+use agent_runtime_config::{build_registry, default_allowlist, default_denylist, pick_protocol};
 use crate::sink::WsEventSink;
 use crate::wire::{WireBody, WireEnvelope};
 use agent_core::{AgentLoop, LoopConfig, WindowContext};
@@ -702,7 +793,7 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
 }
 ```
 
-- [ ] **Step 4: Write the failing integration test (fake Worker WS server)**
+- [ ] **Step 3: Write the failing integration test (fake Worker WS server)**
 
 `agent/crates/agent-server/tests/daemon_roundtrip.rs`. Reuses `agent-core`'s testkit. The test stands up a TCP/WS server that plays the Worker, drives one `user_input`, expects an `approval_request` (the scripted tool call uses a shell metacharacter, which the policy routes to `Ask`), approves it, and expects a terminal `done` event.
 
@@ -783,14 +874,13 @@ async fn user_input_streams_events_and_round_trips_approval() {
 > 1. The integration test references `agent_server::daemon` and `agent_server::testkit`-style items, so the crate needs a `lib` target. Add `src/lib.rs` exposing the modules (next step). The `agent_server_testhooks` line above is a placeholder — delete it; it is not a real dependency.
 > 2. `PassthroughProtocol` is unused here because production `pick_protocol("native")` returns `NativeProtocol`, which also reads native deltas. Keep `protocol: "native"`.
 
-- [ ] **Step 5: Add a `lib.rs` so the crate is both a lib and a bin**
+- [ ] **Step 4: Add a `lib.rs` so the crate is both a lib and a bin**
 
 Create `agent/crates/agent-server/src/lib.rs`:
 
 ```rust
 pub mod approval;
 pub mod daemon;
-pub mod runtime;
 pub mod sink;
 pub mod wire;
 ```
@@ -820,17 +910,17 @@ async fn main() {
 
 Remove the now-duplicated `mod wire; mod sink; ...` lines from `main.rs`.
 
-- [ ] **Step 6: Run the integration test**
+- [ ] **Step 5: Run the integration test**
 
 Run: `source "$HOME/.cargo/env" && cargo test -p agent-server --test daemon_roundtrip`
 Expected: PASS. If it hangs, the policy did not route the command to `Ask` — confirm the scripted command contains `>` (a shell metacharacter), which `RulePolicy` requires approval for.
 
-- [ ] **Step 7: Full crate test + clippy**
+- [ ] **Step 6: Full crate test + clippy**
 
 Run: `source "$HOME/.cargo/env" && cargo test -p agent-server && cargo clippy -p agent-server --all-targets -- -D warnings`
 Expected: all PASS, no warnings.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add agent/crates/agent-server
