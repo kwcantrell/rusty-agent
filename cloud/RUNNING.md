@@ -48,14 +48,25 @@ cd cloud/testpage && python3 -m http.server 8081
 
 ## 4. The web UI (subsystem #6)
 
+Prereq: bring up §1 (cloud) + §2 (daemon) first so there's an agent to pair with.
+
+> If a previous `wrangler dev` is still running on :8787, **stop it first** — a stale
+> instance from before `web/dist` existed (or before the `assets` binding) serves the API
+> but 500s the SPA. `npx wrangler dev` won't bind a busy port; kill the old one.
+
 Dev (HMR, two processes):
 - terminal A: `cd cloud && npx wrangler dev`            # API + WS on :8787
-- terminal B: `cd web && npm run dev`                   # UI on :5173, proxies /enroll,/pair,/agent,/browser to :8787
+- terminal B: `cd web && npm run dev`                   # UI on :5173, proxies /enroll,/pair,/agent,/browser to :8787 (incl. the WS routes)
 - browse http://localhost:5173 — same-origin via the Vite proxy (no CORS). Enter the daemon's pairing code.
+- If :5173 is taken, Vite auto-increments to the next free port (5174, 5175, …) — **use the URL Vite prints in terminal B**, not a hardcoded :5173.
 
 Production-like (single origin, served by the Worker):
-- `cd web && npm run build`                             # writes web/dist
+- `cd web && npm run build`                             # writes web/dist (gitignored output; the committed .gitkeep keeps the dir present)
 - `cd cloud && npx wrangler dev`                        # serves the SPA + API on :8787 (run_worker_first routes the API)
 - browse http://localhost:8787
 
 Deploy ships both together: `cd web && npm run build && cd ../cloud && npx wrangler deploy`.
+
+Both flows are validated live (chrome-driven, against the real model): pair → stream tokens
+→ a command tool raises an approval → Approve runs it **on the local machine** → terminal
+output + diff render → reconnect-replay + presence work.
