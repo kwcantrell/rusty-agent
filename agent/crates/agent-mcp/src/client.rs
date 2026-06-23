@@ -7,6 +7,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+/// MCP protocol version we advertise. Servers negotiate down if needed.
+const PROTOCOL_VERSION: &str = "2024-11-05";
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RawTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
 // `McpClient` and helpers are crate-internal; later tasks (manager, etc.) will
 // use them via `crate::client::…`. Suppress dead_code until then.
 #[allow(dead_code)]
@@ -91,6 +102,36 @@ impl McpClient {
     pub async fn close(&self) {
         self.transport.close().await;
     }
+
+    /// `initialize` → receive capabilities → `notifications/initialized`.
+    pub async fn initialize(&self, timeout: Duration) -> Result<(), McpError> {
+        let params = json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "clientInfo": {"name": "agent-mcp", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {}
+        });
+        self.request("initialize", params, timeout).await?;
+        self.notify("notifications/initialized", json!({})).await
+    }
+
+    /// `tools/list` → parse the tool descriptors.
+    pub async fn list_tools(&self, timeout: Duration) -> Result<Vec<RawTool>, McpError> {
+        let res = self.request("tools/list", json!({}), timeout).await?;
+        let arr = res.get("tools").and_then(Value::as_array)
+            .ok_or_else(|| McpError::Protocol("tools/list: missing 'tools' array".into()))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for t in arr {
+            let name = t.get("name").and_then(Value::as_str)
+                .ok_or_else(|| McpError::Protocol("tool missing 'name'".into()))?;
+            out.push(RawTool {
+                name: name.to_string(),
+                description: t.get("description").and_then(Value::as_str).unwrap_or("").to_string(),
+                input_schema: t.get("inputSchema").cloned()
+                    .unwrap_or_else(|| json!({"type":"object"})),
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +180,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, McpError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn initialize_then_list_tools_parses_descriptors() {
+        let t = MockTransport::scripted(|req| {
+            let id = req["id"].clone();
+            match req["method"].as_str() {
+                Some("initialize") => vec![json!({"jsonrpc":"2.0","id":id,
+                    "result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock"}}})],
+                Some("tools/list") => vec![json!({"jsonrpc":"2.0","id":id,"result":{"tools":[
+                    {"name":"read_file","description":"Read a file",
+                     "inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}
+                ]}})],
+                _ => vec![],
+            }
+        });
+        let client = McpClient::new(Arc::new(t));
+        client.initialize(Duration::from_secs(2)).await.unwrap();
+        let tools = client.list_tools(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "read_file");
+        assert_eq!(tools[0].input_schema["properties"]["path"]["type"], "string");
     }
 }
