@@ -16,6 +16,7 @@ pub struct RuntimeConfig {
     pub protocol: String,       // "native" | "prompted"
     pub command_allowlist: Vec<String>,
     pub command_denylist: Vec<String>, // user-editable portion ONLY (floor added separately)
+    pub http_allow_hosts: Vec<String>, // hosts fetch_url may contact without approval
     pub temperature: f32,
     pub max_tokens: u32,
     pub max_turns: usize,
@@ -32,6 +33,7 @@ struct PartialRuntimeConfig {
     protocol: Option<String>,
     command_allowlist: Option<Vec<String>>,
     command_denylist: Option<Vec<String>>,
+    http_allow_hosts: Option<Vec<String>>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     max_turns: Option<usize>,
@@ -47,6 +49,7 @@ impl RuntimeConfig {
             backend, base_url, model, protocol,
             command_allowlist: default_allowlist(),
             command_denylist: Vec::new(),
+            http_allow_hosts: Vec::new(),
             temperature: 0.2,
             max_tokens: 2048,
             max_turns: 25,
@@ -112,6 +115,7 @@ impl RuntimeConfig {
         if let Some(v) = p.protocol { self.protocol = v; }
         if let Some(v) = p.command_allowlist { self.command_allowlist = v; }
         if let Some(v) = p.command_denylist { self.command_denylist = v; }
+        if let Some(v) = p.http_allow_hosts { self.http_allow_hosts = v; }
         if let Some(v) = p.temperature { self.temperature = v; }
         if let Some(v) = p.max_tokens { self.max_tokens = v; }
         if let Some(v) = p.max_turns { self.max_turns = v; }
@@ -258,6 +262,7 @@ mod tests {
         c.model = "saved-model".into();
         c.temperature = 0.7;
         c.command_denylist = vec!["nope".into()];
+        c.http_allow_hosts = vec!["docs.rs".into()];
         c.save(&path).unwrap();
 
         // A different base proves the file wins.
@@ -267,6 +272,7 @@ mod tests {
         assert_eq!(loaded.model, "saved-model");
         assert_eq!(loaded.temperature, 0.7);
         assert_eq!(loaded.command_denylist, vec!["nope".to_string()]);
+        assert_eq!(loaded.http_allow_hosts, vec!["docs.rs".to_string()]);
     }
 
     #[test]

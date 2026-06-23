@@ -48,6 +48,9 @@ enum Cmd {
         /// Optional MCP server config (mcp.json shape). If absent, MCP is disabled.
         #[arg(long)]
         mcp_config: Option<PathBuf>,
+        /// Host fetch_url may contact without approval (repeatable); overlaid by the runtime config file.
+        #[arg(long = "allow-host")]
+        allow_host: Vec<String>,
     },
 }
 
@@ -69,7 +72,7 @@ async fn main() {
             }
         }
         Cmd::Run { base_url, model, protocol, workspace, context_limit, backend, claude_binary,
-                   runtime_config, mcp_config } => {
+                   runtime_config, mcp_config, allow_host } => {
             let cfg = DaemonConfig::load(&cli.config)
                 .expect("load config (run `enroll` first)");
             println!("pairing code: {}", cfg.pairing_code);
@@ -80,7 +83,8 @@ async fn main() {
                 std::process::exit(2);
             }
             let api_key = std::env::var("AGENT_API_KEY").ok();
-            let base = RuntimeConfig::from_launch(backend, base_url, model, protocol, context_limit);
+            let mut base = RuntimeConfig::from_launch(backend, base_url, model, protocol, context_limit);
+            base.http_allow_hosts = allow_host;
             // Surface bad flags early (the persisted file is only ever written post-validation).
             if let Err(e) = base.clone().normalized().validate() {
                 eprintln!("invalid launch config: {e}");

@@ -7,6 +7,7 @@ pub use runtime_config::{RuntimeConfig, HARD_FLOOR_DENYLIST};
 use agent_mcp::McpServersConfig;
 use agent_model::{ClaudeCliClient, ModelClient, NativeProtocol, OpenAiCompatClient,
                   PromptedJsonProtocol, ToolCallProtocol};
+use agent_http::{FetchUrl, NetworkPolicy};
 use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
 use agent_tools::{git::{GitCommit, GitDiff, GitStatus}, shell::ExecuteCommand, ToolRegistry};
 use std::path::Path;
@@ -56,7 +57,7 @@ pub fn build_model(
     }
 }
 
-pub fn build_registry() -> ToolRegistry {
+pub fn build_registry(http_allow_hosts: &[String]) -> ToolRegistry {
     let mut r = ToolRegistry::new();
     r.register(Arc::new(ReadFile));
     r.register(Arc::new(WriteFile));
@@ -66,6 +67,7 @@ pub fn build_registry() -> ToolRegistry {
     r.register(Arc::new(GitStatus));
     r.register(Arc::new(GitDiff));
     r.register(Arc::new(GitCommit));
+    r.register(Arc::new(FetchUrl::new(NetworkPolicy::new(http_allow_hosts))));
     r
 }
 
@@ -94,9 +96,9 @@ mod tests {
     }
     #[test]
     fn registry_has_all_core_tools() {
-        let r = build_registry();
+        let r = build_registry(&[]);
         for name in ["read_file","write_file","edit_file","list_directory",
-                     "execute_command","git_status","git_diff","git_commit"] {
+                     "execute_command","git_status","git_diff","git_commit","fetch_url"] {
             assert!(r.get(name).is_some(), "missing {name}");
         }
     }

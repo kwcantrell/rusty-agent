@@ -127,7 +127,7 @@ fn build_loop(
         command_allowlist: cfg.command_allowlist.clone(),
         command_denylist: cfg.effective_denylist(),
     });
-    let mut registry = build_registry();
+    let mut registry = build_registry(&cfg.http_allow_hosts);
     for t in mcp_tools {
         registry.register(t.clone());
     }
