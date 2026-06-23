@@ -260,3 +260,13 @@ Preload a skill as a **preset** (its body injected into the system prompt from t
     cargo run -p agent-cli -- ... --skill code-review --skill changelog
 
 `--skills-dir` and `--skill` are accepted by both `agent-cli` and `agent-serverd run`.
+
+### Sampling & thinking flags
+
+- `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, `--repeat-penalty` — optional
+  sampler overrides; omitted from the request when unset (server default applies).
+  `top-k`/`min-p`/`repeat-penalty` are llama.cpp/SGLang extensions, ignored by stock OpenAI.
+- `--no-thinking` — turn off model reasoning (sends `chat_template_kwargs.enable_thinking=false`).
+  Reasoning is on by default and shown dimmed in the terminal.
+- `--preserve-thinking` — keep prior `<think>` reasoning in history across turns
+  (default: stripped, per Qwen3 multi-turn guidance). Ignored by the `claude-cli` backend.

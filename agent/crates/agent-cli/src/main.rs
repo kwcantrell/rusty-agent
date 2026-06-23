@@ -57,6 +57,27 @@ struct Cli {
     /// Preload a skill as a preset by name (repeatable): its body is injected into the system prompt.
     #[arg(long = "skill")]
     skill: Vec<String>,
+    /// Nucleus sampling (0.0–1.0); unset = server default
+    #[arg(long)]
+    top_p: Option<f32>,
+    /// Top-k sampling; unset = server default
+    #[arg(long)]
+    top_k: Option<u32>,
+    /// Min-p sampling (0.0–1.0); unset = server default
+    #[arg(long)]
+    min_p: Option<f32>,
+    /// Presence penalty (-2.0–2.0); unset = server default
+    #[arg(long)]
+    presence_penalty: Option<f32>,
+    /// Repetition penalty (>0.0); unset = server default
+    #[arg(long)]
+    repeat_penalty: Option<f32>,
+    /// Disable model reasoning (chat_template_kwargs.enable_thinking=false)
+    #[arg(long = "no-thinking", default_value_t = false)]
+    no_thinking: bool,
+    /// Keep prior <think> reasoning in conversation history
+    #[arg(long, default_value_t = false)]
+    preserve_thinking: bool,
 }
 
 #[tokio::main]
@@ -121,9 +142,9 @@ async fn main() {
             model_limit: cli.context_limit, max_turns: 25, max_retries: 3, temperature: 0.2,
             max_tokens: Some(2048), workspace, tool_timeout: Duration::from_secs(120),
             stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
-            top_p: None, top_k: None, min_p: None,
-            presence_penalty: None, repeat_penalty: None,
-            enable_thinking: true, preserve_thinking: false,
+            top_p: cli.top_p, top_k: cli.top_k, min_p: cli.min_p,
+            presence_penalty: cli.presence_penalty, repeat_penalty: cli.repeat_penalty,
+            enable_thinking: !cli.no_thinking, preserve_thinking: cli.preserve_thinking,
         });
 
     let mut ctx = WindowContext::new(Message::system(system_prompt));
