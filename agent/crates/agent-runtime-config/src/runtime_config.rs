@@ -1,5 +1,6 @@
 use crate::{default_allowlist, backend_name_is_valid, protocol_name_is_valid};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Commands ALWAYS denied regardless of user settings — defense-in-depth against
 /// the model (or an injected settings frame), not against the operator. Intersected
@@ -19,6 +20,22 @@ pub struct RuntimeConfig {
     pub max_tokens: u32,
     pub max_turns: usize,
     pub context_limit: usize,
+}
+
+/// All-optional mirror used only for on-disk merge: a file written by an older
+/// build is missing newer fields, which then fall back to the flag-derived base.
+#[derive(Debug, Default, Deserialize)]
+struct PartialRuntimeConfig {
+    backend: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    protocol: Option<String>,
+    command_allowlist: Option<Vec<String>>,
+    command_denylist: Option<Vec<String>>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    max_turns: Option<usize>,
+    context_limit: Option<usize>,
 }
 
 impl RuntimeConfig {
@@ -82,6 +99,38 @@ impl RuntimeConfig {
             }
         }
         out
+    }
+
+    fn merge(mut self, p: PartialRuntimeConfig) -> Self {
+        if let Some(v) = p.backend { self.backend = v; }
+        if let Some(v) = p.base_url { self.base_url = v; }
+        if let Some(v) = p.model { self.model = v; }
+        if let Some(v) = p.protocol { self.protocol = v; }
+        if let Some(v) = p.command_allowlist { self.command_allowlist = v; }
+        if let Some(v) = p.command_denylist { self.command_denylist = v; }
+        if let Some(v) = p.temperature { self.temperature = v; }
+        if let Some(v) = p.max_tokens { self.max_tokens = v; }
+        if let Some(v) = p.max_turns { self.max_turns = v; }
+        if let Some(v) = p.context_limit { self.context_limit = v; }
+        self
+    }
+
+    /// Persist the full config (pretty JSON).
+    pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
+    /// Flag-derived `base`, overlaid per-field by the file at `path` if it parses;
+    /// a missing or malformed file leaves `base` unchanged.
+    pub fn load_over(base: RuntimeConfig, path: &Path) -> RuntimeConfig {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match serde_json::from_str::<PartialRuntimeConfig>(&text) {
+                Ok(p) => base.merge(p),
+                Err(_) => base,
+            },
+            Err(_) => base,
+        }
     }
 }
 
@@ -167,5 +216,53 @@ mod tests {
     fn effective_denylist_floor_survives_empty_user_list() {
         let c = base(); // command_denylist empty
         assert!(c.effective_denylist().iter().any(|d| d == "sudo"));
+    }
+
+    #[test]
+    fn save_then_load_over_round_trips_all_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.json");
+        let mut c = base();
+        c.model = "saved-model".into();
+        c.temperature = 0.7;
+        c.command_denylist = vec!["nope".into()];
+        c.save(&path).unwrap();
+
+        // A different base proves the file wins.
+        let other = RuntimeConfig::from_launch(
+            "openai".into(), "http://x".into(), "flag-model".into(), "native".into(), 4096);
+        let loaded = RuntimeConfig::load_over(other, &path);
+        assert_eq!(loaded.model, "saved-model");
+        assert_eq!(loaded.temperature, 0.7);
+        assert_eq!(loaded.command_denylist, vec!["nope".to_string()]);
+    }
+
+    #[test]
+    fn load_over_returns_base_when_file_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.json");
+        let b = base();
+        assert_eq!(RuntimeConfig::load_over(b.clone(), &path), b);
+    }
+
+    #[test]
+    fn load_over_falls_back_per_field_for_partial_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.json");
+        std::fs::write(&path, r#"{"model":"only-model"}"#).unwrap();
+        let b = base();
+        let loaded = RuntimeConfig::load_over(b.clone(), &path);
+        assert_eq!(loaded.model, "only-model"); // file wins
+        assert_eq!(loaded.backend, b.backend);   // absent field falls back to base
+        assert_eq!(loaded.max_tokens, b.max_tokens);
+    }
+
+    #[test]
+    fn load_over_ignores_a_malformed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, "not json").unwrap();
+        let b = base();
+        assert_eq!(RuntimeConfig::load_over(b.clone(), &path), b);
     }
 }
