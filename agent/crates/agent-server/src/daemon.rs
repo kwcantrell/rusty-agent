@@ -24,10 +24,11 @@ pub struct DaemonParams {
     pub claude_binary: String,
     pub config_path: PathBuf,
     pub workspace: PathBuf,
+    pub system_prompt: String,
     pub mcp_tools: Arc<[Arc<dyn Tool>]>,
 }
 
-const SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided tools to inspect \
+pub const SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided tools to inspect \
 and modify the workspace. Think step by step. When the task is complete, reply with a summary \
 and no tool call.";
 
@@ -56,7 +57,7 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
         params.mcp_tools.clone(),
     ));
     let ctx = Arc::new(tokio::sync::Mutex::new(
-        WindowContext::new(Message::system(SYSTEM_PROMPT))));
+        WindowContext::new(Message::system(params.system_prompt.clone()))));
 
     let mut req = params.ws_url.clone().into_client_request()?;
     req.headers_mut().insert("Authorization",

@@ -51,6 +51,12 @@ enum Cmd {
         /// Host fetch_url may contact without approval (repeatable); overlaid by the runtime config file.
         #[arg(long = "allow-host")]
         allow_host: Vec<String>,
+        /// Skill search directory (repeatable). Default: <workspace>/.agent/skills + ~/.agent/skills.
+        #[arg(long = "skills-dir")]
+        skills_dir: Vec<String>,
+        /// Preload a skill as a preset by name (repeatable).
+        #[arg(long = "skill")]
+        skill: Vec<String>,
     },
 }
 
@@ -72,7 +78,7 @@ async fn main() {
             }
         }
         Cmd::Run { base_url, model, protocol, workspace, context_limit, backend, claude_binary,
-                   runtime_config, mcp_config, allow_host } => {
+                   runtime_config, mcp_config, allow_host, skills_dir, skill } => {
             let cfg = DaemonConfig::load(&cli.config)
                 .expect("load config (run `enroll` first)");
             println!("pairing code: {}", cfg.pairing_code);
@@ -103,6 +109,22 @@ async fn main() {
             let mcp_tools: std::sync::Arc<[std::sync::Arc<dyn agent_tools::Tool>]> =
                 mcp_manager.as_ref().map(|m| std::sync::Arc::from(m.tools()))
                     .unwrap_or_else(|| std::sync::Arc::from(Vec::<std::sync::Arc<dyn agent_tools::Tool>>::new()));
+            // Skills: build the shared registry + tools, fold the tools into the
+            // same slice build_loop already registers, and compose presets into the prompt.
+            let (skill_registry, skill_tools) =
+                agent_runtime_config::build_skills(&skills_dir, &workspace);
+            let mut all_tools: Vec<std::sync::Arc<dyn agent_tools::Tool>> = mcp_tools.to_vec();
+            all_tools.extend(skill_tools);
+            let extra_tools: std::sync::Arc<[std::sync::Arc<dyn agent_tools::Tool>]> =
+                std::sync::Arc::from(all_tools);
+            let system_prompt = match agent_skills::compose_system_prompt(
+                daemon::SYSTEM_PROMPT, &skill_registry, &skill) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("skills: {e}");
+                    std::process::exit(2);
+                }
+            };
             let params = daemon::DaemonParams {
                 ws_url: ws_url(&cfg.worker_url),
                 agent_token: cfg.agent_token,
@@ -111,7 +133,8 @@ async fn main() {
                 claude_binary,
                 config_path: runtime_config,
                 workspace,
-                mcp_tools,
+                system_prompt,
+                mcp_tools: extra_tools,
             };
             // Reconnect with simple backoff.
             let mut backoff = 1u64;
@@ -142,6 +165,7 @@ fn params_clone(p: &daemon::DaemonParams) -> daemon::DaemonParams {
         claude_binary: p.claude_binary.clone(),
         config_path: p.config_path.clone(),
         workspace: p.workspace.clone(),
+        system_prompt: p.system_prompt.clone(),
         mcp_tools: p.mcp_tools.clone(),
     }
 }
