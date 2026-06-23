@@ -1,9 +1,10 @@
 use crate::approval::WsApprovalChannel;
 use crate::sink::WsEventSink;
-use crate::wire::{WireBody, WireEnvelope, PROTOCOL_VERSION};
+use crate::wire::{DiscoveredSkill, WireBody, WireEnvelope, PROTOCOL_VERSION};
 use agent_core::{AgentLoop, LoopConfig, DEFAULT_STREAM_IDLE_TIMEOUT};
 use agent_policy::RulePolicy;
 use agent_runtime_config::{build_model, build_registry, pick_protocol, RuntimeConfig, HARD_FLOOR_DENYLIST};
+use agent_skills::SkillRegistry;
 use agent_tools::Tool;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -69,11 +70,18 @@ impl RuntimeState {
     }
 
     fn state_body(&self) -> WireBody {
+        let cfg = self.config.lock().unwrap().clone();
+        let discovered = SkillRegistry::from_config(&cfg.skills_dirs, &self.workspace)
+            .scan()
+            .into_iter()
+            .map(|s| DiscoveredSkill { name: s.name, description: s.description })
+            .collect();
         WireBody::SettingsState {
-            settings: self.config.lock().unwrap().clone(),
+            settings: cfg,
             workspace: self.workspace.display().to_string(),
             api_key_set: self.api_key.is_some(),
             hard_floor: HARD_FLOOR_DENYLIST.iter().map(|s| s.to_string()).collect(),
+            discovered_skills: discovered,
         }
     }
 
@@ -237,5 +245,32 @@ mod tests {
     fn handle_ignores_non_settings_frames() {
         let (rs, _rx, _dir) = make();
         assert!(!rs.handle(&WireBody::UserInput { text: "hi".into() }));
+    }
+
+    #[test]
+    fn settings_state_includes_discovered_skills() {
+        use std::fs;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::new(WsEventSink::new(tx.clone(), session.clone()));
+        let approval = Arc::new(WsApprovalChannel::new(tx.clone(), session.clone(), Duration::from_secs(1)));
+        let dir = tempfile::tempdir().unwrap();
+        // Put a skill in <workspace>/.agent/skills/greeter (the default writable root).
+        let sdir = dir.path().join(".agent").join("skills").join("greeter");
+        fs::create_dir_all(&sdir).unwrap();
+        fs::write(sdir.join("SKILL.md"), "---\nname: greeter\ndescription: says hi\n---\nbody").unwrap();
+        let path = dir.path().join("rt.json");
+        let cfg = RuntimeConfig::from_launch(
+            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
+        let rs = RuntimeState::new(cfg, sink, approval, dir.path().to_path_buf(), None,
+            "claude".into(), path, session, tx, Arc::from(Vec::<Arc<dyn Tool>>::new()));
+        assert!(rs.handle(&WireBody::SettingsGet));
+        let env = rx.try_recv().expect("a frame");
+        match env.body {
+            WireBody::SettingsState { discovered_skills, .. } => {
+                assert!(discovered_skills.iter().any(|s| s.name == "greeter" && s.description == "says hi"));
+            }
+            _ => panic!("expected settings_state"),
+        }
     }
 }
