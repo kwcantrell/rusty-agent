@@ -1,6 +1,26 @@
 //! Claude Code CLI as a pure text-generation backend (`ModelClient`).
-use crate::{Chunk, ModelError, StopReason};
+use crate::{Chunk, Message, ModelError, Role, StopReason};
 use serde_json::Value;
+
+pub(crate) fn render_transcript(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        let header = match m.role {
+            Role::System => "## System".to_string(),
+            Role::User => "## User".to_string(),
+            Role::Assistant => "## Assistant".to_string(),
+            Role::Tool => {
+                let name = m.name.as_deref().unwrap_or("tool");
+                format!("## Tool ({name})")
+            }
+        };
+        out.push_str(&header);
+        out.push('\n');
+        out.push_str(&m.content);
+        out.push_str("\n\n");
+    }
+    out
+}
 
 pub(crate) fn parse_event_line(line: &str) -> Result<Vec<Chunk>, ModelError> {
     let line = line.trim();
@@ -41,6 +61,7 @@ pub(crate) fn parse_event_line(line: &str) -> Result<Vec<Chunk>, ModelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Message;
 
     // NOTE: replace these two literals with the verbatim lines captured in
     // docs/superpowers/context/claude-cli-inference.md (Task 0, Step 5) if the
@@ -78,5 +99,32 @@ mod tests {
     #[test]
     fn non_json_line_is_decode_error() {
         assert!(matches!(parse_event_line("not json"), Err(ModelError::Decode(_))));
+    }
+
+    #[test]
+    fn renders_roles_with_headers() {
+        let msgs = vec![
+            Message::system("you are a coding agent"),
+            Message::user("read a.txt"),
+        ];
+        let p = render_transcript(&msgs);
+        assert!(p.contains("## System\nyou are a coding agent"));
+        assert!(p.contains("## User\nread a.txt"));
+        // System must come before User.
+        assert!(p.find("## System").unwrap() < p.find("## User").unwrap());
+    }
+
+    #[test]
+    fn tool_message_includes_tool_name_in_header() {
+        let msgs = vec![Message::tool("call_0", "read_file", "file contents here")];
+        let p = render_transcript(&msgs);
+        assert!(p.contains("## Tool (read_file)\nfile contents here"), "got: {p}");
+    }
+
+    #[test]
+    fn assistant_message_rendered() {
+        let msgs = vec![Message::assistant("on it", None)];
+        let p = render_transcript(&msgs);
+        assert!(p.contains("## Assistant\non it"));
     }
 }
