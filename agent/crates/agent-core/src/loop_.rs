@@ -148,7 +148,12 @@ impl AgentLoop {
                 }
             };
 
-            ctx.append(Message::assistant(parsed.text.clone(),
+            let stored = if self.config.preserve_thinking && !assistant.reasoning.is_empty() {
+                format!("<think>{}</think>\n{}", assistant.reasoning, parsed.text)
+            } else {
+                parsed.text.clone()
+            };
+            ctx.append(Message::assistant(stored,
                 if parsed.tool_calls.is_empty() { None } else { Some(parsed.tool_calls.clone()) }));
 
             if parsed.tool_calls.is_empty() {
@@ -415,6 +420,42 @@ mod tests {
                 .then(move |c| async move { tokio::time::sleep(gap).await; c })
                 .boxed())
         }
+    }
+
+    async fn run_reasoning(preserve: bool) -> Vec<Message> {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Reasoning("secret plan".into(), "final answer".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink,
+            LoopConfig { model_limit: 100_000, max_turns: 5, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                preserve_thinking: preserve, ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        ctx.build(100_000)
+    }
+
+    #[tokio::test]
+    async fn preserve_thinking_keeps_reasoning_in_history() {
+        let msgs = run_reasoning(true).await;
+        let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
+        assert!(a.content.contains("<think>secret plan</think>"));
+        assert!(a.content.contains("final answer"));
+    }
+
+    #[tokio::test]
+    async fn default_strips_reasoning_from_history() {
+        let msgs = run_reasoning(false).await;
+        let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
+        assert!(!a.content.contains("secret plan"));
+        assert_eq!(a.content, "final answer");
     }
 
     #[tokio::test(start_paused = true)]
