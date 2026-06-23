@@ -9,7 +9,32 @@ const base: RuntimeSettings = {
   max_turns: 25, context_limit: 8192,
   top_p: null, top_k: null, min_p: null, presence_penalty: null, repeat_penalty: null,
   enable_thinking: true, preserve_thinking: false,
+  skills_dirs: [], active_skills: [],
 };
+
+describe("SettingsPanel skills", () => {
+  const meta = { workspace: "/w", apiKeySet: false, hardFloor: [],
+    discoveredSkills: [{ name: "greeter", description: "says hi" }] };
+
+  it("checks an active skill and saves it in active_skills", () => {
+    const onSave = vi.fn();
+    render(<SettingsPanel settings={base} meta={meta} error={null} disabled={false}
+      onSave={onSave} onClose={() => {}} />);
+    fireEvent.click(screen.getByLabelText(/greeter/));
+    fireEvent.click(screen.getByText("Save"));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ active_skills: ["greeter"] }));
+  });
+
+  it("round-trips edited skill directories", () => {
+    const onSave = vi.fn();
+    render(<SettingsPanel settings={base} meta={meta} error={null} disabled={false}
+      onSave={onSave} onClose={() => {}} />);
+    fireEvent.change(screen.getByLabelText("Skill directories (one per line)"),
+      { target: { value: "/a\n/b" } });
+    fireEvent.click(screen.getByText("Save"));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ skills_dirs: ["/a", "/b"] }));
+  });
+});
 
 describe("SettingsPanel sampling inputs", () => {
   it("maps empty top_p to null and a typed value to a number on save", () => {

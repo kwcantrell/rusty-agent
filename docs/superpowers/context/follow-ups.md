@@ -10,6 +10,25 @@ claude-cli detail; this file is the project-wide index.
 
 ---
 
+## 2026-06-23 skills-runtime-config-persistence
+
+Persist `skills_dirs`/`active_skills` into `RuntimeConfig` + full browser Settings capability (daemon
+disk+wire round-trip, live-apply mid-session, discovered-skills picker). One deliberate additive core
+change (`ContextManager::set_system`); `agent-model`/`agent-tools`/`agent-policy`/`agent-skills`
+internals and `agent-cli` untouched. Branch `feat/skills-runtime-config` (commits `ca31368..ebb72b5`).
+Final whole-branch review (opus): **Ready to merge — Yes**; no Critical/Important. All four load-bearing
+invariants verified against source: no-silent-wipe (`#[serde(default)]` + web `...form` spread + UI edit);
+single-core-change discipline; strict-wire/lenient-startup validation split; no-cross-lock next-turn
+concurrency (`apply()` touches only std mutexes; `set_system` only inside the per-turn task holding `ctx`).
+Gates at tip: Rust 199 tests + clippy `-D warnings` clean; web 47 vitest + build clean.
+
+Review follow-ups:
+- **`compose_system_prompt` error was silently swallowed in `build_loop`** — `agent/crates/agent-server/src/runtime.rs` (`build_loop`) — **Resolved** (commit `ebb72b5`). Was `.unwrap_or_else(|_| base)`; now `match` + `tracing::error!` then fall back to base. Deliberately NOT `expect()`: `build_loop` runs at startup via the lenient `RuntimeState::new`, which must never panic. Path is unreachable today (presets pre-filtered against `scan()`); the log surfaces a future pre-filter/compose divergence.
+- **`wire.test.ts` "parses a settings_state frame" inline fixture omitted `discovered_skills`** — `web/test/wire.test.ts` — **Resolved** (commit `ebb72b5`). Passed only because `parseInbound` is a loose cast; added `discovered_skills: []` so the fixture matches the real wire shape.
+- **`state_body` runs a filesystem `scan()` on every `SettingsGet`** — `agent/crates/agent-server/src/runtime.rs` (`state_body`) — **Accepted**. Panel-scoped, human-driven; not a hot path. Deliberate per-request rescan keeps the discovered-skills list fresh. Would matter only if `state_body` were ever called from a ping/reconnect loop.
+- **`apply_rejects_unknown_active_skill_without_swapping` asserts loop ptr unchanged but not `current_system_prompt()`** — `agent/crates/agent-server/src/runtime.rs` (test mod) — **Open**. Behavior is correct (the `return Err` precedes any `system_prompt` swap), so this is a test-fidelity gap only; a one-line `assert_eq!` on the prompt would make it a complete non-mutation proof.
+- **`settings_state_includes_discovered_skills` test uses `try_recv()`** — `agent/crates/agent-server/src/runtime.rs` (test mod) — **Accepted**. Correct while `handle` posts its reply synchronously before the test reads; would need a timed `recv()` only if the reply ever became async.
+
 ## 2026-06-23 skills-subsystem
 
 New `agent-skills` crate: Claude-Code-style skill packages (discover, load-on-demand, author, presets),

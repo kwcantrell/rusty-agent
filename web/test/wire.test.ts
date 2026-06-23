@@ -43,13 +43,14 @@ const sampleSettings: RuntimeSettings = {
   max_tokens: 2048, max_turns: 25, context_limit: 8192,
   top_p: null, top_k: null, min_p: null, presence_penalty: null, repeat_penalty: null,
   enable_thinking: false, preserve_thinking: false,
+  skills_dirs: [], active_skills: [],
 };
 
 describe("settings frames", () => {
   it("parses a settings_state frame", () => {
     const raw = JSON.stringify({
       v: 1, session_id: "s", kind: "settings_state", settings: sampleSettings,
-      workspace: "/w", api_key_set: true, hard_floor: ["sudo"],
+      workspace: "/w", api_key_set: true, hard_floor: ["sudo"], discovered_skills: [],
     });
     const f = parseInbound(raw);
     expect(f?.kind).toBe("settings_state");

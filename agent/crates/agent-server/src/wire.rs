@@ -40,10 +40,20 @@ pub enum WireBody {
         workspace: String,
         api_key_set: bool,
         hard_floor: Vec<String>,
+        discovered_skills: Vec<DiscoveredSkill>,
     },
     SettingsError {
         message: String,
     },
+}
+
+/// Read-only skill info surfaced in `settings_state` for the Settings UI's
+/// active-skills picker. Daemon-computed from the current `skills_dirs`; never
+/// part of `RuntimeConfig`, so it cannot be edited or round-tripped back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredSkill {
+    pub name: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,11 +207,15 @@ mod tests {
             v: PROTOCOL_VERSION, session_id: "s".into(), id: None,
             body: WireBody::SettingsState {
                 settings: cfg, workspace: "/w".into(), api_key_set: true,
-                hard_floor: vec!["sudo".into()] },
+                hard_floor: vec!["sudo".into()],
+                discovered_skills: vec![crate::wire::DiscoveredSkill {
+                    name: "greeter".into(), description: "says hi".into() }] },
         };
         let j = serde_json::to_string(&state).unwrap();
         assert!(j.contains("\"kind\":\"settings_state\""));
         assert!(j.contains("\"api_key_set\":true"));
+        assert!(j.contains("\"discovered_skills\""));
+        assert!(j.contains("greeter"));
         let back: WireEnvelope = serde_json::from_str(&j).unwrap();
         assert!(matches!(back.body, WireBody::SettingsState { .. }));
 

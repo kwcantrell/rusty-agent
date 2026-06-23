@@ -2,7 +2,7 @@ use crate::approval::WsApprovalChannel;
 use crate::runtime::RuntimeState;
 use crate::sink::WsEventSink;
 use crate::wire::{WireBody, WireEnvelope};
-use agent_core::WindowContext;
+use agent_core::{ContextManager, WindowContext};
 use agent_model::Message;
 use agent_runtime_config::RuntimeConfig;
 use agent_tools::Tool;
@@ -55,6 +55,7 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
         session.clone(),
         tx.clone(),
         params.mcp_tools.clone(),
+        params.system_prompt.clone(),
     ));
     let ctx = Arc::new(tokio::sync::Mutex::new(
         WindowContext::new(Message::system(params.system_prompt.clone()))));
@@ -96,9 +97,11 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
             WireBody::UserInput { text } => {
                 *session.lock().unwrap() = env.session_id.clone();
                 let agent = runtime.current_loop();
+                let system_prompt = runtime.current_system_prompt();
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     let mut guard = ctx.lock().await;
+                    guard.set_system(Message::system(system_prompt));
                     if let Err(e) = agent.run(&mut *guard, text).await {
                         tracing::error!(error=%e, "run failed");
                     }

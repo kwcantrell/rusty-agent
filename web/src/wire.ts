@@ -23,7 +23,11 @@ export interface RuntimeSettings {
   repeat_penalty: number | null;
   enable_thinking: boolean;
   preserve_thinking: boolean;
+  skills_dirs: string[];
+  active_skills: string[];
 }
+
+export interface DiscoveredSkill { name: string; description: string }
 
 export type WireEvent =
   | { type: "token"; text: string }
@@ -37,7 +41,7 @@ export type Inbound =
   | { v: number; session_id: string; kind: "event"; payload: WireEvent }
   | { v: number; session_id: string; id: string; kind: "approval_request"; summary: string; command?: string; display?: Display }
   | { v: number; session_id: string; kind: "presence"; online: boolean }
-  | { v: number; session_id: string; kind: "settings_state"; settings: RuntimeSettings; workspace: string; api_key_set: boolean; hard_floor: string[] }
+  | { v: number; session_id: string; kind: "settings_state"; settings: RuntimeSettings; workspace: string; api_key_set: boolean; hard_floor: string[]; discovered_skills: DiscoveredSkill[] }
   | { v: number; session_id: string; kind: "settings_error"; message: string };
 
 export type Decision = "approve" | "approve_always" | "deny";

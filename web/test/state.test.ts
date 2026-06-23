@@ -76,13 +76,15 @@ describe("reducer", () => {
       max_tokens: 2048, max_turns: 25, context_limit: 8192,
       top_p: null, top_k: null, min_p: null, presence_penalty: null, repeat_penalty: null,
       enable_thinking: false, preserve_thinking: false,
+      skills_dirs: [], active_skills: [],
     };
     let st = initialState([]);
     st = reduce(st, { type: "frame", frame: { v: 1, session_id: "x", kind: "settings_error", message: "old" } });
     expect(st.settingsError).toBe("old");
     st = reduce(st, { type: "frame", frame: {
       v: 1, session_id: "x", kind: "settings_state", settings: s,
-      workspace: "/w", api_key_set: true, hard_floor: ["sudo"] } });
+      workspace: "/w", api_key_set: true, hard_floor: ["sudo"],
+      discovered_skills: [] } });
     expect(st.settings?.model).toBe("m");
     expect(st.settingsMeta?.workspace).toBe("/w");
     expect(st.settingsMeta?.apiKeySet).toBe(true);

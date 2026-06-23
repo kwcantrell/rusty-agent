@@ -91,6 +91,8 @@ async fn main() {
             let api_key = std::env::var("AGENT_API_KEY").ok();
             let mut base = RuntimeConfig::from_launch(backend, base_url, model, protocol, context_limit);
             base.http_allow_hosts = allow_host;
+            base.skills_dirs = skills_dir;
+            base.active_skills = skill;
             // Surface bad flags early (the persisted file is only ever written post-validation).
             if let Err(e) = base.clone().normalized().validate() {
                 eprintln!("invalid launch config: {e}");
@@ -109,22 +111,6 @@ async fn main() {
             let mcp_tools: std::sync::Arc<[std::sync::Arc<dyn agent_tools::Tool>]> =
                 mcp_manager.as_ref().map(|m| std::sync::Arc::from(m.tools()))
                     .unwrap_or_else(|| std::sync::Arc::from(Vec::<std::sync::Arc<dyn agent_tools::Tool>>::new()));
-            // Skills: build the shared registry + tools, fold the tools into the
-            // same slice build_loop already registers, and compose presets into the prompt.
-            let (skill_registry, skill_tools) =
-                agent_runtime_config::build_skills(&skills_dir, &workspace);
-            let mut all_tools: Vec<std::sync::Arc<dyn agent_tools::Tool>> = mcp_tools.to_vec();
-            all_tools.extend(skill_tools);
-            let extra_tools: std::sync::Arc<[std::sync::Arc<dyn agent_tools::Tool>]> =
-                std::sync::Arc::from(all_tools);
-            let system_prompt = match agent_skills::compose_system_prompt(
-                daemon::SYSTEM_PROMPT, &skill_registry, &skill) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("skills: {e}");
-                    std::process::exit(2);
-                }
-            };
             let params = daemon::DaemonParams {
                 ws_url: ws_url(&cfg.worker_url),
                 agent_token: cfg.agent_token,
@@ -133,8 +119,8 @@ async fn main() {
                 claude_binary,
                 config_path: runtime_config,
                 workspace,
-                system_prompt,
-                mcp_tools: extra_tools,
+                system_prompt: daemon::SYSTEM_PROMPT.to_string(),
+                mcp_tools,
             };
             // Reconnect with simple backoff.
             let mut backoff = 1u64;
