@@ -43,6 +43,10 @@ struct Cli {
     /// Optional MCP server config (mcp.json shape). If absent, MCP is disabled.
     #[arg(long)]
     mcp_config: Option<std::path::PathBuf>,
+    /// Host fetch_url may contact without approval (repeatable). Exact host or
+    /// a leading-dot suffix, e.g. --allow-host docs.rs --allow-host .rust-lang.org
+    #[arg(long = "allow-host")]
+    allow_host: Vec<String>,
 }
 
 #[tokio::main]
@@ -69,7 +73,7 @@ async fn main() {
         cli.protocol.as_str()
     };
     let protocol = pick_protocol(protocol_name);
-    let mut registry = build_registry();
+    let mut registry = build_registry(&cli.allow_host);
     // Connect MCP servers (if configured), register their tools, keep the manager alive.
     let mcp_manager = match &cli.mcp_config {
         Some(path) => {

@@ -105,6 +105,7 @@ dependencies = [
 name = "agent-runtime-config"
 version = "0.0.0"
 dependencies = [
+ "agent-http",
  "agent-mcp",
  "agent-model",
  "agent-tools",
