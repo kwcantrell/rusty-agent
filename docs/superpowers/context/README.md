@@ -21,13 +21,22 @@ Everything here attaches to the agent core through interfaces that already exist
 
 After the agent core works end-to-end from the CLI, a sensible sequence (each is independent unless noted):
 
-| # | Subsystem | Primer | Attaches via | Depends on |
+| # | Subsystem | Primer | Attaches via | Status |
 |---|---|---|---|---|
-| 1 | HTTP / browser tool | [`http-tool.md`](./http-tool.md) | `Tool` | core only (smallest; good warm-up) |
-| 2 | OS-level sandboxing | [`os-sandboxing.md`](./os-sandboxing.md) | `intent()`/exec boundary | core only |
-| 3 | MCP client support | [`mcp-client.md`](./mcp-client.md) | `Tool`/`ToolRegistry` | core only |
-| 4 | Vector / long-term memory | [`memory-system.md`](./memory-system.md) | `ContextManager` + `Tool` | core only |
-| 5 | Cloudflare control plane | [`cloudflare-control-plane.md`](./cloudflare-control-plane.md) | `EventSink` + WS `ApprovalChannel` | core + an API-server crate |
-| 6 | React frontend | [`react-frontend.md`](./react-frontend.md) | (consumes #5's API) | Cloudflare control plane |
+| 1 | HTTP / browser tool | [`http-tool.md`](./http-tool.md) | `Tool` | deferred (smallest; good warm-up) |
+| 2 | OS-level sandboxing | [`os-sandboxing.md`](./os-sandboxing.md) | `intent()`/exec boundary | deferred |
+| 3 | MCP client support | [`mcp-client.md`](./mcp-client.md) | `Tool`/`ToolRegistry` | deferred |
+| 4 | Vector / long-term memory | [`memory-system.md`](./memory-system.md) | `ContextManager` + `Tool` | deferred |
+| 5 | Cloudflare control plane | [`cloudflare-control-plane.md`](./cloudflare-control-plane.md) | `EventSink` + WS `ApprovalChannel` | ✅ **built & merged** |
+| 6 | React frontend | [`react-frontend.md`](./react-frontend.md) | consumes #5's API (same-origin) | ✅ **built & merged** |
 
-#5 and #6 are the path to the browser experience; #1–#4 deepen the local agent and can be done in any order.
+**#5 and #6 are done** — the browser experience works end-to-end (validated live against the real model). What remains are the independent local deepeners **#1–#4**, doable in any order; **#1 (http-tool)** is the smallest warm-up.
+
+### Completed subsystems (read these for current truth, not just the primers)
+
+| # | Spec | Plan | Notes |
+|---|---|---|---|
+| 5 | [`cloudflare-control-plane-design`](../specs/2026-06-22-cloudflare-control-plane-design.md) + [best-practices revision](../specs/2026-06-22-cloudflare-control-plane-bestpractices-revision-design.md) | [plan](../plans/2026-06-22-cloudflare-control-plane.md) + [revision plan](../plans/2026-06-22-cloudflare-control-plane-bestpractices-revision.md) | New `agent-server` (daemon, **WS client via `tokio-tungstenite` — not Axum**) + `agent-runtime-config` crates; `cloud/` Worker + `AgentSession` Durable Object (**WebSocket Hibernation API**, durable SQLite seq) + D1 + R2, under `wrangler dev`. |
+| 6 | [`react-frontend-design`](../specs/2026-06-23-react-frontend-design.md) | [plan](../plans/2026-06-23-react-frontend.md) | New top-level `web/` React+Vite+TS+Tailwind SPA, **served same-origin by the Worker via Workers static assets** (not Cloudflare Pages → no CORS). Pure WS client; daemon/wire-protocol unchanged. |
+
+> The primers for #5 and #6 below are kept as historical context, but they predate the build — where a primer and the shipped design differ (e.g. "Axum"→`tokio-tungstenite` client; "Cloudflare Pages"→Workers static assets), the **spec/plan above is the source of truth**.

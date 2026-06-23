@@ -1,5 +1,15 @@
 # Context Primer — Cloudflare Control Plane
 
+> ✅ **BUILT & MERGED (2026-06-22).** This primer is historical context. The authoritative
+> design is the spec + plan: [`../specs/2026-06-22-cloudflare-control-plane-design.md`](../specs/2026-06-22-cloudflare-control-plane-design.md)
+> and [`../plans/2026-06-22-cloudflare-control-plane.md`](../plans/2026-06-22-cloudflare-control-plane.md), plus the
+> later best-practices revision ([spec](../specs/2026-06-22-cloudflare-control-plane-bestpractices-revision-design.md) /
+> [plan](../plans/2026-06-22-cloudflare-control-plane-bestpractices-revision.md)).
+> **Key divergences from this primer:** the daemon is a WS *client* built on `tokio-tungstenite`
+> (**not Axum** — it only dials out, no inbound server); the `AgentSession` Durable Object uses the
+> **WebSocket Hibernation API** with a durable SQLite `seq`; a shared `agent-runtime-config` crate was
+> extracted. It runs under `wrangler dev` (D1/R2/DO emulated) and is validated live end-to-end.
+
 **Status:** Not started. Context primer — run `brainstorming` before implementing.
 **Attaches via:** the local Rust agent's `EventSink` (stream out) + a WebSocket `ApprovalChannel` (gate in). Requires a new **API-server crate** in the agent workspace.
 **Depends on:** agent core + an `agent-server` crate (Axum HTTP/WebSocket) that drives `AgentLoop`.

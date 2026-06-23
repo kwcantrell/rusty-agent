@@ -14,54 +14,80 @@ environment changes).
 ---
 
 ```
-I'm continuing work on a local-first AI coding-agent platform. The first slice — the
-Rust "agent core" — is built, reviewed, merged to `main`, and validated end-to-end
-against a real local model. I want to brainstorm and spec the NEXT subsystem.
+I'm continuing work on a local-first AI coding-agent platform. Three slices are already
+built, reviewed, merged to `main`, and validated end-to-end against a real local model:
+the Rust "agent core", the Cloudflare control plane (#5), and the React frontend (#6).
+I want to brainstorm and spec the NEXT subsystem.
 
 ## Repo
 /home/kalen/rust-agent-runtime  (git repo, on `main`)
 
 ## What already exists (don't re-derive — read the docs below)
-A Cargo workspace under `agent/` of 5 trait-decoupled crates implementing a CLI-driven
-ReAct agent: agent-tools (Tool trait, registry, fs/shell/git tools with a workspace
-path guard + command allow/deny policy), agent-policy (PolicyEngine + ApprovalChannel),
-agent-model (OpenAI-compatible SSE streaming client + native & prompted tool-call
-protocols), agent-core (the ReAct loop, token-windowed ContextManager, EventSink/
-AgentEvent model), agent-cli (terminal renderer + approval + REPL). 48 tests pass,
-clippy `-D warnings` clean. Every cross-crate seam is a trait, so new subsystems bolt
-on ADDITIVELY through two seams: `EventSink` (observe/stream the agent) and
-`ApprovalChannel` (gate tools through a different UI). New tools register in
-`ToolRegistry`; alternate context strategies implement `ContextManager`.
+A Cargo workspace under `agent/` of 7 trait-decoupled crates: the original 5 —
+agent-tools (Tool trait, registry, fs/shell/git tools with a workspace path guard +
+command allow/deny policy), agent-policy (PolicyEngine + ApprovalChannel), agent-model
+(OpenAI-compatible SSE streaming client + native & prompted tool-call protocols),
+agent-core (the ReAct loop, token-windowed ContextManager, EventSink/AgentEvent model),
+agent-cli (terminal renderer + approval + REPL) — plus two added by the control-plane
+work: agent-server (an outbound-WebSocket *daemon* that drives AgentLoop and bridges the
+core's seams over the wire) and agent-runtime-config (loop-wiring helpers shared by the
+CLI and the daemon). 58 Rust tests pass, clippy `-D warnings` clean.
+
+Beyond the Rust workspace:
+- `cloud/` — the Cloudflare control plane: a Worker (`/enroll`,`/pair`,`/agent`,`/browser`)
+  + an `AgentSession` Durable Object (WebSocket Hibernation API, durable SQLite seq) + D1
+  (users/agents/sessions) + R2 (event log), all runnable under `wrangler dev` (wrangler 4,
+  vitest-pool-workers 0.16; 11 tests). The daemon dials OUT to the Worker; Cloudflare only
+  relays + records — it never runs the loop or touches the machine.
+- `web/` — a React + Vite + TS + Tailwind SPA, a PURE WebSocket client of the Worker,
+  served SAME-ORIGIN by the Worker via Workers static assets (so no CORS; 31 tests).
+
+Every cross-crate seam is still a trait, and new subsystems bolt on ADDITIVELY: `EventSink`
+(observe/stream), `ApprovalChannel` (gate tools through a different UI), `Tool` +
+`ToolRegistry` (new capabilities), `ContextManager` (alternate context strategies). The
+core crates (agent-core/model/tools/policy) were deliberately left UNMODIFIED through #5
+and #6 — that "attach via the seams, don't touch the core" discipline is the showcase.
 
 It's been driven end-to-end against a real local model (Qwen3.6-35B-A3B via llama.cpp):
-the loop, native tool-calling, approvals, diffs, and execute_command all work. So treat
-the core as proven, not just compiled.
+the CLI loop + native tool-calling + approvals + diffs + execute_command, AND the full
+browser path (pair → stream tokens → approve a command that runs on the local machine →
+R2 reconnect-replay → presence) all work live. Treat all three slices as proven.
 
 ## Read these first (authoritative context)
-- Core design spec:    docs/superpowers/specs/2026-06-22-rust-agent-core-design.md
-- Core impl plan:      docs/superpowers/plans/2026-06-22-rust-agent-core.md
-- Deferred-subsystem primers + recommended build order:
+- Deferred-subsystem primers + build order + what's already built:
                        docs/superpowers/context/README.md
-  (one primer each for: http-tool, os-sandboxing, mcp-client, memory-system,
-   cloudflare-control-plane, react-frontend — each states what it is, which core seam
-   it attaches to, open questions, and definition of done)
-- How to run / the live model setup:  agent/docs/RUNNING.md
+- Core:                docs/superpowers/specs/2026-06-22-rust-agent-core-design.md
+                       docs/superpowers/plans/2026-06-22-rust-agent-core.md
+- Cloudflare control plane (#5, built): specs/2026-06-22-cloudflare-control-plane-design.md
+                       + plans/2026-06-22-cloudflare-control-plane.md, and the later
+                       best-practices revision (…-bestpractices-revision-design.md / -revision.md)
+- React frontend (#6, built):           specs/2026-06-23-react-frontend-design.md
+                       + plans/2026-06-23-react-frontend.md
+- How to run: agent/docs/RUNNING.md (the CLI + live model) and cloud/RUNNING.md
+                       (the control plane, the chrome-driven E2E, and the web UI dev/build flow)
 
 ## Project intent / constraints (carry these forward)
 - Learning/portfolio, local-first. Optimize for a clean, well-architected vertical
   slice over production hardening; the trait-decoupled architecture is the showcase.
 - Each subsystem is its own spec → plan → implement cycle. Do ONE subsystem now.
-- Keep the core untouched where possible; attach via the existing seams.
+- Keep the core untouched where possible; attach via the existing seams. (#5 and #6 each
+  changed zero lines of the core crates — hold that bar.)
 - Carry these notes from the core's final review (relevant to sandboxing/MCP specs):
   the command allow/deny policy is a guardrail, not a sandbox; the workspace path guard
   is lexical (no symlink resolution); OS-level sandboxing is deliberately deferred.
+- Ground Cloudflare/Workers/Wrangler and browser work in the official docs (the cloudflare
+  + chrome-devtools plugins/MCP are installed) rather than memory — the platform moves fast.
 
 ## Subsystem to spec this session
-[FILL IN ONE — or ask me to choose. Per the build order in context/README.md:
- Cloudflare control plane (#5) is the path to the browser experience and needs a new
- `agent-server` (Axum) crate exposing EventSink/ApprovalChannel over WebSocket (the
- React frontend, #6, is its follow-up); http-tool / mcp-client / memory-system /
- os-sandboxing (#1–#4) are independent local deepeners doable in any order.]
+[FILL IN ONE — or ask me to choose. Per the build order in context/README.md, #5 (Cloudflare
+ control plane) and #6 (React frontend) are DONE. What remains are the independent local
+ deepeners, doable in any order:
+   #1 http-tool        — a `Tool` that fetches/parses web content (smallest; good warm-up)
+   #2 os-sandboxing    — OS-level isolation at the intent()/exec boundary
+   #3 mcp-client       — connect to MCP servers, surface their tools via ToolRegistry
+   #4 memory-system    — vector / long-term memory via ContextManager + a Tool
+ A natural next step is also a "Settings" capability (deferred out of #6): editing model/
+ endpoint/policy from the browser, which needs a new inbound daemon-config channel.]
 
 ## Your task
 Use the brainstorming skill to turn the chosen subsystem's primer into an approved,
@@ -73,11 +99,14 @@ one at a time. Do NOT write code or scaffold anything until I approve the design
 - Rust 1.96 via rustup, but cargo is NOT on PATH — run `source "$HOME/.cargo/env"`
   before any cargo command. Build/test from `agent/`: `cargo test --workspace`,
   `cargo clippy --all-targets -- -D warnings`.
+- Node 22 + npm are available for the cloud/web sides. `cloud/`: `npm test` (Miniflare),
+  `npx wrangler dev`. `web/`: `npm test` (Vitest+jsdom), `npm run dev` / `npm run build`.
+  Full-stack run + the chrome-driven browser E2E: see cloud/RUNNING.md.
 - A live model is available for testing if relevant: llama.cpp server
   (OpenAI-compatible) on http://localhost:8080, model id `qwen3.6-35b-a3b`, running in
   Docker as container `llama-agent` at 256k context. If it's not up:
   `docker start llama-agent` (or see the launch command in agent/docs/RUNNING.md).
-- Drive it: `cargo run -p agent-cli -- --base-url http://localhost:8080 --model
+- Drive the CLI: `cargo run -p agent-cli -- --base-url http://localhost:8080 --model
   qwen3.6-35b-a3b --workspace <dir> --context-limit 32768`. Keep --context-limit well
   below the server's capacity for latency (see RUNNING.md for the -c vs --context-limit
   note).
