@@ -94,6 +94,22 @@ R2 reconnect-replay → presence) all work live. Treat all three slices as prove
  A natural next step is also a "Settings" capability (deferred out of #6): editing model/
  endpoint/policy from the browser, which needs a new inbound daemon-config channel.]
 
+## Known follow-ups (smaller than a subsystem — pick one if not specing a subsystem)
+Open tech-debt items from shipped work. Canonical, always-current list (detail, file
+refs, Resolved/Accepted history): docs/superpowers/context/claude-cli-inference.md
+→ "Follow-ups / known limitations". Keep that file as the source of truth; the boxes
+below are a pointer, not a second copy.
+   [ ] P1  AgentLoop has no timeout around model-stream consumption
+           (agent-core/src/loop_.rs:54-58) — a hung backend blocks a turn forever;
+           affects BOTH the SGLang and claude-cli paths. Touches the core loop, so
+           brainstorm→spec it (don't hack the loop). Highest value.
+   [ ] P2  claude-cli: rate-limit strategy for the 5-hour subscription cap (detect
+           rate_limit_event → typed ModelError + backoff) before sustained loops.
+   [ ] P2  claude-cli: pin the subprocess CWD (Command::current_dir to an empty scratch
+           dir) so project-local hooks in the launch dir can't load. Small, self-contained.
+   [ ] P3  claude-cli: guard BARE_SYSTEM_PROMPT acceptance with an #[ignore]-gated
+           real-CLI test, so a future guardrail change doesn't break it silently.
+
 ## Your task
 Use the brainstorming skill to turn the chosen subsystem's primer into an approved,
 written design spec (saved under docs/superpowers/specs/), then stop at the
