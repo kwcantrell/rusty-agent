@@ -17,5 +17,10 @@
   ],
   "r2_buckets": [
     { "binding": "LOGS", "bucket_name": "agent-logs" }
-  ]
+  ],
+  "assets": {
+    "directory": "../web/dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/enroll", "/pair", "/agent", "/browser"]
+  }
 }
