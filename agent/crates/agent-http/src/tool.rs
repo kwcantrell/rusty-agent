@@ -357,4 +357,42 @@ mod tests {
         let err = t.execute(json!({ "url": "http://127.0.0.1:9/" }), &ctx()).await.unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "expected SSRF Denied, got {err:?}");
     }
+
+    #[tokio::test]
+    async fn redirect_to_non_http_scheme_is_denied() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/evil"))
+            .respond_with(ResponseTemplate::new(302)
+                .insert_header("location", "file:///etc/passwd"))
+            .mount(&server).await;
+
+        let url = format!("{}/evil", server.uri());
+        let err = permissive().execute(json!({ "url": url }), &ctx()).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::Denied(_)),
+            "expected Denied for non-http redirect scheme, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_redirects_is_failed() {
+        let server = MockServer::start().await;
+        // Set up a chain of 7 redirects: /r/1 -> /r/2 -> ... -> /r/7 -> /r/8
+        // MAX_REDIRECTS is 5, so the 6th hop (hops > 5) trips the cap.
+        for i in 1..=7usize {
+            Mock::given(method("GET")).and(path(format!("/r/{i}")))
+                .respond_with(ResponseTemplate::new(302)
+                    .insert_header("location", format!("/r/{}", i + 1)))
+                .mount(&server).await;
+        }
+
+        let url = format!("{}/r/1", server.uri());
+        let err = permissive().execute(json!({ "url": url }), &ctx()).await.unwrap_err();
+        match &err {
+            ToolError::Failed { message, .. } => {
+                assert!(message.contains("too many redirects"), "expected 'too many redirects', got: {message}");
+            }
+            other => panic!("expected Failed(too many redirects), got {other:?}"),
+        }
+    }
 }
