@@ -1,0 +1,9 @@
+# Generated Wrangler build artifacts — dev bundles, middleware loaders,
+# bundled worker.js. These produced the dev_*/bundle_*/middleware_* noise
+# communities in the graph (generated output, not authored architecture).
+.wrangler/
+
+# SDD task ledger — per-task process briefs/reports. Useful as a work log,
+# but they flood the graph with task-N nodes that crowd out the real
+# architecture. Excluded from the knowledge map.
+.superpowers/sdd/
