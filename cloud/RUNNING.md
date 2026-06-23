@@ -1,5 +1,10 @@
 # Running the control plane locally
 
+> **The real browser client is the React web UI — see [§4](#4-the-web-ui-subsystem-6).**
+> §1–§2 bring up the cloud + daemon (needed either way); §3 is a *legacy* throwaway HTML
+> harness kept only for minimal/no-build verification. For the actual product experience,
+> start the cloud (§1) + daemon (§2), then jump to §4.
+
 ## 1. Start the cloud (terminal A)
 cd cloud
 npm install                       # applies no patches now; clean install
@@ -17,7 +22,9 @@ cargo run -p agent-server -- --config ../agent-server.json \
   run --base-url http://localhost:8080 --model qwen3.6-35b-a3b \
       --workspace /tmp/agent-ws --context-limit 32768
 
-## 3. Open the test client (terminal C)
+## 3. Open the test client (terminal C) — LEGACY throwaway harness (prefer §4)
+# This single-file HTML page predates the React UI (§4) and hits the cross-origin wall
+# below. Use it only for a quick no-build smoke test; otherwise skip straight to §4.
 cd cloud/testpage && python3 -m http.server 8081
 # browse http://localhost:8081, enter the pairing code, Pair, send a prompt.
 #

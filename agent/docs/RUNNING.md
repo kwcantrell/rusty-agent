@@ -1,5 +1,12 @@
 # Running the agent
 
+> **Two front-ends, one agent core.** This doc covers the **terminal CLI** (`agent-cli`)
+> driving a local model directly — the fastest way to a working agent. There is also a
+> **browser UI**: the `agent-server` daemon dials out to a Cloudflare Worker that a React
+> SPA (`web/`) talks to, so you can drive your *local* agent from a browser. For that path
+> see [`../../cloud/RUNNING.md`](../../cloud/RUNNING.md). Both use the same model server
+> (below) and the same agent core.
+
 ## 1. Start an inference server (OpenAI-compatible)
 
 **SGLang (primary target):**
