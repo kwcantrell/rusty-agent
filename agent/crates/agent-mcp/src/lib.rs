@@ -4,8 +4,10 @@
 mod client;
 mod config;
 mod error;
+mod tool;
 mod transport;
 
 pub use config::{McpServerSpec, McpServersConfig, Trust};
 pub use error::McpError;
+pub use tool::McpTool;
 pub use transport::{McpTransport, StdioTransport};

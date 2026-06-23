@@ -16,3 +16,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 agent-policy = { path = "../agent-policy" }
 tempfile = { workspace = true }
+tokio-util = { workspace = true }
