@@ -4,7 +4,7 @@ mod render;
 use agent_core::{AgentLoop, LoopConfig, WindowContext};
 use agent_model::Message;
 use agent_policy::RulePolicy;
-use agent_runtime_config::{backend_name_is_valid, build_registry, build_model,
+use agent_runtime_config::{backend_name_is_valid, build_registry, build_model, build_skills,
     default_allowlist, default_denylist, pick_protocol};
 use approval::TerminalApproval;
 use clap::Parser;
@@ -12,6 +12,10 @@ use render::TerminalSink;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::time::Duration;
+
+const BASE_SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided tools to \
+inspect and modify the workspace. Think step by step. When the task is complete, reply with a \
+summary and no tool call.";
 
 #[derive(Parser)]
 #[command(name = "agent", about = "Local Rust agent core (CLI)")]
@@ -47,6 +51,12 @@ struct Cli {
     /// a leading-dot suffix, e.g. --allow-host docs.rs --allow-host .rust-lang.org
     #[arg(long = "allow-host")]
     allow_host: Vec<String>,
+    /// Skill search directory (repeatable). Default: <workspace>/.agent/skills + ~/.agent/skills.
+    #[arg(long = "skills-dir")]
+    skills_dir: Vec<String>,
+    /// Preload a skill as a preset by name (repeatable): its body is injected into the system prompt.
+    #[arg(long = "skill")]
+    skill: Vec<String>,
 }
 
 #[tokio::main]
@@ -86,6 +96,19 @@ async fn main() {
         }
         None => None,
     };
+    // Skills: register the four skill tools, then compose any presets into the system prompt.
+    let (skill_registry, skill_tools) = build_skills(&cli.skills_dir, &workspace);
+    for t in skill_tools {
+        registry.register(t);
+    }
+    let system_prompt = match agent_skills::compose_system_prompt(
+        BASE_SYSTEM_PROMPT, &skill_registry, &cli.skill) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("skills: {e}");
+            std::process::exit(2);
+        }
+    };
     let tools = Arc::new(registry);
     let policy = Arc::new(RulePolicy {
         workspace: workspace.clone(),
@@ -100,10 +123,7 @@ async fn main() {
             stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
         });
 
-    let mut ctx = WindowContext::new(Message::system(
-        "You are a local coding agent. Use the provided tools to inspect and modify the \
-         workspace. Think step by step. When the task is complete, reply with a summary and \
-         no tool call."));
+    let mut ctx = WindowContext::new(Message::system(system_prompt));
 
     println!("agent ready. Type a task, or 'exit'.");
     let stdin = std::io::stdin();
