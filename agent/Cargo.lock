@@ -9,6 +9,7 @@ dependencies = [
  "agent-core",
  "agent-model",
  "agent-policy",
+ "agent-runtime-config",
  "agent-tools",
  "async-trait",
  "clap",
@@ -61,6 +62,14 @@ dependencies = [
  "agent-tools",
  "async-trait",
  "tracing",
+]
+
+[[package]]
+name = "agent-runtime-config"
+version = "0.0.0"
+dependencies = [
+ "agent-model",
+ "agent-tools",
 ]
 
 [[package]]

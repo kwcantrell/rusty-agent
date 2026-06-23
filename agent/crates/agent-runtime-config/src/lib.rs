@@ -1,9 +1,10 @@
+//! Shared agent loop wiring (tool registry, protocol picker, command lists)
+//! used by both the CLI (`agent-cli`) and the daemon (`agent-server`).
 use agent_model::{NativeProtocol, PromptedJsonProtocol, ToolCallProtocol};
 use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
 use agent_tools::{git::{GitCommit, GitDiff, GitStatus}, shell::ExecuteCommand, ToolRegistry};
 use std::sync::Arc;
 
-#[allow(dead_code)]
 pub fn protocol_name_is_valid(name: &str) -> bool {
     matches!(name, "native" | "prompted")
 }

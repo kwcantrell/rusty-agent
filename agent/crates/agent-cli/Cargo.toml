@@ -11,6 +11,7 @@ agent-core = { path = "../agent-core" }
 agent-tools = { path = "../agent-tools" }
 agent-policy = { path = "../agent-policy" }
 agent-model = { path = "../agent-model" }
+agent-runtime-config = { path = "../agent-runtime-config" }
 tokio.workspace = true
 async-trait.workspace = true
 serde.workspace = true
