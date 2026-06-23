@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseInbound } from "../src/wire";
+import { parseInbound, type RuntimeSettings } from "../src/wire";
 
 describe("parseInbound", () => {
   it("parses a token event", () => {
@@ -36,8 +36,6 @@ describe("parseInbound", () => {
     expect(parseInbound(JSON.stringify({ v: 1, session_id: "s", kind: "mystery" }))).toBeNull();
   });
 });
-
-import { parseInbound, type RuntimeSettings } from "../src/wire";
 
 const sampleSettings: RuntimeSettings = {
   backend: "openai", base_url: "http://localhost:8080", model: "qwen", protocol: "native",

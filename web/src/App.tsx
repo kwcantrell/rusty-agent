@@ -7,6 +7,7 @@ import { StatusBar } from "./components/StatusBar";
 import { MessageList } from "./components/MessageList";
 import { ApprovalPrompt } from "./components/ApprovalPrompt";
 import { Composer } from "./components/Composer";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { appendUserMsg, clearSession, loadSessionId, loadToken, loadUserMsgs, saveSession } from "./storage";
 
 function wsUrl(token: string): string {
@@ -17,6 +18,7 @@ export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(loadSessionId());
   const [token, setToken] = useState<string | null>(loadToken());
   const [state, dispatch] = useReducer(reduce, loadUserMsgs(sessionId ?? ""), initialState);
+  const [showSettings, setShowSettings] = useState(false);
   const sock = useRef<ReturnType<typeof connect> | null>(null);
 
   useEffect(() => {
@@ -50,11 +52,28 @@ export default function App() {
     dispatch({ type: "approval_sent" });
   };
   const signOut = () => { sock.current?.close(); clearSession(); setToken(null); setSessionId(null); };
+  const openSettings = () => {
+    setShowSettings(true);
+    sock.current?.send({ v: 1, session_id: sessionId, kind: "settings_get" });
+  };
+  const saveSettings = (s: import("./wire").RuntimeSettings) => {
+    sock.current?.send({ v: 1, session_id: sessionId, kind: "settings_update", settings: s });
+  };
 
   const connected = state.status === "open";
   return (
     <div className="flex h-screen flex-col bg-zinc-950">
-      <StatusBar online={state.online} status={state.status} onSignOut={signOut} />
+      <StatusBar online={state.online} status={state.status} onSignOut={signOut} onOpenSettings={openSettings} />
+      {showSettings && state.settings && (
+        <SettingsPanel
+          settings={state.settings}
+          meta={state.settingsMeta}
+          error={state.settingsError}
+          disabled={!connected}
+          onSave={saveSettings}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
       <MessageList items={state.items} />
       {state.pendingApproval && <ApprovalPrompt approval={state.pendingApproval} onDecide={decide} />}
       <Composer disabled={!connected} onSend={send} />
