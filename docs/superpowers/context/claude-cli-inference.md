@@ -99,17 +99,6 @@ design scoped for. Last reconciled 2026-06-23 after the branch merged to `main`.
 
 ### Open
 
-**P1 — reliability (cross-cutting, needs its own spec)**
-
-- [ ] **Add a per-turn timeout around model-stream consumption in `AgentLoop`**
-  (`agent-core/src/loop_.rs:54-58` — bare `while let Some(item) = stream.next().await`;
-  `tool_timeout` wraps only tool execution at ~line 167). A hung backend blocks the
-  turn indefinitely. **Pre-existing** — affects the `OpenAiCompatClient`/SGLang path
-  identically and lives in the core loop that's been kept untouched, so it needs a
-  brainstorm→spec cycle. `ClaudeCliClient`'s `kill_on_drop(true)` already kills the
-  subprocess once the stream is dropped, so a loop-level deadline would make that
-  fire on a stall.
-
 **P2 — `claude-cli` robustness (before sustained/automated use)**
 
 - [ ] **Rate-limit strategy for the 5-hour subscription cap** (risk #5). No backoff
@@ -128,6 +117,11 @@ design scoped for. Last reconciled 2026-06-23 after the branch merged to `main`.
 
 ### Resolved (kept for context)
 
+- [x] Per-turn idle timeout on model-stream consumption (P1) — `agent-core/src/loop_.rs`
+  `one_completion` now wraps stream-open + each chunk in `tokio::time::timeout`, surfacing a
+  retryable `ModelError::Timeout`. Configurable via `LoopConfig.stream_idle_timeout`
+  (default 120s) / CLI `--stream-timeout-secs`. Spec:
+  `docs/superpowers/specs/2026-06-23-agent-loop-stream-timeout-design.md`.
 - [x] Operator docs for `--backend` / `--claude-binary` — `agent/docs/RUNNING.md` §1, `cloud/RUNNING.md` §2.
 - [x] SessionStart-hook context pollution (risk #1) — `--setting-sources project`.
 - [x] ETXTBSY parallel-test flake — `serial_test` `#[serial]` on the process-spawning tests.

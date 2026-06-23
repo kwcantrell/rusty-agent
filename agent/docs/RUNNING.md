@@ -134,6 +134,11 @@ cargo run -p agent-cli -- \
   --context-limit 32768                 # how much the agent actually fills (see note)
 ```
 
+**`--stream-timeout-secs <secs>`** (default 120): idle timeout for model streaming. If the
+backend produces no stream progress (no open, no new chunk) for this many seconds, the
+turn fails with a retryable timeout instead of hanging. Covers both the SGLang/OpenAI and
+`claude-cli` backends.
+
 **Server `-c` vs agent `--context-limit`:** `-c` is the server's *capacity* (set high,
 262144, so it's never the bottleneck). `--context-limit` is how many tokens the agent
 actually fills per turn before its sliding window evicts old history. Keep it **well
