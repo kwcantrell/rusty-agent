@@ -9,6 +9,12 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+/// Replaces the Claude Code harness system prompt so it behaves as a plain
+/// generator. The actual task instructions and tool-call protocol live in the
+/// transcript piped on stdin (see `render_transcript` + the Prompted protocol).
+const BARE_SYSTEM_PROMPT: &str =
+    "You are a text generator. Follow the instructions in the message exactly.";
+
 /// Drives the Claude Code CLI as a pure text generator.
 pub struct ClaudeCliClient {
     binary: String,
@@ -35,6 +41,20 @@ impl ModelClient for ClaudeCliClient {
             .arg("--verbose")
             .arg("--allowedTools").arg("")
             .arg("--model").arg(&self.model)
+            // Run the CLI as a pure generator without losing subscription auth.
+            // `--system-prompt` REPLACES the "you are Claude Code" harness prompt
+            // (so it can't compete with the Prompted tool preamble on stdin); the
+            // transcript still carries our own instructions in the piped prompt.
+            .arg("--system-prompt").arg(BARE_SYSTEM_PROMPT)
+            // Don't load the user's settings — that's where SessionStart hooks
+            // live, which otherwise inject the whole skill harness into context.
+            .arg("--setting-sources").arg("project")
+            // Skip MCP discovery and session-to-disk writes (we're stateless).
+            .arg("--strict-mcp-config")
+            .arg("--no-session-persistence")
+            // NOTE: do NOT use `--bare` — it forces ANTHROPIC_API_KEY/apiKeyHelper
+            // auth and never reads OAuth/keychain, which defeats the whole point
+            // of driving the CLI (piggybacking the Claude subscription).
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

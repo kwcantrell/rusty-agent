@@ -12,10 +12,27 @@ disables its own tool execution.
 ## Working invocation
 
 ```
-claude -p --output-format stream-json --verbose --allowedTools "" --model sonnet
+claude -p --output-format stream-json --verbose --allowedTools "" --model <model> \
+  --system-prompt "<neutral generator instruction>" \
+  --setting-sources project --strict-mcp-config --no-session-persistence
 ```
 
 Prompt delivered on stdin. Exit code 0 on success.
+
+**Flag rationale** (hardened after the initial spike, all verified to preserve
+subscription auth):
+
+- `--system-prompt` **replaces** the "you are Claude Code" harness prompt, so it
+  can't compete with the Prompted tool preamble (retires the harness-prompt risk).
+- `--setting-sources project` stops loading the **user** settings where the
+  `SessionStart` hook lives — eliminating the context pollution noted below.
+- `--strict-mcp-config` + `--no-session-persistence` skip MCP discovery and
+  disk writes (stateless per turn) to cut per-turn overhead.
+- **Do NOT use `--bare`.** It strips hooks/auto-memory/etc. in one flag, but its
+  help states auth is *"strictly ANTHROPIC_API_KEY or apiKeyHelper … OAuth and
+  keychain are never read"* — i.e. it disables the subscription auth that is the
+  entire reason for this backend. The flags above achieve "bare-ish" behavior
+  while keeping the subscription.
 
 ## Real captured event lines (fixtures source of truth)
 
@@ -58,13 +75,14 @@ Reading `a.txt` now.
 
 ## Risks / notes for implementation
 
-1. **SessionStart hooks fire in the nested invocation.** The user's
-   `SessionStart:startup` hook injects the entire `using-superpowers` skill into
-   the generator's context (visible as a large `{"type":"system","subtype":"hook_response",...}`
-   stdout line, and it leaks into the model's `thinking`). Harmless to the parser
-   (all `type":"system"` lines are ignored) and it still produced correct output,
-   but it is context pollution and burns tokens. Mitigation deferred; revisit with
-   `--settings` / hook-suppression flags if it causes misbehavior.
+1. **SessionStart hooks fire in the nested invocation.** ✅ **RESOLVED** by
+   `--setting-sources project` (see Working invocation above) — verified the
+   `hook_started`/`hook_response` events disappear from the stream while
+   subscription auth still works. Originally: the user's `SessionStart:startup`
+   hook injected the entire `using-superpowers` skill into the generator's
+   context (a large `{"type":"system","subtype":"hook_response",...}` line) and
+   leaked into `thinking`. Caveat: project-local hooks *in the agent's workspace*
+   would still load — only `--bare` loads nothing, and that breaks auth.
 2. **`thinking` content blocks appear** before the text block. The parser must
    extract only `type == "text"` blocks (it does) — thinking is ignored.
 3. **Other stdout event types seen, all ignored** by the parser's catch-all arm:
@@ -84,12 +102,10 @@ backend and tracked here so they survive the merge.
    `--backend {openai|claude-cli}` or `--claude-binary` (e.g. in a `RUNNING.md`).
    A short stanza should cover: the authenticated-CLI prerequisite, the
    `sonnet`/`opus` model values, and the rate-limit caveat (risk #5).
-2. **Production risks to track before non-dev use** (already noted as risks #1
-   and #5 above): the SessionStart-hook context pollution (every nested turn
-   ingests the user's `using-superpowers` injection, burning tokens and leaking
-   into `thinking`) and the 5-hour subscription rate cap. Investigate
-   `--settings` / hook-suppression and a backoff/limit strategy before driving
-   sustained loops.
+2. **Production risk to track before non-dev use** (risk #5 above): the 5-hour
+   subscription rate cap — investigate a backoff/limit strategy before driving
+   sustained loops. (The SessionStart-hook context pollution from risk #1 is now
+   resolved via `--setting-sources project`.)
 3. **`AgentLoop` has no timeout around model-stream consumption**
    (`agent-core/src/loop_.rs:54-58` — bare `while let Some(item) = stream.next().await`;
    `tool_timeout` wraps only tool execution at ~line 167). A hung backend blocks
