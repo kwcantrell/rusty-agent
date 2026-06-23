@@ -16,6 +16,13 @@ export interface RuntimeSettings {
   max_tokens: number;
   max_turns: number;
   context_limit: number;
+  top_p: number | null;
+  top_k: number | null;
+  min_p: number | null;
+  presence_penalty: number | null;
+  repeat_penalty: number | null;
+  enable_thinking: boolean;
+  preserve_thinking: boolean;
 }
 
 export type WireEvent =

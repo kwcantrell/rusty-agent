@@ -1,4 +1,4 @@
-import { useState } from "react";
+import React, { useState } from "react";
 import type { RuntimeSettings } from "../wire";
 
 interface Meta { workspace: string; apiKeySet: boolean; hardFloor: string[] }
@@ -24,6 +24,10 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
     setForm((f) => ({ ...f, [k]: v }));
 
   const save = () => onSave({ ...form, command_allowlist: fromLines(allow), command_denylist: fromLines(deny) });
+
+  const num = (k: keyof RuntimeSettings) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    set(k, (e.target.value === "" ? null : Number(e.target.value)) as RuntimeSettings[typeof k]);
+  const numVal = (v: number | null) => (v === null ? "" : v);
 
   const floor = meta?.hardFloor ?? [];
   const redundant = fromLines(deny).filter((d) => floor.includes(d));
@@ -117,6 +121,45 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
             <input id="context_limit" type="number" className={field} value={form.context_limit}
               onChange={(e) => set("context_limit", Number(e.target.value))} />
           </div>
+        </section>
+
+        <section className="mb-4 space-y-3">
+          <h3 className="text-sm font-semibold text-zinc-300">Sampling &amp; thinking</h3>
+          <div>
+            <label className={label} htmlFor="top_p">Top-p</label>
+            <input id="top_p" type="number" step="0.05" className={field}
+              value={numVal(form.top_p)} onChange={num("top_p")} />
+          </div>
+          <div>
+            <label className={label} htmlFor="top_k">Top-k</label>
+            <input id="top_k" type="number" className={field}
+              value={numVal(form.top_k)} onChange={num("top_k")} />
+          </div>
+          <div>
+            <label className={label} htmlFor="min_p">Min-p</label>
+            <input id="min_p" type="number" step="0.01" className={field}
+              value={numVal(form.min_p)} onChange={num("min_p")} />
+          </div>
+          <div>
+            <label className={label} htmlFor="presence_penalty">Presence penalty</label>
+            <input id="presence_penalty" type="number" step="0.1" className={field}
+              value={numVal(form.presence_penalty)} onChange={num("presence_penalty")} />
+          </div>
+          <div>
+            <label className={label} htmlFor="repeat_penalty">Repeat penalty</label>
+            <input id="repeat_penalty" type="number" step="0.05" className={field}
+              value={numVal(form.repeat_penalty)} onChange={num("repeat_penalty")} />
+          </div>
+          <label className="flex items-center gap-2 text-sm">
+            <input id="enable_thinking" type="checkbox" checked={form.enable_thinking}
+              onChange={(e) => set("enable_thinking", e.target.checked)} />
+            Enable thinking
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input id="preserve_thinking" type="checkbox" checked={form.preserve_thinking}
+              onChange={(e) => set("preserve_thinking", e.target.checked)} />
+            Preserve thinking in history
+          </label>
         </section>
 
         {meta && (
