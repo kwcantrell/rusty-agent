@@ -1,0 +1,7 @@
+# Example invocation reference (flags shown; this file is documentation only).
+# agent --base-url http://localhost:30000 --model my-model --protocol native --workspace .
+base_url = "http://localhost:30000"
+model = "default"
+protocol = "native"   # or "prompted"
+workspace = "."
+context_limit = 8192

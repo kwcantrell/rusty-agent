@@ -1,0 +1,8 @@
+[package]
+name = "agent-policy"
+edition.workspace = true
+
+[dependencies]
+agent-tools = { path = "../agent-tools" }
+async-trait.workspace = true
+tracing.workspace = true

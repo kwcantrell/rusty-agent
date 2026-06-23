@@ -1,0 +1,26 @@
+[package]
+name = "agent-core"
+edition.workspace = true
+
+[dependencies]
+agent-tools = { path = "../agent-tools" }
+agent-policy = { path = "../agent-policy" }
+agent-model = { path = "../agent-model" }
+async-trait.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+testkit = []
+e2e = []
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { version = "3" }
+agent-model = { path = "../agent-model" }
+agent-tools = { path = "../agent-tools" }
+agent-policy = { path = "../agent-policy" }

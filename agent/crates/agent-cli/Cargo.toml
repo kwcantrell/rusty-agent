@@ -1,0 +1,21 @@
+[package]
+name = "agent-cli"
+edition.workspace = true
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+agent-tools = { path = "../agent-tools" }
+agent-policy = { path = "../agent-policy" }
+agent-model = { path = "../agent-model" }
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+similar.workspace = true
