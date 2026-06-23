@@ -102,10 +102,12 @@ A natural next step is also a "Settings" capability (deferred out of #6): editin
 endpoint/policy from the browser, which needs a new inbound daemon-config channel.
 
 ## Known follow-ups (smaller than a subsystem — pick one if not specing a subsystem)
-Open tech-debt items from shipped work. Canonical, always-current list (detail, file
-refs, Resolved/Accepted history): docs/superpowers/context/claude-cli-inference.md
-→ "Follow-ups / known limitations". Keep that file as the source of truth; the boxes
-below are a pointer, not a second copy.
+Open tech-debt items from shipped work. Project-wide canonical, always-current ledger
+(per-subsystem review findings, Open/Accepted/Resolved): docs/superpowers/context/follow-ups.md
+(populated automatically at the end of each SDD cycle — see "Track review findings durably"
+below). The per-backend list docs/superpowers/context/claude-cli-inference.md
+→ "Follow-ups / known limitations" remains the source of truth for claude-cli detail.
+Keep both current; the boxes below are a pointer, not a second copy.
    [x] P1  RESOLVED — AgentLoop now enforces a per-turn idle (inter-chunk) timeout in
            one_completion (wraps stream-open + each chunk in tokio::time::timeout →
            retryable ModelError::Timeout). Config: LoopConfig.stream_idle_timeout
@@ -123,6 +125,20 @@ Use the brainstorming skill to turn the chosen subsystem's primer into an approv
 written design spec (saved under docs/superpowers/specs/), then stop at the
 writing-plans handoff. Read the relevant context primer first. Ask clarifying questions
 one at a time. Do NOT write code or scaffold anything until I approve the design.
+
+## Track review findings durably (don't lose Minors)
+When this subsystem is later executed (subagent-driven-development), the SDD progress
+ledger under `.superpowers/sdd/` is gitignored SCRATCH — never the resting place for
+findings. Before finishing the branch, record EVERY Minor finding from the final
+whole-branch review (plus any Important/accepted won't-fix items) into the durable,
+committed ledger `docs/superpowers/context/follow-ups.md` (create it if absent), and
+commit it as part of finishing. Use the same Open / Accepted (won't-fix) / Resolved
+convention as `claude-cli-inference.md` → "Follow-ups / known limitations":
+- One dated `## YYYY-MM-DD <subsystem>` section per cycle.
+- Each item: short title, file:line ref, status (Open / Accepted / Resolved), and a
+  one-line reason; mark items fixed during the cycle as Resolved with the commit SHA.
+This `follow-ups.md` is the project-wide source of truth for review follow-ups
+(the per-backend `claude-cli-inference.md` list remains for claude-cli detail).
 
 ## Environment notes
 - Rust 1.96 via rustup, but cargo is NOT on PATH — run `source "$HOME/.cargo/env"`
