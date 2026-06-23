@@ -221,4 +221,76 @@ mod tests {
         assert!(events.iter().any(|e| e == "tool_result:read_file"));
         assert!(events.last().unwrap() == "done");
     }
+
+    use agent_policy::PolicyEngine;
+    use agent_tools::ToolIntent;
+
+    struct DenyAll;
+    impl PolicyEngine for DenyAll {
+        fn check(&self, _i: &ToolIntent) -> Decision { Decision::Deny("nope".into()) }
+    }
+
+    #[tokio::test]
+    async fn denied_tool_feeds_error_back_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "X").unwrap();
+        let ws = dir.path().to_path_buf();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()),
+            Scripted::Text("Understood, it was denied.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), Arc::new(DenyAll),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5) });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        // No tool_result (it was denied), but the loop still reached done.
+        assert!(!events.iter().any(|e| e == "tool_result:read_file"));
+        assert_eq!(events.last().unwrap(), "done");
+    }
+
+    #[tokio::test]
+    async fn transport_error_then_success_via_retry() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Error,
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 3, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5) });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_stops_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "X").unwrap();
+        let ws = dir.path().to_path_buf();
+        // Model always calls a tool, never finishes -> must hit max_turns.
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()); 100
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 3, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5) });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "loop forever".into()).await.unwrap();
+        // 3 turns, each a tool call, then done (BudgetExhausted).
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.iter().filter(|e| *e == "tool_start:read_file").count(), 3);
+        assert_eq!(events.last().unwrap(), "done");
+    }
 }
