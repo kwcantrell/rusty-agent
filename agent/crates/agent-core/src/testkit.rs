@@ -16,6 +16,10 @@ pub enum Scripted {
     Call(String, String, String),
     /// Force a transport error this turn.
     Error,
+    /// `stream()` succeeds but the returned stream never yields (inter-chunk stall).
+    Hang,
+    /// The `stream()` call itself never resolves (stream-open stall).
+    HangOpen,
 }
 
 pub struct ScriptedModel { turns: Mutex<std::collections::VecDeque<Scripted>> }
@@ -39,6 +43,11 @@ impl ModelClient for ScriptedModel {
                 Ok(Chunk::ToolCallDelta(RawToolCall { id: Some(id), name: Some(name),
                     args_fragment: args })),
                 Ok(Chunk::Done(StopReason::ToolCalls))]).boxed()),
+            Scripted::Hang => Ok(stream::pending().boxed()),
+            Scripted::HangOpen => {
+                std::future::pending::<()>().await;
+                unreachable!("HangOpen never resolves")
+            }
         }
     }
 }

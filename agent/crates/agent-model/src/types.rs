@@ -76,6 +76,8 @@ pub enum ModelError {
     Stream(String),
     #[error("process error: {0}")]
     Process(String),
+    #[error("stream idle timeout after {0:?}")]
+    Timeout(std::time::Duration),
 }
 
 #[cfg(test)]
@@ -90,5 +92,11 @@ mod tests {
         assert!(matches!(t.role, Role::Tool));
         assert_eq!(t.tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(t.name.as_deref(), Some("read_file"));
+    }
+
+    #[test]
+    fn timeout_error_displays_duration() {
+        let e = ModelError::Timeout(std::time::Duration::from_secs(120));
+        assert_eq!(e.to_string(), "stream idle timeout after 120s");
     }
 }

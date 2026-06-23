@@ -53,6 +53,7 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
             model_limit: params.context_limit, max_turns: 25, max_retries: 3,
             temperature: 0.2, max_tokens: Some(2048), workspace: params.workspace.clone(),
             tool_timeout: Duration::from_secs(120),
+            stream_idle_timeout: agent_core::DEFAULT_STREAM_IDLE_TIMEOUT,
         },
     ));
     let ctx = Arc::new(tokio::sync::Mutex::new(
