@@ -27,6 +27,51 @@ been folded into this ledger, which is now their home). For backend design detai
 - **Guard `BARE_SYSTEM_PROMPT` acceptance** (P3) — **Open**. Add an `#[ignore]`-gated real-CLI
   test so a future guardrail change doesn't break it silently.
 
+## 2026-06-23 memory-system
+
+Subsystem #4 (Vector / Long-Term Memory), tools-first slice. New `agent-memory` crate: `Embedder`
+trait (in-process fastembed/ONNX `BGESmallENV15` 384-dim behind default feature `onnx`; deterministic
+`StubEmbedder` for tests) + `MemoryStore` trait (`SqliteStore` single file `~/.agent/memory.db` +
+`InMemoryStore`) + three tools `remember`/`recall`/`forget`. Per-project (hashed git-toplevel) + global
+scoping, dedup-on-write, LRU cap, relevance threshold, budgeted recall. **Zero `agent-core` changes** —
+attaches via the `Tool` seam + `build_memory` wiring into both `agent-cli` and `agent-server` (mirrors the
+`mcp_tools` injection so memory survives a live settings-reconfigure) behind `--memory`/`--memory-db`/
+`--memory-model-dir`. Spec `2026-06-23-memory-system-design.md`, plan `2026-06-23-memory-system.md`.
+Branch `worktree-feat+memory-system` (commits `840c7e3..35e58c7`, 14 commits). Built subagent-driven (12 tasks).
+Final whole-branch review (opus): **Ready to merge — Yes** (no Critical, no Important). All 5 binding
+constraints verified against source: zero agent-core churn; best-effort isolation (tool errors → `ToolError`,
+construction failure → memory disabled, never aborts); `Access::Read` auto-allow confirmed in `RulePolicy`
+(approval-gating deferred, documented); SQL-enforced scope isolation for recall+dedup (and now by-id forget);
+offline-safe `StubEmbedder` test discipline. Gates at tip: `cargo test --workspace` **252 passed / 0 failed /
+9 ignored**; `clippy --all-targets -D warnings` clean. **Spec DoD validated against the real model**: live
+`#[ignore]` `paraphrase_recall_across_reopen` passes — paraphrase query retrieves a stored memory across a
+fresh-process reopen (11.8s incl. model load).
+
+### Resolved during the cycle
+- **Embedding-result `.unwrap()` panic surface** (Task 7 review, Important) — `agent/crates/agent-memory/src/tools.rs` — **Resolved** (`9e29b70`). `embed(...).into_iter().next().unwrap()` could panic on an empty embedder result, violating "memory tools never panic"; added a shared `first_embedding(vectors) -> Result<Vec<f32>, ToolError>` helper used by all three tools.
+- **`forget` by-id deleted across scope** (final whole-branch review, Minor→hardened) — `agent/crates/agent-memory/src/tools.rs` (`Forget::execute` by-id branch) — **Resolved** (`35e58c7`). `delete(id)` matched on primary key alone, so a by-id forget was not scope-isolated like recall/dedup. Now get-then-check-`ScopeFilter::ProjectAndGlobal`-then-delete; not-found and out-of-scope collapse to the same `NotFound` (no cross-project id-existence probing). Subsumes the empty-string-id nit (`{"id":""}` → NotFound). Regression test `forget_by_id_refuses_other_project_scope`.
+
+### Open (Minor — deferred to ledger by the final review; all cosmetic or single-user-bounded)
+- **FastEmbedEmbedder holds the model mutex during blocking ONNX inference** — `agent/crates/agent-memory/src/embedder.rs` — **Open**. Reactor-blocking under concurrent load (spec defers `spawn_blocking`); `model.lock().unwrap()` poison-panics (idiomatic). The one item that could bite under future concurrent load; fine at single-user, low-call-volume scale.
+- **`render_hits` budget uses strict `>`** — `agent/crates/agent-memory/src/tools.rs` — **Open**. Output can exceed `max_recall_chars` by the truncation-marker length (~38B); bounded + tested (`<= max + 64`), context-safe. Ambiguous in spec whether the marker counts against budget.
+- **`rank` "one-time-ish warning" comment is misleading** — `agent/crates/agent-memory/src/store.rs` — **Open**. The dimension-mismatch `tracing::warn!` fires per row per query; consider debug-level or a per-query dedup, and fix the comment.
+- **`SqliteStore` hygiene** — `agent/crates/agent-memory/src/store.rs` — **Open**. `SELECT *` loads the unused `dim` column; `0600` perms set with `let _ =` (silently fails on a foreign-owned file); the `"global"` literal is duplicated between `MemoryScope::kind()` and `row_to_record`'s round-trip.
+- **`config` defaults test asserts 8/13 fields** — `agent/crates/agent-memory/src/config.rs` — **Open**. `max_tags`/`max_tag_len`/`candidate_warn_threshold`/`db_path`/`model_cache_dir` are not round-trip-asserted; `default_db_path` uses `$HOME` (Linux/macOS; not Windows — acceptable for local-first).
+- **`parse_tags` silently drops non-string JSON tag values** — `agent/crates/agent-memory/src/tools.rs` — **Open**. Reasonable, but undocumented in the tool schema.
+- **`scope.rs` `to_string_lossy` → lossy hash on non-UTF-8 paths** — `agent/crates/agent-memory/src/scope.rs` — **Open**. Theoretical (legal-but-exotic on Linux); stable but lossy project key.
+- **`Embedder::dim()` is never called** — `agent/crates/agent-memory/src/embedder.rs` — **Open**. Dimension-mismatch handling relies on `cosine()` → NaN; `dim()` is part of the seam contract but currently dead. Flagged for the ledger.
+- **README has no explicit prompt-injection/threat note** — `agent/crates/agent-memory/README.md` — **Open**. The residual prompt-injection-persistence risk is in the spec but not surfaced at the crate; a two-line "Security/threat model" note would make the accepted residual risk discoverable.
+- **Cosmetics** — **Open**. `cosine` index-loop vs `zip` + `format!` per-dim alloc in `StubEmbedder` (test stub); `agent-runtime-config` Cargo.toml `agent-memory` line indent; `build_memory` clones `Option<PathBuf>` args; the `build_memory_enabled` test asserts the three names present rather than `len()==3`; a redundant `use std::process::Command` in `scope.rs` tests; memory tools registered before skills (last-write-wins registry, but `remember`/`recall`/`forget` don't collide with skill tool names).
+
+### Deferred scope (intentional, from spec §1 "Out of scope")
+- **Automatic `RetrievingContextManager` (silent top-K injection) + the async `ContextManager::build` core refactor** — Open — the headline follow-on; deliberately deferred so the async-seam change lands on its own atop a proven store.
+- **Auto-ingestion** (end-of-session salient-fact capture) — Open — pairs with the auto-retrieval slice.
+- **RuntimeConfig persistence + browser/Settings UI for memory** — Open — flags-only this slice (mirrors the skills→skills-runtime-config precedent; avoids a browser save wiping an un-round-tripped field).
+- **Approval-gated memory writes** — Open — `Access::Read` auto-allow this slice; flipping to `Access::Write` is a one-line change.
+- **LanceDB / ANN backend** — Open — `MemoryStore` trait keeps it a swap; exact brute-force is correct at single-user scale (a `candidate_warn_threshold` logs when scale would warrant ANN).
+- **HTTP `/v1/embeddings` Embedder** — Open — `Embedder` trait keeps it a swap; in-process fastembed shipped.
+- **Re-embedding / migration on embedding-model change** — Open — dimension-mismatched rows go inert with a one-time notice rather than being re-embedded.
+
 ## 2026-06-23 os-sandboxing-docker
 
 Subsystem #2 (top hardening priority). New `agent-sandbox` crate (Docker `docker run` impl) behind a
