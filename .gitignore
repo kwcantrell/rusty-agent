@@ -9,3 +9,6 @@ graphify-out/
 
 # Superpowers SDD scratch (briefs, reports, diffs, ledger)
 .superpowers/
+
+# Local git worktrees (isolated workspaces for feature branches)
+.worktrees/
