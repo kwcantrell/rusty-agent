@@ -9,6 +9,7 @@ agent-model = { path = "../agent-model" }
 agent-mcp = { path = "../agent-mcp" }
 agent-http = { path = "../agent-http" }
 agent-skills = { path = "../agent-skills" }
+agent-memory = { path = "../agent-memory" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true

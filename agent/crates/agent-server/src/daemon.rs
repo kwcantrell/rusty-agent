@@ -26,6 +26,7 @@ pub struct DaemonParams {
     pub workspace: PathBuf,
     pub system_prompt: String,
     pub mcp_tools: Arc<[Arc<dyn Tool>]>,
+    pub memory_tools: Arc<[Arc<dyn Tool>]>,
 }
 
 pub const SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided tools to inspect \
@@ -55,6 +56,7 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
         session.clone(),
         tx.clone(),
         params.mcp_tools.clone(),
+        params.memory_tools.clone(),
         params.system_prompt.clone(),
     ));
     let ctx = Arc::new(tokio::sync::Mutex::new(
