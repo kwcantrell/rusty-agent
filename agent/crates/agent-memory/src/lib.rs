@@ -13,3 +13,4 @@ pub use embedder::{cosine, EmbedError, Embedder, StubEmbedder};
 pub use store::{InMemoryStore, MemoryStore, SqliteStore, StoreError};
 pub use tools::Remember;
 pub use tools::Recall;
+pub use tools::Forget;

@@ -184,6 +184,65 @@ impl Tool for Recall {
     }
 }
 
+pub struct Forget {
+    pub embedder: Arc<dyn Embedder>,
+    pub store: Arc<dyn MemoryStore>,
+    pub cfg: Arc<MemoryConfig>,
+    pub project_key: String,
+}
+
+#[async_trait]
+impl Tool for Forget {
+    fn name(&self) -> &str { "forget" }
+    fn description(&self) -> &str {
+        "Remove a memory. Args: either id (exact) or query (deletes the single best match \
+         only if confidently similar). Never mass-deletes."
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "forget".into(),
+            description: self.description().into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "query": {"type": "string"}
+                }
+            }),
+        }
+    }
+    fn intent(&self, _args: &Value) -> Result<ToolIntent, ToolError> {
+        Ok(read_intent("forget", "remove from long-term memory".into()))
+    }
+    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        if let Some(id) = args.get("id").and_then(Value::as_str) {
+            let removed = self.store.delete(id).await.map_err(store_failed)?;
+            return if removed {
+                Ok(ToolOutput { content: format!("Removed memory {id}."), display: None })
+            } else {
+                Err(ToolError::NotFound(format!("no memory with id {id}")))
+            };
+        }
+        let query = args.get("query").and_then(Value::as_str)
+            .map(str::trim).filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgs("provide 'id' or non-empty 'query'".into()))?;
+        let qv = first_embedding(self.embedder.embed(&[query.to_string()]).await.map_err(embed_failed)?)?;
+        let filter = ScopeFilter::ProjectAndGlobal { project_key: self.project_key.clone() };
+        let hits = self.store.query(&qv, 1, &filter).await.map_err(store_failed)?;
+        match hits.first() {
+            Some(top) if top.score >= self.cfg.forget_threshold => {
+                let id = top.record.id.clone();
+                self.store.delete(&id).await.map_err(store_failed)?;
+                tracing::info!(target: "memory", %id, "forget: removed by query");
+                Ok(ToolOutput { content: format!("Removed memory {id}: {}", top.record.text), display: None })
+            }
+            _ => Ok(ToolOutput {
+                content: "No confident match; nothing removed. Use a more specific query or an id.".into(),
+                display: None }),
+        }
+    }
+}
+
 fn render_hits(hits: &[crate::record::Scored], max_chars: usize) -> String {
     let mut out = String::new();
     for h in hits {
@@ -259,6 +318,57 @@ mod recall_tests {
         let body = render_hits(&hits, 512);
         assert!(body.len() <= 512 + 64);
         assert!(body.contains("[truncated"));
+    }
+}
+
+#[cfg(test)]
+mod forget_tests {
+    use super::test_support::ctx;
+    use super::*;
+    use crate::config::MemoryConfig;
+    use crate::embedder::StubEmbedder;
+    use crate::store::InMemoryStore;
+    use crate::record::ScopeFilter;
+
+    async fn seeded() -> (Forget, Arc<dyn MemoryStore>, String) {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
+        let cfg = Arc::new(MemoryConfig::default());
+        let rem = Remember { embedder: embedder.clone(), store: store.clone(), cfg: cfg.clone(),
+            project_key: "A".into() };
+        let out = rem.execute(json!({"text": "delete me please"}), &ctx()).await.unwrap();
+        let id = out.content.trim_start_matches("Stored memory ").trim_end_matches('.').to_string();
+        let f = Forget { embedder, store: store.clone(), cfg, project_key: "A".into() };
+        (f, store, id)
+    }
+
+    #[tokio::test]
+    async fn forget_by_id() {
+        let (f, store, id) = seeded().await;
+        f.execute(json!({"id": id}), &ctx()).await.unwrap();
+        assert_eq!(store.count(&ScopeFilter::ProjectAndGlobal { project_key: "A".into() }).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn forget_by_query_above_threshold_deletes_one() {
+        let (f, store, _id) = seeded().await;
+        f.execute(json!({"query": "delete me please"}), &ctx()).await.unwrap(); // exact → 1.0
+        assert_eq!(store.count(&ScopeFilter::ProjectAndGlobal { project_key: "A".into() }).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn forget_by_weak_query_deletes_nothing() {
+        let (f, store, _id) = seeded().await;
+        let out = f.execute(json!({"query": "qwerty unrelated zxcv"}), &ctx()).await.unwrap();
+        assert!(out.content.contains("nothing removed"));
+        assert_eq!(store.count(&ScopeFilter::ProjectAndGlobal { project_key: "A".into() }).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn forget_unknown_id_is_not_found() {
+        let (f, _s, _id) = seeded().await;
+        let err = f.execute(json!({"id": "nope"}), &ctx()).await.unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
     }
 }
 
