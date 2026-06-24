@@ -17,10 +17,15 @@ pub fn validate_mount(path: &str, home: Option<&Path>) -> Result<PathBuf, Sandbo
         return Err(SandboxError::InvalidMount("refusing to mount /".into()));
     }
     if let Some(h) = home {
-        if canon == h {
+        // Canonicalize home too, so a symlinked $HOME prefix can't dodge the check.
+        let h_canon = h.canonicalize();
+        let h_cmp = h_canon.as_deref().unwrap_or(h);
+        if canon == h_cmp {
             return Err(SandboxError::InvalidMount("refusing to mount \\$HOME root".into()));
         }
     }
+    // NOTE: on modern Linux /var/run is a symlink to /run, so canonicalize() maps
+    // /var/run* -> /run*; the /run* entries are the real guard. Keep both as belt-and-suspenders.
     for bad in ["/var/run/docker.sock", "/run/docker.sock", "/var/run", "/run"] {
         if canon == Path::new(bad) {
             return Err(SandboxError::InvalidMount(format!("refusing to mount {bad}")));
@@ -57,5 +62,25 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let got = validate_mount("~/agent-sbx-tilde", Some(&home)).unwrap();
         assert_eq!(got, sub.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn rejects_symlinked_home_root() {
+        // Create a real directory and a symlink pointing to it.
+        let temp = std::env::temp_dir();
+        let real_dir = temp.join("agent-sbx-real-home");
+        let link_dir = temp.join("agent-sbx-symlink-home");
+        let _ = std::fs::remove_dir_all(&real_dir);
+        let _ = std::fs::remove_dir_all(&link_dir);
+        std::fs::create_dir(&real_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        // Pass the symlink as home; validating it should be rejected as the home root.
+        let err = validate_mount(link_dir.to_str().unwrap(), Some(&link_dir));
+        assert!(err.is_err(), "should reject symlinked home root");
+
+        let _ = std::fs::remove_dir_all(&real_dir);
+        let _ = std::fs::remove_dir_all(&link_dir);
     }
 }
