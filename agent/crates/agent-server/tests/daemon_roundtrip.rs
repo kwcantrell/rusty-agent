@@ -66,6 +66,7 @@ async fn settings_get_round_trips_over_websocket() {
         workspace: workspace.path().to_path_buf(),
         system_prompt: agent_server::daemon::SYSTEM_PROMPT.to_string(),
         mcp_tools: std::sync::Arc::from(Vec::<std::sync::Arc<dyn agent_tools::Tool>>::new()),
+        memory_tools: std::sync::Arc::from(Vec::<std::sync::Arc<dyn agent_tools::Tool>>::new()),
     };
 
     let daemon = tokio::spawn(async move {

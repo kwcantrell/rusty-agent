@@ -89,6 +89,16 @@ enum Cmd {
         /// Extra read-only bind-mount path inside the sandbox (repeatable)
         #[arg(long = "sandbox-extra-ro")]
         sandbox_extra_ro: Vec<String>,
+        // ── Memory flags ───────────────────────────────────────────────────────
+        /// Enable long-term memory (remember/recall/forget tools).
+        #[arg(long, default_value_t = false)]
+        memory: bool,
+        /// Override the memory DB path (default ~/.agent/memory.db).
+        #[arg(long)]
+        memory_db: Option<PathBuf>,
+        /// Override the embedding-model cache dir.
+        #[arg(long)]
+        memory_model_dir: Option<PathBuf>,
     },
 }
 
@@ -112,7 +122,8 @@ async fn main() {
         Cmd::Run { base_url, model, protocol, workspace, context_limit, backend, claude_binary,
                    runtime_config, mcp_config, allow_host, skills_dir, skill,
                    sandbox_mode, sandbox_image, sandbox_network, sandbox_memory, sandbox_cpus,
-                   sandbox_pids, sandbox_fsize, sandbox_tmp_size, sandbox_extra_rw, sandbox_extra_ro } => {
+                   sandbox_pids, sandbox_fsize, sandbox_tmp_size, sandbox_extra_rw, sandbox_extra_ro,
+                   memory, memory_db, memory_model_dir } => {
             let cfg = DaemonConfig::load(&cli.config)
                 .expect("load config (run `enroll` first)");
             println!("pairing code: {}", cfg.pairing_code);
@@ -156,6 +167,10 @@ async fn main() {
             let mcp_tools: std::sync::Arc<[std::sync::Arc<dyn agent_tools::Tool>]> =
                 mcp_manager.as_ref().map(|m| std::sync::Arc::from(m.tools()))
                     .unwrap_or_else(|| std::sync::Arc::from(Vec::<std::sync::Arc<dyn agent_tools::Tool>>::new()));
+            // Long-term memory: construct once (loads the embedding model) and survive reconfigure.
+            let memory_tools: std::sync::Arc<[std::sync::Arc<dyn agent_tools::Tool>]> =
+                std::sync::Arc::from(agent_runtime_config::build_memory(
+                    memory, memory_db, memory_model_dir, &workspace));
             let params = daemon::DaemonParams {
                 ws_url: ws_url(&cfg.worker_url),
                 agent_token: cfg.agent_token,
@@ -166,6 +181,7 @@ async fn main() {
                 workspace,
                 system_prompt: daemon::SYSTEM_PROMPT.to_string(),
                 mcp_tools,
+                memory_tools,
             };
             // Reconnect with simple backoff.
             let mut backoff = 1u64;
@@ -198,5 +214,6 @@ fn params_clone(p: &daemon::DaemonParams) -> daemon::DaemonParams {
         workspace: p.workspace.clone(),
         system_prompt: p.system_prompt.clone(),
         mcp_tools: p.mcp_tools.clone(),
+        memory_tools: p.memory_tools.clone(),
     }
 }
