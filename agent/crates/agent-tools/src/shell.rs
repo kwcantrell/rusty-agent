@@ -52,14 +52,23 @@ impl Tool for ExecuteCommand {
             s
         };
 
-        let status = tokio::select! {
-            _ = ctx.cancel.cancelled() => { child.kill().await; return Err(ToolError::Denied("cancelled".into())); }
-            r = tokio::time::timeout(ctx.timeout, child.wait()) => match r {
-                Err(_elapsed) => { child.kill().await; return Err(ToolError::Timeout); }
-                Ok(inner) => inner.map_err(|e| ToolError::Failed { message: e.to_string(), stderr: None })?,
+        // Drain both pipes CONCURRENTLY with wait() to avoid a pipe-buffer deadlock.
+        let run = async {
+            let (status, stdout, stderr) = tokio::join!(child.wait(), read_out, read_err);
+            (status, stdout, stderr)
+        };
+
+        let (status, stdout, stderr) = tokio::select! {
+            // On cancel/timeout we return; dropping `child` fires SandboxedChild::Drop
+            // (docker kill / start_kill) + the inner child's kill_on_drop.
+            _ = ctx.cancel.cancelled() => return Err(ToolError::Denied("cancelled".into())),
+            r = tokio::time::timeout(ctx.timeout, run) => match r {
+                Err(_elapsed) => return Err(ToolError::Timeout),
+                Ok((status, stdout, stderr)) => (
+                    status.map_err(|e| ToolError::Failed { message: e.to_string(), stderr: None })?,
+                    stdout, stderr),
             }
         };
-        let (stdout, stderr) = tokio::join!(read_out, read_err);
         let exit_code = status.code().unwrap_or(-1);
         let content = format!("exit={exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
         Ok(ToolOutput { content, display: Some(Display::Terminal {
@@ -101,5 +110,16 @@ mod tests {
         let err = ExecuteCommand.execute(json!({"command":"sleep 5"}),
             &ctx(Duration::from_millis(200))).await.unwrap_err();
         assert!(matches!(err, ToolError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn captures_large_output_without_deadlock() {
+        // ~200 KiB of stdout — well past the OS pipe buffer; would hang under the
+        // wait-before-drain bug.
+        let out = ExecuteCommand.execute(
+            json!({"command": "for i in $(seq 1 20000); do echo 0123456789; done"}),
+            &ctx(Duration::from_secs(20))).await.unwrap();
+        assert!(out.content.len() > 100_000);
+        assert!(matches!(out.display, Some(Display::Terminal { exit_code: 0, .. })));
     }
 }

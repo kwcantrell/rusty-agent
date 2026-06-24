@@ -201,7 +201,9 @@ impl AgentLoop {
         // cancel source (e.g. Ctrl-C / SIGINT). Live cancellation is not yet
         // functional; this is a stub for future wiring.
         let ctx = ToolCtx { workspace: self.config.workspace.clone(),
-            timeout: self.config.tool_timeout, cancel: CancellationToken::new() };
+            timeout: self.config.tool_timeout, cancel: CancellationToken::new(),
+            // stopgap; Task 3 replaces this with the config-driven strategy
+            sandbox: std::sync::Arc::new(agent_tools::HostExecutor) };
         tool.execute(call.args, &ctx).await
     }
 }
