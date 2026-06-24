@@ -87,6 +87,14 @@ mod tests {
         assert!(s.ends_with("debian:stable-slim sh -c echo hi"));
         assert!(!s.contains("--privileged"));
         assert!(!s.contains("seccomp=unconfined"));
+        // Resource-limit flags (always emitted)
+        assert!(s.contains("--memory 2g"));
+        assert!(s.contains("--cpus 2"));
+        assert!(s.contains("--pids-limit 512"));
+        assert!(s.contains("--tmpfs /tmp:rw,size=256m"));
+        assert!(s.contains("--name agent-sbx-1"));
+        // Dangerous flags absent
+        assert!(!s.contains("--cap-add"));
     }
 
     #[test]
@@ -101,5 +109,17 @@ mod tests {
         let v = docker_run_args(&policy(false), &spec, "n", "1000:1000");
         assert!(v.contains(&"-i".to_string()));
         assert!(!v.contains(&"--rm".to_string()));
+    }
+
+    #[test]
+    fn ulimit_fsize_emitted_only_when_set() {
+        // None → no --ulimit
+        let v = docker_run_args(&policy(false), &oneshot(), "n", "1000:1000");
+        assert!(!v.join(" ").contains("--ulimit"));
+        // Some → --ulimit fsize=<f>
+        let mut p = policy(false);
+        p.limits.fsize = Some("1g".into());
+        let v = docker_run_args(&p, &oneshot(), "n", "1000:1000");
+        assert!(v.join(" ").contains("--ulimit fsize=1g"));
     }
 }
