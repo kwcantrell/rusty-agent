@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { connect } from "./socket";
-import { initialState, reduce, useAnimatedItems, useTurnGrouping } from "./state";
+import { initialState, reduce, useAnimatedItems, artifactsFrom } from "./state";
 import type { Decision, RuntimeSettings } from "./wire";
 import { PairingScreen } from "./components/PairingScreen";
 import { StatusBar } from "./components/StatusBar";
@@ -8,7 +8,8 @@ import { MessageList } from "./components/MessageList";
 import { ApprovalPrompt } from "./components/ApprovalPrompt";
 import { Composer } from "./components/Composer";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { TimelineView } from "./components/TimelineView";
+import { ActivityRail } from "./components/ActivityRail";
+import { Inspector } from "./components/inspector/Inspector";
 import { resolveInitialTheme, applyTheme, type Theme } from "./theme";
 import { appendUserMsg, clearSession, loadSessionId, loadTheme, loadToken, loadUserMsgs, saveSession, saveTheme } from "./storage";
 
@@ -23,6 +24,9 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [theme, setTheme] = useState<Theme>(() =>
     resolveInitialTheme(loadTheme(), window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false));
+  const [activeArtifactKey, setActiveArtifactKey] = useState<string | null>(null);
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(true);
   const sock = useRef<ReturnType<typeof connect> | null>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
 
@@ -30,7 +34,11 @@ export default function App() {
   const toggleTheme = () => setTheme((t) => { const next = t === "dark" ? "light" : "dark"; saveTheme(next); return next; });
 
   const animatedItems = useAnimatedItems(state.items);
-  const turns = useTurnGrouping(animatedItems);
+  const artifacts = artifactsFrom(state.items);
+
+  useEffect(() => {
+    if (artifacts.length > 0) { setActiveArtifactKey(artifacts[artifacts.length - 1].key); setInspectorOpen(true); }
+  }, [artifacts.length]);
 
   useEffect(() => {
     if (!token || !sessionId) return;
@@ -85,10 +93,20 @@ export default function App() {
           onClose={() => setShowSettings(false)}
         />
       )}
-      <div ref={messageListRef} className="flex flex-1 flex-col overflow-y-auto">
-        <MessageList items={animatedItems} />
+      <div className="flex min-h-0 flex-1">
+        <ActivityRail items={state.items} sessionLabel={sessionId.slice(0, 8)}
+          onOpenSettings={openSettings} collapsed={railCollapsed}
+          onToggleCollapse={() => setRailCollapsed((c) => !c)} />
+        <div ref={messageListRef} className="flex min-w-0 flex-1 flex-col overflow-y-auto">
+          <MessageList items={animatedItems} />
+        </div>
+        {inspectorOpen && (
+          <div style={{ width: 360, borderLeft: "1px solid var(--border)" }} className="min-h-0">
+            <Inspector artifacts={artifacts} activeKey={activeArtifactKey}
+              onSelect={setActiveArtifactKey} onClose={() => setInspectorOpen(false)} />
+          </div>
+        )}
       </div>
-      <TimelineView turns={turns} messageListRef={messageListRef} />
       {state.pendingApproval && <ApprovalPrompt approval={state.pendingApproval} onDecide={decide} />}
       <Composer disabled={!connected} onSend={send} />
     </div>
