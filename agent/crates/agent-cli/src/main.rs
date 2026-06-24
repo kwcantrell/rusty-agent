@@ -75,7 +75,9 @@ struct Cli {
     /// Disable model reasoning (chat_template_kwargs.enable_thinking=false)
     #[arg(long = "no-thinking", default_value_t = false)]
     no_thinking: bool,
-    /// Keep prior <think> reasoning in conversation history
+    /// Keep prior reasoning in conversation history (claude_cli backend only;
+    /// OpenAI-compat reasoning models reject prior chain-of-thought, so it is
+    /// dropped there)
     #[arg(long, default_value_t = false)]
     preserve_thinking: bool,
     // ── Sandbox flags ──────────────────────────────────────────────────────
