@@ -43,3 +43,26 @@ export function appendUserMsg(sessionId: string, text: string): void {
   arr.push(text);
   localStorage.setItem(MSGS(sessionId), JSON.stringify(arr));
 }
+
+export type WorkspaceView = {
+  mode: "preview" | "code";
+  viewport: "desktop" | "tablet" | "mobile";
+};
+const WORKSPACE_VIEW = "agent.workspaceView";
+const DEFAULT_VIEW: WorkspaceView = { mode: "preview", viewport: "desktop" };
+
+export function loadWorkspaceView(): WorkspaceView {
+  const raw = localStorage.getItem(WORKSPACE_VIEW);
+  if (!raw) return { ...DEFAULT_VIEW };
+  try {
+    const v = JSON.parse(raw) as Partial<WorkspaceView>;
+    const mode = v.mode === "code" ? "code" : "preview";
+    const viewport = v.viewport === "tablet" || v.viewport === "mobile" ? v.viewport : "desktop";
+    return { mode, viewport };
+  } catch {
+    return { ...DEFAULT_VIEW };
+  }
+}
+export function saveWorkspaceView(v: WorkspaceView): void {
+  try { localStorage.setItem(WORKSPACE_VIEW, JSON.stringify(v)); } catch { /* ignore */ }
+}
