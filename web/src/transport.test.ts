@@ -7,14 +7,14 @@ describe("resolveTransport", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     localStorage.clear();
-    delete (window as Record<string, unknown>).__TAURI_INTERNALS__;
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
   });
   afterEach(() => {
-    delete (window as Record<string, unknown>).__TAURI_INTERNALS__;
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
   });
 
   it("uses the local bridge URL and skips pairing in Tauri mode", async () => {
-    (window as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
     invokeMock.mockResolvedValue("ws://127.0.0.1:54321/agent");
     const { resolveTransport } = await import("./transport");
     const t = await resolveTransport();
