@@ -50,11 +50,25 @@ fn id_of(flag: &str) -> u32 {
 
 #[tokio::test]
 #[ignore]
-async fn cannot_read_etc_shadow() {
-    let (code, _) = run(false, std::env::temp_dir(), "cat /etc/shadow").await;
-    // debian:stable-slim runs as root-in-container, so /etc/shadow may be empty/absent
-    // rather than permission-denied. Assert blocked or empty (non-zero exit).
-    assert_ne!(code, 0);
+async fn host_filesystem_is_not_visible() {
+    // Create a secret file on the HOST that is NOT mounted into the container.
+    let secret_dir = tempfile::tempdir().unwrap();
+    let secret = secret_dir.path().join("host_secret.txt");
+    std::fs::write(&secret, "TOPSECRET").unwrap();
+
+    // The workspace is a SEPARATE tempdir; secret_dir is never mounted.
+    let ws = tempfile::tempdir().unwrap();
+    let sb = DockerSandbox::new(policy(false), "0:0".into(), Availability::Available);
+    let mut child = sb
+        .launch(cmd(&format!("cat {}", secret.display()), ws.path().into()))
+        .unwrap();
+    let mut out = child.take_stdout().unwrap();
+    let mut s = String::new();
+    out.read_to_string(&mut s).await.unwrap();
+    let code = child.wait().await.unwrap().code().unwrap_or(-1);
+
+    assert_ne!(code, 0, "host secret must be unreachable inside the sandbox");
+    assert!(!s.contains("TOPSECRET"), "host secret content must not leak");
 }
 
 #[tokio::test]
@@ -80,7 +94,10 @@ async fn network_is_off_by_default() {
 #[ignore]
 async fn workspace_is_writable() {
     let ws = tempfile::tempdir().unwrap();
-    let mut child = DockerSandbox::new(policy(false), "0:0".into(), Availability::Available)
+    let uid = id_of("-u");
+    let gid = id_of("-g");
+    let uid_gid = format!("{}:{}", uid, gid);
+    let mut child = DockerSandbox::new(policy(false), uid_gid, Availability::Available)
         .launch(cmd(
             "touch /workspace/made_in_container",
             ws.path().into(),

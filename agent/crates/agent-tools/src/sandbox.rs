@@ -80,7 +80,11 @@ impl Drop for SandboxedChild {
         // Backstop: Drop cannot await. Fire-and-forget a detached docker kill,
         // and start_kill the local child so nothing leaks on panic/early-return.
         if let Some(name) = self.container.take() {
-            let _ = std::process::Command::new("docker").args(["kill", &name]).spawn();
+            let _ = std::process::Command::new("docker")
+                .args(["kill", &name])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
         }
         let _ = self.child.start_kill();
     }
