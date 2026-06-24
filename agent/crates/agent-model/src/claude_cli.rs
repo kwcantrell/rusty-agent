@@ -134,6 +134,14 @@ pub(crate) fn render_transcript(messages: &[Message]) -> String {
         };
         out.push_str(&header);
         out.push('\n');
+        // claude_cli is a bare text generator with no separate reasoning channel,
+        // so preserved chain-of-thought rides inline as a <think> block ahead of
+        // the answer (mirrors how the CLI emits and re-consumes its own thinking).
+        if let Some(reasoning) = &m.reasoning {
+            out.push_str("<think>");
+            out.push_str(reasoning);
+            out.push_str("</think>\n");
+        }
         out.push_str(&m.content);
         out.push_str("\n\n");
     }
@@ -378,5 +386,20 @@ mod tests {
         let msgs = vec![Message::assistant("on it", None)];
         let p = render_transcript(&msgs);
         assert!(p.contains("## Assistant\non it"));
+    }
+
+    #[test]
+    fn preserved_reasoning_renders_as_think_block_before_content() {
+        let msgs = vec![Message::assistant("final answer", None).with_reasoning("secret plan")];
+        let p = render_transcript(&msgs);
+        assert!(p.contains("## Assistant\n<think>secret plan</think>\nfinal answer"), "got: {p}");
+    }
+
+    #[test]
+    fn no_reasoning_renders_content_only() {
+        let msgs = vec![Message::assistant("final answer", None)];
+        let p = render_transcript(&msgs);
+        assert!(!p.contains("<think>"));
+        assert!(p.contains("## Assistant\nfinal answer"));
     }
 }
