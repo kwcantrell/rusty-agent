@@ -2,10 +2,9 @@ use crate::config::McpServerSpec;
 use crate::error::McpError;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::process::Stdio;
 use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::process::ChildStdin;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -23,21 +22,25 @@ pub trait McpTransport: Send + Sync {
 pub struct StdioTransport {
     stdin: AsyncMutex<ChildStdin>,
     inbound: AsyncMutex<mpsc::UnboundedReceiver<Value>>,
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<agent_tools::SandboxedChild>>,
 }
 
 impl StdioTransport {
-    pub fn spawn(spec: &McpServerSpec) -> Result<Self, McpError> {
-        let mut cmd = tokio::process::Command::new(&spec.command);
-        cmd.args(&spec.args)
-            .envs(&spec.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| McpError::Io(e.to_string()))?;
-        let stdin = child.stdin.take().ok_or_else(|| McpError::Io("no stdin".into()))?;
-        let stdout = child.stdout.take().ok_or_else(|| McpError::Io("no stdout".into()))?;
-        if let Some(stderr) = child.stderr.take() {
+    pub fn spawn(
+        spec: &McpServerSpec,
+        sandbox: &std::sync::Arc<dyn agent_tools::SandboxStrategy>,
+    ) -> Result<Self, McpError> {
+        let cspec = agent_tools::CommandSpec {
+            program: spec.command.clone(),
+            args: spec.args.clone(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| ".".into()),
+            env: spec.env.clone().into_iter().collect(),
+            kind: agent_tools::ProcKind::Service,
+        };
+        let mut child = sandbox.launch(cspec).map_err(|e| McpError::Io(e.to_string()))?;
+        let stdin = child.take_stdin().ok_or_else(|| McpError::Io("no stdin".into()))?;
+        let stdout = child.take_stdout().ok_or_else(|| McpError::Io("no stdout".into()))?;
+        if let Some(stderr) = child.take_stderr() {
             // Drain server diagnostics to tracing so they never block the pipe.
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
@@ -86,17 +89,18 @@ impl McpTransport for StdioTransport {
     }
 
     async fn close(&self) {
-        if let Some(mut child) = self.child.lock().unwrap().take() {
-            let _ = child.start_kill();
+        // Take child out of the Mutex first so the guard drops before the await.
+        let child = self.child.lock().unwrap().take();
+        if let Some(mut c) = child {
+            c.kill().await;
         }
     }
 }
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.lock().unwrap().take() {
-            let _ = child.start_kill();
-        }
+        // SandboxedChild's own Drop handles teardown — just drop it.
+        let _ = self.child.lock().unwrap().take();
     }
 }
 
@@ -156,9 +160,14 @@ mod tests {
         }
     }
 
+    fn host_sandbox() -> std::sync::Arc<dyn agent_tools::SandboxStrategy> {
+        std::sync::Arc::new(agent_tools::HostExecutor)
+    }
+
     #[tokio::test]
     async fn stdio_roundtrips_newline_delimited_json_via_cat() {
-        let t = StdioTransport::spawn(&cat_spec()).expect("spawn cat");
+        let sandbox = host_sandbox();
+        let t = StdioTransport::spawn(&cat_spec(), &sandbox).expect("spawn cat");
         t.send(json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await.unwrap();
         let got = t.recv().await.expect("a message");
         assert_eq!(got["id"], 1);

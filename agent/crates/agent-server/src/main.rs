@@ -144,9 +144,10 @@ async fn main() {
             }
             // Connect MCP once at process start; the manager owns server processes for the
             // full lifetime of the binary (across all WebSocket reconnects below).
+            let mcp_sandbox = agent_runtime_config::build_sandbox(&base);
             let mcp_manager = match &mcp_config {
                 Some(path) => {
-                    let mgr = agent_runtime_config::connect_mcp(path).await;
+                    let mgr = agent_runtime_config::connect_mcp(path, mcp_sandbox).await;
                     println!("{}", mgr.summary_line());
                     Some(mgr)
                 }

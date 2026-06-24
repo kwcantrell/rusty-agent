@@ -155,7 +155,7 @@ async fn main() {
     // Connect MCP servers (if configured), register their tools, keep the manager alive.
     let mcp_manager = match &cli.mcp_config {
         Some(path) => {
-            let mgr = agent_runtime_config::connect_mcp(path).await;
+            let mgr = agent_runtime_config::connect_mcp(path, sandbox.clone()).await;
             println!("{}", mgr.summary_line());
             for t in mgr.tools() {
                 registry.register(t);
@@ -213,8 +213,6 @@ async fn main() {
     }
     // Keep MCP manager alive for the entire REPL session (dropping it would kill server processes).
     let _ = &mcp_manager;
-    // Keep sandbox Arc in scope for Task 11 (MCP sandbox wiring).
-    let _ = &sandbox;
 }
 
 #[cfg(test)]
