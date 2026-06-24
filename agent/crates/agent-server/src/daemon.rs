@@ -10,9 +10,11 @@ use futures::{SinkExt, StreamExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::WebSocketStream;
 
 type DynErr = Box<dyn std::error::Error + Send + Sync>;
 
@@ -34,6 +36,22 @@ and modify the workspace. Think step by step. When the task is complete, reply w
 and no tool call.";
 
 pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
+    // Cloud path: dial the Worker, then hand the socket to the transport-agnostic
+    // serve() below.
+    let mut req = params.ws_url.clone().into_client_request()?;
+    req.headers_mut().insert("Authorization",
+        format!("Bearer {}", params.agent_token).parse()?);
+    let (ws, _resp) = tokio_tungstenite::connect_async(req).await?;
+    serve(ws, params).await
+}
+
+/// Drive the runtime over an already-established WebSocket. Transport-agnostic:
+/// the cloud path (`run`) dials the Worker; the desktop bridge accepts a local
+/// connection. Everything from here down is the original `run()` body.
+pub async fn serve<S>(ws: WebSocketStream<S>, params: DaemonParams) -> Result<(), DynErr>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Shared session id (MVP: one active session per agent). The read loop sets it
     // on each user_input; the sink, approval channel, and settings replies stamp it.
     let session = Arc::new(Mutex::new(String::new()));
@@ -62,10 +80,6 @@ pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
     let ctx = Arc::new(tokio::sync::Mutex::new(
         WindowContext::new(Message::system(params.system_prompt.clone()))));
 
-    let mut req = params.ws_url.clone().into_client_request()?;
-    req.headers_mut().insert("Authorization",
-        format!("Bearer {}", params.agent_token).parse()?);
-    let (ws, _resp) = tokio_tungstenite::connect_async(req).await?;
     let (mut write, mut read) = ws.split();
 
     // Writer task: drain the channel to the socket; ping periodically to stay alive.
