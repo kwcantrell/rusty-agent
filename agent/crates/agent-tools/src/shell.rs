@@ -25,29 +25,42 @@ impl Tool for ExecuteCommand {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx)
         -> Result<ToolOutput, ToolError> {
+        use tokio::io::AsyncReadExt;
         let command = cmd_arg(&args)?;
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(&command).current_dir(&ctx.workspace)
-            .kill_on_drop(true)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        let spec = crate::CommandSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), command.clone()],
+            cwd: ctx.workspace.clone(),
+            env: Default::default(),
+            kind: crate::ProcKind::OneShot,
+        };
+        let mut child = ctx.sandbox.launch(spec).map_err(|e| match e {
+            crate::SandboxError::Unavailable(m) => ToolError::Denied(m),
+            other => ToolError::Failed { message: other.to_string(), stderr: None },
+        })?;
 
-        let run = async {
-            cmd.output().await
-                .map_err(|e| ToolError::Failed { message: e.to_string(), stderr: None })
+        let mut out_pipe = child.take_stdout();
+        let mut err_pipe = child.take_stderr();
+        let read_out = async {
+            let mut s = String::new();
+            if let Some(p) = out_pipe.as_mut() { let _ = p.read_to_string(&mut s).await; }
+            s
+        };
+        let read_err = async {
+            let mut s = String::new();
+            if let Some(p) = err_pipe.as_mut() { let _ = p.read_to_string(&mut s).await; }
+            s
         };
 
-        let output = tokio::select! {
-            _ = ctx.cancel.cancelled() => return Err(ToolError::Denied("cancelled".into())),
-            r = tokio::time::timeout(ctx.timeout, run) => match r {
-                Err(_elapsed) => return Err(ToolError::Timeout),
-                Ok(inner) => inner?,
+        let status = tokio::select! {
+            _ = ctx.cancel.cancelled() => { child.kill().await; return Err(ToolError::Denied("cancelled".into())); }
+            r = tokio::time::timeout(ctx.timeout, child.wait()) => match r {
+                Err(_elapsed) => { child.kill().await; return Err(ToolError::Timeout); }
+                Ok(inner) => inner.map_err(|e| ToolError::Failed { message: e.to_string(), stderr: None })?,
             }
         };
-
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let exit_code = output.status.code().unwrap_or(-1);
+        let (stdout, stderr) = tokio::join!(read_out, read_err);
+        let exit_code = status.code().unwrap_or(-1);
         let content = format!("exit={exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
         Ok(ToolOutput { content, display: Some(Display::Terminal {
             command, stdout, stderr, exit_code }) })
@@ -63,7 +76,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(timeout: Duration) -> ToolCtx {
-        ToolCtx { workspace: std::env::temp_dir(), timeout, cancel: CancellationToken::new() }
+        use std::sync::Arc;
+        ToolCtx { workspace: std::env::temp_dir(), timeout, cancel: CancellationToken::new(),
+            sandbox: Arc::new(crate::HostExecutor) }
     }
 
     #[tokio::test]

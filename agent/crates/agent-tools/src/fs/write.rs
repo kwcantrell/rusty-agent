@@ -95,7 +95,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(ws: std::path::PathBuf) -> ToolCtx {
-        ToolCtx { workspace: ws, timeout: Duration::from_secs(5), cancel: CancellationToken::new() }
+        use std::sync::Arc;
+        ToolCtx { workspace: ws, timeout: Duration::from_secs(5), cancel: CancellationToken::new(),
+            sandbox: Arc::new(crate::HostExecutor) }
     }
 
     #[tokio::test]
