@@ -9,3 +9,6 @@ agent-tools = { path = "../agent-tools" }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
