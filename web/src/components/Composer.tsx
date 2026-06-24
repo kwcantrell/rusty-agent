@@ -9,9 +9,10 @@ export function Composer({ disabled, onSend }: { disabled: boolean; onSend: (tex
     setText("");
   };
   return (
-    <div className="flex gap-2 border-t border-zinc-800 bg-zinc-950 p-3">
+    <div className="flex gap-2 p-3" style={{ background: "var(--surface-base)", borderTop: "1px solid var(--border)" }}>
       <textarea
-        className="flex-1 resize-none rounded bg-zinc-900 p-2 text-zinc-100 outline-none disabled:opacity-50"
+        className="flex-1 resize-none rounded-xl p-3 outline-none disabled:opacity-50"
+        style={{ background: "var(--surface-overlay)", color: "var(--text-strong)", border: "1px solid var(--border)" }}
         rows={2}
         value={text}
         disabled={disabled}
@@ -19,7 +20,9 @@ export function Composer({ disabled, onSend }: { disabled: boolean; onSend: (tex
         onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } }}
         placeholder={disabled ? "disconnected…" : "Message the agent…"}
       />
-      <button onClick={submit} disabled={disabled} className="rounded bg-zinc-700 px-4 text-zinc-100 hover:bg-zinc-600 disabled:opacity-50">Send</button>
+      <button onClick={submit} disabled={disabled}
+        className="self-end rounded-full px-5 py-2 disabled:opacity-50 hover:opacity-90"
+        style={{ background: "var(--accent)", color: "var(--accent-fg)" }}>Send</button>
     </div>
   );
 }

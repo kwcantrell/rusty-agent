@@ -1,6 +1,18 @@
+import type { Theme } from "./theme";
+
 const TOKEN = "agent.sessionToken";
 const SID = "agent.sessionId";
 const MSGS = (sid: string) => `agent.userMsgs.${sid}`;
+const THEME_KEY = "agent.theme";
+
+export function loadTheme(): Theme | null {
+  const v = localStorage.getItem(THEME_KEY);
+  return v === "light" || v === "dark" ? v : null;
+}
+
+export function saveTheme(t: Theme): void {
+  try { localStorage.setItem(THEME_KEY, t); } catch { /* ignore */ }
+}
 
 export function saveSession(sessionId: string, token: string): void {
   localStorage.setItem(SID, sessionId);
@@ -30,4 +42,27 @@ export function appendUserMsg(sessionId: string, text: string): void {
   const arr = loadUserMsgs(sessionId);
   arr.push(text);
   localStorage.setItem(MSGS(sessionId), JSON.stringify(arr));
+}
+
+export type WorkspaceView = {
+  mode: "preview" | "code";
+  viewport: "desktop" | "tablet" | "mobile";
+};
+const WORKSPACE_VIEW = "agent.workspaceView";
+const DEFAULT_VIEW: WorkspaceView = { mode: "preview", viewport: "desktop" };
+
+export function loadWorkspaceView(): WorkspaceView {
+  const raw = localStorage.getItem(WORKSPACE_VIEW);
+  if (!raw) return { ...DEFAULT_VIEW };
+  try {
+    const v = JSON.parse(raw) as Partial<WorkspaceView>;
+    const mode = v.mode === "code" ? "code" : "preview";
+    const viewport = v.viewport === "tablet" || v.viewport === "mobile" ? v.viewport : "desktop";
+    return { mode, viewport };
+  } catch {
+    return { ...DEFAULT_VIEW };
+  }
+}
+export function saveWorkspaceView(v: WorkspaceView): void {
+  try { localStorage.setItem(WORKSPACE_VIEW, JSON.stringify(v)); } catch { /* ignore */ }
 }

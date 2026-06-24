@@ -3,7 +3,13 @@ export const PROTOCOL_VERSION = 1;
 export type Display =
   | { Text: string }
   | { Diff: { path: string; before: string; after: string } }
-  | { Terminal: { command: string; stdout: string; stderr: string; exit_code: number } };
+  | { Terminal: { command: string; stdout: string; stderr: string; exit_code: number } }
+  | { Markdown: { text: string; title?: string; id?: string } }
+  | { Code: { lang: string; filename?: string; text: string; title?: string; id?: string } }
+  | { Html: { html: string; title?: string; id?: string } }
+  | { Mermaid: { source: string; title?: string; id?: string } }
+  | { Table: { columns: string[]; rows: string[][]; title?: string; id?: string } }
+  | { Image: { mime: string; data: string; title?: string; id?: string } };
 
 export interface RuntimeSettings {
   backend: string;

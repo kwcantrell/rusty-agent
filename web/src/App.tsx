@@ -1,15 +1,14 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { connect } from "./socket";
-import { initialState, reduce, useAnimatedItems, useTurnGrouping } from "./state";
+import { initialState, reduce, useAnimatedItems, artifactsFrom } from "./state";
 import type { Decision, RuntimeSettings } from "./wire";
 import { PairingScreen } from "./components/PairingScreen";
-import { StatusBar } from "./components/StatusBar";
-import { MessageList } from "./components/MessageList";
-import { ApprovalPrompt } from "./components/ApprovalPrompt";
-import { Composer } from "./components/Composer";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { TimelineView } from "./components/TimelineView";
-import { appendUserMsg, clearSession, loadSessionId, loadToken, loadUserMsgs, saveSession } from "./storage";
+import { TopBar } from "./components/TopBar";
+import { AgentColumn } from "./components/AgentColumn";
+import { WorkspacePane } from "./components/workspace/WorkspacePane";
+import { resolveInitialTheme, applyTheme, type Theme } from "./theme";
+import { appendUserMsg, clearSession, loadSessionId, loadTheme, loadToken, loadUserMsgs, saveSession, saveTheme } from "./storage";
 
 function wsUrl(token: string): string {
   return `${location.origin.replace(/^http/, "ws")}/browser?token=${encodeURIComponent(token)}`;
@@ -20,11 +19,21 @@ export default function App() {
   const [token, setToken] = useState<string | null>(loadToken());
   const [state, dispatch] = useReducer(reduce, loadUserMsgs(sessionId ?? ""), initialState);
   const [showSettings, setShowSettings] = useState(false);
+  const [theme, setTheme] = useState<Theme>(() =>
+    resolveInitialTheme(loadTheme(), window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false));
+  const [activeArtifactKey, setActiveArtifactKey] = useState<string | null>(null);
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const sock = useRef<ReturnType<typeof connect> | null>(null);
-  const messageListRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => { applyTheme(theme); }, [theme]);
+  const toggleTheme = () => setTheme((t) => { const next = t === "dark" ? "light" : "dark"; saveTheme(next); return next; });
 
   const animatedItems = useAnimatedItems(state.items);
-  const turns = useTurnGrouping(animatedItems);
+  const artifacts = artifactsFrom(state.items);
+
+  useEffect(() => {
+    if (artifacts.length > 0) { setActiveArtifactKey(artifacts[artifacts.length - 1].key); }
+  }, [artifacts.length]);
 
   useEffect(() => {
     if (!token || !sessionId) return;
@@ -40,7 +49,7 @@ export default function App() {
 
   if (!token || !sessionId) {
     return (
-      <div className="h-screen bg-zinc-950">
+      <div className="h-screen" style={{ background: "var(--surface-base)" }}>
         <PairingScreen onPaired={({ sessionId, token }) => { saveSession(sessionId, token); setSessionId(sessionId); setToken(token); }} />
       </div>
     );
@@ -66,25 +75,58 @@ export default function App() {
   };
 
   const connected = state.status === "open";
+  const projectLabel = `session ${sessionId.slice(0, 8)}`;
+  const model = state.settings?.model;
+  const narrow = useNarrow();
+
   return (
-    <div className="flex h-screen flex-col bg-zinc-950">
-      <StatusBar online={state.online} status={state.status} onSignOut={signOut} onOpenSettings={openSettings} settingsDisabled={!(connected && state.online)} />
+    <div className="flex h-screen flex-col" style={{ background: "var(--surface-base)" }}>
+      <TopBar projectLabel={projectLabel} online={state.online} status={state.status}
+        theme={theme} onToggleTheme={toggleTheme}
+        onOpenSettings={openSettings} settingsDisabled={!(connected && state.online)}
+        onSignOut={signOut}
+        showWorkspaceToggle={narrow} onToggleWorkspace={() => setWorkspaceOpen((o) => !o)} />
       {showSettings && state.settings && (
-        <SettingsPanel
-          settings={state.settings}
-          meta={state.settingsMeta}
-          error={state.settingsError}
-          disabled={!connected}
-          onSave={saveSettings}
-          onClose={() => setShowSettings(false)}
-        />
+        <SettingsPanel settings={state.settings} meta={state.settingsMeta} error={state.settingsError}
+          disabled={!connected} onSave={saveSettings} onClose={() => setShowSettings(false)} />
       )}
-      <div ref={messageListRef} className="flex flex-1 flex-col overflow-y-auto">
-        <MessageList items={animatedItems} />
+      <div className="relative flex min-h-0 flex-1">
+        <div className="min-w-0 flex-1" style={!narrow ? { flexBasis: "38%", maxWidth: "42%", borderRight: "1px solid var(--border)" } : undefined}>
+          <AgentColumn items={animatedItems} activeArtifactKey={activeArtifactKey}
+            onSelectArtifact={(key) => { setActiveArtifactKey(key); setWorkspaceOpen(true); }}
+            projectLabel={projectLabel} model={model}
+            pendingApproval={state.pendingApproval} onDecide={decide}
+            composerDisabled={!connected} onSend={send} />
+        </div>
+        {!narrow && (
+          <div className="min-w-0 flex-1">
+            <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />
+          </div>
+        )}
+        {narrow && workspaceOpen && (
+          <div className="absolute inset-0 z-20" style={{ background: "var(--surface-overlay)" }}>
+            <div className="flex items-center justify-end p-2" style={{ borderBottom: "1px solid var(--border)" }}>
+              <button onClick={() => setWorkspaceOpen(false)} aria-label="close workspace"
+                className="px-2 text-sm" style={{ color: "var(--text-muted)" }}>✕</button>
+            </div>
+            <div className="h-[calc(100%-2.5rem)]">
+              <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />
+            </div>
+          </div>
+        )}
       </div>
-      <TimelineView turns={turns} messageListRef={messageListRef} />
-      {state.pendingApproval && <ApprovalPrompt approval={state.pendingApproval} onDecide={decide} />}
-      <Composer disabled={!connected} onSend={send} />
     </div>
   );
+}
+
+function useNarrow(): boolean {
+  const [narrow, setNarrow] = useState(() => window.matchMedia?.("(max-width: 900px)").matches ?? false);
+  useEffect(() => {
+    const mq = window.matchMedia?.("(max-width: 900px)");
+    if (!mq) return;
+    const on = () => setNarrow(mq.matches);
+    mq.addEventListener("change", on);
+    return () => mq.removeEventListener("change", on);
+  }, []);
+  return narrow;
 }

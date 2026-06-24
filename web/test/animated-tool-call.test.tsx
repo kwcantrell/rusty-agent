@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { AnimatedToolCall } from "../src/components/AnimatedToolCall";
 import type { AnimatedItem } from "../src/state";
@@ -26,37 +26,41 @@ describe("AnimatedToolCall", () => {
     expect(screen.getByText("✓")).toBeInTheDocument();
   });
 
-  it("renders diff display", () => {
+  it("is a clickable chip that focuses its artifact, without rendering output inline", () => {
+    const onSelect = vi.fn();
     const item = {
       kind: "tool", name: "write_file", args: { path: "a.txt" }, status: "done",
       display: { Diff: { path: "a.txt", before: "foo\nbar\n", after: "foo\nbaz\n" } },
       ts: Date.now(), streaming: false, progress: 1,
     } as ToolItem;
-    render(<AnimatedToolCall item={item} />);
+    render(<AnimatedToolCall item={item} artifactKey="art-3" active={false} onSelect={onSelect} />);
     expect(screen.getByText(/write_file/)).toBeInTheDocument();
-    expect(screen.getByText("a.txt")).toBeInTheDocument();
-    expect(screen.getByText(/-\s*bar/)).toBeInTheDocument();
-    expect(screen.getByText(/\+\s*baz/)).toBeInTheDocument();
+    // diff content is shown in the Inspector, not inline:
+    expect(screen.queryByText(/-\s*bar/)).not.toBeInTheDocument();
+    screen.getByRole("button").click();
+    expect(onSelect).toHaveBeenCalledWith("art-3");
   });
 
-  it("renders terminal display", () => {
+  it("shows a 'viewing' affordance when its artifact is active", () => {
     const item = {
       kind: "tool", name: "execute_command", args: { command: "echo hi" }, status: "done",
       display: { Terminal: { command: "echo hi", stdout: "hi\n", stderr: "", exit_code: 0 } },
       ts: Date.now(), streaming: false, progress: 1,
     } as ToolItem;
-    render(<AnimatedToolCall item={item} />);
+    render(<AnimatedToolCall item={item} artifactKey="art-2" active={true} onSelect={() => {}} />);
     expect(screen.getByText(/execute_command/)).toBeInTheDocument();
-    expect(screen.getByText(/echo hi/)).toBeInTheDocument();
+    expect(screen.getByText(/viewing/)).toBeInTheDocument();
   });
 
-  it("renders raw content when no display", () => {
+  it("renders a non-clickable chip when there is no artifact", () => {
     const item = {
       kind: "tool", name: "read_file", args: { path: "a.txt" }, status: "done", content: "file contents",
       ts: Date.now(), streaming: false, progress: 1,
     } as ToolItem;
     render(<AnimatedToolCall item={item} />);
     expect(screen.getByText(/read_file/)).toBeInTheDocument();
-    expect(screen.getByText("file contents")).toBeInTheDocument();
+    // raw content is not dumped into the conversation:
+    expect(screen.queryByText("file contents")).not.toBeInTheDocument();
+    expect(screen.getByRole("button")).toBeDisabled();
   });
 });

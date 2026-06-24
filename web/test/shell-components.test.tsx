@@ -1,21 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { StatusBar } from "../src/components/StatusBar";
 import { ApprovalPrompt } from "../src/components/ApprovalPrompt";
 import { Composer } from "../src/components/Composer";
 
+// StatusBar coverage moved to TopBar.test.tsx (StatusBar removed in the two-pane redesign).
+// MessageList coverage moved to message-list.test.tsx (now takes AnimatedItem[]).
 describe("shell components", () => {
-  it("StatusBar shows presence and triggers sign-out", async () => {
-    const onSignOut = vi.fn();
-    render(<StatusBar online={true} status="open" onSignOut={onSignOut} />);
-    expect(screen.getByText(/online/i)).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: /sign out/i }));
-    expect(onSignOut).toHaveBeenCalled();
-  });
-
-  // MessageList coverage moved to message-list.test.tsx (now takes AnimatedItem[]).
-
   it("ApprovalPrompt emits the chosen decision", async () => {
     const onDecide = vi.fn();
     render(<ApprovalPrompt approval={{ id: "c0", summary: "run x", command: "x" }} onDecide={onDecide} />);

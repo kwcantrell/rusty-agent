@@ -224,3 +224,23 @@ export function useAnimatedItems(items: Item[]): AnimatedItem[] {
 export function useTurnGrouping(animatedItems: AnimatedItem[]): TurnGroup[] {
   return useMemo(() => turnGroupsFrom(animatedItems), [animatedItems]);
 }
+
+export interface InspectorArtifact { key: string; title: string; display: Display; }
+
+/** One Inspector artifact per tool Item that carries a display, in order. */
+export function artifactsFrom(items: Item[]): InspectorArtifact[] {
+  const out: InspectorArtifact[] = [];
+  items.forEach((it, i) => {
+    if (it.kind === "tool" && it.display) {
+      const title = displayTitle(it.display) ?? it.name;
+      out.push({ key: `art-${i}`, title, display: it.display });
+    }
+  });
+  return out;
+}
+
+function displayTitle(d: Display): string | undefined {
+  // every rich variant carries an optional title; older variants don't.
+  const v = Object.values(d)[0] as { title?: string };
+  return v && typeof v === "object" ? v.title : undefined;
+}
