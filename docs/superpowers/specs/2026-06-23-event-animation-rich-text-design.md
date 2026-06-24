@@ -37,10 +37,10 @@ No changes to the Rust backend or wire protocol. All changes are frontend-only.
 |---------|---------|------|
 | `framer-motion` | All animations (streaming, transitions, timeline) | ~30 KB |
 | `react-markdown` | Markdown rendering | ~10 KB |
-| `rehype-pretty-code` | Syntax-highlighted code blocks (shiki) | ~15 KB |
+| `rehype-highlight` | Syntax-highlighted code blocks (highlight.js, synchronous) | — |
 | `remark-gfm` | GitHub Flavored Markdown (tables, strikethrough, task lists) | ~2 KB |
 
-Total added bundle: ~57 KB (gzipped). Negligible for a dev tool.
+> **Highlighter note:** the original choice was `rehype-pretty-code` (shiki, theme `dark-plus`). It was dropped during implementation because shiki's rehype transform is **asynchronous**, while `react-markdown`'s default renderer is synchronous (`runSync`) — the combination throws `runSync finished async` on every render, in production as well as tests. `rehype-highlight` (highlight.js) is synchronous and works with `react-markdown` and with streaming re-renders; the theme is supplied by importing `highlight.js/styles/github-dark.css`. Actual production bundle is ~686 KB raw / ~213 KB gzipped (highlight.js bundles many language grammars, and framer-motion is sizeable) — heavier than first estimated, acceptable for a dev tool.
 
 ## Animation System
 
@@ -83,7 +83,7 @@ Total added bundle: ~57 KB (gzipped). Negligible for a dev tool.
 
 ### MarkdownText component
 
-- `react-markdown` with `remark-gfm` + `rehype-pretty-code` (shiki, theme: "dark-plus")
+- `react-markdown` with `remark-gfm` + `rehype-highlight` (highlight.js, `github-dark` theme CSS; synchronous so it works under react-markdown's `runSync` and during streaming re-renders)
 - Code blocks: dark theme with copy button on hover (top-right corner)
 - Inline code: monospace, `bg-zinc-800 rounded px-1`
 - Headings: h2/h3 size reduction for chat context
@@ -92,8 +92,9 @@ Total added bundle: ~57 KB (gzipped). Negligible for a dev tool.
 
 ### Streaming integration
 
-- **During streaming, render as plain text** (the `useStreamingText` output in a `<pre>`/whitespace-preserving block), not live markdown. Re-running react-markdown + rehype-pretty-code (shiki tokenization) on every character tick is the expensive path and would also flicker on unclosed fences. Plain-text-while-streaming avoids both.
-- On `done` (item gains `done` / stops streaming), swap to the full `MarkdownText` render with complete syntax highlighting. This is the single expensive parse, run once per message.
+- **As implemented:** the animated assistant/reasoning components render `MarkdownText` on the *progressively revealed* `useStreamingText` output, so markdown is re-parsed each animation tick. This is tolerable because `rehype-highlight` is synchronous (no async shiki tokenization); partial/unclosed fences render as plain text until the closing fence streams in.
+- On `done` (item gains `done` / stops streaming), `useStreamingText` returns the full text and `MarkdownText` renders the complete, highlighted result.
+- (A cheaper alternative — render plain text while streaming and only parse markdown once on `done` — was considered but not implemented; the per-tick sync re-parse is acceptable for a dev tool.)
 - Code block copy button: `navigator.clipboard.writeText()`, shows "Copied!" tooltip
 
 ## New Types (additive, in state.ts)
@@ -134,7 +135,7 @@ Responsibilities:
 ## Error Handling
 
 - `react-markdown` handles malformed markdown gracefully (renders raw text)
-- `rehype-pretty-code` falls back to plain text if syntax highlighting fails
+- `rehype-highlight` falls back to plain (unhighlighted) code if a language is unknown or highlighting fails
 - Streaming text: if websocket disconnects mid-stream, rAF loop stops and accumulated text renders
 - Timeline: missing timestamps fall back to sequential ordering without duration bars
 
