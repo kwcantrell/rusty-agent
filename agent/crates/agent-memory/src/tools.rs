@@ -216,12 +216,16 @@ impl Tool for Forget {
     }
     async fn execute(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         if let Some(id) = args.get("id").and_then(Value::as_str) {
-            let removed = self.store.delete(id).await.map_err(store_failed)?;
-            return if removed {
-                Ok(ToolOutput { content: format!("Removed memory {id}."), display: None })
-            } else {
-                Err(ToolError::NotFound(format!("no memory with id {id}")))
-            };
+            let visible = ScopeFilter::ProjectAndGlobal { project_key: self.project_key.clone() };
+            match self.store.get(id).await.map_err(store_failed)? {
+                Some(rec) if visible.matches(&rec.scope) => {
+                    self.store.delete(id).await.map_err(store_failed)?;
+                    return Ok(ToolOutput { content: format!("Removed memory {id}."), display: None });
+                }
+                // Not found, OR found but outside this scope — report identically so a caller
+                // cannot probe for the existence of another project's memory ids.
+                _ => return Err(ToolError::NotFound(format!("no memory with id {id}"))),
+            }
         }
         let query = args.get("query").and_then(Value::as_str)
             .map(str::trim).filter(|s| !s.is_empty())
@@ -369,6 +373,31 @@ mod forget_tests {
         let (f, _s, _id) = seeded().await;
         let err = f.execute(json!({"id": "nope"}), &ctx()).await.unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn forget_by_id_refuses_other_project_scope() {
+        // Forget tool is scoped to project "A".
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
+        let cfg = Arc::new(MemoryConfig::default());
+        let f = Forget { embedder: embedder.clone(), store: store.clone(), cfg, project_key: "A".into() };
+
+        // Insert a record belonging to project "B" directly into the store.
+        let v = StubEmbedder::d384().embed(&["foreign secret".to_string()]).await.unwrap().pop().unwrap();
+        store.upsert(MemoryRecord {
+            id: "bX".into(), text: "foreign secret".into(),
+            scope: MemoryScope::Project("B".into()),
+            tags: vec![], vector: v,
+            created_at: 1, updated_at: 1, source: "test".into(),
+        }).await.unwrap();
+
+        // Forget-by-id from project "A" must be refused.
+        let err = f.execute(json!({"id": "bX"}), &ctx()).await.unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)), "expected NotFound, got {err:?}");
+
+        // The record must still be present in the store.
+        assert!(store.get("bX").await.unwrap().is_some(), "foreign record was silently deleted");
     }
 }
 
