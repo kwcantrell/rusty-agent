@@ -1,14 +1,31 @@
 # Review Follow-ups Ledger (project-wide)
 
 Durable, committed home for review findings from each subagent-driven-development cycle.
-Populated at the end of every `/next-spec` subsystem cycle (the `.superpowers/sdd/` progress
-ledger is gitignored scratch — findings live HERE). Convention mirrors
-[`claude-cli-inference.md`](./claude-cli-inference.md) → "Follow-ups / known limitations":
-each item has a file:line ref, a status (**Open** / **Accepted (won't-fix)** / **Resolved**),
-and a one-line reason. The per-backend claude-cli list remains the source of truth for
-claude-cli detail; this file is the project-wide index.
+**ALL project review follow-ups are saved here** — this is the single source of truth.
+Populated at the end of every `/implement-subsystem` cycle (the `.superpowers/sdd/` progress
+ledger is gitignored scratch — findings live HERE). Convention: each item has a file:line ref,
+a status (**Open** / **Accepted (won't-fix)** / **Resolved**), and a one-line reason. This file
+is the project-wide index, including the claude-cli backend items below.
 
 ---
+
+## claude-cli backend (standing)
+
+Standing items for the `ClaudeCliClient` inference backend (the prior per-backend spike doc has
+been folded into this ledger, which is now their home). For backend design detail see the spec
+`2026-06-23-claude-cli-inference-backend-design.md` + its plan.
+
+- **Per-turn idle (inter-chunk) stream timeout** — `agent/crates/agent-core` (`one_completion`) —
+  **Resolved**. Wraps stream-open + each chunk in `tokio::time::timeout` → retryable
+  `ModelError::Timeout`. Config: `LoopConfig.stream_idle_timeout` (default 120s) /
+  `--stream-timeout-secs`. Covers SGLang + claude-cli. Spec
+  `2026-06-23-agent-loop-stream-timeout-design.md` (merged 2026-06-23).
+- **Rate-limit strategy for the 5-hour subscription cap** (P2) — **Open**. Detect a
+  `rate_limit_event` → typed `ModelError` + backoff before running sustained loops.
+- **Pin the subprocess CWD** (P2) — **Open**. `Command::current_dir` to an empty scratch dir so
+  project-local hooks in the launch dir can't load. Small, self-contained.
+- **Guard `BARE_SYSTEM_PROMPT` acceptance** (P3) — **Open**. Add an `#[ignore]`-gated real-CLI
+  test so a future guardrail change doesn't break it silently.
 
 ## 2026-06-23 skills-runtime-config-persistence
 
