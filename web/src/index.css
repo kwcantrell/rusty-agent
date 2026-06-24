@@ -8,13 +8,15 @@
   --text-strong: #16181a;
   --text: #3f4448;
   --text-muted: #8a9082;
-  --accent: #4f7a52;
-  --accent-fg: #ffffff;
+  --accent: #1c1e1d;
+  --accent-fg: #faf9f6;
   --accent-2: #c4622d;
   --state-run: #c4622d;
   --state-done: #4f7a52;
   --state-error: #b3402e;
   --ring: #4f7a52;
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-display: "Fraunces Variable", ui-serif, Georgia, "Times New Roman", serif;
 }
 
 :root[data-theme="dark"] {
@@ -25,13 +27,15 @@
   --text-strong: #f3f4ee;
   --text: #c4cabe;
   --text-muted: #6a6f63;
-  --accent: #6fae72;
+  --accent: #e8e6df;
   --accent-fg: #16181a;
   --accent-2: #d9824f;
   --state-run: #d9824f;
   --state-done: #6fae72;
   --state-error: #e0654f;
   --ring: #6fae72;
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-display: "Fraunces Variable", ui-serif, Georgia, "Times New Roman", serif;
 }
 
 /* default before JS applies a theme: match light */
@@ -42,9 +46,11 @@ body {
   margin: 0;
   background: var(--surface-base);
   color: var(--text);
-  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-family: var(--font-sans);
 }
 
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+.font-display { font-family: var(--font-display); }

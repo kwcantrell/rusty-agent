@@ -10,6 +10,8 @@
     "typecheck": "tsc -b --noEmit"
   },
   "dependencies": {
+    "@fontsource-variable/fraunces": "^5.2.9",
+    "@fontsource-variable/inter": "^5.2.8",
     "diff": "^7.0.0",
     "framer-motion": "^12.0.0",
     "highlight.js": "^11.0.0",
