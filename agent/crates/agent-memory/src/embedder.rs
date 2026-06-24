@@ -81,6 +81,43 @@ impl Embedder for StubEmbedder {
     }
 }
 
+#[cfg(feature = "onnx")]
+pub struct FastEmbedEmbedder {
+    model: std::sync::Mutex<fastembed::TextEmbedding>,
+    dim: usize,
+}
+
+#[cfg(feature = "onnx")]
+impl FastEmbedEmbedder {
+    /// Load BGE-Small-EN-v1.5 (384-dim). Downloads the ONNX model to the cache dir on
+    /// first use (network required once); cached thereafter. Returns Err offline-with-no-cache.
+    pub fn new(cfg: &crate::config::MemoryConfig) -> Result<Self, EmbedError> {
+        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+        let mut opts = InitOptions::new(EmbeddingModel::BGESmallENV15);
+        if let Some(dir) = &cfg.model_cache_dir {
+            opts = opts.with_cache_dir(dir.clone());
+        }
+        let model = TextEmbedding::try_new(opts).map_err(|e| EmbedError::Failed(e.to_string()))?;
+        Ok(Self { model: std::sync::Mutex::new(model), dim: 384 })
+    }
+}
+
+#[cfg(feature = "onnx")]
+#[async_trait]
+impl Embedder for FastEmbedEmbedder {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let owned: Vec<String> = texts.to_vec();
+        let res = {
+            let guard = self.model.lock().unwrap();
+            guard.embed(owned, None)
+        };
+        res.map_err(|e| EmbedError::Failed(e.to_string()))
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
