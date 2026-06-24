@@ -13,6 +13,12 @@ pub fn messages_to_json(messages: &[Message]) -> Vec<Value> {
                 Role::Tool => "tool",
             };
             let mut obj = json!({ "role": role, "content": m.content });
+            // Preserved chain-of-thought goes in `reasoning_content` — the field
+            // Qwen3.6's chat template reads first and re-includes when
+            // chat_template_kwargs.preserve_thinking is set (see body()).
+            if let Some(reasoning) = &m.reasoning {
+                obj["reasoning_content"] = json!(reasoning);
+            }
             if let Some(id) = &m.tool_call_id {
                 obj["tool_call_id"] = json!(id);
             }
@@ -47,14 +53,21 @@ mod tests {
     }
 
     #[test]
-    fn drops_preserved_reasoning_for_openai_backend() {
-        // OpenAI-compat reasoning backends don't accept prior chain-of-thought
-        // back (DeepSeek 400s on reasoning_content in input; Qwen templates strip
-        // historical <think>). So reasoning is preserved as data but NOT re-sent.
+    fn emits_reasoning_content_for_qwen_round_trip() {
+        // Qwen3.6's chat template reads `message.reasoning_content` first, then
+        // includes it when chat_template_kwargs.preserve_thinking is true. We send
+        // preserved reasoning there and keep `content` as just the answer.
         let m = Message::assistant("final answer", None).with_reasoning("secret plan");
         let v = &messages_to_json(&[m])[0];
         assert_eq!(v["content"], "final answer");
-        assert!(v.get("reasoning_content").is_none());
+        assert_eq!(v["reasoning_content"], "secret plan");
         assert!(!v["content"].as_str().unwrap().contains("<think>"));
+    }
+
+    #[test]
+    fn omits_reasoning_content_when_message_has_none() {
+        let m = Message::assistant("final answer", None);
+        let v = &messages_to_json(&[m])[0];
+        assert!(v.get("reasoning_content").is_none());
     }
 }

@@ -75,9 +75,10 @@ struct Cli {
     /// Disable model reasoning (chat_template_kwargs.enable_thinking=false)
     #[arg(long = "no-thinking", default_value_t = false)]
     no_thinking: bool,
-    /// Keep prior reasoning in conversation history (claude_cli backend only;
-    /// OpenAI-compat reasoning models reject prior chain-of-thought, so it is
-    /// dropped there)
+    /// Keep prior-turn reasoning in conversation history. OpenAI-compat backends
+    /// receive it as `reasoning_content` + chat_template_kwargs.preserve_thinking
+    /// (Qwen3.6); claude_cli renders it inline as <think>. Backends that reject
+    /// prior chain-of-thought (e.g. DeepSeek) should leave this off.
     #[arg(long, default_value_t = false)]
     preserve_thinking: bool,
     // ── Sandbox flags ──────────────────────────────────────────────────────
