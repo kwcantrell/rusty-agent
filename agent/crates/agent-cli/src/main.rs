@@ -145,6 +145,7 @@ async fn main() {
             top_p: cli.top_p, top_k: cli.top_k, min_p: cli.min_p,
             presence_penalty: cli.presence_penalty, repeat_penalty: cli.repeat_penalty,
             enable_thinking: !cli.no_thinking, preserve_thinking: cli.preserve_thinking,
+            sandbox: None,
         });
 
     let mut ctx = WindowContext::new(Message::system(system_prompt));

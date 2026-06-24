@@ -38,6 +38,7 @@ pub struct LoopConfig {
     pub repeat_penalty: Option<f32>,
     pub enable_thinking: bool,
     pub preserve_thinking: bool,
+    pub sandbox: Option<std::sync::Arc<dyn agent_tools::SandboxStrategy>>,
 }
 
 pub struct AgentLoop {
@@ -200,10 +201,11 @@ impl AgentLoop {
         // NOTE: this token is currently inert — it is not wired to any external
         // cancel source (e.g. Ctrl-C / SIGINT). Live cancellation is not yet
         // functional; this is a stub for future wiring.
+        let sandbox = self.config.sandbox.clone()
+            .unwrap_or_else(|| std::sync::Arc::new(agent_tools::HostExecutor));
         let ctx = ToolCtx { workspace: self.config.workspace.clone(),
             timeout: self.config.tool_timeout, cancel: CancellationToken::new(),
-            // stopgap; Task 3 replaces this with the config-driven strategy
-            sandbox: std::sync::Arc::new(agent_tools::HostExecutor) };
+            sandbox };
         tool.execute(call.args, &ctx).await
     }
 }
@@ -458,6 +460,54 @@ mod tests {
         let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
         assert!(!a.content.contains("secret plan"));
         assert_eq!(a.content, "final answer");
+    }
+
+    #[tokio::test]
+    async fn loop_routes_execute_command_through_injected_sandbox() {
+        use agent_tools::{CommandSpec, SandboxStrategy, SandboxedChild, SandboxError,
+            SandboxDescriptor, Mode, HostExecutor};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        struct CountingSandbox { inner: HostExecutor, hits: Arc<AtomicUsize> }
+        impl SandboxStrategy for CountingSandbox {
+            fn launch(&self, spec: CommandSpec) -> Result<SandboxedChild, SandboxError> {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                self.inner.launch(spec)
+            }
+            fn describe(&self) -> SandboxDescriptor {
+                SandboxDescriptor { mode: Mode::Off, mechanism: "counting", image: None,
+                    network: true, degraded: None }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let sandbox = Arc::new(CountingSandbox { inner: HostExecutor, hits: hits.clone() });
+
+        // Register execute_command tool
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "execute_command".into(), r#"{"command":"echo hello"}"#.into()),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), tools, policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2,
+                temperature: 0.0, max_tokens: None, workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                sandbox: Some(sandbox), ..Default::default() });
+
+        let mut ctx = WindowContext::new(Message::system("you are a test agent"));
+        agent.run(&mut ctx, "run echo hello".into()).await.unwrap();
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]

@@ -227,6 +227,7 @@ fn build_loop(
             repeat_penalty: cfg.repeat_penalty,
             enable_thinking: cfg.enable_thinking,
             preserve_thinking: cfg.preserve_thinking,
+            sandbox: None,
         },
     ));
     BuiltLoop { loop_, system_prompt, unknown_presets }
