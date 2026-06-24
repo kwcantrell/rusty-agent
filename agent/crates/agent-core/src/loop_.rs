@@ -156,13 +156,15 @@ impl AgentLoop {
                 }
             };
 
-            let stored = if self.config.preserve_thinking && !assistant.reasoning.is_empty() {
-                format!("<think>{}</think>\n{}", assistant.reasoning, parsed.text)
-            } else {
-                parsed.text.clone()
-            };
-            ctx.append(Message::assistant(stored,
-                if parsed.tool_calls.is_empty() { None } else { Some(parsed.tool_calls.clone()) }));
+            let mut msg = Message::assistant(parsed.text.clone(),
+                if parsed.tool_calls.is_empty() { None } else { Some(parsed.tool_calls.clone()) });
+            // Preserve reasoning as data, not inline text — the model backend
+            // decides how to render it back (claude_cli inlines <think>; openai
+            // drops it, since OpenAI-compat reasoning models reject prior CoT).
+            if self.config.preserve_thinking && !assistant.reasoning.is_empty() {
+                msg = msg.with_reasoning(assistant.reasoning.clone());
+            }
+            ctx.append(msg);
 
             if parsed.tool_calls.is_empty() {
                 self.sink.emit(AgentEvent::Done(assistant.stop));
@@ -487,18 +489,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preserve_thinking_keeps_reasoning_in_history() {
+    async fn preserve_thinking_keeps_reasoning_as_message_data() {
         let msgs = run_reasoning(true).await;
         let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
-        assert!(a.content.contains("<think>secret plan</think>"));
-        assert!(a.content.contains("final answer"));
+        // Reasoning is preserved as separate data, NOT baked into content — each
+        // backend renders it per its own contract (see agent-model adapters).
+        assert_eq!(a.reasoning.as_deref(), Some("secret plan"));
+        assert_eq!(a.content, "final answer");
+        assert!(!a.content.contains("<think>"));
     }
 
     #[tokio::test]
     async fn default_strips_reasoning_from_history() {
         let msgs = run_reasoning(false).await;
         let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
-        assert!(!a.content.contains("secret plan"));
+        assert_eq!(a.reasoning, None);
         assert_eq!(a.content, "final answer");
     }
 
