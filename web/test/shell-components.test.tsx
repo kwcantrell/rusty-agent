@@ -8,10 +8,18 @@ import { Composer } from "../src/components/Composer";
 describe("shell components", () => {
   it("StatusBar shows presence and triggers sign-out", async () => {
     const onSignOut = vi.fn();
-    render(<StatusBar online={true} status="open" onSignOut={onSignOut} />);
+    render(<StatusBar online={true} status="open" onSignOut={onSignOut} theme="dark" onToggleTheme={() => {}} />);
     expect(screen.getByText(/online/i)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /sign out/i }));
     expect(onSignOut).toHaveBeenCalled();
+  });
+
+  it("StatusBar renders a theme toggle and fires onToggleTheme", async () => {
+    const onToggleTheme = vi.fn();
+    render(<StatusBar online status="open" onSignOut={() => {}}
+      theme="dark" onToggleTheme={onToggleTheme} />);
+    await userEvent.click(screen.getByLabelText("toggle theme"));
+    expect(onToggleTheme).toHaveBeenCalledOnce();
   });
 
   // MessageList coverage moved to message-list.test.tsx (now takes AnimatedItem[]).

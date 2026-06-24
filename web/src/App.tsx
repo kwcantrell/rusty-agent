@@ -9,7 +9,8 @@ import { ApprovalPrompt } from "./components/ApprovalPrompt";
 import { Composer } from "./components/Composer";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { TimelineView } from "./components/TimelineView";
-import { appendUserMsg, clearSession, loadSessionId, loadToken, loadUserMsgs, saveSession } from "./storage";
+import { resolveInitialTheme, applyTheme, type Theme } from "./theme";
+import { appendUserMsg, clearSession, loadSessionId, loadTheme, loadToken, loadUserMsgs, saveSession, saveTheme } from "./storage";
 
 function wsUrl(token: string): string {
   return `${location.origin.replace(/^http/, "ws")}/browser?token=${encodeURIComponent(token)}`;
@@ -20,8 +21,13 @@ export default function App() {
   const [token, setToken] = useState<string | null>(loadToken());
   const [state, dispatch] = useReducer(reduce, loadUserMsgs(sessionId ?? ""), initialState);
   const [showSettings, setShowSettings] = useState(false);
+  const [theme, setTheme] = useState<Theme>(() =>
+    resolveInitialTheme(loadTheme(), window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false));
   const sock = useRef<ReturnType<typeof connect> | null>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => { applyTheme(theme); }, [theme]);
+  const toggleTheme = () => setTheme((t) => { const next = t === "dark" ? "light" : "dark"; saveTheme(next); return next; });
 
   const animatedItems = useAnimatedItems(state.items);
   const turns = useTurnGrouping(animatedItems);
@@ -40,7 +46,7 @@ export default function App() {
 
   if (!token || !sessionId) {
     return (
-      <div className="h-screen bg-zinc-950">
+      <div className="h-screen" style={{ background: "var(--surface-base)" }}>
         <PairingScreen onPaired={({ sessionId, token }) => { saveSession(sessionId, token); setSessionId(sessionId); setToken(token); }} />
       </div>
     );
@@ -67,8 +73,8 @@ export default function App() {
 
   const connected = state.status === "open";
   return (
-    <div className="flex h-screen flex-col bg-zinc-950">
-      <StatusBar online={state.online} status={state.status} onSignOut={signOut} onOpenSettings={openSettings} settingsDisabled={!(connected && state.online)} />
+    <div className="flex h-screen flex-col" style={{ background: "var(--surface-base)" }}>
+      <StatusBar online={state.online} status={state.status} onSignOut={signOut} onOpenSettings={openSettings} settingsDisabled={!(connected && state.online)} theme={theme} onToggleTheme={toggleTheme} />
       {showSettings && state.settings && (
         <SettingsPanel
           settings={state.settings}
