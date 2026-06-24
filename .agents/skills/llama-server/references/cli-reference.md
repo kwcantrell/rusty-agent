@@ -40,7 +40,7 @@ a curated subset of the most-used flags.
 | `-ngl, --gpu-layers N` | Layers to offload to GPU. `99`/`all` = everything; `auto` lets it choose; `0` = CPU-only. Recent builds accept `auto`/`all`. |
 | `-dev, --device <d1,d2,…>` | Restrict to specific devices. |
 | `--list-devices` | Print detected devices and exit. |
-| `-sm, --split-mode {none,layer,row}` | How to split a model across GPUs. |
+| `-sm, --split-mode {none,layer,row,tensor}` | How to split a model across GPUs. |
 | `-ts, --tensor-split F0,F1,…` | Fraction of the model per GPU (e.g. `0.5,0.5`). |
 | `-mg, --main-gpu INDEX` | Primary GPU (default `0`). |
 | `-fit, --fit [on\|off]` | Auto-adjust unset args to fit device memory (default on). |
