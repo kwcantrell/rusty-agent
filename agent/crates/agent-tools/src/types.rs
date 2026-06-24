@@ -37,6 +37,40 @@ pub enum Display {
     Text(String),
     Diff { path: String, before: String, after: String },
     Terminal { command: String, stdout: String, stderr: String, exit_code: i32 },
+    Markdown {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+    },
+    Code {
+        lang: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")] filename: Option<String>,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+    },
+    Html {
+        html: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+    },
+    Mermaid {
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+    },
+    Table {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+    },
+    Image {
+        mime: String,
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -96,5 +130,47 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn display_markdown_round_trips_externally_tagged() {
+        let d = Display::Markdown { text: "# Hi".into(), title: Some("Notes".into()), id: None };
+        let j = serde_json::to_string(&d).unwrap();
+        assert!(j.starts_with("{\"Markdown\":"), "got {j}");
+        assert!(j.contains("\"text\":\"# Hi\""));
+        let back: Display = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back, Display::Markdown { .. }));
+    }
+
+    #[test]
+    fn display_code_carries_lang_and_optional_filename() {
+        let d = Display::Code { lang: "rust".into(), filename: Some("a.rs".into()),
+            text: "fn x(){}".into(), title: None, id: Some("art-1".into()) };
+        let j = serde_json::to_string(&d).unwrap();
+        let back: Display = serde_json::from_str(&j).unwrap();
+        match back {
+            Display::Code { lang, filename, id, .. } => {
+                assert_eq!(lang, "rust");
+                assert_eq!(filename.as_deref(), Some("a.rs"));
+                assert_eq!(id.as_deref(), Some("art-1"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn display_table_round_trips() {
+        let d = Display::Table { columns: vec!["a".into(), "b".into()],
+            rows: vec![vec!["1".into(), "2".into()]], title: None, id: None };
+        let j = serde_json::to_string(&d).unwrap();
+        let back: Display = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back, Display::Table { .. }));
+    }
+
+    #[test]
+    fn existing_diff_variant_json_is_unchanged() {
+        let d = Display::Diff { path: "a".into(), before: "x".into(), after: "y".into() };
+        let j = serde_json::to_string(&d).unwrap();
+        assert_eq!(j, r#"{"Diff":{"path":"a","before":"x","after":"y"}}"#);
     }
 }
