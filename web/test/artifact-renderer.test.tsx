@@ -22,4 +22,15 @@ describe("ArtifactRenderer", () => {
     render(<ArtifactRenderer display={{ Diff: { path: "a.txt", before: "foo\n", after: "bar\n" } }} />);
     expect(screen.getByText("a.txt")).toBeInTheDocument();
   });
+  it("renders an Html artifact inside a sandboxed iframe", () => {
+    const { container } = render(<ArtifactRenderer display={{ Html: { html: "<p>hello</p>" } }} />);
+    const iframe = container.querySelector("iframe");
+    expect(iframe).not.toBeNull();
+    expect(iframe?.getAttribute("sandbox")).toBe("");
+    expect(iframe?.getAttribute("srcdoc")).toContain("<p>hello</p>");
+  });
+  it("renders a Mermaid artifact container", () => {
+    const { container } = render(<ArtifactRenderer display={{ Mermaid: { source: "graph TD; A-->B;" } }} />);
+    expect(container.querySelector("[data-mermaid]")).not.toBeNull();
+  });
 });

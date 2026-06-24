@@ -2,6 +2,8 @@ import type { Display } from "../../wire";
 import { DiffView } from "../DiffView";
 import { TerminalBlock } from "../TerminalBlock";
 import { MarkdownText } from "../MarkdownText";
+import { HtmlArtifact } from "./HtmlArtifact";
+import { MermaidArtifact } from "./MermaidArtifact";
 
 export function ArtifactRenderer({ display }: { display: Display }) {
   if ("Text" in display) {
@@ -56,6 +58,11 @@ export function ArtifactRenderer({ display }: { display: Display }) {
     const src = data.startsWith("http") || data.startsWith("data:") ? data : `data:${mime};base64,${data}`;
     return <div className="p-3"><img src={src} alt="rendered artifact" className="max-w-full rounded" /></div>;
   }
-  // Html and Mermaid are added in Task 9.
+  if ("Html" in display) {
+    return <HtmlArtifact html={display.Html.html} />;
+  }
+  if ("Mermaid" in display) {
+    return <MermaidArtifact source={display.Mermaid.source} />;
+  }
   return null;
 }
