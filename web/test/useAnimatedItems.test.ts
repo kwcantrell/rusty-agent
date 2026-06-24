@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { animatedItemsFrom, turnGroupsFrom, type AnimatedItem, type TurnGroup } from "../src/state";
+import { animatedItemsFrom, turnGroupsFrom, type AnimatedItem } from "../src/state";
 import type { Item } from "../src/state";
 
 function makeItem(kind: string, props: Record<string, unknown>): Item {

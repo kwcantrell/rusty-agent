@@ -133,11 +133,11 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
 }
 
 /** Animation metadata derived from Item — never persisted. */
-export interface AnimatedItem extends Item {
+export type AnimatedItem = Item & {
   ts: number;
   streaming: boolean;
   progress: number;
-}
+};
 
 export interface TurnGroup {
   items: AnimatedItem[];
