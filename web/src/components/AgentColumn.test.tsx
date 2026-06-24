@@ -6,6 +6,8 @@ const base = {
   items: [], activeArtifactKey: null, onSelectArtifact: () => {},
   projectLabel: "studio-x", model: "qwen3", pendingApproval: null,
   onDecide: () => {}, composerDisabled: false, onSend: vi.fn(),
+  usage: null as null | { promptTokens: number; contextLimit: number; turn: number; maxTurns: number },
+  settings: null, toolCount: 0, artifactCount: 0,
 };
 
 describe("AgentColumn", () => {
@@ -26,5 +28,11 @@ describe("AgentColumn", () => {
     fireEvent.change(ta, { target: { value: "hello" } });
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("hello");
+  });
+  it("renders the context dashboard gauge above the composer", () => {
+    render(<AgentColumn {...base} usage={{ promptTokens: 4000, contextLimit: 8000, turn: 1, maxTurns: 20 }} />);
+    expect(screen.getByLabelText("context usage")).toBeInTheDocument();
+    expect(screen.getByText(/4k\s*\/\s*8k/)).toBeInTheDocument();
+    expect(screen.getByText(/50%/)).toBeInTheDocument();
   });
 });

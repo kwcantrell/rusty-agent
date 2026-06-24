@@ -30,6 +30,7 @@ export default function App() {
 
   const animatedItems = useAnimatedItems(state.items);
   const artifacts = artifactsFrom(state.items);
+  const toolCount = state.items.filter((it) => it.kind === "tool").length;
 
   useEffect(() => {
     if (artifacts.length > 0) { setActiveArtifactKey(artifacts[artifacts.length - 1].key); }
@@ -96,7 +97,9 @@ export default function App() {
             onSelectArtifact={(key) => { setActiveArtifactKey(key); setWorkspaceOpen(true); }}
             projectLabel={projectLabel} model={model}
             pendingApproval={state.pendingApproval} onDecide={decide}
-            composerDisabled={!connected} onSend={send} />
+            composerDisabled={!connected} onSend={send}
+            usage={state.usage} settings={state.settings}
+            toolCount={toolCount} artifactCount={artifacts.length} />
         </div>
         {!narrow && (
           <div className="min-w-0 flex-1">
