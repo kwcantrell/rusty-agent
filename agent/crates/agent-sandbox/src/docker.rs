@@ -19,7 +19,7 @@ pub fn docker_run_args(policy: &SandboxPolicy, spec: &CommandSpec,
     let mut a: Vec<String> = vec!["run".into()];
     match spec.kind {
         ProcKind::OneShot => a.push("--rm".into()),
-        ProcKind::Service => { a.push("-i".into()); } // keep stdin open; no --rm (we kill by name)
+        ProcKind::Service => { a.push("-i".into()); a.push("--rm".into()); } // keep stdin open; --rm auto-removes on exit/kill
     }
     a.push("--name".into()); a.push(container_name.into());
     a.push("--network".into());
@@ -39,6 +39,8 @@ pub fn docker_run_args(policy: &SandboxPolicy, spec: &CommandSpec,
     a.push("-v".into());
     a.push(format!("{}:{}", spec.cwd.display(), WORKDIR));
     a.push("-w".into());            a.push(WORKDIR.into());
+    // extra_rw mounts widen the writable boundary BEYOND /workspace to a host-visible path
+    // (validated against /, $HOME root, and the docker socket, but still host-writable).
     for p in &policy.extra_rw {
         a.push("-v".into()); a.push(format!("{}:{}:rw", p.display(), p.display()));
     }
@@ -104,11 +106,14 @@ mod tests {
     }
 
     #[test]
-    fn service_keeps_stdin_open_and_no_rm() {
+    fn service_keeps_stdin_open_and_rm() {
         let mut spec = oneshot(); spec.kind = ProcKind::Service;
         let v = docker_run_args(&policy(false), &spec, "n", "1000:1000");
-        assert!(v.contains(&"-i".to_string()));
-        assert!(!v.contains(&"--rm".to_string()));
+        assert!(v.contains(&"-i".to_string()), "Service must have -i");
+        assert!(v.contains(&"--rm".to_string()), "Service must have --rm to prevent container leaks");
+        // OneShot must NOT get -i
+        let v2 = docker_run_args(&policy(false), &oneshot(), "n", "1000:1000");
+        assert!(!v2.contains(&"-i".to_string()), "OneShot must not have -i");
     }
 
     #[test]

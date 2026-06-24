@@ -69,6 +69,8 @@ impl SandboxedChild {
             let _ = tokio::process::Command::new("docker")
                 .args(["kill", name]).output().await;
         }
+        // Intentional dual-kill: docker kill stops the container; start_kill reaps
+        // the local foreground `docker run` client process.
         let _ = self.child.start_kill();
     }
 }
