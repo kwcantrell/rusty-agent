@@ -1,1 +1,50 @@
 @import "tailwindcss";
+
+:root[data-theme="light"] {
+  --surface-base: #fcfcfa;
+  --surface-raised: #f5f6f1;
+  --surface-overlay: #ffffff;
+  --border: #e4e6e0;
+  --text-strong: #16181a;
+  --text: #3f4448;
+  --text-muted: #8a9082;
+  --accent: #4f7a52;
+  --accent-fg: #ffffff;
+  --accent-2: #c4622d;
+  --state-run: #c4622d;
+  --state-done: #4f7a52;
+  --state-error: #b3402e;
+  --ring: #4f7a52;
+}
+
+:root[data-theme="dark"] {
+  --surface-base: #16181a;
+  --surface-raised: #1d201e;
+  --surface-overlay: #22271f;
+  --border: #2a2e2b;
+  --text-strong: #f3f4ee;
+  --text: #c4cabe;
+  --text-muted: #6a6f63;
+  --accent: #6fae72;
+  --accent-fg: #16181a;
+  --accent-2: #d9824f;
+  --state-run: #d9824f;
+  --state-done: #6fae72;
+  --state-error: #e0654f;
+  --ring: #6fae72;
+}
+
+/* default before JS applies a theme: match light */
+:root { color-scheme: light dark; }
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--surface-base);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

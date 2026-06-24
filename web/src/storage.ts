@@ -1,6 +1,18 @@
+import type { Theme } from "./theme";
+
 const TOKEN = "agent.sessionToken";
 const SID = "agent.sessionId";
 const MSGS = (sid: string) => `agent.userMsgs.${sid}`;
+const THEME_KEY = "agent.theme";
+
+export function loadTheme(): Theme | null {
+  const v = localStorage.getItem(THEME_KEY);
+  return v === "light" || v === "dark" ? v : null;
+}
+
+export function saveTheme(t: Theme): void {
+  try { localStorage.setItem(THEME_KEY, t); } catch { /* ignore */ }
+}
 
 export function saveSession(sessionId: string, token: string): void {
   localStorage.setItem(SID, sessionId);
