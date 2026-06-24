@@ -24,6 +24,23 @@ describe("reducer", () => {
     expect(s.items).toEqual([{ kind: "tool", name: "execute_command", args: {}, status: "done", content: "exit=0", display: undefined }]);
   });
 
+  it("stores the latest usage event and clears it on reset", () => {
+    let s = run([
+      frame({ v: 1, session_id: "s", kind: "event", payload: { type: "usage", prompt_tokens: 1200, context_limit: 8000, turn: 1, max_turns: 20 } }),
+      frame({ v: 1, session_id: "s", kind: "event", payload: { type: "usage", prompt_tokens: 1500, context_limit: 8000, turn: 2, max_turns: 20 } }),
+    ]);
+    expect(s.usage).toEqual({ promptTokens: 1500, contextLimit: 8000, turn: 2, maxTurns: 20 });
+    s = reduce(s, { type: "reset", userMsgs: [] });
+    expect(s.usage).toBeNull();
+  });
+
+  it("does not add usage events to the transcript", () => {
+    const s = run([
+      frame({ v: 1, session_id: "s", kind: "event", payload: { type: "usage", prompt_tokens: 100, context_limit: 8000, turn: 1, max_turns: 20 } }),
+    ]);
+    expect(s.items).toEqual([]);
+  });
+
   it("sets and clears the pending approval", () => {
     let s = run([frame({ v: 1, session_id: "s", id: "c0", kind: "approval_request", summary: "run x", command: "x" })]);
     expect(s.pendingApproval).toMatchObject({ id: "c0", summary: "run x" });

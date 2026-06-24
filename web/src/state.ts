@@ -20,6 +20,7 @@ export interface PendingApproval {
 export interface ConversationState {
   items: Item[];
   pendingApproval: PendingApproval | null;
+  usage: { promptTokens: number; contextLimit: number; turn: number; maxTurns: number } | null;
   online: boolean;
   status: ConnectionStatus;
   // replay scaffolding (not rendered):
@@ -39,7 +40,7 @@ export type Action =
   | { type: "status"; status: ConnectionStatus };
 
 export function initialState(userMsgs: string[]): ConversationState {
-  return { items: [], pendingApproval: null, online: false, status: "connecting", userMsgs, turnIndex: 0, inTurn: false,
+  return { items: [], pendingApproval: null, usage: null, online: false, status: "connecting", userMsgs, turnIndex: 0, inTurn: false,
     settings: null, settingsMeta: null, settingsError: null };
 }
 
@@ -86,6 +87,8 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
   const s = startTurn(state);
   const p = frame.payload;
   switch (p.type) {
+    case "usage":
+      return { ...s, usage: { promptTokens: p.prompt_tokens, contextLimit: p.context_limit, turn: p.turn, maxTurns: p.max_turns } };
     case "token": {
       const items = [...s.items];
       const last = items[items.length - 1];

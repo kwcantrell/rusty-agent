@@ -6,6 +6,10 @@ describe("parseInbound", () => {
     const f = parseInbound(JSON.stringify({ v: 1, session_id: "s", kind: "event", payload: { type: "token", text: "hi" } }));
     expect(f).toEqual({ v: 1, session_id: "s", kind: "event", payload: { type: "token", text: "hi" } });
   });
+  it("parses a usage event", () => {
+    const f = parseInbound(JSON.stringify({ v: 1, session_id: "s", kind: "event", payload: { type: "usage", prompt_tokens: 1200, context_limit: 8000, turn: 1, max_turns: 20 } }));
+    expect(f).toEqual({ v: 1, session_id: "s", kind: "event", payload: { type: "usage", prompt_tokens: 1200, context_limit: 8000, turn: 1, max_turns: 20 } });
+  });
   it("parses a tool_result with a Terminal display", () => {
     const f = parseInbound(JSON.stringify({
       v: 1, session_id: "s", kind: "event",
