@@ -98,7 +98,8 @@ export default function App() {
           onOpenSettings={openSettings} collapsed={railCollapsed}
           onToggleCollapse={() => setRailCollapsed((c) => !c)} />
         <div ref={messageListRef} className="flex min-w-0 flex-1 flex-col overflow-y-auto">
-          <MessageList items={animatedItems} />
+          <MessageList items={animatedItems} activeArtifactKey={activeArtifactKey}
+            onSelectArtifact={(key) => { setActiveArtifactKey(key); setInspectorOpen(true); }} />
         </div>
         {inspectorOpen && (
           <div style={{ width: 360, borderLeft: "1px solid var(--border)" }} className="min-h-0">

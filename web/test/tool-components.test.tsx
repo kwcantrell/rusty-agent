@@ -17,10 +17,10 @@ describe("tool components", () => {
     expect(screen.getByText(/hi/, { selector: "pre" })).toBeInTheDocument(); // stdout in <pre>
     expect(screen.getByText(/exit 0/)).toBeInTheDocument();
   });
-  it("ToolCall renders a Terminal display for execute_command", () => {
+  it("ToolCall renders a compact chip with the tool name and status", () => {
     render(<ToolCall item={{ kind: "tool", name: "execute_command", args: {}, status: "done", content: "exit=0",
       display: { Terminal: { command: "ls", stdout: "file\n", stderr: "", exit_code: 0 } } }} />);
     expect(screen.getByText(/execute_command/)).toBeInTheDocument();
-    expect(screen.getByText(/ls/)).toBeInTheDocument();
+    expect(screen.getByText("✓")).toBeInTheDocument();
   });
 });

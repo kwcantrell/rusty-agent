@@ -16,10 +16,11 @@ export function AnimatedAssistantMessage({ item }: Props) {
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, height: 0 }}
-      className="whitespace-pre-wrap py-2 text-zinc-100"
+      className="whitespace-pre-wrap py-2"
+      style={{ color: "var(--text)" }}
     >
       <MarkdownText text={visibleText} />
-      {streaming && <span className="inline-block h-4 w-[1ch] animate-pulse text-cyan-400">|</span>}
+      {streaming && <span className="inline-block h-4 w-[1ch] animate-pulse" style={{ color: "var(--accent)" }}>|</span>}
     </motion.div>
   );
 }

@@ -14,11 +14,11 @@ describe("AnimatedError", () => {
     expect(screen.getByText(/something went wrong/)).toBeInTheDocument();
   });
 
-  it("has red border styling", () => {
+  it("uses the error state token for its border and text", () => {
     const item = { kind: "error", message: "fail", ts: Date.now(), streaming: false, progress: 1 } as ErrorItem;
     const { container } = render(<AnimatedError item={item} />);
     const el = container.firstChild as HTMLElement;
-    expect(el.className).toContain("border-red-700");
-    expect(el.className).toContain("bg-red-950");
+    expect(el.style.color).toContain("--state-error");
+    expect(el.style.border).toContain("--state-error");
   });
 });

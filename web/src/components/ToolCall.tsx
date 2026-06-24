@@ -1,21 +1,15 @@
 import type { Item } from "../state";
-import { DiffView } from "./DiffView";
-import { TerminalBlock } from "./TerminalBlock";
 
 type ToolItem = Extract<Item, { kind: "tool" }>;
 
 export function ToolCall({ item }: { item: ToolItem }) {
-  const statusIcon = item.status === "running" ? "…" : "✓";
-  const d = item.display;
+  const running = item.status === "running";
   return (
-    <div className="my-2">
-      <div className="font-mono text-cyan-400">⚙ {item.name} <span className="text-zinc-500">{statusIcon}</span></div>
-      {d && "Diff" in d && <DiffView path={d.Diff.path} before={d.Diff.before} after={d.Diff.after} />}
-      {d && "Terminal" in d && (
-        <TerminalBlock command={d.Terminal.command} stdout={d.Terminal.stdout} stderr={d.Terminal.stderr} exitCode={d.Terminal.exit_code} />
-      )}
-      {d && "Text" in d && <pre className="whitespace-pre-wrap p-2 font-mono text-sm text-zinc-300">{d.Text}</pre>}
-      {!d && item.content && <pre className="whitespace-pre-wrap p-2 font-mono text-sm text-zinc-400">{item.content}</pre>}
+    <div className="my-1 inline-flex items-center gap-2 rounded-md px-2 py-1 font-mono text-xs"
+      style={{ background: "var(--surface-raised)", border: "1px solid var(--border)", color: "var(--text)" }}>
+      <span className="rounded-full px-1.5 text-[10px]"
+        style={{ background: "var(--accent)", color: "var(--accent-fg)" }}>{item.name}</span>
+      <span style={{ color: running ? "var(--state-run)" : "var(--state-done)" }}>{running ? "…" : "✓"}</span>
     </div>
   );
 }
