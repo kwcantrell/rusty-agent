@@ -36,6 +36,12 @@ fn embed_failed(e: impl std::fmt::Display) -> ToolError {
 fn store_failed(e: impl std::fmt::Display) -> ToolError {
     ToolError::Failed { message: format!("memory store error: {e}"), stderr: None }
 }
+/// Take the single embedding for a one-element embed() call, or a ToolError if the
+/// embedder returned nothing (contract violation) — memory ops never panic.
+fn first_embedding(vectors: Vec<Vec<f32>>) -> Result<Vec<f32>, ToolError> {
+    vectors.into_iter().next()
+        .ok_or_else(|| embed_failed("embedder returned no vectors"))
+}
 
 pub struct Remember {
     pub embedder: Arc<dyn Embedder>,
@@ -79,8 +85,7 @@ impl Tool for Remember {
         }
         let scope = parse_scope(&args, &self.project_key);
         let tags = parse_tags(&args, &self.cfg);
-        let vector = self.embedder.embed(&[text.to_string()]).await
-            .map_err(embed_failed)?.into_iter().next().unwrap();
+        let vector = first_embedding(self.embedder.embed(&[text.to_string()]).await.map_err(embed_failed)?)?;
 
         // Dedup: supersede a near-identical memory in the same scope instead of duplicating.
         let near = self.store.query(&vector, 1, &ScopeFilter::Exact(scope.clone()))
@@ -162,8 +167,7 @@ impl Tool for Recall {
             .ok_or_else(|| ToolError::InvalidArgs("missing non-empty 'query'".into()))?;
         let k = args.get("k").and_then(Value::as_u64).map(|n| n as usize)
             .unwrap_or(self.cfg.default_k).clamp(1, self.cfg.max_k);
-        let qv = self.embedder.embed(&[query.to_string()]).await
-            .map_err(embed_failed)?.into_iter().next().unwrap();
+        let qv = first_embedding(self.embedder.embed(&[query.to_string()]).await.map_err(embed_failed)?)?;
 
         let filter = ScopeFilter::ProjectAndGlobal { project_key: self.project_key.clone() };
         let mut hits = self.store.query(&qv, self.cfg.max_k, &filter).await.map_err(store_failed)?;
