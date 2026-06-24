@@ -1247,9 +1247,12 @@ export function AnimatedToolCall({ item }: Props) {
           {"display" in item && item.display && "Text" in item.display && (
             <pre className="whitespace-pre-wrap p-2 font-mono text-sm text-zinc-300">{item.display.Text}</pre>
           )}
-          {!("display" in item) || (!item.display || !("Diff" in item.display) && !("Terminal" in item.display) && !("Text" in item.display)) ? (
-            item.content && <pre className="whitespace-pre-wrap p-2 font-mono text-sm text-zinc-400">{item.content}</pre>
-          ) : null}
+          {(() => {
+            const hasDisplay = "display" in item && item.display;
+            const hasDisplayContent = hasDisplay && ("Diff" in item.display || "Terminal" in item.display || "Text" in item.display);
+            if (hasDisplay && hasDisplayContent) return null;
+            return item.content ? <pre className="whitespace-pre-wrap p-2 font-mono text-sm text-zinc-400">{item.content}</pre> : null;
+          })()}
         </motion.div>
       )}
 
@@ -1554,8 +1557,10 @@ export function TimelineView({ turns, onTurnClick, messageListRef }: Props) {
                   <div
                     key={`user-${ui}`}
                     className={`rounded-full border border-zinc-700 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-200 transition-colors hover:border-zinc-500 ${
-                      isHovered ? "cursor-pointer" : ""
-                    }`}
+                  isHovered ? "cursor-pointer" : ""
+                }`}
+                onMouseEnter={() => setHoveredTurn(turnIndex)}
+                onMouseLeave={() => setHoveredTurn(null)}
                     title={userItem.text}
                   >
                     {userItem.text.length > 30 ? userItem.text.slice(0, 30) + "…" : userItem.text}
@@ -1568,6 +1573,8 @@ export function TimelineView({ turns, onTurnClick, messageListRef }: Props) {
                     key={`reasoning-${ri}`}
                     className="mx-1 flex h-3 items-center"
                     title={reasoningItem.text.length > 50 ? reasoningItem.text.slice(0, 50) + "…" : reasoningItem.text}
+                    onMouseEnter={() => setHoveredTurn(turnIndex)}
+                    onMouseLeave={() => setHoveredTurn(null)}
                   >
                     <div className="h-1 w-12 rounded-full bg-purple-500/60" />
                   </div>
@@ -1581,6 +1588,8 @@ export function TimelineView({ turns, onTurnClick, messageListRef }: Props) {
                       key={`tool-${ti}`}
                       className="mx-1 flex h-3 items-center"
                       title={toolItem.name}
+                      onMouseEnter={() => setHoveredTurn(turnIndex)}
+                      onMouseLeave={() => setHoveredTurn(null)}
                     >
                       <div
                         className={`h-1 w-16 rounded-full ${
