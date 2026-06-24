@@ -11,7 +11,7 @@ export function MessageList({ items, activeArtifactKey, onSelectArtifact }:
       {items.map((it, i) => {
         switch (it.kind) {
           case "user":
-            return <div key={i} className="my-2 ml-auto max-w-[80%] rounded-lg px-3 py-2"
+            return <div key={i} className="my-2 ml-auto max-w-[80%] rounded-2xl px-4 py-2"
               style={{ background: "var(--text-strong)", color: "var(--surface-base)" }}>{it.text}</div>;
           case "assistant":
             return <AnimatedAssistantMessage key={i} item={it} />;

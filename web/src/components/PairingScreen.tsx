@@ -30,7 +30,7 @@ export function PairingScreen({ onPaired }: { onPaired: (s: { sessionId: string;
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3" style={{ color: "var(--text-strong)" }}>
-      <h1 className="text-lg">Pair with your agent</h1>
+      <h1 className="font-display text-3xl">Pair with your agent</h1>
       <input
         className="rounded-lg px-3 py-2 text-center font-mono tracking-widest outline-none"
         style={{ background: "var(--surface-overlay)", color: "var(--text-strong)", border: "1px solid var(--border)" }}
@@ -39,7 +39,7 @@ export function PairingScreen({ onPaired }: { onPaired: (s: { sessionId: string;
         placeholder="pairing code"
         onKeyDown={(e) => { if (e.key === "Enter") pair(); }}
       />
-      <button onClick={pair} disabled={busy || !code.trim()} className="rounded-lg px-4 py-2 hover:opacity-90 disabled:opacity-50"
+      <button onClick={pair} disabled={busy || !code.trim()} className="rounded-full px-5 py-2 hover:opacity-90 disabled:opacity-50"
         style={{ background: "var(--accent)", color: "var(--accent-fg)" }}>
         {busy ? "Pairing…" : "Pair"}
       </button>
