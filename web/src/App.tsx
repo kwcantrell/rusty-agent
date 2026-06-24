@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { connect } from "./socket";
-import { initialState, reduce } from "./state";
+import { initialState, reduce, useAnimatedItems, useTurnGrouping } from "./state";
 import type { Decision, RuntimeSettings } from "./wire";
 import { PairingScreen } from "./components/PairingScreen";
 import { StatusBar } from "./components/StatusBar";
@@ -8,6 +8,7 @@ import { MessageList } from "./components/MessageList";
 import { ApprovalPrompt } from "./components/ApprovalPrompt";
 import { Composer } from "./components/Composer";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { TimelineView } from "./components/TimelineView";
 import { appendUserMsg, clearSession, loadSessionId, loadToken, loadUserMsgs, saveSession } from "./storage";
 
 function wsUrl(token: string): string {
@@ -20,6 +21,10 @@ export default function App() {
   const [state, dispatch] = useReducer(reduce, loadUserMsgs(sessionId ?? ""), initialState);
   const [showSettings, setShowSettings] = useState(false);
   const sock = useRef<ReturnType<typeof connect> | null>(null);
+  const messageListRef = useRef<HTMLDivElement>(null);
+
+  const animatedItems = useAnimatedItems(state.items);
+  const turns = useTurnGrouping(animatedItems);
 
   useEffect(() => {
     if (!token || !sessionId) return;
@@ -74,7 +79,10 @@ export default function App() {
           onClose={() => setShowSettings(false)}
         />
       )}
-      <MessageList items={state.items} />
+      <div ref={messageListRef} className="flex flex-1 flex-col overflow-y-auto">
+        <MessageList items={animatedItems} />
+      </div>
+      <TimelineView turns={turns} messageListRef={messageListRef} />
       {state.pendingApproval && <ApprovalPrompt approval={state.pendingApproval} onDecide={decide} />}
       <Composer disabled={!connected} onSend={send} />
     </div>

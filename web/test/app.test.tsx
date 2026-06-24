@@ -30,6 +30,9 @@ describe("App", () => {
     act(() => {
       TestWS.last!.onmessage?.({ data: JSON.stringify({ v: 1, session_id: "sess-1", kind: "presence", online: true }) });
       TestWS.last!.onmessage?.({ data: JSON.stringify({ v: 1, session_id: "sess-1", kind: "event", payload: { type: "token", text: "hello world" } }) });
+      // Complete the stream so the assistant text is fully revealed (no longer mid-stream
+      // animating char-by-char via useStreamingText).
+      TestWS.last!.onmessage?.({ data: JSON.stringify({ v: 1, session_id: "sess-1", kind: "event", payload: { type: "done", reason: "stop" } }) });
     });
     expect(screen.getByText(/agent online/i)).toBeInTheDocument();
     expect(screen.getByText("hello world")).toBeInTheDocument();

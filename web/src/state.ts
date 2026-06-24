@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import type { Display, Inbound, RuntimeSettings } from "./wire";
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
@@ -206,4 +207,20 @@ export function turnGroupsFrom(items: AnimatedItem[]): TurnGroup[] {
   }
 
   return groups;
+}
+
+/**
+ * Derives animated items from raw items.
+ * In production, calls Date.now() for timestamps.
+ * In tests, use `animatedItemsFrom(items, fixedNow)` directly.
+ */
+export function useAnimatedItems(items: Item[]): AnimatedItem[] {
+  return useMemo(() => animatedItemsFrom(items, Date.now()), [items]);
+}
+
+/**
+ * Groups animated items into turns.
+ */
+export function useTurnGrouping(animatedItems: AnimatedItem[]): TurnGroup[] {
+  return useMemo(() => turnGroupsFrom(animatedItems), [animatedItems]);
 }

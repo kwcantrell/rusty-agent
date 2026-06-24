@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StatusBar } from "../src/components/StatusBar";
-import { MessageList } from "../src/components/MessageList";
 import { ApprovalPrompt } from "../src/components/ApprovalPrompt";
 import { Composer } from "../src/components/Composer";
 
@@ -15,16 +14,7 @@ describe("shell components", () => {
     expect(onSignOut).toHaveBeenCalled();
   });
 
-  it("MessageList renders items in order by type", () => {
-    render(<MessageList items={[
-      { kind: "user", text: "hi" },
-      { kind: "assistant", text: "hello", done: "stop" },
-      { kind: "error", message: "boom" },
-    ]} />);
-    expect(screen.getByText("hi")).toBeInTheDocument();
-    expect(screen.getByText("hello")).toBeInTheDocument();
-    expect(screen.getByText(/boom/)).toBeInTheDocument();
-  });
+  // MessageList coverage moved to message-list.test.tsx (now takes AnimatedItem[]).
 
   it("ApprovalPrompt emits the chosen decision", async () => {
     const onDecide = vi.fn();
@@ -68,11 +58,4 @@ describe("shell components", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it("MessageList renders a tool item", () => {
-    render(<MessageList items={[
-      { kind: "tool", name: "execute_command", args: {}, status: "done", content: "exit=0",
-        display: { Terminal: { command: "ls", stdout: "f\n", stderr: "", exit_code: 0 } } },
-    ]} />);
-    expect(screen.getByText(/execute_command/)).toBeInTheDocument();
-  });
 });

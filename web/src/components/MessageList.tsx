@@ -1,9 +1,10 @@
-import type { Item } from "../state";
-import { AssistantMessage } from "./AssistantMessage";
-import { ReasoningMessage } from "./ReasoningMessage";
-import { ToolCall } from "./ToolCall";
+import type { AnimatedItem } from "../state";
+import { AnimatedAssistantMessage } from "./AnimatedAssistantMessage";
+import { AnimatedReasoningMessage } from "./AnimatedReasoningMessage";
+import { AnimatedToolCall } from "./AnimatedToolCall";
+import { AnimatedError } from "./AnimatedError";
 
-export function MessageList({ items }: { items: Item[] }) {
+export function MessageList({ items }: { items: AnimatedItem[] }) {
   return (
     <div className="flex-1 overflow-y-auto px-4">
       {items.map((it, i) => {
@@ -11,13 +12,13 @@ export function MessageList({ items }: { items: Item[] }) {
           case "user":
             return <div key={i} className="my-2 ml-auto max-w-[80%] rounded bg-zinc-800 px-3 py-2 text-zinc-100">{it.text}</div>;
           case "assistant":
-            return <AssistantMessage key={i} item={it} />;
+            return <AnimatedAssistantMessage key={i} item={it} />;
           case "reasoning":
-            return <ReasoningMessage key={i} text={it.text} />;
+            return <AnimatedReasoningMessage key={i} item={it} />;
           case "tool":
-            return <ToolCall key={i} item={it} />;
+            return <AnimatedToolCall key={i} item={it} />;
           case "error":
-            return <div key={i} className="my-2 rounded border border-red-700 bg-red-950 px-3 py-2 text-red-300">✗ {it.message}</div>;
+            return <AnimatedError key={i} item={it} />;
         }
       })}
     </div>
