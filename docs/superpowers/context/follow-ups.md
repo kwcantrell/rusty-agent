@@ -27,6 +27,49 @@ been folded into this ledger, which is now their home). For backend design detai
 - **Guard `BARE_SYSTEM_PROMPT` acceptance** (P3) — **Open**. Add an `#[ignore]`-gated real-CLI
   test so a future guardrail change doesn't break it silently.
 
+## 2026-06-23 os-sandboxing-docker
+
+Subsystem #2 (top hardening priority). New `agent-sandbox` crate (Docker `docker run` impl) behind a
+`SandboxStrategy` trait in `agent-tools` (`HostExecutor` default + `DockerSandbox`); `execute_command` and
+MCP stdio servers launch through it. Tri-state mode (off/auto/enforce; default auto = degrade-to-host-with-warning,
+enforce = fail-closed→`ToolError::Denied`). Hardened `docker run` (network none, read-only rootfs + tmpfs,
+cap-drop ALL, no-new-privileges, --user, mem/cpu/pids/fsize limits, workspace bind at /workspace). Config via
+`RuntimeConfig.sandbox_*` (serde-default, no-silent-wipe) + `--sandbox-*` flags on both binaries; Settings/web
+wiring deferred. Spec `2026-06-23-os-sandboxing-docker-design.md`, plan `2026-06-23-os-sandboxing-docker.md`.
+Branch `feat/os-sandboxing-docker` (commits `784b4b5..54fa126`, 17 commits). Built subagent-driven (12 tasks).
+Final whole-branch review (opus): **Ready to merge — With fixes** (2 cross-task Important, both fixed; no Critical).
+Gates at tip: `cargo test --workspace` 225 passed / 0 failed / 7 ignored; `clippy --all-targets -D warnings` clean.
+**DoD validated against real Docker 29.4.0 + debian:stable-slim**: all 5 ignore-gated escape proofs pass
+(host-FS isolation, read-only rootfs, network off, workspace writable as host-uid, workspace host-owned); zero
+container leaks (`docker ps -a` clean after).
+
+### Resolved during the cycle
+- **Approval posture misreported the degraded reality** (final review, Important) — `agent/crates/agent-core/src/loop_.rs` (`run_tool` `Decision::Ask`) — **Resolved** (`227ec8d`). In `auto` mode with Docker absent a command runs on the host (full network, no isolation) but the prompt said `(sandbox: docker, network off)`. Now: when `describe().degraded.is_some()`, the posture reads `(sandbox: docker unavailable->host, network on)`. Regression test `degraded_posture_shows_unavailable_and_network_on`.
+- **Service (MCP) containers leaked stopped records** (final review, Important) — `agent/crates/agent-sandbox/src/docker.rs` (`docker_run_args` Service branch) — **Resolved** (`227ec8d`). Service launched with `-i` but no `--rm`, and teardown only `docker kill`s (never `docker rm`), so stopped containers accumulated with a PID-reuse name-collision tail risk. Service now also gets `--rm` (docker auto-removes on exit/kill; kill-by-name still works). Test renamed `service_keeps_stdin_open_and_rm`.
+- **Pipe-buffer deadlock in `execute_command`** (Task 2, Critical) — `agent/crates/agent-tools/src/shell.rs` — **Resolved** (`4971bd2`). Plan's example drained stdout/stderr after `wait()`; restored concurrent drain via `tokio::join!(child.wait(), read_out, read_err)`. Regression test `captures_large_output_without_deadlock` (~220 KiB).
+- **Workspace compile break between tasks** (Task 2, Critical) — 5 cross-crate `ToolCtx` literals — **Resolved** (`4971bd2`). Non-optional `ToolCtx.sandbox` left agent-core + 4 test helpers uncompilable; added `HostExecutor` stopgaps (agent-core's replaced by the config-driven strategy in Task 3 / `895c536`).
+- **`$HOME`-root reject compared a raw (un-canonicalized) home** (Task 5, Important) — `agent/crates/agent-sandbox/src/mounts.rs` — **Resolved** (`1d7f192`). A symlinked `$HOME` prefix could dodge the reject; now canonicalizes home before compare. Also clarified the `/var/run`->`/run` symlink aliasing. Regression test `rejects_symlinked_home_root`.
+- **Escape-proof test bugs surfaced by real-Docker validation** — `agent/crates/agent-sandbox/tests/escape.rs` — **Resolved** (`54fa126`). `workspace_is_writable` used `--user 0:0` but `--cap-drop ALL` removes `CAP_DAC_OVERRIDE`, so container-root cannot write a host-user-owned bind mount (the failure actually *proved* the hardening) — switched to the real host uid:gid. `cannot_read_etc_shadow` was misconceived (read the container's own throwaway `/etc/shadow`, not a host secret) — replaced with `host_filesystem_is_not_visible` (unmounted host secret unreachable).
+- **Drop backstop `docker kill` printed spurious "No such container" on every `--rm` completion** — `agent/crates/agent-tools/src/sandbox.rs` (`SandboxedChild::Drop`) — **Resolved** (`54fa126`). Fire-and-forget `docker kill` inherited stderr; now nulls stdout/stderr. The async `kill()` path already captured via `.output()`.
+- **Task-4 test gaps on security flags** — `agent/crates/agent-sandbox/src/docker.rs` (tests) — **Resolved** (`c0a890e`). Added assertions for `--memory/--cpus/--pids-limit/--tmpfs`, the `--ulimit fsize` positive path, and `--cap-add` absence.
+- **`kill()` dual-kill + `extra_rw` boundary undocumented** (final review fold-ins) — `sandbox.rs` / `docker.rs` — **Resolved** (`227ec8d`). Added the dual-kill comment (docker kill stops the container; start_kill reaps the local `docker run` client) and a note that `--sandbox-extra-rw` widens the writable boundary beyond `/workspace`.
+
+### Open (Minor — deferred to ledger by the final review)
+- **`StdioTransport::Drop` uses `self.child.lock().unwrap()`** — `agent/crates/agent-mcp/src/transport.rs` (`Drop`) — **Open**. Double-panic risk on a poisoned mutex; matches the pre-existing pattern and Drop now only `take()`s (no await/kill), so the window is tiny. `if let Ok(g) = ...` would close it.
+- **Cosmetics in the MCP transport** — `agent/crates/agent-mcp/src/transport.rs`/`manager.rs` — **Open**. Redundant `spec.env.clone().into_iter().collect()` (plain `.clone()` suffices); fully-qualified `std::sync::Arc<...>` vs a `use` alias.
+- **`current_uid_gid` yields `":"` on pathological empty `id` output; no isolated `enforce` `build_sandbox` test** — `agent/crates/agent-runtime-config/src/lib.rs` — **Open**. No panic; bad `--user` arg only if `id -u`/`id -g` returned empty. Enforce denial is covered at the strategy layer (`enforce_denies_when_unavailable`).
+- **`build_loop` smoke tests assert no-panic only; agent-cli `sbcfg` is a carrier-only `RuntimeConfig`** — `agent/crates/agent-server/src/runtime.rs`, `agent/crates/agent-cli/src/main.rs` — **Open**. Readability/coverage; both paths are correct and exercised.
+- **`~user` (other-user tilde) mounts fall through to canonicalize→err** — `agent/crates/agent-sandbox/src/mounts.rs` — **Open**. Rejected, but via not-found rather than explicit policy; the socket-reject unit test likewise passes via not-found when Docker is absent (test-quality, not a security gap).
+- **Task-1 TDD RED was procedurally weak** (single-commit delivery) — `agent/crates/agent-tools/src/sandbox.rs` — **Open**. Process note only; no code impact.
+
+### Deferred scope (intentional, from spec §10)
+- **Settings-panel/web UI + `AgentEvent::SandboxNotice` wire round-trip** — Open — flags + disk only this slice (avoids a browser save wiping an un-round-tripped field, per the skills-config precedent).
+- **Per-approval / per-command network & path grants** — Open — global `sandbox_network` toggle this slice; per-call grants would expand the ApprovalChannel/wire/web surface.
+- **Auto `docker pull`, devcontainer/Dockerfile detection, image-build caching** — Open — deferred; a missing image surfaces as a clear `docker run` error (auto degrades, enforce denies).
+- **Landlock/seccomp/firejail strategies** — Open — the `SandboxStrategy` trait keeps them pluggable.
+- **Redirect-caches-into-workspace build ergonomics** — Open — strict FS grants + `extra_rw` config knob this slice.
+- **OS-confining the in-process file tools** — Open — would require sandboxing the agent process itself (a different, larger effort); they keep the logical `resolve_in_workspace` guard.
+
 ## 2026-06-23 skills-runtime-config-persistence
 
 Persist `skills_dirs`/`active_skills` into `RuntimeConfig` + full browser Settings capability (daemon

@@ -319,6 +319,8 @@ mod tests {
             workspace: std::env::temp_dir(),
             timeout: Duration::from_secs(5),
             cancel: CancellationToken::new(),
+            // stopgap; Task 3 replaces this with the config-driven strategy
+            sandbox: std::sync::Arc::new(agent_tools::HostExecutor),
         }
     }
 

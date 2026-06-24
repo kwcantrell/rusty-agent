@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use crate::SandboxStrategy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSchema {
@@ -64,6 +66,7 @@ pub struct ToolCtx {
     pub workspace: PathBuf,
     pub timeout: Duration,
     pub cancel: CancellationToken,
+    pub sandbox: Arc<dyn SandboxStrategy>,
 }
 
 #[cfg(test)]

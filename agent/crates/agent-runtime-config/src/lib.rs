@@ -10,9 +10,10 @@ use agent_model::{ClaudeCliClient, ModelClient, NativeProtocol, OpenAiCompatClie
 use agent_http::{FetchUrl, NetworkPolicy};
 use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
 use agent_tools::{git::{GitCommit, GitDiff, GitStatus}, shell::ExecuteCommand, ToolRegistry};
-use agent_tools::Tool;
+use agent_tools::{HostExecutor, Limits, Mode, SandboxStrategy, Tool};
+use agent_sandbox::{validate_mount, DockerSandbox, SandboxPolicy};
 use agent_skills::{CreateSkill, ListSkills, ReadSkillFile, SkillRegistry, UseSkill};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,12 +22,15 @@ pub use agent_mcp::{McpManager, ServerStatus};
 /// Load `mcp.json` at `path` and connect its servers. A missing file yields an
 /// empty manager (MCP disabled); a malformed file warns and yields empty. The
 /// returned `McpManager` owns the server processes — keep it alive for the session.
-pub async fn connect_mcp(path: &Path) -> McpManager {
+pub async fn connect_mcp(
+    path: &Path,
+    sandbox: Arc<dyn SandboxStrategy>,
+) -> McpManager {
     let (cfg, warning) = McpServersConfig::load_or_empty(path);
     if let Some(w) = warning {
         eprintln!("warning: {} ({}); MCP disabled", w, path.display());
     }
-    McpManager::connect(&cfg, Duration::from_secs(15)).await
+    McpManager::connect(&cfg, Duration::from_secs(15), sandbox).await
 }
 
 pub fn protocol_name_is_valid(name: &str) -> bool {
@@ -98,9 +102,106 @@ pub fn default_denylist() -> Vec<String> {
     ["rm -rf /","sudo",":(){","mkfs","dd if="].into_iter().map(String::from).collect()
 }
 
+/// Map a `RuntimeConfig` to a `SandboxStrategy`:
+/// - `sandbox_mode == "off"` → `HostExecutor` (no Docker overhead).
+/// - `"enforce"` → `DockerSandbox` in `Mode::Enforce` (fails if Docker absent).
+/// - anything else (e.g. `"auto"`) → `DockerSandbox` in `Mode::Auto` (degrades to host).
+///
+/// Invalid mount paths in `sandbox_extra_rw`/`sandbox_extra_ro` are dropped with a
+/// `tracing::warn!` rather than panicking.
+pub fn build_sandbox(cfg: &RuntimeConfig) -> Arc<dyn SandboxStrategy> {
+    let mode = match cfg.sandbox_mode.as_str() {
+        "off" => return Arc::new(HostExecutor),
+        "enforce" => Mode::Enforce,
+        _ => Mode::Auto,
+    };
+
+    let home = dirs_home();
+    let resolve = |list: &[String]| {
+        list.iter()
+            .filter_map(|p| match validate_mount(p, home.as_deref()) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(target: "sandbox", "dropping mount {p}: {e}");
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let policy = SandboxPolicy {
+        mode,
+        image: cfg.sandbox_image.clone(),
+        network: cfg.sandbox_network,
+        limits: Limits {
+            memory: cfg.sandbox_memory.clone(),
+            cpus: cfg.sandbox_cpus.clone(),
+            pids: cfg.sandbox_pids,
+            fsize: cfg.sandbox_fsize.clone(),
+            tmp_size: cfg.sandbox_tmp_size.clone(),
+        },
+        extra_rw: resolve(&cfg.sandbox_extra_rw),
+        extra_ro: resolve(&cfg.sandbox_extra_ro),
+    };
+    let uid_gid = current_uid_gid();
+    Arc::new(DockerSandbox::new(policy, uid_gid, DockerSandbox::probe()))
+}
+
+/// Return `"uid:gid"` of the current process on Unix; `"0:0"` on other platforms.
+/// Uses `std::process::Command` to avoid a `nix`/`libc` dependency.
+fn current_uid_gid() -> String {
+    #[cfg(unix)]
+    {
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "0".into());
+        let gid = std::process::Command::new("id")
+            .arg("-g")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "0".into());
+        format!("{uid}:{gid}")
+    }
+    #[cfg(not(unix))]
+    {
+        "0:0".into()
+    }
+}
+
+/// Return the user's home directory from `$HOME`, if set.
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_config::RuntimeConfig;
+
+    fn base_cfg() -> RuntimeConfig {
+        RuntimeConfig::from_launch(
+            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192,
+        )
+    }
+
+    #[test]
+    fn build_sandbox_off_is_host() {
+        let mut cfg = base_cfg();
+        cfg.sandbox_mode = "off".into();
+        assert_eq!(build_sandbox(&cfg).describe().mechanism, "host");
+    }
+
+    #[test]
+    fn build_sandbox_auto_is_docker_descriptor() {
+        let mut cfg = base_cfg();
+        cfg.sandbox_mode = "auto".into();
+        let d = build_sandbox(&cfg).describe();
+        assert_eq!(d.mechanism, "docker");
+        assert_eq!(d.image.as_deref(), Some("debian:stable-slim"));
+    }
+
     #[test]
     fn backend_validation() {
         assert!(backend_name_is_valid("openai"));

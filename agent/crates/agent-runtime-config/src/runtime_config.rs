@@ -39,6 +39,26 @@ pub struct RuntimeConfig {
     pub skills_dirs: Vec<String>,
     #[serde(default)]
     pub active_skills: Vec<String>,
+    #[serde(default = "default_sandbox_mode")]
+    pub sandbox_mode: String,        // "off" | "auto" | "enforce"
+    #[serde(default = "default_sandbox_image")]
+    pub sandbox_image: String,
+    #[serde(default)]
+    pub sandbox_network: bool,
+    #[serde(default = "default_sandbox_memory")]
+    pub sandbox_memory: String,
+    #[serde(default = "default_sandbox_cpus")]
+    pub sandbox_cpus: String,
+    #[serde(default = "default_sandbox_pids")]
+    pub sandbox_pids: u32,
+    #[serde(default)]
+    pub sandbox_fsize: Option<String>,
+    #[serde(default = "default_sandbox_tmp_size")]
+    pub sandbox_tmp_size: String,
+    #[serde(default)]
+    pub sandbox_extra_rw: Vec<String>,
+    #[serde(default)]
+    pub sandbox_extra_ro: Vec<String>,
 }
 
 /// All-optional mirror used only for on-disk merge: a file written by an older
@@ -65,9 +85,25 @@ struct PartialRuntimeConfig {
     preserve_thinking: Option<bool>,
     skills_dirs: Option<Vec<String>>,
     active_skills: Option<Vec<String>>,
+    sandbox_mode: Option<String>,
+    sandbox_image: Option<String>,
+    sandbox_network: Option<bool>,
+    sandbox_memory: Option<String>,
+    sandbox_cpus: Option<String>,
+    sandbox_pids: Option<u32>,
+    sandbox_fsize: Option<String>,
+    sandbox_tmp_size: Option<String>,
+    sandbox_extra_rw: Option<Vec<String>>,
+    sandbox_extra_ro: Option<Vec<String>>,
 }
 
 fn default_true() -> bool { true }
+fn default_sandbox_mode() -> String { "auto".into() }
+fn default_sandbox_image() -> String { "debian:stable-slim".into() }
+fn default_sandbox_memory() -> String { "2g".into() }
+fn default_sandbox_cpus() -> String { "2".into() }
+fn default_sandbox_pids() -> u32 { 512 }
+fn default_sandbox_tmp_size() -> String { "256m".into() }
 
 impl RuntimeConfig {
     /// Seed a config from launch flags + sensible defaults for the rest.
@@ -92,6 +128,16 @@ impl RuntimeConfig {
             preserve_thinking: false,
             skills_dirs: Vec::new(),
             active_skills: Vec::new(),
+            sandbox_mode: default_sandbox_mode(),
+            sandbox_image: default_sandbox_image(),
+            sandbox_network: false,
+            sandbox_memory: default_sandbox_memory(),
+            sandbox_cpus: default_sandbox_cpus(),
+            sandbox_pids: default_sandbox_pids(),
+            sandbox_fsize: None,
+            sandbox_tmp_size: default_sandbox_tmp_size(),
+            sandbox_extra_rw: Vec::new(),
+            sandbox_extra_ro: Vec::new(),
         }
     }
 
@@ -139,6 +185,11 @@ impl RuntimeConfig {
             return Err("presence_penalty must be between -2.0 and 2.0".into()); } }
         if let Some(v) = self.repeat_penalty { if v <= 0.0 {
             return Err("repeat_penalty must be > 0.0".into()); } }
+        if !matches!(self.sandbox_mode.as_str(), "off" | "auto" | "enforce") {
+            return Err(format!(
+                "unknown sandbox_mode '{}': use off | auto | enforce", self.sandbox_mode
+            ));
+        }
         Ok(())
     }
 
@@ -175,6 +226,16 @@ impl RuntimeConfig {
         if let Some(v) = p.preserve_thinking { self.preserve_thinking = v; }
         if let Some(v) = p.skills_dirs { self.skills_dirs = v; }
         if let Some(v) = p.active_skills { self.active_skills = v; }
+        if let Some(v) = p.sandbox_mode { self.sandbox_mode = v; }
+        if let Some(v) = p.sandbox_image { self.sandbox_image = v; }
+        if let Some(v) = p.sandbox_network { self.sandbox_network = v; }
+        if let Some(v) = p.sandbox_memory { self.sandbox_memory = v; }
+        if let Some(v) = p.sandbox_cpus { self.sandbox_cpus = v; }
+        if let Some(v) = p.sandbox_pids { self.sandbox_pids = v; }
+        if let Some(v) = p.sandbox_fsize { self.sandbox_fsize = Some(v); }
+        if let Some(v) = p.sandbox_tmp_size { self.sandbox_tmp_size = v; }
+        if let Some(v) = p.sandbox_extra_rw { self.sandbox_extra_rw = v; }
+        if let Some(v) = p.sandbox_extra_ro { self.sandbox_extra_ro = v; }
         self
     }
 
@@ -442,6 +503,51 @@ mod tests {
         assert_eq!(loaded.model, "only-model");
         assert!(loaded.skills_dirs.is_empty());   // absent field falls back to base
         assert!(loaded.active_skills.is_empty());
+    }
+
+    #[test]
+    fn sandbox_defaults_and_round_trip() {
+        let b = base();
+        assert_eq!(b.sandbox_mode, "auto");
+        assert_eq!(b.sandbox_image, "debian:stable-slim");
+        assert!(!b.sandbox_network);
+        assert_eq!(b.sandbox_memory, "2g");
+        assert_eq!(b.sandbox_cpus, "2");
+        assert_eq!(b.sandbox_pids, 512);
+        assert!(b.sandbox_fsize.is_none());
+        assert_eq!(b.sandbox_tmp_size, "256m");
+        assert!(b.sandbox_extra_rw.is_empty());
+        assert!(b.sandbox_extra_ro.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_sandbox_mode() {
+        let mut c = base();
+        c.sandbox_mode = "bogus".into();
+        assert!(c.validate().is_err());
+        // valid modes should pass
+        for mode in &["off", "auto", "enforce"] {
+            let mut c = base();
+            c.sandbox_mode = mode.to_string();
+            assert!(c.validate().is_ok(), "mode '{mode}' should be valid");
+        }
+    }
+
+    #[test]
+    fn old_config_file_missing_sandbox_keeps_base_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.json");
+        // Simulate an old config file that predates sandbox fields
+        std::fs::write(&path, r#"{"backend":"openai","base_url":"http://localhost:8080","model":"m1","protocol":"native","command_allowlist":[],"command_denylist":[],"http_allow_hosts":[],"temperature":0.2,"max_tokens":2048,"max_turns":25,"context_limit":8192}"#).unwrap();
+        let loaded = RuntimeConfig::load_over(base(), &path);
+        // Sandbox fields must fall back to base defaults, not wipe to empty
+        assert_eq!(loaded.sandbox_mode, "auto");
+        assert_eq!(loaded.sandbox_image, "debian:stable-slim");
+        assert!(!loaded.sandbox_network);
+        assert_eq!(loaded.sandbox_pids, 512);
+        assert!(loaded.sandbox_fsize.is_none());
+        assert!(loaded.sandbox_extra_rw.is_empty());
+        assert!(loaded.sandbox_extra_ro.is_empty());
     }
 
     #[test]

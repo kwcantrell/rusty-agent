@@ -38,6 +38,7 @@ pub struct LoopConfig {
     pub repeat_penalty: Option<f32>,
     pub enable_thinking: bool,
     pub preserve_thinking: bool,
+    pub sandbox: Option<std::sync::Arc<dyn agent_tools::SandboxStrategy>>,
 }
 
 pub struct AgentLoop {
@@ -187,6 +188,19 @@ impl AgentLoop {
             Decision::Allow => true,
             Decision::Deny(reason) => return Err(ToolError::Denied(reason)),
             Decision::Ask => {
+                let d = self.config.sandbox.as_ref()
+                    .map(|s| s.describe())
+                    .unwrap_or(agent_tools::SandboxDescriptor {
+                        mode: agent_tools::Mode::Off, mechanism: "host", image: None,
+                        network: true, degraded: None });
+                let posture = if d.degraded.is_some() {
+                    format!(" (sandbox: {} unavailable->host, network on)", d.mechanism)
+                } else {
+                    format!(" (sandbox: {}, network {})",
+                        d.mechanism, if d.network { "on" } else { "off" })
+                };
+                let mut intent = intent;
+                if intent.command.is_some() { intent.summary.push_str(&posture); }
                 // diff preview is produced by execute(); the approval prompt shows the summary.
                 let req = ApprovalRequest { intent, display: None };
                 self.sink.emit(AgentEvent::Approval(req.clone()));
@@ -200,8 +214,11 @@ impl AgentLoop {
         // NOTE: this token is currently inert — it is not wired to any external
         // cancel source (e.g. Ctrl-C / SIGINT). Live cancellation is not yet
         // functional; this is a stub for future wiring.
+        let sandbox = self.config.sandbox.clone()
+            .unwrap_or_else(|| std::sync::Arc::new(agent_tools::HostExecutor));
         let ctx = ToolCtx { workspace: self.config.workspace.clone(),
-            timeout: self.config.tool_timeout, cancel: CancellationToken::new() };
+            timeout: self.config.tool_timeout, cancel: CancellationToken::new(),
+            sandbox };
         tool.execute(call.args, &ctx).await
     }
 }
@@ -456,6 +473,172 @@ mod tests {
         let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
         assert!(!a.content.contains("secret plan"));
         assert_eq!(a.content, "final answer");
+    }
+
+    #[tokio::test]
+    async fn loop_routes_execute_command_through_injected_sandbox() {
+        use agent_tools::{CommandSpec, SandboxStrategy, SandboxedChild, SandboxError,
+            SandboxDescriptor, Mode, HostExecutor};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        struct CountingSandbox { inner: HostExecutor, hits: Arc<AtomicUsize> }
+        impl SandboxStrategy for CountingSandbox {
+            fn launch(&self, spec: CommandSpec) -> Result<SandboxedChild, SandboxError> {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                self.inner.launch(spec)
+            }
+            fn describe(&self) -> SandboxDescriptor {
+                SandboxDescriptor { mode: Mode::Off, mechanism: "counting", image: None,
+                    network: true, degraded: None }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let sandbox = Arc::new(CountingSandbox { inner: HostExecutor, hits: hits.clone() });
+
+        // Register execute_command tool
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "execute_command".into(), r#"{"command":"echo hello"}"#.into()),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), tools, policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2,
+                temperature: 0.0, max_tokens: None, workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                sandbox: Some(sandbox), ..Default::default() });
+
+        let mut ctx = WindowContext::new(Message::system("you are a test agent"));
+        agent.run(&mut ctx, "run echo hello".into()).await.unwrap();
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn approval_summary_includes_sandbox_posture() {
+        use agent_tools::{HostExecutor};
+        use agent_policy::ApprovalChannel;
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingApproval { captured: Arc<Mutex<Option<String>>> }
+        #[async_trait::async_trait]
+        impl ApprovalChannel for RecordingApproval {
+            async fn request(&self, req: ApprovalRequest) -> ApprovalResponse {
+                *self.captured.lock().unwrap() = Some(req.intent.summary.clone());
+                ApprovalResponse::Deny
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+
+        // Register execute_command tool
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+
+        // Empty allowlist -> Decision::Ask for any command
+        let pol = Arc::new(RulePolicy { workspace: ws.clone(), command_allowlist: vec![], command_denylist: vec![] });
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let approval = Arc::new(RecordingApproval { captured: captured.clone() });
+
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "execute_command".into(), r#"{"command":"echo hello"}"#.into()),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), tools, pol, approval, sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2,
+                temperature: 0.0, max_tokens: None, workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                sandbox: Some(Arc::new(HostExecutor)), ..Default::default() });
+
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "run echo hello".into()).await.unwrap();
+
+        let summary = captured.lock().unwrap().clone()
+            .expect("approval must have been requested");
+        assert!(summary.contains("(sandbox: host, network on)"),
+            "summary does not contain posture: {summary:?}");
+    }
+
+    #[tokio::test]
+    async fn degraded_posture_shows_unavailable_and_network_on() {
+        use agent_tools::{CommandSpec, SandboxStrategy, SandboxedChild, SandboxError,
+            SandboxDescriptor, Mode, HostExecutor};
+        use agent_policy::ApprovalChannel;
+        use std::sync::{Arc, Mutex};
+
+        struct DegradedFake;
+        impl SandboxStrategy for DegradedFake {
+            fn launch(&self, spec: CommandSpec) -> Result<SandboxedChild, SandboxError> {
+                HostExecutor.launch(spec) // degraded == runs on host
+            }
+            fn describe(&self) -> SandboxDescriptor {
+                SandboxDescriptor { mode: Mode::Auto, mechanism: "docker",
+                    image: Some("debian:stable-slim".into()), network: false,
+                    degraded: Some("no daemon".into()) }
+            }
+        }
+
+        struct RecordingApproval { captured: Arc<Mutex<Option<String>>> }
+        #[async_trait::async_trait]
+        impl ApprovalChannel for RecordingApproval {
+            async fn request(&self, req: ApprovalRequest) -> ApprovalResponse {
+                *self.captured.lock().unwrap() = Some(req.intent.summary.clone());
+                ApprovalResponse::Deny
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+
+        // Empty allowlist -> Decision::Ask for any command
+        let pol = Arc::new(RulePolicy { workspace: ws.clone(), command_allowlist: vec![], command_denylist: vec![] });
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let approval = Arc::new(RecordingApproval { captured: captured.clone() });
+
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "execute_command".into(), r#"{"command":"echo hello"}"#.into()),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), tools, pol, approval, sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2,
+                temperature: 0.0, max_tokens: None, workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                sandbox: Some(Arc::new(DegradedFake)), ..Default::default() });
+
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "run echo hello".into()).await.unwrap();
+
+        let summary = captured.lock().unwrap().clone()
+            .expect("approval must have been requested");
+        assert!(summary.contains("unavailable"),
+            "summary should signal degraded state: {summary:?}");
+        assert!(summary.contains("network on"),
+            "summary should show actual (host) network state: {summary:?}");
+        assert!(!summary.contains("network off"),
+            "summary must NOT show policy network (false) when degraded: {summary:?}");
     }
 
     #[tokio::test(start_paused = true)]

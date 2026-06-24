@@ -95,7 +95,9 @@ mod tests {
         dir
     }
     fn ctx(ws: std::path::PathBuf) -> ToolCtx {
-        ToolCtx { workspace: ws, timeout: Duration::from_secs(10), cancel: CancellationToken::new() }
+        use std::sync::Arc;
+        ToolCtx { workspace: ws, timeout: Duration::from_secs(10), cancel: CancellationToken::new(),
+            sandbox: Arc::new(crate::HostExecutor) }
     }
 
     #[tokio::test]

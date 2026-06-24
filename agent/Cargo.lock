@@ -109,11 +109,24 @@ dependencies = [
  "agent-http",
  "agent-mcp",
  "agent-model",
+ "agent-sandbox",
  "agent-skills",
  "agent-tools",
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "agent-sandbox"
+version = "0.1.0"
+dependencies = [
+ "agent-tools",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
