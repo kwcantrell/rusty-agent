@@ -46,11 +46,13 @@ Total added bundle: ~57 KB (gzipped). Negligible for a dev tool.
 
 ### Layer 1: Streaming text effect
 
-- `useStreamingText` hook tracks `isStreaming: boolean` per assistant/reasoning item
-- Text renders character-by-character via `requestAnimationFrame` (not `setInterval`)
-- Rate: ~60 chars/sec
-- Blinking cursor at insertion point (CSS `@keyframes blink`)
-- When item receives `done` signal, `isStreaming` flips to `false` and full text renders instantly
+- `useStreamingText` hook — signature: `useStreamingText(text: string, isStreaming: boolean): string`
+  - Returns the visible text for rendering (full text when not streaming, partial when streaming)
+  - Internally manages a `ref` to the current character index
+  - On each rAF frame, reveals the next character from the source text
+- Rate: ~60 chars/sec (adjustable via a `charsPerSec` parameter)
+- Blinking cursor at insertion point (CSS `@keyframes blink`, 530ms period)
+- When `isStreaming` flips to `false`, the hook instantly returns the full text (no more rAF)
 - Tool call status: running state shows pulsing ring (`framer-motion` `animate={{ scale: [1, 1.1, 1] }}` with `transition: { repeat: Infinity, duration: 1.5 }`)
 
 ### Layer 2: Message transitions
@@ -60,10 +62,13 @@ Total added bundle: ~57 KB (gzipped). Negligible for a dev tool.
   - `exit={{ opacity: 0, height: 0 }}` (for reset/clear transitions)
   - `layout` prop on tool calls for smooth repositioning
 - Stagger: 40ms between messages within same turn (`staggerChildren: 0.04` via `AnimatePresence`)
+- `AnimatedError` uses the same pattern as other messages (fade-in via Layer 2); no special animation needed beyond the standard entry transition
 
 ### Layer 3: Timeline view
 
-- Horizontal scrollable bar, fixed height (~48px), below message list, above composer
+- Horizontal scrollable bar, fixed height (~48px), positioned between `MessageList` and `Composer` in the App layout
+- Scroll-hint overlay: fades in on the left edge when content overflows
+- Turn segments: `[User pill] ──▶ (▸ Thinking) ──▶ [⚙ tool_call ···] ──▶ [✓ done]`
 - Turn segments: `[User pill] ──▶ (▸ Thinking) ──▶ [⚙ tool_call ···] ──▶ [✓ done]`
 - Status colors: green=success, amber=running, red=error, blue=tool, purple=reasoning
 - Connecting line: `h-px bg-zinc-700` between segments
@@ -77,7 +82,7 @@ Total added bundle: ~57 KB (gzipped). Negligible for a dev tool.
 
 ### MarkdownText component
 
-- `react-markdown` with `remark-gfm` + `rehype-pretty-code` (shiki)
+- `react-markdown` with `remark-gfm` + `rehype-pretty-code` (shiki, theme: "dark-plus")
 - Code blocks: dark theme with copy button on hover (top-right corner)
 - Inline code: monospace, `bg-zinc-800 rounded px-1`
 - Headings: h2/h3 size reduction for chat context
@@ -96,7 +101,7 @@ Total added bundle: ~57 KB (gzipped). Negligible for a dev tool.
 interface AnimatedItem extends Item {
   ts: number;        // timestamp when item was emitted (ms)
   streaming: boolean; // is this item still receiving events?
-  progress: number;   // 0-1 for streaming text items
+  progress: number;   // charsRendered / totalChars for streaming text items (0-1)
 }
 ```
 
