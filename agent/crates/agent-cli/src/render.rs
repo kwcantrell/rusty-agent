@@ -76,6 +76,7 @@ impl EventSink for TerminalSink {
                     let _ = writeln!(out, "\x1b[32m✓ {name}\x1b[0m");
                 }
             }
+            AgentEvent::Usage { .. } => {} // telemetry for the web context dashboard; not shown in the CLI
             AgentEvent::Approval(_) => {} // the TerminalApproval channel prints its own prompt
             AgentEvent::Error(e) => {
                 let _ = writeln!(out, "\n\x1b[31m✗ {e}\x1b[0m");

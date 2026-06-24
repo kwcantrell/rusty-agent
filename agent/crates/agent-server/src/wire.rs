@@ -61,6 +61,7 @@ pub struct DiscoveredSkill {
 pub enum WireEvent {
     Token { text: String },
     Reasoning { text: String },
+    Usage { prompt_tokens: usize, context_limit: usize, turn: usize, max_turns: usize },
     ToolStart { name: String, args: serde_json::Value },
     ToolResult {
         name: String,
@@ -102,6 +103,8 @@ pub fn wire_event_from(event: AgentEvent) -> Option<WireEvent> {
     Some(match event {
         AgentEvent::Token(t) => WireEvent::Token { text: t },
         AgentEvent::Reasoning(t) => WireEvent::Reasoning { text: t },
+        AgentEvent::Usage { prompt_tokens, context_limit, turn, max_turns } =>
+            WireEvent::Usage { prompt_tokens, context_limit, turn, max_turns },
         AgentEvent::ToolStart { name, args } => WireEvent::ToolStart { name, args },
         AgentEvent::ToolResult { name, output } => WireEvent::ToolResult {
             name,
@@ -214,6 +217,19 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("\"type\":\"reasoning\""));
         assert!(json.contains("thinking"));
+    }
+
+    #[test]
+    fn usage_event_maps_to_wire_and_serializes() {
+        let payload = wire_event_from(AgentEvent::Usage {
+            prompt_tokens: 1234, context_limit: 128_000, turn: 2, max_turns: 20,
+        }).unwrap();
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"type\":\"usage\""));
+        assert!(json.contains("\"prompt_tokens\":1234"));
+        assert!(json.contains("\"context_limit\":128000"));
+        assert!(json.contains("\"turn\":2"));
+        assert!(json.contains("\"max_turns\":20"));
     }
 
     #[test]
