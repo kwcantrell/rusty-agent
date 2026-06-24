@@ -94,7 +94,10 @@ impl OpenAiCompatClient {
             "messages": messages_to_json(&req.messages),
             "stream": true,
             "temperature": req.temperature,
-            "chat_template_kwargs": { "enable_thinking": req.enable_thinking },
+            "chat_template_kwargs": {
+                "enable_thinking": req.enable_thinking,
+                "preserve_thinking": req.preserve_thinking,
+            },
         });
         if let Some(mt) = req.max_tokens {
             b["max_tokens"] = json!(mt);
@@ -416,6 +419,9 @@ mod tests {
         assert!((b["top_p"].as_f64().unwrap() - 0.8_f32 as f64).abs() < 1e-6);
         assert_eq!(b["top_k"], serde_json::json!(30));
         assert_eq!(b["chat_template_kwargs"]["enable_thinking"], serde_json::json!(false));
+        // preserve_thinking rides alongside enable_thinking (Qwen3.6 keeps prior
+        // reasoning only when this is true); default is false here.
+        assert_eq!(b["chat_template_kwargs"]["preserve_thinking"], serde_json::json!(false));
         // Unset params are omitted entirely.
         assert!(b.get("min_p").is_none());
         assert!(b.get("presence_penalty").is_none());
