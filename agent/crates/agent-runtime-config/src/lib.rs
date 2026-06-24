@@ -13,6 +13,7 @@ use agent_tools::{git::{GitCommit, GitDiff, GitStatus}, shell::ExecuteCommand, T
 use agent_tools::{HostExecutor, Limits, Mode, SandboxStrategy, Tool};
 use agent_sandbox::{validate_mount, DockerSandbox, SandboxPolicy};
 use agent_skills::{CreateSkill, ListSkills, ReadSkillFile, SkillRegistry, UseSkill};
+use agent_memory::{build_tools, MemoryConfig};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +93,31 @@ pub fn build_skills(
         Arc::new(CreateSkill::new(registry.clone())),
     ];
     (registry, tools)
+}
+
+/// Build the three memory tools, or an empty vec when disabled or when construction fails
+/// (model unavailable, DB unopenable). Memory is best-effort: failure disables it, never aborts.
+pub fn build_memory(
+    enabled: bool,
+    db_path: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
+    workspace: &Path,
+) -> Vec<Arc<dyn Tool>> {
+    if !enabled {
+        return Vec::new();
+    }
+    let mut cfg = MemoryConfig::default();
+    if let Some(p) = db_path {
+        cfg.db_path = p;
+    }
+    cfg.model_cache_dir = model_dir;
+    match build_tools(cfg, workspace) {
+        Ok(tools) => tools,
+        Err(e) => {
+            tracing::warn!(target: "memory", "disabled: {e}");
+            Vec::new()
+        }
+    }
 }
 
 pub fn default_allowlist() -> Vec<String> {
@@ -228,6 +254,25 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         for expected in ["list_skills", "use_skill", "read_skill_file", "create_skill"] {
             assert!(names.contains(&expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn build_memory_disabled_returns_no_tools() {
+        let tools = build_memory(false, None, None, std::path::Path::new("/tmp/ws"));
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    #[ignore = "constructs the real embedding model (network/model download)"]
+    fn build_memory_enabled_returns_three_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("memory.db");
+        let cache = tmp.path().join("models");
+        let tools = build_memory(true, Some(db), Some(cache), tmp.path());
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        for n in ["remember", "recall", "forget"] {
+            assert!(names.contains(&n), "missing {n}");
         }
     }
 }

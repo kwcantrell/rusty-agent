@@ -4,8 +4,8 @@ mod render;
 use agent_core::{AgentLoop, LoopConfig, WindowContext};
 use agent_model::Message;
 use agent_policy::RulePolicy;
-use agent_runtime_config::{backend_name_is_valid, build_registry, build_model, build_sandbox,
-    build_skills, default_allowlist, default_denylist, pick_protocol};
+use agent_runtime_config::{backend_name_is_valid, build_memory, build_registry, build_model,
+    build_sandbox, build_skills, default_allowlist, default_denylist, pick_protocol};
 use approval::TerminalApproval;
 use clap::Parser;
 use render::TerminalSink;
@@ -109,6 +109,16 @@ struct Cli {
     /// Extra read-only bind-mount path inside the sandbox (repeatable)
     #[arg(long = "sandbox-extra-ro")]
     sandbox_extra_ro: Vec<String>,
+    // ── Memory flags ───────────────────────────────────────────────────────
+    /// Enable long-term memory (remember/recall/forget tools).
+    #[arg(long, default_value_t = false)]
+    memory: bool,
+    /// Override the memory DB path (default ~/.agent/memory.db).
+    #[arg(long)]
+    memory_db: Option<std::path::PathBuf>,
+    /// Override the embedding-model cache dir.
+    #[arg(long)]
+    memory_model_dir: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -167,6 +177,10 @@ async fn main() {
     // Skills: register the four skill tools, then compose any presets into the system prompt.
     let (skill_registry, skill_tools) = build_skills(&cli.skills_dir, &workspace);
     for t in skill_tools {
+        registry.register(t);
+    }
+    // Long-term memory: construct once (loads the embedding model) and register.
+    for t in build_memory(cli.memory, cli.memory_db.clone(), cli.memory_model_dir.clone(), &workspace) {
         registry.register(t);
     }
     let system_prompt = match agent_skills::compose_system_prompt(
