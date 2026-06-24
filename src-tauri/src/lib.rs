@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod llama;
 pub mod workspace;
 
 use std::path::PathBuf;
@@ -38,6 +39,11 @@ async fn pick_workspace(
     Ok(Some(dir.to_string_lossy().into_owned()))
 }
 
+#[tauri::command]
+async fn llama_health() -> llama::LlamaHealth {
+    llama::check_health("http://localhost:8080").await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -68,7 +74,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_local_ws_url,
             get_workspace,
-            pick_workspace
+            pick_workspace,
+            llama_health
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
