@@ -120,6 +120,24 @@ mod tests {
     use agent_core::AgentEvent;
 
     #[test]
+    fn tool_result_with_markdown_display_round_trips() {
+        use agent_tools::Display;
+        let payload = WireEvent::ToolResult {
+            name: "render".into(),
+            content: "rendered markdown".into(),
+            display: Some(Display::Markdown { text: "# Hi".into(), title: Some("Plan".into()), id: None }),
+        };
+        let env = WireEnvelope { v: PROTOCOL_VERSION, session_id: "s".into(), id: None,
+            body: WireBody::Event { payload } };
+        let j = serde_json::to_string(&env).unwrap();
+        assert!(j.contains("\"kind\":\"event\""));
+        assert!(j.contains("\"type\":\"tool_result\""));
+        assert!(j.contains("\"Markdown\""));
+        let back: WireEnvelope = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back.body, WireBody::Event { .. }));
+    }
+
+    #[test]
     fn event_envelope_round_trips() {
         let payload = wire_event_from(AgentEvent::Token("hi".into())).unwrap();
         let env = WireEnvelope {

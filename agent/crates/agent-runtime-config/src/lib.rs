@@ -10,7 +10,7 @@ use agent_model::{ClaudeCliClient, ModelClient, NativeProtocol, OpenAiCompatClie
 use agent_http::{FetchUrl, NetworkPolicy};
 use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
 use agent_tools::{git::{GitCommit, GitDiff, GitStatus}, shell::ExecuteCommand, ToolRegistry};
-use agent_tools::{HostExecutor, Limits, Mode, SandboxStrategy, Tool};
+use agent_tools::{HostExecutor, Limits, Mode, RenderArtifact, SandboxStrategy, Tool};
 use agent_sandbox::{validate_mount, DockerSandbox, SandboxPolicy};
 use agent_skills::{CreateSkill, ListSkills, ReadSkillFile, SkillRegistry, UseSkill};
 use agent_memory::{build_tools, MemoryConfig};
@@ -74,6 +74,7 @@ pub fn build_registry(http_allow_hosts: &[String]) -> ToolRegistry {
     r.register(Arc::new(GitStatus));
     r.register(Arc::new(GitDiff));
     r.register(Arc::new(GitCommit));
+    r.register(Arc::new(RenderArtifact));
     r.register(Arc::new(FetchUrl::new(NetworkPolicy::new(http_allow_hosts))));
     r
 }
@@ -226,6 +227,12 @@ mod tests {
         let d = build_sandbox(&cfg).describe();
         assert_eq!(d.mechanism, "docker");
         assert_eq!(d.image.as_deref(), Some("debian:stable-slim"));
+    }
+
+    #[test]
+    fn build_registry_includes_render() {
+        let r = build_registry(&[]);
+        assert!(r.get("render").is_some(), "render tool must be registered");
     }
 
     #[test]
