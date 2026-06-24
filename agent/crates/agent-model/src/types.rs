@@ -11,6 +11,11 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     pub tool_call_id: Option<String>,
     pub name: Option<String>,
+    /// Preserved chain-of-thought for this turn, kept as data rather than baked
+    /// into `content`. Each model backend decides how (or whether) to render it
+    /// back into the prompt — see `render_transcript` (claude_cli) and
+    /// `messages_to_json` (openai). `None` unless `preserve_thinking` is on.
+    pub reasoning: Option<String>,
 }
 
 impl Message {
@@ -18,14 +23,20 @@ impl Message {
     pub fn user(c: impl Into<String>) -> Self { Self::plain(Role::User, c) }
     pub fn assistant(c: impl Into<String>, calls: Option<Vec<ToolCall>>) -> Self {
         Self { role: Role::Assistant, content: c.into(), tool_calls: calls,
-               tool_call_id: None, name: None }
+               tool_call_id: None, name: None, reasoning: None }
     }
     pub fn tool(call_id: impl Into<String>, name: impl Into<String>, c: impl Into<String>) -> Self {
         Self { role: Role::Tool, content: c.into(), tool_calls: None,
-               tool_call_id: Some(call_id.into()), name: Some(name.into()) }
+               tool_call_id: Some(call_id.into()), name: Some(name.into()), reasoning: None }
     }
     fn plain(role: Role, c: impl Into<String>) -> Self {
-        Self { role, content: c.into(), tool_calls: None, tool_call_id: None, name: None }
+        Self { role, content: c.into(), tool_calls: None, tool_call_id: None, name: None,
+               reasoning: None }
+    }
+    /// Attach preserved reasoning, returning the message for chaining.
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning = Some(reasoning.into());
+        self
     }
 }
 
@@ -99,6 +110,15 @@ mod tests {
         assert!(matches!(t.role, Role::Tool));
         assert_eq!(t.tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(t.name.as_deref(), Some("read_file"));
+    }
+
+    #[test]
+    fn assistant_carries_no_reasoning_by_default_and_builder_attaches_it() {
+        let plain = Message::assistant("answer", None);
+        assert_eq!(plain.reasoning, None);
+        let with = Message::assistant("answer", None).with_reasoning("secret plan");
+        assert_eq!(with.reasoning.as_deref(), Some("secret plan"));
+        assert_eq!(with.content, "answer"); // reasoning is separate data, not baked into content
     }
 
     #[test]
