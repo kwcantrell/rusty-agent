@@ -151,6 +151,7 @@ fn parse_sse_line(line: &str, splitter: &mut ThinkingSplitter) -> Option<Result<
     if let Some(calls) = choice["delta"]["tool_calls"].as_array() {
         for c in calls {
             out.push(Chunk::ToolCallDelta(RawToolCall {
+                index: c["index"].as_u64().map(|i| i as usize),
                 id: c["id"].as_str().map(str::to_string),
                 name: c["function"]["name"].as_str().map(str::to_string),
                 args_fragment: c["function"]["arguments"]

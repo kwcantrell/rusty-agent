@@ -42,7 +42,7 @@ impl ModelClient for ScriptedModel {
             Scripted::Text(t) => Ok(stream::iter(vec![
                 Ok(Chunk::Text(t)), Ok(Chunk::Done(StopReason::Stop))]).boxed()),
             Scripted::Call(id, name, args) => Ok(stream::iter(vec![
-                Ok(Chunk::ToolCallDelta(RawToolCall { id: Some(id), name: Some(name),
+                Ok(Chunk::ToolCallDelta(RawToolCall { index: None, id: Some(id), name: Some(name),
                     args_fragment: args })),
                 Ok(Chunk::Done(StopReason::ToolCalls))]).boxed()),
             Scripted::Reasoning(reasoning, answer) => Ok(stream::iter(vec![

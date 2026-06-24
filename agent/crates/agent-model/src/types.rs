@@ -63,6 +63,9 @@ pub enum StopReason { #[default] Stop, ToolCalls, Length, BudgetExhausted }
 
 #[derive(Debug, Clone, Default)]
 pub struct RawToolCall {
+    /// Streaming correlation index (OpenAI/llama.cpp send it on every fragment of
+    /// a call). Used to reassemble parallel calls even if fragments interleave.
+    pub index: Option<usize>,
     pub id: Option<String>,
     pub name: Option<String>,
     pub args_fragment: String,

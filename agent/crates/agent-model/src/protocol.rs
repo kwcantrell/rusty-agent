@@ -43,7 +43,7 @@ mod tests {
         let turn = AssistantTurn {
             text: "ok".into(),
             raw_tool_calls: vec![RawToolCall {
-                id: Some("c1".into()), name: Some("read_file".into()),
+                index: None, id: Some("c1".into()), name: Some("read_file".into()),
                 args_fragment: r#"{"path":"a.txt"}"#.into() }],
             stop: StopReason::ToolCalls,
             reasoning: String::new(),
@@ -58,7 +58,7 @@ mod tests {
     #[test]
     fn native_rejects_malformed_args() {
         let turn = AssistantTurn { text: "".into(),
-            raw_tool_calls: vec![RawToolCall { id: Some("c1".into()),
+            raw_tool_calls: vec![RawToolCall { index: None, id: Some("c1".into()),
                 name: Some("x".into()), args_fragment: "{not json".into() }],
             stop: StopReason::ToolCalls, reasoning: String::new() };
         assert!(NativeProtocol.parse(&turn).is_err());

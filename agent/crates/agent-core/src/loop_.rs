@@ -234,7 +234,22 @@ impl AgentLoop {
 }
 
 /// Merge a streamed tool-call delta into the accumulator (handles fragmented args).
+///
+/// Prefers the streaming `index` to correlate fragments, so parallel tool calls
+/// reassemble correctly even if their argument fragments interleave. Falls back
+/// to the legacy order-based merge for servers that omit `index`.
 fn merge_tool_call(acc: &mut Vec<RawToolCall>, delta: RawToolCall) {
+    if let Some(idx) = delta.index {
+        if let Some(existing) = acc.iter_mut().find(|c| c.index == Some(idx)) {
+            if existing.id.is_none() { existing.id = delta.id; }
+            if existing.name.is_none() { existing.name = delta.name; }
+            existing.args_fragment.push_str(&delta.args_fragment);
+        } else {
+            acc.push(delta);
+        }
+        return;
+    }
+    // No index field: correlate by arrival order (a new call announces an id).
     if delta.id.is_some() || acc.is_empty() {
         acc.push(delta);
     } else if let Some(last) = acc.last_mut() {
@@ -257,6 +272,37 @@ mod tests {
         let mut r = ToolRegistry::new();
         r.register(Arc::new(ReadFile));
         Arc::new(r)
+    }
+
+    #[test]
+    fn merge_tool_call_keys_on_index_for_interleaved_parallel_calls() {
+        let mut acc = Vec::new();
+        // Two calls open (each first fragment carries id+name+index)...
+        merge_tool_call(&mut acc, RawToolCall { index: Some(0), id: Some("a".into()),
+            name: Some("f0".into()), args_fragment: "{\"x\":".into() });
+        merge_tool_call(&mut acc, RawToolCall { index: Some(1), id: Some("b".into()),
+            name: Some("f1".into()), args_fragment: "{\"y\":".into() });
+        // ...then INTERLEAVED arg fragments (id/name absent, only index correlates them).
+        merge_tool_call(&mut acc, RawToolCall { index: Some(0), id: None, name: None,
+            args_fragment: "1}".into() });
+        merge_tool_call(&mut acc, RawToolCall { index: Some(1), id: None, name: None,
+            args_fragment: "2}".into() });
+        assert_eq!(acc.len(), 2);
+        assert_eq!(acc[0].name.as_deref(), Some("f0"));
+        assert_eq!(acc[0].args_fragment, "{\"x\":1}");
+        assert_eq!(acc[1].name.as_deref(), Some("f1"));
+        assert_eq!(acc[1].args_fragment, "{\"y\":2}");
+    }
+
+    #[test]
+    fn merge_tool_call_falls_back_to_order_when_no_index() {
+        let mut acc = Vec::new();
+        merge_tool_call(&mut acc, RawToolCall { index: None, id: Some("a".into()),
+            name: Some("f".into()), args_fragment: "{".into() });
+        merge_tool_call(&mut acc, RawToolCall { index: None, id: None, name: None,
+            args_fragment: "}".into() });
+        assert_eq!(acc.len(), 1);
+        assert_eq!(acc[0].args_fragment, "{}");
     }
     fn policy(ws: std::path::PathBuf) -> Arc<RulePolicy> {
         Arc::new(RulePolicy { workspace: ws, command_allowlist: vec![], command_denylist: vec![] })
