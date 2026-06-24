@@ -6,7 +6,7 @@
 
 ## Overview
 
-Bring the existing React+Vite+Tailwind web client to life with three animation layers and full markdown rendering:
+Bring the existing React+Vite+Tailwind web client to life with three animation layers plus full markdown rendering:
 
 1. **Streaming text** — assistant and reasoning text appears character-by-character
 2. **Event transitions** — messages slide/fade in, tool calls pulse while running
@@ -48,10 +48,10 @@ Total added bundle: ~57 KB (gzipped). Negligible for a dev tool.
 
 - `useStreamingText` hook — signature: `useStreamingText(text: string, isStreaming: boolean): string`
   - Returns the visible text for rendering (full text when not streaming, partial when streaming)
-  - Internally manages a `ref` to the current character index
-  - On each rAF frame, reveals the next character from the source text
-- Rate: ~60 chars/sec (adjustable via a `charsPerSec` parameter)
-- Blinking cursor at insertion point (CSS `@keyframes blink`, 530ms period)
+  - Tracks the reveal index in a `ref`; resets to 0 whenever `text` or `isStreaming` changes
+  - Reveal is **time-based**, not per-frame: on each rAF tick it reveals up to `floor(elapsed_seconds × 60)` characters, so it catches up correctly after dropped frames
+- Rate: fixed at 60 chars/sec (`CHARS_PER_SECOND` module constant in `useStreamingText.ts`)
+- Blinking cursor at insertion point — `useStreamingCursor` hook toggles a boolean every 530ms (`CURSOR_PERIOD_MS`) via `setInterval`; the component renders the cursor glyph based on that flag
 - When `isStreaming` flips to `false`, the hook instantly returns the full text (no more rAF)
 - Tool call status: running state shows pulsing ring (`framer-motion` `animate={{ scale: [1, 1.1, 1] }}` with `transition: { repeat: Infinity, duration: 1.5 }`)
 
@@ -69,13 +69,14 @@ Total added bundle: ~57 KB (gzipped). Negligible for a dev tool.
 - Horizontal scrollable bar, fixed height (~48px), positioned between `MessageList` and `Composer` in the App layout
 - Scroll-hint overlay: fades in on the left edge when content overflows
 - Turn segments: `[User pill] ──▶ (▸ Thinking) ──▶ [⚙ tool_call ···] ──▶ [✓ done]`
-- Turn segments: `[User pill] ──▶ (▸ Thinking) ──▶ [⚙ tool_call ···] ──▶ [✓ done]`
 - Status colors: green=success, amber=running, red=error, blue=tool, purple=reasoning
 - Connecting line: `h-px bg-zinc-700` between segments
 - Interactivity:
   - Click turn segment → scrolls message list to that turn
-  - Hover tool call bar → tooltip with name and duration
+  - Hover tool call bar → tooltip with name (and duration, once real per-event timestamps land — see note below)
   - Hover thinking bar → tooltip with full reasoning text (truncated to 50 chars)
+
+> **Timestamp note:** `animatedItemsFrom` currently assigns synthetic monotonic timestamps (`now, now+1, now+2 …`) as a stable ordering key, **not** wall-clock emission times. Turn "duration" derived from these equals `itemCount − 1` ms, so it is an ordering artifact, not a real duration. Real durations require the reducer to stamp `Date.now()` onto each item as it is emitted (a follow-up change to `reduceFrame`). Until then, the timeline renders segments and ordering but should not present duration as meaningful.
 - Animated shimmer on running tool bars
 
 ## Rich Text Rendering
@@ -91,8 +92,8 @@ Total added bundle: ~57 KB (gzipped). Negligible for a dev tool.
 
 ### Streaming integration
 
-- Progressive markdown rendering during streaming (partial blocks show unclosed fences)
-- On `done`, full markdown renders with complete syntax highlighting
+- **During streaming, render as plain text** (the `useStreamingText` output in a `<pre>`/whitespace-preserving block), not live markdown. Re-running react-markdown + rehype-pretty-code (shiki tokenization) on every character tick is the expensive path and would also flicker on unclosed fences. Plain-text-while-streaming avoids both.
+- On `done` (item gains `done` / stops streaming), swap to the full `MarkdownText` render with complete syntax highlighting. This is the single expensive parse, run once per message.
 - Code block copy button: `navigator.clipboard.writeText()`, shows "Copied!" tooltip
 
 ## New Types (additive, in state.ts)
@@ -101,16 +102,16 @@ Total added bundle: ~57 KB (gzipped). Negligible for a dev tool.
 interface AnimatedItem extends Item {
   ts: number;        // timestamp when item was emitted (ms)
   streaming: boolean; // is this item still receiving events?
-  progress: number;   // charsRendered / totalChars for streaming text items (0-1)
+  progress: number;   // 0 while the item is still streaming, 1 once complete; per-character reveal progress is tracked in the component via useStreamingText, not here
 }
 ```
 
-## useAnimatedItems Hook
+## Deriving AnimatedItems
 
-Sits between `state.items` and render layer. Derives `AnimatedItem[]` from `Item[]` without mutating source of truth.
+Pure functions in `state.ts` (`animatedItemsFrom`, `turnGroupsFrom`) sit between `state.items` and the render layer. They derive `AnimatedItem[]` / `TurnGroup[]` from `Item[]` without mutating the source of truth. (Not React hooks — plain functions, so they are trivially unit-testable; the test file is named `useAnimatedItems.test.ts` for historical reasons.)
 
 Responsibilities:
-- Assigns timestamps to new items (Date.now() on emission)
+- Assigns synthetic monotonic timestamps for stable ordering (the `now` base plus the item's index). Real wall-clock emission times are a future enhancement requiring the reducer to stamp items in `reduceFrame` — see the Timeline timestamp note above.
 - Tracks streaming state per item
 - Groups items into turns (delimited by `done` events)
 - Computes turn durations for timeline
@@ -120,7 +121,8 @@ Responsibilities:
 | File | Change |
 |------|--------|
 | `web/package.json` | Add 4 deps |
-| `web/src/state.ts` | Add `AnimatedItem` type + `useAnimatedItems` hook |
+| `web/src/state.ts` | Add `AnimatedItem` type + `animatedItemsFrom`/`turnGroupsFrom` derive functions |
+| `web/src/hooks/useStreamingText.ts` | New — `useStreamingText` + `useStreamingCursor` hooks |
 | `web/src/components/AnimatedAssistantMessage.tsx` | New — streaming + markdown |
 | `web/src/components/AnimatedReasoningMessage.tsx` | New — streaming + collapse |
 | `web/src/components/AnimatedToolCall.tsx` | New — expand/collapse + status pulse |
@@ -141,11 +143,12 @@ Responsibilities:
 - `useStreamingText` hook: unit test with mocked rAF — verify text accumulates and stops on `done`
 - `AnimatedToolCall`: unit test — verify running→done animation sequence
 - `TimelineView`: integration test — verify turn grouping produces correct segments
-- Existing tests continue to pass (no changes to public component APIs)
+- `MessageList` swaps in the `Animated*` components, which changes rendered markup. Existing `tool-components.test.tsx` / `shell-components.test.tsx` / `smoke.test.tsx` that assert on the current `ToolCall`/`AssistantMessage`/`ReasoningMessage` output will need updating in lockstep — the data flow into `MessageList` is unchanged, but the DOM it produces is not.
 
 ## Backward Compatibility
 
-- Existing `Item` type unchanged — all changes are additive
+- Existing `Item` type unchanged — all type changes are additive
 - `AnimatedItem` is a derived view, not persisted
 - Old sessions (no timestamps) render correctly in both MessageList and TimelineView
+- Note: "additive" applies to types and data flow, not to rendered DOM — see the Testing section for the component tests that change
 - WebSocket protocol version unchanged
