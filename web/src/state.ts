@@ -131,3 +131,79 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
     }
   }
 }
+
+/** Animation metadata derived from Item — never persisted. */
+export interface AnimatedItem extends Item {
+  ts: number;
+  streaming: boolean;
+  progress: number;
+}
+
+export interface TurnGroup {
+  items: AnimatedItem[];
+  startTs: number;
+  endTs: number;
+  duration: number;
+}
+
+/**
+ * Derives animation metadata from raw Item[] for consumption by animated components.
+ * @param items - items from the reducer
+ * @param now - current timestamp (for tests: fixed value)
+ */
+export function animatedItemsFrom(items: Item[], now: number): AnimatedItem[] {
+  let ts = now;
+  return items.map((item) => {
+    const streaming = isStreamingItem(item);
+    const progress = streaming ? 0 : 1;
+    const curTs = ts++;
+    return { ...item, ts: curTs, streaming, progress } as AnimatedItem;
+  });
+}
+
+function isStreamingItem(item: Item): boolean {
+  if (item.kind === "assistant" && item.done === undefined) return true;
+  if (item.kind === "reasoning") return true;
+  if (item.kind === "tool" && item.status === "running") return true;
+  return false;
+}
+
+/**
+ * Groups animated items into turns, delimited by done signals.
+ * Each turn starts with the first item after the previous turn's done (or the start).
+ */
+export function turnGroupsFrom(items: AnimatedItem[]): TurnGroup[] {
+  const groups: TurnGroup[] = [];
+  let currentGroup: AnimatedItem[] = [];
+
+  for (const item of items) {
+    currentGroup.push(item);
+    if (item.kind === "assistant" && item.done !== undefined) {
+      if (currentGroup.length > 0) {
+        const startTs = currentGroup[0].ts;
+        const endTs = currentGroup[currentGroup.length - 1].ts;
+        groups.push({
+          items: [...currentGroup],
+          startTs,
+          endTs,
+          duration: endTs - startTs,
+        });
+      }
+      currentGroup = [];
+    }
+  }
+
+  // Flush any remaining items (e.g., if stream ended mid-turn)
+  if (currentGroup.length > 0) {
+    const startTs = currentGroup[0].ts;
+    const endTs = currentGroup[currentGroup.length - 1].ts;
+    groups.push({
+      items: [...currentGroup],
+      startTs,
+      endTs,
+      duration: endTs - startTs,
+    });
+  }
+
+  return groups;
+}
