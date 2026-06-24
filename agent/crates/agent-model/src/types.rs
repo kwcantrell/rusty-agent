@@ -52,6 +52,10 @@ pub struct CompletionRequest {
     pub presence_penalty: Option<f32>,
     pub repeat_penalty: Option<f32>,
     pub enable_thinking: bool,
+    /// Ask the backend to retain prior-turn reasoning in the rendered prompt
+    /// (Qwen3.6 `chat_template_kwargs.preserve_thinking`). Paired with assistant
+    /// `Message.reasoning`, which the OpenAI adapter sends as `reasoning_content`.
+    pub preserve_thinking: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -110,6 +114,12 @@ mod tests {
         assert!(matches!(t.role, Role::Tool));
         assert_eq!(t.tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(t.name.as_deref(), Some("read_file"));
+    }
+
+    #[test]
+    fn completion_request_defaults_preserve_thinking_off() {
+        let req = CompletionRequest::default();
+        assert!(!req.preserve_thinking);
     }
 
     #[test]

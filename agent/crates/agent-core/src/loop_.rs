@@ -138,6 +138,7 @@ impl AgentLoop {
                 presence_penalty: self.config.presence_penalty,
                 repeat_penalty: self.config.repeat_penalty,
                 enable_thinking: self.config.enable_thinking,
+                preserve_thinking: self.config.preserve_thinking,
             };
             let assistant = self.completion_with_retry(&base).await?;
 
