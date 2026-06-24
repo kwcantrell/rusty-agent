@@ -15,6 +15,10 @@ vi.mock("./socket", () => ({
   connect: () => ({ send: vi.fn(), close: vi.fn() }),
 }));
 
+// App dynamically imports invoke() for get_workspace; stub it so no real
+// Tauri internals are touched.
+vi.mock("@tauri-apps/api/core", () => ({ invoke: async () => null }));
+
 describe("App in Tauri mode", () => {
   beforeEach(() => localStorage.clear());
 

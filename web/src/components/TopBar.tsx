@@ -1,13 +1,16 @@
+import { invoke } from "@tauri-apps/api/core";
 import type { ConnectionStatus } from "../state";
 import type { Theme } from "../theme";
 import { ThemeToggle } from "./ThemeToggle";
 
 export function TopBar({ projectLabel, online, status, theme, onToggleTheme,
-  onOpenSettings, settingsDisabled, onSignOut, onToggleWorkspace, showWorkspaceToggle }:
+  onOpenSettings, settingsDisabled, onSignOut, onToggleWorkspace, showWorkspaceToggle,
+  tauriWorkspace, onWorkspaceChanged }:
   { projectLabel: string; online: boolean; status: ConnectionStatus;
     theme: Theme; onToggleTheme: () => void;
     onOpenSettings?: () => void; settingsDisabled?: boolean; onSignOut: () => void;
-    onToggleWorkspace?: () => void; showWorkspaceToggle?: boolean }) {
+    onToggleWorkspace?: () => void; showWorkspaceToggle?: boolean;
+    tauriWorkspace?: string; onWorkspaceChanged?: (path: string) => void }) {
   return (
     <div className="flex items-center justify-between px-4 py-2.5"
       style={{ background: "var(--surface-base)", borderBottom: "1px solid var(--border)" }}>
@@ -19,6 +22,22 @@ export function TopBar({ projectLabel, online, status, theme, onToggleTheme,
         <span className="text-xs" style={{ color: "var(--text-muted)" }}>· {status}</span>
       </div>
       <div className="flex items-center gap-3 text-sm">
+        {tauriWorkspace !== undefined && (
+          <div className="flex items-center gap-2 text-xs" style={{ color: "var(--text-muted)" }}>
+            <span title={tauriWorkspace} className="max-w-[28ch] truncate">{tauriWorkspace}</span>
+            <button
+              type="button"
+              className="rounded-full px-3 py-1 hover:opacity-80"
+              style={{ border: "1px solid var(--border)", color: "var(--text)" }}
+              onClick={async () => {
+                const picked = await invoke<string | null>("pick_workspace");
+                if (picked) onWorkspaceChanged?.(picked);
+              }}
+            >
+              Change…
+            </button>
+          </div>
+        )}
         {showWorkspaceToggle && (
           <button onClick={onToggleWorkspace} aria-label="toggle workspace"
             className="rounded-full px-3 py-1 text-xs hover:opacity-80"

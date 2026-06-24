@@ -26,6 +26,7 @@ export default function App() {
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const sock = useRef<ReturnType<typeof connect> | null>(null);
   const [localUrl, setLocalUrl] = useState<string | null>(null);
+  const [workspace, setWorkspace] = useState<string | undefined>(undefined);
   const tauri = isTauri();
 
   useEffect(() => {
@@ -36,6 +37,8 @@ export default function App() {
       setLocalUrl(t.wsUrl);
       setSessionId(t.sessionId); // satisfies the existing sessionId gate
     });
+    import("@tauri-apps/api/core").then(({ invoke }) =>
+      invoke<string | null>("get_workspace").then((w) => { if (active && w) setWorkspace(w); }));
     return () => { active = false; };
   }, [tauri]);
 
@@ -109,7 +112,9 @@ export default function App() {
         theme={theme} onToggleTheme={toggleTheme}
         onOpenSettings={openSettings} settingsDisabled={!(connected && state.online)}
         onSignOut={signOut}
-        showWorkspaceToggle={narrow} onToggleWorkspace={() => setWorkspaceOpen((o) => !o)} />
+        showWorkspaceToggle={narrow} onToggleWorkspace={() => setWorkspaceOpen((o) => !o)}
+        tauriWorkspace={tauri ? workspace : undefined}
+        onWorkspaceChanged={(p) => setWorkspace(p)} />
       {showSettings && state.settings && (
         <SettingsPanel settings={state.settings} meta={state.settingsMeta} error={state.settingsError}
           disabled={!connected} onSave={saveSettings} onClose={() => setShowSettings(false)} />
