@@ -127,6 +127,30 @@ impl OpenAiCompatClient {
     }
 }
 
+/// Accumulates raw response bytes and hands back complete SSE lines. Buffering at
+/// the byte level (not as a `String`) is what keeps a multi-byte UTF-8 character
+/// intact when it straddles two network chunks: a line is only decoded once its
+/// terminating `\n` arrives, and a `\n` can never split a UTF-8 char — so the
+/// per-line lossy decode is exact. Only the trailing partial line stays buffered.
+#[derive(Default)]
+struct SseLineBuffer {
+    buf: Vec<u8>,
+}
+
+impl SseLineBuffer {
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Pop the next complete line (newline stripped, trimmed), or `None` if no
+    /// full line is buffered yet.
+    fn next_line(&mut self) -> Option<String> {
+        let idx = self.buf.iter().position(|&c| c == b'\n')?;
+        let line: Vec<u8> = self.buf.drain(..=idx).collect();
+        Some(String::from_utf8_lossy(&line[..line.len() - 1]).trim().to_string())
+    }
+}
+
 fn parse_sse_line(line: &str, splitter: &mut ThinkingSplitter) -> Option<Result<Vec<Chunk>, ModelError>> {
     let data = line.strip_prefix("data:")?.trim();
     if data == "[DONE]" {
@@ -193,13 +217,11 @@ impl ModelClient for OpenAiCompatClient {
 
         let mut byte_stream = resp.bytes_stream();
         let stream = async_stream::stream! {
-            let mut buf = String::new();
+            let mut lines = SseLineBuffer::default();
             let mut splitter = ThinkingSplitter::default();
             loop {
-                // Drain any complete lines from buf before fetching more bytes.
-                if let Some(idx) = buf.find('\n') {
-                    let line = buf[..idx].trim().to_string();
-                    buf.drain(..=idx);
+                // Drain any complete lines before fetching more bytes.
+                if let Some(line) = lines.next_line() {
                     if line.is_empty() {
                         continue;
                     }
@@ -224,7 +246,7 @@ impl ModelClient for OpenAiCompatClient {
                 }
                 // Need more bytes.
                 match byte_stream.next().await {
-                    Some(Ok(b)) => buf.push_str(&String::from_utf8_lossy(&b)),
+                    Some(Ok(b)) => lines.push(&b),
                     Some(Err(e)) => {
                         yield Err(ModelError::Stream(e.to_string()));
                         return;
@@ -262,6 +284,29 @@ mod tests {
             }
         }
         (text, reasoning)
+    }
+
+    #[test]
+    fn sse_line_buffer_preserves_multibyte_char_split_across_chunks() {
+        let mut b = SseLineBuffer::default();
+        // "5°C" — '°' is 0xC2 0xB0; split the two bytes across separate pushes,
+        // mid-line. A per-chunk lossy decode would corrupt it to replacement chars.
+        b.push(b"data: {\"t\":\"5\xc2");
+        assert!(b.next_line().is_none(), "no newline yet -> hold the partial char");
+        b.push(b"\xb0C\"}\n");
+        assert_eq!(b.next_line().as_deref(), Some("data: {\"t\":\"5°C\"}"));
+        assert!(b.next_line().is_none());
+    }
+
+    #[test]
+    fn sse_line_buffer_splits_multiple_lines_and_keeps_trailing_partial() {
+        let mut b = SseLineBuffer::default();
+        b.push(b"line one\nline two\npartial");
+        assert_eq!(b.next_line().as_deref(), Some("line one"));
+        assert_eq!(b.next_line().as_deref(), Some("line two"));
+        assert!(b.next_line().is_none()); // "partial" has no '\n' yet
+        b.push(b" done\n");
+        assert_eq!(b.next_line().as_deref(), Some("partial done"));
     }
 
     #[test]
