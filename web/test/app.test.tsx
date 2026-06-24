@@ -34,7 +34,8 @@ describe("App", () => {
       // animating char-by-char via useStreamingText).
       TestWS.last!.onmessage?.({ data: JSON.stringify({ v: 1, session_id: "sess-1", kind: "event", payload: { type: "done", reason: "stop" } }) });
     });
-    expect(screen.getByText(/agent online/i)).toBeInTheDocument();
+    // The two-pane TopBar conveys presence via the status dot's title (not visible text).
+    expect(screen.getByTitle(/agent online/i)).toBeInTheDocument();
     expect(screen.getByText("hello world")).toBeInTheDocument();
   });
 
