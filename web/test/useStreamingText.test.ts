@@ -55,6 +55,28 @@ describe("useStreamingText", () => {
     expect(result.current).toBe("cd");
   });
 
+  it("continues from the current position when text is appended (does not restart)", () => {
+    vi.useFakeTimers();
+    const { result, rerender } = renderHook(
+      ({ text, isStreaming }) => useStreamingText(text, isStreaming),
+      { initialProps: { text: "Hello", isStreaming: true } }
+    );
+
+    // Fully reveal the first chunk.
+    act(() => {
+      for (let i = 0; i < 1000; i++) vi.advanceTimersByTime(1);
+    });
+    expect(result.current).toBe("Hello");
+
+    // Append more text — the already-revealed prefix must NOT flash back to the start.
+    rerender({ text: "Hello world", isStreaming: true });
+    act(() => {
+      vi.advanceTimersByTime(16);
+    });
+    expect(result.current.startsWith("Hello")).toBe(true);
+    expect(result.current.length).toBeGreaterThanOrEqual("Hello".length);
+  });
+
   it("switches to full text when isStreaming flips to false", () => {
     vi.useFakeTimers();
     const { result, rerender } = renderHook(

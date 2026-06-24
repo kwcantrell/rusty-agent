@@ -1,45 +1,36 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 
 const CHARS_PER_SECOND = 60;
+// Extra reveal speed proportional to the backlog: when a burst of tokens lands
+// the reveal accelerates so it never lags arbitrarily far behind a fast stream.
+const CATCHUP_PER_SECOND = 2;
 const CURSOR_PERIOD_MS = 530;
 
 /**
  * Returns a progressively revealed version of `text` when `isStreaming` is true.
- * While streaming, characters are revealed at ~60 chars/sec based on elapsed time.
- * When `isStreaming` is false, returns the full `text` immediately.
- * When `text` changes, the reveal index resets to 0.
+ * The reveal advances at a steady base rate (~60 chars/sec) plus a catch-up term
+ * so it keeps pace with fast/large streams. Appended tokens do NOT restart the
+ * reveal — the position is preserved across deltas; it only resets when `text` is
+ * replaced by a non-extending value (a different message reusing this component) or
+ * shrinks. When `isStreaming` is false, returns the full `text` immediately.
  */
 export function useStreamingText(text: string, isStreaming: boolean): string {
-  const [revealed, setRevealed] = useState("");
-  const idxRef = useRef(0);
+  const [revealed, setRevealed] = useState(isStreaming ? "" : text);
+  const idxRef = useRef(isStreaming ? 0 : text.length);
   const rafRef = useRef<number | null>(null);
+  const lastTsRef = useRef(0);
   const textRef = useRef(text);
-  const streamingRef = useRef(isStreaming);
-  const startTimeRef = useRef(0);
+  const prevTextRef = useRef(text);
 
-  textRef.current = text;
-  streamingRef.current = isStreaming;
-
-  // On first render, show full text when not streaming
-  if (revealed === "" && !isStreaming && text.length > 0) {
-    setRevealed(text);
+  // Reset the reveal only when the text is replaced (not a pure append) or shrinks;
+  // a streamed append keeps the current position so the prefix doesn't flash back.
+  if (text !== prevTextRef.current) {
+    if (!text.startsWith(prevTextRef.current) || text.length < idxRef.current) {
+      idxRef.current = 0;
+    }
+    prevTextRef.current = text;
   }
-
-  const tick = useCallback(() => {
-    if (!streamingRef.current) {
-      rafRef.current = null;
-      return;
-    }
-    const target = Math.min(
-      Math.floor(((performance.now() - startTimeRef.current) / 1000) * CHARS_PER_SECOND),
-      textRef.current.length,
-    );
-    if (target > idxRef.current) {
-      idxRef.current = target;
-      setRevealed(textRef.current.slice(0, idxRef.current));
-    }
-    rafRef.current = requestAnimationFrame(tick);
-  }, []);
+  textRef.current = text;
 
   useEffect(() => {
     if (rafRef.current !== null) {
@@ -47,13 +38,30 @@ export function useStreamingText(text: string, isStreaming: boolean): string {
       rafRef.current = null;
     }
 
-    if (isStreaming && text.length > 0) {
-      startTimeRef.current = performance.now();
-      idxRef.current = 0;
-      rafRef.current = requestAnimationFrame(tick);
-    } else {
+    if (!isStreaming) {
+      idxRef.current = text.length;
       setRevealed(text);
+      return;
     }
+
+    // Reveal advances only inside the rAF tick (async) — never synchronously here,
+    // which would re-enter this effect on each render and exhaust the update depth.
+    // `revealed` already holds the prefix shown so far, so an append doesn't flash back.
+    lastTsRef.current = performance.now();
+
+    const tick = (now: number) => {
+      const dt = (now - lastTsRef.current) / 1000;
+      lastTsRef.current = now;
+      const remaining = textRef.current.length - idxRef.current;
+      if (remaining > 0) {
+        const rate = CHARS_PER_SECOND + remaining * CATCHUP_PER_SECOND;
+        const step = Math.max(1, Math.floor(dt * rate));
+        idxRef.current = Math.min(idxRef.current + step, textRef.current.length);
+        setRevealed(textRef.current.slice(0, idxRef.current));
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
 
     return () => {
       if (rafRef.current !== null) {
@@ -61,7 +69,7 @@ export function useStreamingText(text: string, isStreaming: boolean): string {
         rafRef.current = null;
       }
     };
-  }, [isStreaming, text, tick]);
+  }, [isStreaming, text]);
 
   return revealed;
 }

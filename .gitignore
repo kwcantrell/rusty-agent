@@ -12,3 +12,6 @@ graphify-out/
 
 # Local git worktrees (isolated workspaces for feature branches)
 .worktrees/
+
+# Playwright MCP scratch (snapshots, console logs from browser-driven debugging)
+.playwright-mcp/

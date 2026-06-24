@@ -154,17 +154,21 @@ export interface TurnGroup {
  */
 export function animatedItemsFrom(items: Item[], now: number): AnimatedItem[] {
   let ts = now;
-  return items.map((item) => {
-    const streaming = isStreamingItem(item);
+  return items.map((item, i) => {
+    const streaming = isStreamingItem(item, i === items.length - 1);
     const progress = streaming ? 0 : 1;
     const curTs = ts++;
     return { ...item, ts: curTs, streaming, progress } as AnimatedItem;
   });
 }
 
-function isStreamingItem(item: Item): boolean {
-  if (item.kind === "assistant" && item.done === undefined) return true;
-  if (item.kind === "reasoning") return true;
+// Tokens only ever extend the LAST item (the reducer appends to last-if-same-kind,
+// else pushes a new item). So a reasoning/assistant block is live only while it is
+// the trailing item; once any later block exists it can receive no more deltas and
+// is finished. Tools carry their own explicit running/done status.
+function isStreamingItem(item: Item, isLast: boolean): boolean {
+  if (item.kind === "assistant") return isLast && item.done === undefined;
+  if (item.kind === "reasoning") return isLast;
   if (item.kind === "tool" && item.status === "running") return true;
   return false;
 }
