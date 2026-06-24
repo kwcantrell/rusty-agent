@@ -37,7 +37,7 @@ export function MarkdownText({ text }: Props) {
                 {children}
               </pre>
               <button
-                className="absolute right-2 top-2 rounded bg-zinc-700 px-2 py-0.5 text-xs text-zinc-200 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-zinc-600"
+                className="absolute right-2 top-2 rounded bg-[var(--surface-raised)] px-2 py-0.5 text-xs text-[var(--text)] opacity-0 transition-opacity group-hover:opacity-100 hover:opacity-80 border border-[var(--border)]"
                 onClick={() => handleCopy(codeText, index)}
               >
                 {copiedIndex === index ? "Copied!" : "Copy"}
@@ -56,42 +56,42 @@ export function MarkdownText({ text }: Props) {
             );
           }
           return (
-            <code className="rounded bg-zinc-800 px-1 font-mono text-sm" {...props}>
+            <code className="rounded bg-[var(--surface-raised)] px-1 font-mono text-sm text-[var(--text)]" {...props}>
               {children}
             </code>
           );
         },
         // Headings
         h1({ children }) {
-          return <h1 className="mb-1 mt-2 text-xl font-semibold text-zinc-100">{children}</h1>;
+          return <h1 className="mb-1 mt-2 text-xl font-semibold text-[var(--text-strong)]">{children}</h1>;
         },
         h2({ children }) {
-          return <h2 className="mb-1 mt-2 text-lg font-semibold text-zinc-100">{children}</h2>;
+          return <h2 className="mb-1 mt-2 text-lg font-semibold text-[var(--text-strong)]">{children}</h2>;
         },
         h3({ children }) {
-          return <h3 className="mb-1 mt-2 text-base font-semibold text-zinc-100">{children}</h3>;
+          return <h3 className="mb-1 mt-2 text-base font-semibold text-[var(--text-strong)]">{children}</h3>;
         },
         // Links
         a({ children, href, ...props }) {
           return (
-            <a className="text-cyan-400 underline" href={href} target="_blank" rel="noopener noreferrer" {...props}>
+            <a className="text-[var(--accent)] underline" href={href} target="_blank" rel="noopener noreferrer" {...props}>
               {children}
             </a>
           );
         },
         // Lists
         ul({ children }) {
-          return <ul className="my-2 ml-4 list-disc space-y-1 text-zinc-100">{children}</ul>;
+          return <ul className="my-2 ml-4 list-disc space-y-1 text-[var(--text-strong)]">{children}</ul>;
         },
         ol({ children }) {
-          return <ol className="my-2 ml-4 list-decimal space-y-1 text-zinc-100">{children}</ol>;
+          return <ol className="my-2 ml-4 list-decimal space-y-1 text-[var(--text-strong)]">{children}</ol>;
         },
         li({ children }) {
-          return <li className="text-zinc-100">{children}</li>;
+          return <li className="text-[var(--text-strong)]">{children}</li>;
         },
         // Paragraphs
         p({ children }) {
-          return <p className="my-1 text-zinc-100">{children}</p>;
+          return <p className="my-1 text-[var(--text-strong)]">{children}</p>;
         },
       }}
     >
