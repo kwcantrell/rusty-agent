@@ -93,8 +93,8 @@ pub struct ProtocolError(pub String);
 pub enum ModelError {
     #[error("http error: {0}")]
     Http(String),
-    #[error("status {0}")]
-    Status(u16),
+    #[error("status {code}: {body}")]
+    Status { code: u16, body: String },
     #[error("decode error: {0}")]
     Decode(String),
     #[error("stream error: {0}")]

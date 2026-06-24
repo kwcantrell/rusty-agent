@@ -212,7 +212,13 @@ impl ModelClient for OpenAiCompatClient {
             .await
             .map_err(|e| ModelError::Http(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(ModelError::Status(resp.status().as_u16()));
+            let code = resp.status().as_u16();
+            // Capture the body — backends put the actionable error here (bad
+            // request shape, slot limits, etc.). Truncate so a stray HTML page
+            // can't flood logs.
+            let mut body = resp.text().await.unwrap_or_default();
+            body = body.trim().chars().take(1000).collect();
+            return Err(ModelError::Status { code, body });
         }
 
         let mut byte_stream = resp.bytes_stream();
@@ -232,7 +238,9 @@ impl ModelClient for OpenAiCompatClient {
                             return;
                         }
                         Some(Ok(chunks)) => {
-                            let is_done = line.contains("[DONE]");
+                            // Only the bare `data: [DONE]` sentinel ends the stream —
+                            // NOT a content delta that merely contains "[DONE]".
+                            let is_done = line.strip_prefix("data:").map(str::trim) == Some("[DONE]");
                             for chunk in chunks {
                                 yield Ok(chunk);
                             }
@@ -372,11 +380,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn literal_done_in_content_does_not_truncate_stream() {
+        let server = MockServer::start().await;
+        // A content delta legitimately contains the text "[DONE]"; only the bare
+        // `data: [DONE]` sentinel line should end the stream.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"see [DONE] here\"}}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                    data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
+        let req = CompletionRequest { messages: vec![Message::user("hi")], ..Default::default() };
+        let mut stream = client.stream(req).await.unwrap();
+        let mut text = String::new();
+        let mut done = None;
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                Chunk::Text(t) => text.push_str(&t),
+                Chunk::Done(r) => done = Some(r),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "see [DONE] here");
+        assert_eq!(done, Some(StopReason::Stop)); // finish_reason was reached, not skipped
+    }
+
+    #[tokio::test]
     async fn surfaces_http_error_status() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(ResponseTemplate::new(500)
+                .set_body_string("{\"error\":\"n_cmpl cannot be greater than slots\"}"))
             .mount(&server)
             .await;
         let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
@@ -385,7 +427,13 @@ mod tests {
             ..Default::default()
         };
         let err = client.stream(req).await.err().unwrap();
-        assert!(matches!(err, ModelError::Status(500)));
+        match err {
+            ModelError::Status { code, body } => {
+                assert_eq!(code, 500);
+                assert!(body.contains("cannot be greater than slots"), "body was: {body}");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     #[tokio::test]
