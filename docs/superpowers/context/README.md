@@ -26,11 +26,11 @@ After the agent core works end-to-end from the CLI, a sensible sequence (each is
 | 1 | HTTP / browser tool | _(spec/plan below)_ | `Tool` | ✅ **built & merged** |
 | 2 | OS-level sandboxing | [`os-sandboxing.md`](./os-sandboxing.md) | `intent()`/exec boundary | deferred (top hardening priority) |
 | 3 | MCP client support | _(spec/plan below)_ | `Tool`/`ToolRegistry` | ✅ **built & merged** |
-| 4 | Vector / long-term memory | [`memory-system.md`](./memory-system.md) | `ContextManager` + `Tool` | deferred |
+| 4 | Vector / long-term memory | [`memory-system.md`](./memory-system.md) | `ContextManager` + `Tool` | ✅ **built & merged** |
 | 5 | Cloudflare control plane | _(spec/plan below)_ | `EventSink` + WS `ApprovalChannel` | ✅ **built & merged** |
 | 6 | React frontend | _(spec/plan below)_ | consumes #5's API (same-origin) | ✅ **built & merged** |
 
-**#1, #3, #5, and #6 are done** — the browser experience works end-to-end (validated live against the real model), and the http-tool (#1) + MCP client (#3) deepeners have shipped. What remains from the deferred list are **#2 (OS-level sandboxing — the top production-hardening priority)** and **#4 (vector / long-term memory)**. Several enhancements beyond the original list have also shipped (Settings, sampling/thinking controls, the skills subsystem + runtime-config persistence, the stream-timeout hardening, the Claude CLI backend — see the tables below).
+**#1, #3, #4, #5, and #6 are done** — the browser experience works end-to-end (validated live against the real model), the http-tool (#1) + MCP client (#3) deepeners have shipped, and long-term semantic memory (#4) is fully wired into both binaries. What remains from the deferred list is **#2 (OS-level sandboxing — the top production-hardening priority)**. Several enhancements beyond the original list have also shipped (Settings, sampling/thinking controls, the skills subsystem + runtime-config persistence, the stream-timeout hardening, the Claude CLI backend — see the tables below).
 
 ### Completed subsystems (read these for current truth, not just the primers)
 
@@ -39,9 +39,10 @@ After the agent core works end-to-end from the CLI, a sensible sequence (each is
 | 1 | [`http-tool-design`](../specs/2026-06-23-http-tool-design.md) | [plan](../plans/2026-06-23-http-tool.md) | New `agent-http` crate: read-only `fetch_url` web-fetch tool (attaches via `Tool`). Non-overridable SSRF floor + DNS-rebinding pin; GET-only. |
 | 3 | [`mcp-client-support-design`](../specs/2026-06-23-mcp-client-support-design.md) | [plan](../plans/2026-06-23-mcp-client-support.md) | New `agent-mcp` crate: connect to MCP servers (stdio transport), surface their tools via `ToolRegistry`. Streamable-HTTP transport + resources/prompts deferred. |
 | 5 | [`cloudflare-control-plane-design`](../specs/2026-06-22-cloudflare-control-plane-design.md) + [best-practices revision](../specs/2026-06-22-cloudflare-control-plane-bestpractices-revision-design.md) | [plan](../plans/2026-06-22-cloudflare-control-plane.md) + [revision plan](../plans/2026-06-22-cloudflare-control-plane-bestpractices-revision.md) | New `agent-server` (daemon, **WS client via `tokio-tungstenite` — not Axum**) + `agent-runtime-config` crates; `cloud/` Worker + `AgentSession` Durable Object (**WebSocket Hibernation API**, durable SQLite seq) + D1 + R2, under `wrangler dev`. |
+| 4 | [`memory-system-design`](../specs/2026-06-23-memory-system-design.md) | [plan](../plans/2026-06-23-memory-system.md) | New `agent-memory` crate: `remember`/`recall`/`forget` tools over a local SQLite vector store (fastembed BGE-Small-EN-v1.5, 384-dim, `onnx` feature). Scope isolation SQL-enforced; `build_memory` in `agent-runtime-config`; `--memory`/`--memory-db`/`--memory-model-dir` flags on both binaries. Auto-retrieval `ContextManager` + RuntimeConfig/web persistence deferred. |
 | 6 | [`react-frontend-design`](../specs/2026-06-23-react-frontend-design.md) | [plan](../plans/2026-06-23-react-frontend.md) | New top-level `web/` React+Vite+TS+Tailwind SPA, **served same-origin by the Worker via Workers static assets** (not Cloudflare Pages → no CORS). Pure WS client; daemon/wire-protocol unchanged. |
 
-> The context primers for completed subsystems have been removed now that each is captured in an approved spec + plan — **the spec/plan above is the source of truth** (e.g. where they differ: "Axum"→`tokio-tungstenite` client; "Cloudflare Pages"→Workers static assets). Only the primers for not-yet-built subsystems (#2 os-sandboxing, #4 memory-system) remain.
+> The context primers for completed subsystems have been removed now that each is captured in an approved spec + plan — **the spec/plan above is the source of truth** (e.g. where they differ: "Axum"→`tokio-tungstenite` client; "Cloudflare Pages"→Workers static assets). Only the primer for the not-yet-built subsystem (#2 os-sandboxing) remains.
 
 ### Other shipped enhancements (not from the deferred list)
 
