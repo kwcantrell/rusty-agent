@@ -75,10 +75,12 @@ struct Cli {
     /// Disable model reasoning (chat_template_kwargs.enable_thinking=false)
     #[arg(long = "no-thinking", default_value_t = false)]
     no_thinking: bool,
-    /// Keep prior-turn reasoning in conversation history. OpenAI-compat backends
-    /// receive it as `reasoning_content` + chat_template_kwargs.preserve_thinking
-    /// (Qwen3.6); claude_cli renders it inline as <think>. Backends that reject
-    /// prior chain-of-thought (e.g. DeepSeek) should leave this off.
+    /// Keep prior-turn reasoning in conversation history. Auto-enabled whenever
+    /// tools are registered (agentic runs need within-turn reasoning continuity),
+    /// so this flag only matters for tool-less chat. OpenAI-compat backends get it
+    /// as `reasoning_content` + chat_template_kwargs.preserve_thinking (Qwen3.6);
+    /// claude_cli renders it inline as <think>. Note: backends that reject prior
+    /// chain-of-thought in input (e.g. DeepSeek cloud) may error during tool use.
     #[arg(long, default_value_t = false)]
     preserve_thinking: bool,
     // ── Sandbox flags ──────────────────────────────────────────────────────

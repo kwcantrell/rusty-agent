@@ -119,6 +119,12 @@ impl AgentLoop {
         ctx.append(Message::user(user_input));
         let mut protocol_repairs = 0;
 
+        // Agentic (tool-bearing) runs auto-preserve reasoning so the model keeps
+        // its chain-of-thought across the within-turn tool loop; each backend then
+        // decides how to surface it (Qwen3.6 via reasoning_content + the kwarg;
+        // claude_cli inline). Plain config still controls the tool-less case.
+        let preserve_thinking = self.config.preserve_thinking || !self.tools.schemas().is_empty();
+
         for turn in 0..self.config.max_turns {
             let messages = ctx.build(self.config.model_limit);
             self.sink.emit(AgentEvent::Usage {
@@ -138,7 +144,7 @@ impl AgentLoop {
                 presence_penalty: self.config.presence_penalty,
                 repeat_penalty: self.config.repeat_penalty,
                 enable_thinking: self.config.enable_thinking,
-                preserve_thinking: self.config.preserve_thinking,
+                preserve_thinking,
             };
             let assistant = self.completion_with_retry(&base).await?;
 
@@ -160,9 +166,9 @@ impl AgentLoop {
             let mut msg = Message::assistant(parsed.text.clone(),
                 if parsed.tool_calls.is_empty() { None } else { Some(parsed.tool_calls.clone()) });
             // Preserve reasoning as data, not inline text — the model backend
-            // decides how to render it back (claude_cli inlines <think>; openai
-            // drops it, since OpenAI-compat reasoning models reject prior CoT).
-            if self.config.preserve_thinking && !assistant.reasoning.is_empty() {
+            // decides how to render it (claude_cli inlines <think>; openai sends
+            // reasoning_content for Qwen3.6). Gated by the effective flag above.
+            if preserve_thinking && !assistant.reasoning.is_empty() {
                 msg = msg.with_reasoning(assistant.reasoning.clone());
             }
             ctx.append(msg);
@@ -515,7 +521,9 @@ mod tests {
         }
     }
 
-    async fn run_reasoning(preserve: bool) -> Vec<Message> {
+    fn empty_registry() -> Arc<ToolRegistry> { Arc::new(ToolRegistry::new()) }
+
+    async fn run_reasoning_with(preserve: bool, tools: Arc<ToolRegistry>) -> Vec<Message> {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().to_path_buf();
         let model = Arc::new(ScriptedModel::new(vec![
@@ -523,7 +531,7 @@ mod tests {
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            model, Arc::new(PassthroughProtocol), tools, policy(ws.clone()),
             Arc::new(AlwaysApprove), sink,
             LoopConfig { model_limit: 100_000, max_turns: 5, max_retries: 1, temperature: 0.0,
                 max_tokens: None, workspace: ws,
@@ -533,6 +541,21 @@ mod tests {
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         ctx.build(100_000)
+    }
+
+    // No tools registered, so preservation is driven purely by the config flag.
+    async fn run_reasoning(preserve: bool) -> Vec<Message> {
+        run_reasoning_with(preserve, empty_registry()).await
+    }
+
+    #[tokio::test]
+    async fn tools_present_force_reasoning_preservation_even_with_flag_off() {
+        // Agentic workloads need within-turn reasoning continuity across the
+        // tool loop, so registered tools auto-enable preservation regardless of
+        // the config flag (Qwen3.6 keeps it via reasoning_content + the kwarg).
+        let msgs = run_reasoning_with(false, registry()).await;
+        let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
+        assert_eq!(a.reasoning.as_deref(), Some("secret plan"));
     }
 
     #[tokio::test]
