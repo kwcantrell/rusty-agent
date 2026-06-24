@@ -39,21 +39,23 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
   const floor = meta?.hardFloor ?? [];
   const redundant = fromLines(deny).filter((d) => floor.includes(d));
 
-  const field = "w-full rounded bg-zinc-800 px-2 py-1 text-sm text-zinc-100";
-  const label = "block text-xs uppercase tracking-wide text-zinc-400 mb-1";
+  const field = "w-full rounded bg-[var(--surface-base)] px-2 py-1 text-sm text-[var(--text-strong)] border border-[var(--border)]";
+  const label = "block text-xs uppercase tracking-wide text-[var(--text-muted)] mb-1";
 
   return (
-    <div className="absolute inset-0 z-10 flex justify-end bg-black/50">
-      <div className="h-full w-96 overflow-y-auto bg-zinc-900 p-4 text-zinc-200 shadow-xl">
+    <div className="absolute inset-0 z-10 flex justify-end" style={{ background: "rgba(0,0,0,0.5)" }}>
+      <div className="h-full w-96 overflow-y-auto p-4 shadow-xl"
+        style={{ background: "var(--surface-overlay)", color: "var(--text)" }}>
         <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold">Settings</h2>
-          <button onClick={onClose} className="text-zinc-400 hover:text-zinc-200">close</button>
+          <h2 className="text-lg font-semibold" style={{ color: "var(--text-strong)" }}>Settings</h2>
+          <button onClick={onClose} className="hover:opacity-80" style={{ color: "var(--text-muted)" }}>close</button>
         </div>
 
-        {error && <div className="mb-3 rounded bg-red-900/50 px-2 py-1 text-sm text-red-200">{error}</div>}
+        {error && <div className="mb-3 rounded px-2 py-1 text-sm"
+          style={{ background: "var(--surface-raised)", color: "var(--state-error)", border: "1px solid var(--state-error)" }}>{error}</div>}
 
         <section className="mb-4 space-y-3">
-          <h3 className="text-sm font-semibold text-zinc-300">Model &amp; inference</h3>
+          <h3 className="text-sm font-semibold text-[var(--text-strong)]">Model &amp; inference</h3>
           <div>
             <label className={label} htmlFor="backend">Backend</label>
             <select id="backend" className={field} value={form.backend}
@@ -83,7 +85,7 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
         </section>
 
         <section className="mb-4 space-y-3">
-          <h3 className="text-sm font-semibold text-zinc-300">Command policy</h3>
+          <h3 className="text-sm font-semibold text-[var(--text-strong)]">Command policy</h3>
           <div>
             <label className={label} htmlFor="allowlist">Allowlist (one per line)</label>
             <textarea id="allowlist" rows={4} className={field} value={allow}
@@ -95,19 +97,19 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
               onChange={(e) => setDeny(e.target.value)} />
           </div>
           {meta && (
-            <p className="text-xs text-zinc-500">
+            <p className="text-xs text-[var(--text-muted)]">
               Always blocked (hard floor): {meta.hardFloor.join(", ")}
             </p>
           )}
           {redundant.length > 0 && (
-            <p className="text-xs text-amber-400/80">
+            <p className="text-xs text-[var(--accent-2)]">
               Redundant — already in the hard floor: {redundant.join(", ")}
             </p>
           )}
         </section>
 
         <section className="mb-4 space-y-3">
-          <h3 className="text-sm font-semibold text-zinc-300">Loop tuning</h3>
+          <h3 className="text-sm font-semibold text-[var(--text-strong)]">Loop tuning</h3>
           <div>
             <label className={label} htmlFor="temperature">Temperature</label>
             <input id="temperature" type="number" step="0.1" className={field} value={form.temperature}
@@ -131,7 +133,7 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
         </section>
 
         <section className="mb-4 space-y-3">
-          <h3 className="text-sm font-semibold text-zinc-300">Sampling &amp; thinking</h3>
+          <h3 className="text-sm font-semibold text-[var(--text-strong)]">Sampling &amp; thinking</h3>
           <div>
             <label className={label} htmlFor="top_p">Top-p</label>
             <input id="top_p" type="number" step="0.05" className={field}
@@ -170,19 +172,19 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
         </section>
 
         <section className="mb-4 space-y-3">
-          <h3 className="text-sm font-semibold text-zinc-300">Skills</h3>
+          <h3 className="text-sm font-semibold text-[var(--text-strong)]">Skills</h3>
           <div>
             <label className={label} htmlFor="skills_dirs">Skill directories (one per line)</label>
             <textarea id="skills_dirs" rows={3} className={field} value={skillsDirs}
               onChange={(e) => setSkillsDirs(e.target.value)} />
-            <p className="mt-1 text-xs text-zinc-500">
+            <p className="mt-1 text-xs text-[var(--text-muted)]">
               Save directories, then the skills they contain appear below to activate.
             </p>
           </div>
           <div>
             <span className={label}>Active skills</span>
             {(meta?.discoveredSkills ?? []).length === 0 ? (
-              <p className="text-xs text-zinc-500">No skills found in the configured directories.</p>
+              <p className="text-xs text-[var(--text-muted)]">No skills found in the configured directories.</p>
             ) : (
               <ul className="space-y-1">
                 {meta!.discoveredSkills.map((s) => (
@@ -191,8 +193,8 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
                       <input type="checkbox" className="mt-1"
                         checked={form.active_skills.includes(s.name)}
                         onChange={() => toggleSkill(s.name)} />
-                      <span><span className="text-zinc-200">{s.name}</span>
-                        <span className="block text-xs text-zinc-500">{s.description}</span></span>
+                      <span><span className="text-[var(--text-strong)]">{s.name}</span>
+                        <span className="block text-xs text-[var(--text-muted)]">{s.description}</span></span>
                     </label>
                   </li>
                 ))}
@@ -202,14 +204,15 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
         </section>
 
         {meta && (
-          <section className="mb-4 text-xs text-zinc-500">
+          <section className="mb-4 text-xs text-[var(--text-muted)]">
             <p>Workspace: <span>{meta.workspace}</span></p>
             <p>API key: <span>{meta.apiKeySet ? "set" : "not set"}</span></p>
           </section>
         )}
 
         <button onClick={save} disabled={disabled}
-          className="w-full rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-40">
+          className="w-full rounded px-3 py-2 text-sm font-medium hover:opacity-90 disabled:opacity-40"
+          style={{ background: "var(--accent)", color: "var(--accent-fg)" }}>
           Save
         </button>
       </div>

@@ -1,11 +1,11 @@
 export function TerminalBlock({ command, stdout, stderr, exitCode }: { command: string; stdout: string; stderr: string; exitCode: number }) {
   return (
-    <div className="rounded border border-zinc-700 bg-black text-sm">
-      <div className="flex items-center justify-between border-b border-zinc-700 px-2 py-1">
-        <span className="font-mono text-zinc-300">$ {command}</span>
-        <span className={exitCode === 0 ? "text-green-400" : "text-red-400"}>exit {exitCode}</span>
+    <div className="rounded text-sm" style={{ border: "1px solid var(--border)", background: "var(--surface-overlay)" }}>
+      <div className="flex items-center justify-between px-2 py-1" style={{ borderBottom: "1px solid var(--border)" }}>
+        <span className="font-mono" style={{ color: "var(--accent)" }}>$ {command}</span>
+        <span style={{ color: exitCode === 0 ? "var(--state-done)" : "var(--state-error)" }}>exit {exitCode}</span>
       </div>
-      <pre className="overflow-x-auto p-2 font-mono leading-tight text-zinc-200">{stdout}{stderr}</pre>
+      <pre className="overflow-x-auto p-2 font-mono leading-tight" style={{ color: "var(--text)" }}>{stdout}<span style={{ color: "var(--state-error)" }}>{stderr}</span></pre>
     </div>
   );
 }

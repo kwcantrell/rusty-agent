@@ -29,19 +29,21 @@ export function PairingScreen({ onPaired }: { onPaired: (s: { sessionId: string;
   };
 
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 text-zinc-100">
+    <div className="flex h-full flex-col items-center justify-center gap-3" style={{ color: "var(--text-strong)" }}>
       <h1 className="text-lg">Pair with your agent</h1>
       <input
-        className="rounded bg-zinc-900 px-3 py-2 text-center font-mono tracking-widest outline-none"
+        className="rounded-lg px-3 py-2 text-center font-mono tracking-widest outline-none"
+        style={{ background: "var(--surface-overlay)", color: "var(--text-strong)", border: "1px solid var(--border)" }}
         value={code}
         onChange={(e) => setCode(e.target.value)}
         placeholder="pairing code"
         onKeyDown={(e) => { if (e.key === "Enter") pair(); }}
       />
-      <button onClick={pair} disabled={busy || !code.trim()} className="rounded bg-zinc-700 px-4 py-2 hover:bg-zinc-600 disabled:opacity-50">
+      <button onClick={pair} disabled={busy || !code.trim()} className="rounded-lg px-4 py-2 hover:opacity-90 disabled:opacity-50"
+        style={{ background: "var(--accent)", color: "var(--accent-fg)" }}>
         {busy ? "Pairing…" : "Pair"}
       </button>
-      {error && <div className="text-red-400">{error}</div>}
+      {error && <div style={{ color: "var(--state-error)" }}>{error}</div>}
     </div>
   );
 }
