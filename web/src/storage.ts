@@ -66,3 +66,12 @@ export function loadWorkspaceView(): WorkspaceView {
 export function saveWorkspaceView(v: WorkspaceView): void {
   try { localStorage.setItem(WORKSPACE_VIEW, JSON.stringify(v)); } catch { /* ignore */ }
 }
+
+const DASH_EXPANDED = "agent.contextDashExpanded";
+
+export function loadDashExpanded(): boolean {
+  return localStorage.getItem(DASH_EXPANDED) === "1";
+}
+export function saveDashExpanded(v: boolean): void {
+  try { localStorage.setItem(DASH_EXPANDED, v ? "1" : "0"); } catch { /* ignore */ }
+}

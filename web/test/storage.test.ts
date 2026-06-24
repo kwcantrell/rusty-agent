@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { loadToken, saveSession, clearSession, loadUserMsgs, appendUserMsg, loadSessionId } from "../src/storage";
+import { loadToken, saveSession, clearSession, loadUserMsgs, appendUserMsg, loadSessionId, loadDashExpanded, saveDashExpanded } from "../src/storage";
 
 beforeEach(() => localStorage.clear());
 
@@ -19,5 +19,16 @@ describe("storage", () => {
     expect(loadUserMsgs("sess-1")).toEqual(["q1", "q2"]);
     expect(loadUserMsgs("sess-2")).toEqual(["other"]);
     expect(loadUserMsgs("nope")).toEqual([]);
+  });
+});
+
+describe("context dashboard persistence", () => {
+  it("defaults to collapsed and round-trips the expanded flag", () => {
+    localStorage.clear();
+    expect(loadDashExpanded()).toBe(false);
+    saveDashExpanded(true);
+    expect(loadDashExpanded()).toBe(true);
+    saveDashExpanded(false);
+    expect(loadDashExpanded()).toBe(false);
   });
 });
