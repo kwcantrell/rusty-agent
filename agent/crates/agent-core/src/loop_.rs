@@ -1,4 +1,4 @@
-use crate::{AgentEvent, ContextManager, EventSink};
+use crate::{built_tokens, AgentEvent, ContextManager, EventSink};
 use agent_model::{AssistantTurn, Chunk, CompletionRequest, Message, ModelClient, ModelError,
                   RawToolCall, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse, Decision, PolicyEngine};
@@ -119,9 +119,16 @@ impl AgentLoop {
         ctx.append(Message::user(user_input));
         let mut protocol_repairs = 0;
 
-        for _turn in 0..self.config.max_turns {
+        for turn in 0..self.config.max_turns {
+            let messages = ctx.build(self.config.model_limit);
+            self.sink.emit(AgentEvent::Usage {
+                prompt_tokens: built_tokens(&messages),
+                context_limit: self.config.model_limit,
+                turn: turn + 1,
+                max_turns: self.config.max_turns,
+            });
             let base = CompletionRequest {
-                messages: ctx.build(self.config.model_limit),
+                messages,
                 tools: self.tools.schemas(),
                 temperature: self.config.temperature,
                 max_tokens: self.config.max_tokens,
@@ -310,6 +317,26 @@ mod tests {
         // No tool_result (it was denied), but the loop still reached done.
         assert!(!events.iter().any(|e| e == "tool_result:read_file"));
         assert_eq!(events.last().unwrap(), "done");
+    }
+
+    #[tokio::test]
+    async fn emits_usage_event_before_completing() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("hi".into())]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), Arc::new(DenyAll),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        // A usage event is emitted, and it precedes the terminal done.
+        let usage_idx = events.iter().position(|e| e.starts_with("usage:")).expect("usage event present");
+        let done_idx = events.iter().rposition(|e| e == "done").expect("done present");
+        assert!(usage_idx < done_idx);
     }
 
     #[tokio::test]

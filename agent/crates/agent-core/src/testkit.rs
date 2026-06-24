@@ -82,6 +82,7 @@ impl EventSink for CollectingSink {
         let label = match event {
             AgentEvent::Token(t) => format!("token:{t}"),
             AgentEvent::Reasoning(r) => format!("reasoning:{r}"),
+            AgentEvent::Usage { prompt_tokens, .. } => format!("usage:{prompt_tokens}"),
             AgentEvent::ToolStart { name, .. } => format!("tool_start:{name}"),
             AgentEvent::ToolResult { name, .. } => format!("tool_result:{name}"),
             AgentEvent::Approval(_) => "approval".into(),

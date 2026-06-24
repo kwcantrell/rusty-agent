@@ -10,6 +10,12 @@ fn message_tokens(m: &Message) -> usize {
     estimate_tokens(&m.content) + 4 // per-message overhead
 }
 
+/// Total estimated tokens for a built context (system + kept history),
+/// using the same per-message estimate the window manager evicts against.
+pub fn built_tokens(messages: &[Message]) -> usize {
+    messages.iter().map(message_tokens).sum()
+}
+
 pub trait ContextManager: Send + Sync {
     fn append(&mut self, msg: Message);
     fn build(&self, model_limit: usize) -> Vec<Message>;
@@ -64,6 +70,13 @@ impl ContextManager for WindowContext {
 mod tests {
     use super::*;
     use agent_model::{Message, Role};
+
+    #[test]
+    fn built_tokens_sums_per_message_estimate() {
+        let msgs = vec![Message::system("SYS"), Message::user("hello world")];
+        let expected = message_tokens(&msgs[0]) + message_tokens(&msgs[1]);
+        assert_eq!(built_tokens(&msgs), expected);
+    }
 
     #[test]
     fn estimate_tokens_is_roughly_quarter_of_chars() {
