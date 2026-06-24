@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { connect } from "./socket";
+import { resolveTransport, isTauri } from "./transport";
 import { initialState, reduce, useAnimatedItems, artifactsFrom } from "./state";
 import type { Decision, RuntimeSettings } from "./wire";
 import { PairingScreen } from "./components/PairingScreen";
@@ -24,6 +25,22 @@ export default function App() {
   const [activeArtifactKey, setActiveArtifactKey] = useState<string | null>(null);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const sock = useRef<ReturnType<typeof connect> | null>(null);
+  const [localUrl, setLocalUrl] = useState<string | null>(null);
+  const [workspace, setWorkspace] = useState<string | undefined>(undefined);
+  const tauri = isTauri();
+
+  useEffect(() => {
+    if (!tauri) return;
+    let active = true;
+    resolveTransport().then((t) => {
+      if (!active) return;
+      setLocalUrl(t.wsUrl);
+      setSessionId(t.sessionId); // satisfies the existing sessionId gate
+    });
+    import("@tauri-apps/api/core").then(({ invoke }) =>
+      invoke<string | null>("get_workspace").then((w) => { if (active && w) setWorkspace(w); }));
+    return () => { active = false; };
+  }, [tauri]);
 
   useEffect(() => { applyTheme(theme); }, [theme]);
   const toggleTheme = () => setTheme((t) => { const next = t === "dark" ? "light" : "dark"; saveTheme(next); return next; });
@@ -31,29 +48,39 @@ export default function App() {
   const animatedItems = useAnimatedItems(state.items);
   const artifacts = artifactsFrom(state.items);
   const toolCount = state.items.filter((it) => it.kind === "tool").length;
+  // Called before any early return so hook order stays stable across the
+  // pairing/loading → connected transition (React: no conditional hooks).
+  const narrow = useNarrow();
 
   useEffect(() => {
     if (artifacts.length > 0) { setActiveArtifactKey(artifacts[artifacts.length - 1].key); }
   }, [artifacts.length]);
 
   useEffect(() => {
-    if (!token || !sessionId) return;
+    if (!sessionId) return;
+    if (tauri ? !localUrl : !token) return;
     dispatch({ type: "reset", userMsgs: loadUserMsgs(sessionId) });
     const WebSocketImpl = (window as unknown as { __WS__?: typeof WebSocket }).__WS__;
+    const url = tauri ? (localUrl as string) : wsUrl(token as string);
     sock.current = connect(
-      wsUrl(token),
+      url,
       { onFrame: (f) => dispatch({ type: "frame", frame: f }), onStatus: (s) => dispatch({ type: "status", status: s }) },
       WebSocketImpl ? { WebSocketImpl } : undefined,
     );
     return () => { sock.current?.close(); sock.current = null; };
-  }, [token, sessionId]);
+  }, [token, sessionId, tauri, localUrl]);
 
-  if (!token || !sessionId) {
+  if (!tauri && (!token || !sessionId)) {
     return (
       <div className="h-screen" style={{ background: "var(--surface-base)" }}>
         <PairingScreen onPaired={({ sessionId, token }) => { saveSession(sessionId, token); setSessionId(sessionId); setToken(token); }} />
       </div>
     );
+  }
+
+  // Tauri mode: brief window before resolveTransport() sets the local session id.
+  if (!sessionId) {
+    return <div className="h-screen" style={{ background: "var(--surface-base)" }} />;
   }
 
   const send = (text: string) => {
@@ -78,7 +105,6 @@ export default function App() {
   const connected = state.status === "open";
   const projectLabel = `session ${sessionId.slice(0, 8)}`;
   const model = state.settings?.model;
-  const narrow = useNarrow();
 
   return (
     <div className="flex h-screen flex-col" style={{ background: "var(--surface-base)" }}>
@@ -86,7 +112,9 @@ export default function App() {
         theme={theme} onToggleTheme={toggleTheme}
         onOpenSettings={openSettings} settingsDisabled={!(connected && state.online)}
         onSignOut={signOut}
-        showWorkspaceToggle={narrow} onToggleWorkspace={() => setWorkspaceOpen((o) => !o)} />
+        showWorkspaceToggle={narrow} onToggleWorkspace={() => setWorkspaceOpen((o) => !o)}
+        tauriWorkspace={tauri ? workspace : undefined}
+        onWorkspaceChanged={(p) => setWorkspace(p)} />
       {showSettings && state.settings && (
         <SettingsPanel settings={state.settings} meta={state.settingsMeta} error={state.settingsError}
           disabled={!connected} onSave={saveSettings} onClose={() => setShowSettings(false)} />

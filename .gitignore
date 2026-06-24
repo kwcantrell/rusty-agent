@@ -15,3 +15,8 @@ graphify-out/
 
 # Playwright MCP scratch (snapshots, console logs from browser-driven debugging)
 .playwright-mcp/
+
+src-tauri/target/
+src-tauri/gen/
+
+node_modules/

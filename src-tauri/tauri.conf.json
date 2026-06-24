@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "rust-agent-runtime",
+  "version": "0.1.0",
+  "identifier": "dev.rust-agent-runtime.desktop",
+  "build": {
+    "frontendDist": "../web/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm --prefix web run dev",
+    "beforeBuildCommand": "npm --prefix web run build"
+  },
+  "app": {
+    "windows": [
+      { "label": "main", "title": "rust-agent-runtime", "width": 1280, "height": 820 }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ws://127.0.0.1:* ws://localhost:* http://localhost:*; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage"],
+    "icon": ["icons/icon.png"]
+  }
+}
