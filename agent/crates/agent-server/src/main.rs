@@ -14,6 +14,7 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Register this daemon with the Worker and store credentials.
@@ -57,6 +58,37 @@ enum Cmd {
         /// Preload a skill as a preset by name (repeatable).
         #[arg(long = "skill")]
         skill: Vec<String>,
+        // ── Sandbox flags ───────────────────────────────────────────────────
+        /// Sandbox execution mode: off | auto | enforce
+        #[arg(long, default_value = "auto")]
+        sandbox_mode: String,
+        /// Docker image used for sandboxed execution
+        #[arg(long, default_value = "debian:stable-slim")]
+        sandbox_image: String,
+        /// Allow network access inside the sandbox
+        #[arg(long, default_value_t = false)]
+        sandbox_network: bool,
+        /// Memory limit for the sandbox container (e.g. "2g")
+        #[arg(long, default_value = "2g")]
+        sandbox_memory: String,
+        /// CPU quota for the sandbox container (e.g. "2")
+        #[arg(long, default_value = "2")]
+        sandbox_cpus: String,
+        /// Max PIDs inside the sandbox container
+        #[arg(long, default_value_t = 512u32)]
+        sandbox_pids: u32,
+        /// Max file size for writes inside the sandbox (e.g. "512m"); unset = no limit
+        #[arg(long)]
+        sandbox_fsize: Option<String>,
+        /// Size of the tmpfs mounted at /tmp inside the sandbox (e.g. "256m")
+        #[arg(long, default_value = "256m")]
+        sandbox_tmp_size: String,
+        /// Extra read-write bind-mount path inside the sandbox (repeatable)
+        #[arg(long = "sandbox-extra-rw")]
+        sandbox_extra_rw: Vec<String>,
+        /// Extra read-only bind-mount path inside the sandbox (repeatable)
+        #[arg(long = "sandbox-extra-ro")]
+        sandbox_extra_ro: Vec<String>,
     },
 }
 
@@ -78,7 +110,9 @@ async fn main() {
             }
         }
         Cmd::Run { base_url, model, protocol, workspace, context_limit, backend, claude_binary,
-                   runtime_config, mcp_config, allow_host, skills_dir, skill } => {
+                   runtime_config, mcp_config, allow_host, skills_dir, skill,
+                   sandbox_mode, sandbox_image, sandbox_network, sandbox_memory, sandbox_cpus,
+                   sandbox_pids, sandbox_fsize, sandbox_tmp_size, sandbox_extra_rw, sandbox_extra_ro } => {
             let cfg = DaemonConfig::load(&cli.config)
                 .expect("load config (run `enroll` first)");
             println!("pairing code: {}", cfg.pairing_code);
@@ -93,6 +127,16 @@ async fn main() {
             base.http_allow_hosts = allow_host;
             base.skills_dirs = skills_dir;
             base.active_skills = skill;
+            base.sandbox_mode = sandbox_mode;
+            base.sandbox_image = sandbox_image;
+            base.sandbox_network = sandbox_network;
+            base.sandbox_memory = sandbox_memory;
+            base.sandbox_cpus = sandbox_cpus;
+            base.sandbox_pids = sandbox_pids;
+            base.sandbox_fsize = sandbox_fsize;
+            base.sandbox_tmp_size = sandbox_tmp_size;
+            base.sandbox_extra_rw = sandbox_extra_rw;
+            base.sandbox_extra_ro = sandbox_extra_ro;
             // Surface bad flags early (the persisted file is only ever written post-validation).
             if let Err(e) = base.clone().normalized().validate() {
                 eprintln!("invalid launch config: {e}");

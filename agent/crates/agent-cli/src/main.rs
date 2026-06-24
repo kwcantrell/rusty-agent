@@ -4,8 +4,8 @@ mod render;
 use agent_core::{AgentLoop, LoopConfig, WindowContext};
 use agent_model::Message;
 use agent_policy::RulePolicy;
-use agent_runtime_config::{backend_name_is_valid, build_registry, build_model, build_skills,
-    default_allowlist, default_denylist, pick_protocol};
+use agent_runtime_config::{backend_name_is_valid, build_registry, build_model, build_sandbox,
+    build_skills, default_allowlist, default_denylist, pick_protocol};
 use approval::TerminalApproval;
 use clap::Parser;
 use render::TerminalSink;
@@ -78,6 +78,37 @@ struct Cli {
     /// Keep prior <think> reasoning in conversation history
     #[arg(long, default_value_t = false)]
     preserve_thinking: bool,
+    // ── Sandbox flags ──────────────────────────────────────────────────────
+    /// Sandbox execution mode: off | auto | enforce
+    #[arg(long, default_value = "auto")]
+    sandbox_mode: String,
+    /// Docker image used for sandboxed execution
+    #[arg(long, default_value = "debian:stable-slim")]
+    sandbox_image: String,
+    /// Allow network access inside the sandbox
+    #[arg(long, default_value_t = false)]
+    sandbox_network: bool,
+    /// Memory limit for the sandbox container (e.g. "2g")
+    #[arg(long, default_value = "2g")]
+    sandbox_memory: String,
+    /// CPU quota for the sandbox container (e.g. "2")
+    #[arg(long, default_value = "2")]
+    sandbox_cpus: String,
+    /// Max PIDs inside the sandbox container
+    #[arg(long, default_value_t = 512u32)]
+    sandbox_pids: u32,
+    /// Max file size for writes inside the sandbox (e.g. "512m"); unset = no limit
+    #[arg(long)]
+    sandbox_fsize: Option<String>,
+    /// Size of the tmpfs mounted at /tmp inside the sandbox (e.g. "256m")
+    #[arg(long, default_value = "256m")]
+    sandbox_tmp_size: String,
+    /// Extra read-write bind-mount path inside the sandbox (repeatable)
+    #[arg(long = "sandbox-extra-rw")]
+    sandbox_extra_rw: Vec<String>,
+    /// Extra read-only bind-mount path inside the sandbox (repeatable)
+    #[arg(long = "sandbox-extra-ro")]
+    sandbox_extra_ro: Vec<String>,
 }
 
 #[tokio::main]
@@ -103,6 +134,22 @@ async fn main() {
     } else {
         cli.protocol.as_str()
     };
+    // Build the sandbox strategy early so it can be passed to both LoopConfig and (in Task 11)
+    // the MCP manager. We synthesise a RuntimeConfig purely as a carrier for the sandbox fields.
+    let mut sbcfg = agent_runtime_config::RuntimeConfig::from_launch(
+        cli.backend.clone(), cli.base_url.clone(), cli.model.clone(),
+        protocol_name.to_string(), cli.context_limit);
+    sbcfg.sandbox_mode = cli.sandbox_mode.clone();
+    sbcfg.sandbox_image = cli.sandbox_image.clone();
+    sbcfg.sandbox_network = cli.sandbox_network;
+    sbcfg.sandbox_memory = cli.sandbox_memory.clone();
+    sbcfg.sandbox_cpus = cli.sandbox_cpus.clone();
+    sbcfg.sandbox_pids = cli.sandbox_pids;
+    sbcfg.sandbox_fsize = cli.sandbox_fsize.clone();
+    sbcfg.sandbox_tmp_size = cli.sandbox_tmp_size.clone();
+    sbcfg.sandbox_extra_rw = cli.sandbox_extra_rw.clone();
+    sbcfg.sandbox_extra_ro = cli.sandbox_extra_ro.clone();
+    let sandbox = build_sandbox(&sbcfg);
     let protocol = pick_protocol(protocol_name);
     let mut registry = build_registry(&cli.allow_host);
     // Connect MCP servers (if configured), register their tools, keep the manager alive.
@@ -145,7 +192,7 @@ async fn main() {
             top_p: cli.top_p, top_k: cli.top_k, min_p: cli.min_p,
             presence_penalty: cli.presence_penalty, repeat_penalty: cli.repeat_penalty,
             enable_thinking: !cli.no_thinking, preserve_thinking: cli.preserve_thinking,
-            sandbox: None,
+            sandbox: Some(sandbox.clone()),
         });
 
     let mut ctx = WindowContext::new(Message::system(system_prompt));
@@ -166,4 +213,51 @@ async fn main() {
     }
     // Keep MCP manager alive for the entire REPL session (dropping it would kill server processes).
     let _ = &mcp_manager;
+    // Keep sandbox Arc in scope for Task 11 (MCP sandbox wiring).
+    let _ = &sandbox;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn sandbox_mode_flag_parsed() {
+        let cli = Cli::parse_from(["agent-cli", "--sandbox-mode", "enforce"]);
+        assert_eq!(cli.sandbox_mode, "enforce");
+    }
+
+    #[test]
+    fn sandbox_network_flag_parsed() {
+        let cli = Cli::parse_from(["agent-cli", "--sandbox-network"]);
+        assert!(cli.sandbox_network);
+    }
+
+    #[test]
+    fn sandbox_defaults() {
+        let cli = Cli::parse_from(["agent-cli"]);
+        assert_eq!(cli.sandbox_mode, "auto");
+        assert_eq!(cli.sandbox_image, "debian:stable-slim");
+        assert!(!cli.sandbox_network);
+        assert_eq!(cli.sandbox_memory, "2g");
+        assert_eq!(cli.sandbox_cpus, "2");
+        assert_eq!(cli.sandbox_pids, 512u32);
+        assert!(cli.sandbox_fsize.is_none());
+        assert_eq!(cli.sandbox_tmp_size, "256m");
+        assert!(cli.sandbox_extra_rw.is_empty());
+        assert!(cli.sandbox_extra_ro.is_empty());
+    }
+
+    #[test]
+    fn sandbox_repeatable_flags_parsed() {
+        let cli = Cli::parse_from([
+            "agent-cli",
+            "--sandbox-extra-rw", "/data",
+            "--sandbox-extra-rw", "/mnt",
+            "--sandbox-extra-ro", "/etc/config",
+        ]);
+        assert_eq!(cli.sandbox_extra_rw, vec!["/data", "/mnt"]);
+        assert_eq!(cli.sandbox_extra_ro, vec!["/etc/config"]);
+    }
 }
