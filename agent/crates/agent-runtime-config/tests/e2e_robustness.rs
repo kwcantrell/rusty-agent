@@ -170,3 +170,38 @@ async fn c_escaping_read_requests_approval_through_assembled_loop() {
         "escaping read must request approval (normalized gate); events: {events:?}"
     );
 }
+
+// T4 — B2: a truncated model stream (no finish_reason / [DONE]) is detected,
+// retried, and finally surfaced as an Error through the assembled loop — not
+// silently accepted as a clean completion. (On pre-B2 code: clean Ok, no Error.)
+#[tokio::test]
+async fn b2_truncated_stream_surfaces_error_through_assembled_loop() {
+    let server = MockServer::start().await;
+    // A content delta, then the body just ends: no finish_reason, no [DONE].
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().to_path_buf();
+    let model = Arc::new(OpenAiCompatClient::new(server.uri(), "test-model".into(), None));
+    let (built, sink) = assemble_test(ws, model, Arc::new(AlwaysApprove));
+    let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()));
+
+    // max_retries is 3 (hardcoded in loop_config_from): 4 attempts, all truncated,
+    // then the loop gives up and propagates the model error.
+    let err = built.loop_.run(&mut ctx, "go".into()).await.unwrap_err();
+    assert!(matches!(err, AgentError::Model(_)), "expected Model error, got {err:?}");
+    let events = sink.events.lock().unwrap().clone();
+    assert!(
+        events.iter().any(|e| e.starts_with("error:")),
+        "the truncation must surface as an Error event; events: {events:?}"
+    );
+}
