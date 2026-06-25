@@ -160,6 +160,14 @@ fn parse_sse_line(line: &str, splitter: &mut ThinkingSplitter) -> Option<Result<
         Ok(v) => v,
         Err(e) => return Some(Err(ModelError::Decode(e.to_string()))),
     };
+    // A 200-status stream can still carry an error object instead of choices
+    // (e.g. llama.cpp slot limits). Surface it instead of parsing empty deltas.
+    if let Some(err) = v.get("error") {
+        let msg = err.get("message").and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| err.to_string());
+        return Some(Err(ModelError::Stream(format!("server error in stream: {msg}"))));
+    }
     let choice = &v["choices"][0];
     let mut out = Vec::new();
     if let Some(reasoning) = choice["delta"]["reasoning_content"].as_str() {
@@ -233,6 +241,13 @@ impl ModelClient for OpenAiCompatClient {
                     }
                     match parse_sse_line(&line, &mut splitter) {
                         None => continue,
+                        // A malformed `data:` line (Decode) is transient corruption —
+                        // skip it and keep streaming. Any other error (e.g. an in-band
+                        // server error) is terminal.
+                        Some(Err(ModelError::Decode(e))) => {
+                            tracing::warn!(error = %e, "skipping malformed SSE data line");
+                            continue;
+                        }
                         Some(Err(e)) => {
                             yield Err(e);
                             return;
@@ -474,6 +489,61 @@ mod tests {
         assert_eq!(reasoning, "thinking hard");
         assert_eq!(text, "the answer");
         assert_eq!(done, Some(StopReason::Stop));
+    }
+
+    #[tokio::test]
+    async fn skips_malformed_sse_line_and_keeps_streaming() {
+        let server = MockServer::start().await;
+        // A good delta, then a malformed data line, then another good delta + terminal.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n\
+                    data: {bad json\n\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                    data: [DONE]\n\n";
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body))
+            .mount(&server).await;
+        let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
+        let req = CompletionRequest { messages: vec![Message::user("hi")], ..Default::default() };
+        let mut stream = client.stream(req).await.unwrap();
+
+        let mut text = String::new();
+        let mut done = None;
+        while let Some(item) = stream.next().await {
+            // unwrap() would panic if the bad line aborted the stream with an Err.
+            match item.unwrap() {
+                Chunk::Text(t) => text.push_str(&t),
+                Chunk::Done(r) => done = Some(r),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "AB", "the malformed line is skipped, both good deltas survive");
+        assert_eq!(done, Some(StopReason::Stop));
+    }
+
+    #[tokio::test]
+    async fn surfaces_in_band_error_object_in_200_body() {
+        let server = MockServer::start().await;
+        let body = "data: {\"error\":{\"message\":\"boom\"}}\n\n";
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body))
+            .mount(&server).await;
+        let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
+        let req = CompletionRequest { messages: vec![Message::user("hi")], ..Default::default() };
+        let mut stream = client.stream(req).await.unwrap();
+
+        let mut err = None;
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item { err = Some(e); break; }
+        }
+        match err {
+            Some(ModelError::Stream(m)) => assert!(m.contains("boom"), "message was: {m}"),
+            other => panic!("expected Stream error carrying the in-band message, got {other:?}"),
+        }
     }
 
     #[test]
