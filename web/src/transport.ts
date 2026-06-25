@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 export interface Transport {
   wsUrl: string;
   sessionId: string;
-  needsPairing: boolean;
 }
 
 // Tauri v2 with withGlobalTauri=false still injects __TAURI_INTERNALS__.
@@ -25,7 +24,7 @@ function localSessionId(): string {
 export async function resolveTransport(): Promise<Transport> {
   if (isTauri()) {
     const wsUrl = await invoke<string>("get_local_ws_url");
-    return { wsUrl, sessionId: localSessionId(), needsPairing: false };
+    return { wsUrl, sessionId: localSessionId() };
   }
-  return { wsUrl: "", sessionId: "", needsPairing: true };
+  return { wsUrl: "", sessionId: "" };
 }

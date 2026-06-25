@@ -3,21 +3,15 @@ import { connect } from "./socket";
 import { resolveTransport, isTauri } from "./transport";
 import { initialState, reduce, useAnimatedItems, artifactsFrom } from "./state";
 import type { Decision, RuntimeSettings } from "./wire";
-import { PairingScreen } from "./components/PairingScreen";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { TopBar } from "./components/TopBar";
 import { AgentColumn } from "./components/AgentColumn";
 import { WorkspacePane } from "./components/workspace/WorkspacePane";
 import { resolveInitialTheme, applyTheme, type Theme } from "./theme";
-import { appendUserMsg, clearSession, loadSessionId, loadTheme, loadToken, loadUserMsgs, saveSession, saveTheme } from "./storage";
-
-function wsUrl(token: string): string {
-  return `${location.origin.replace(/^http/, "ws")}/browser?token=${encodeURIComponent(token)}`;
-}
+import { appendUserMsg, loadSessionId, loadTheme, loadUserMsgs, saveTheme } from "./storage";
 
 export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(loadSessionId());
-  const [token, setToken] = useState<string | null>(loadToken());
   const [state, dispatch] = useReducer(reduce, loadUserMsgs(sessionId ?? ""), initialState);
   const [showSettings, setShowSettings] = useState(false);
   const [theme, setTheme] = useState<Theme>(() =>
@@ -51,12 +45,12 @@ export default function App() {
     resolveTransport().then((t) => {
       if (!active) return;
       setLocalUrl(t.wsUrl);
-      setSessionId(t.sessionId); // satisfies the existing sessionId gate
+      setSessionId(t.sessionId);
     });
     import("@tauri-apps/api/core")
       .then(({ invoke }) => invoke<string | null>("get_workspace"))
       .then((w) => { if (active && w) setWorkspace(w); })
-      .catch(() => { /* no workspace available yet; TopBar simply won't show it */ });
+      .catch(() => { /* no workspace yet; TopBar simply won't show it */ });
     return () => { active = false; };
   }, [tauri]);
 
@@ -67,7 +61,7 @@ export default function App() {
   const artifacts = artifactsFrom(state.items);
   const toolCount = state.items.filter((it) => it.kind === "tool").length;
   // Called before any early return so hook order stays stable across the
-  // pairing/loading → connected transition (React: no conditional hooks).
+  // loading → connected transition (React: no conditional hooks).
   const narrow = useNarrow();
 
   useEffect(() => {
@@ -76,22 +70,26 @@ export default function App() {
 
   useEffect(() => {
     if (!sessionId) return;
-    if (tauri ? !localUrl : !token) return;
+    if (!localUrl) return;
     dispatch({ type: "reset", userMsgs: loadUserMsgs(sessionId) });
     const WebSocketImpl = (window as unknown as { __WS__?: typeof WebSocket }).__WS__;
-    const url = tauri ? (localUrl as string) : wsUrl(token as string);
     sock.current = connect(
-      url,
+      localUrl,
       { onFrame: (f) => dispatch({ type: "frame", frame: f }), onStatus: (s) => dispatch({ type: "status", status: s }) },
       WebSocketImpl ? { WebSocketImpl } : undefined,
     );
     return () => { sock.current?.close(); sock.current = null; };
-  }, [token, sessionId, tauri, localUrl]);
+  }, [sessionId, localUrl]);
 
-  if (!tauri && (!token || !sessionId)) {
+  // Not running inside the desktop shell (plain browser / tests): there is no
+  // local bridge to connect to, so render a notice instead of hanging.
+  if (!tauri) {
     return (
-      <div className="h-screen" style={{ background: "var(--surface-base)" }}>
-        <PairingScreen onPaired={({ sessionId, token }) => { saveSession(sessionId, token); setSessionId(sessionId); setToken(token); }} />
+      <div className="flex h-screen items-center justify-center"
+        style={{ background: "var(--surface-base)", color: "var(--text-strong)" }}>
+        <p className="font-display text-lg">
+          This is the desktop app — launch it from the rust-agent-runtime window.
+        </p>
       </div>
     );
   }
@@ -111,7 +109,13 @@ export default function App() {
     sock.current?.send({ v: 1, session_id: sessionId, id: state.pendingApproval.id, kind: "approval_response", decision: d });
     dispatch({ type: "approval_sent" });
   };
-  const signOut = () => { sock.current?.close(); clearSession(); setToken(null); setSessionId(null); };
+  // Local desktop has no account/session token; "sign out" resets the local
+  // session id and reconnects to the bridge with a fresh session.
+  const signOut = () => {
+    sock.current?.close();
+    localStorage.removeItem("local_session_id");
+    location.reload();
+  };
   const openSettings = () => {
     setShowSettings(true);
     sock.current?.send({ v: 1, session_id: sessionId, kind: "settings_get" });
@@ -131,9 +135,9 @@ export default function App() {
         onOpenSettings={openSettings} settingsDisabled={!(connected && state.online)}
         onSignOut={signOut}
         showWorkspaceToggle={narrow} onToggleWorkspace={() => setWorkspaceOpen((o) => !o)}
-        tauriWorkspace={tauri ? workspace : undefined}
+        tauriWorkspace={workspace}
         onWorkspaceChanged={(p) => setWorkspace(p)}
-        llamaOk={tauri ? (llama?.ok ?? false) : undefined}
+        llamaOk={llama?.ok ?? false}
         llamaModel={llama?.model} />
       {showSettings && state.settings && (
         <SettingsPanel settings={state.settings} meta={state.settingsMeta} error={state.settingsError}
