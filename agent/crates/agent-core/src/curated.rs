@@ -6,7 +6,7 @@ use crate::context::{
 use crate::event::{AgentEvent, ContextEvent};
 use crate::offload::OffloadStore;
 use crate::offload_policy::{placeholder_for, select_offloads, OffloadConfig};
-use agent_model::Message;
+use agent_model::{Message, Role};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -88,9 +88,6 @@ impl CuratedContext {
     pub(crate) fn history(&self) -> &[Message] {
         &self.history
     }
-    pub(crate) fn goal_text(&self) -> Option<&str> {
-        self.goal.as_ref().map(|m| m.content.as_str())
-    }
 }
 
 #[async_trait]
@@ -161,22 +158,38 @@ impl ContextManager for CuratedContext {
         };
         if (requested || over_high_water) && self.history.len() > self.config.keep_recent + 1 {
             let split = self.history.len() - self.config.keep_recent;
-            // Carry prior summary forward so its information isn't lost on re-compaction.
-            let mut span: Vec<Message> = Vec::new();
-            if let Some(prev) = &self.compaction_summary {
-                span.push(prev.clone());
+            let prior = self.compaction_summary.clone();
+            // User turns are durable, author-authored instructions — the facts most
+            // costly to lose. Keep them VERBATIM and never feed them to the lossy
+            // summarizer; only assistant/tool chatter in the old span is compacted, with
+            // the prior summary carried forward so re-compaction accumulates instead of
+            // collapsing to the most recent turn.
+            let (verbatim, to_summarize): (Vec<Message>, Vec<Message>) = self.history[..split]
+                .iter()
+                .cloned()
+                .partition(|m| matches!(m.role, Role::User));
+            // "Worthwhile" (non-empty AND a net token win) is judged against everything
+            // actually replaced: the prior summary plus the chatter being summarized.
+            let mut replaced: Vec<Message> = prior.iter().cloned().collect();
+            replaced.extend_from_slice(&to_summarize);
+            let tokens_before: usize = replaced.iter().map(message_tokens).sum();
+            // Nothing summarizable beyond the prior summary — the verbatim user turns are
+            // already the most compact faithful form, so don't burn a model call.
+            if to_summarize.is_empty() {
+                return report;
             }
-            span.extend_from_slice(&self.history[..split]);
-            let tokens_before: usize = span.iter().map(message_tokens).sum();
-            match run_compaction(&span, self.goal_text(), deps.model, deps.cancel).await {
-                Ok(summary) if compaction_is_worthwhile(&summary, &span) => {
+            match run_compaction(&to_summarize, prior.as_ref(), deps.model, deps.cancel).await {
+                Ok(summary) if compaction_is_worthwhile(&summary, &replaced) => {
                     let tokens_after = message_tokens(&summary);
+                    // Reassemble history: verbatim user instructions (chronological), then
+                    // the recent window. The summarized chatter becomes the pinned summary.
                     let recent = self.history.split_off(split);
-                    self.history = recent;
+                    self.history = verbatim;
+                    self.history.extend(recent);
                     self.compaction_summary = Some(summary);
-                    report.compacted_turns = split;
+                    report.compacted_turns = to_summarize.len();
                     deps.sink.emit(AgentEvent::Context(ContextEvent::Compacted {
-                        turns_replaced: split,
+                        turns_replaced: to_summarize.len(),
                         tokens_before,
                         tokens_after,
                     }));
@@ -307,7 +320,8 @@ mod tests {
         c.high_water_pct = 0.0; // force compaction regardless of size
         c.config.keep_recent = 1;
         for i in 0..6 {
-            c.append(Message::user(format!("turn {i} with a fair bit of padding text here")));
+            // Assistant chatter (not user instructions) is what gets summarized.
+            c.append(Message::assistant(format!("turn {i} with a fair bit of padding text here"), None));
         }
         let model: Arc<dyn ModelClient> =
             Arc::new(ScriptedModel::new(vec![Scripted::Text("compact summary".into())]));
@@ -323,12 +337,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintain_keeps_user_instructions_verbatim_through_compaction() {
+        // The durable facts live in user turns; compaction must never route them
+        // through the lossy summarizer — they survive byte-for-byte.
+        let mut c = ctx();
+        c.high_water_pct = 0.0; // force compaction
+        c.config.keep_recent = 1;
+        // Interleave user instructions with assistant chatter.
+        for i in 0..4 {
+            c.append(Message::user(format!("instruction {i}: add value {i}{i}")));
+            c.append(Message::assistant(format!("ok, acknowledged {i}, lots of filler chatter"), None));
+        }
+        let model: Arc<dyn ModelClient> =
+            Arc::new(ScriptedModel::new(vec![Scripted::Text("chatter summary".into())]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+
+        assert!(report.compacted_turns > 0, "assistant chatter should have been summarized");
+        let built = c.build(100_000);
+        // Every user instruction is still present verbatim, none lost to summarization.
+        for i in 0..4 {
+            let want = format!("instruction {i}: add value {i}{i}");
+            assert!(
+                built.iter().any(|m| m.content == want),
+                "user instruction {i} must survive compaction verbatim"
+            );
+        }
+        // And a compaction summary block exists for the chatter.
+        assert!(built.iter().any(|m| m.content.contains("chatter summary")));
+    }
+
+    #[tokio::test]
     async fn maintain_leaves_history_intact_when_compaction_fails() {
         let mut c = ctx();
         c.high_water_pct = 0.0;
         c.config.keep_recent = 1;
         for i in 0..6 {
-            c.append(Message::user(format!("turn {i} with padding text")));
+            c.append(Message::assistant(format!("turn {i} with padding text"), None));
         }
         let before = c.history().len();
         // Empty script => stream yields nothing => empty summary => not worthwhile => discarded.
