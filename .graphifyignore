@@ -9,4 +9,31 @@
 .superpowers/sdd/
 
 docs/superpowers
-.claude/commands
+.claude/
+.agents
+
+# Dependency / build output trees — vendored deps and compiler artifacts, not
+# authored architecture. These dwarf the real source if ingested.
+node_modules/
+agent/target/
+src-tauri/target/
+src-tauri/gen/
+
+# Lock files — machine-generated dependency pins. Pure noise in the graph.
+Cargo.lock
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Local worktrees + tool scratch
+.worktrees/
+.playwright-mcp/
+.superpowers/
+
+# Graphify's own output (avoid ingesting the graph into itself)
+graphify-out/
+
+# OS / editor junk
+.DS_Store
+.idea/
+.vscode/
