@@ -25,9 +25,12 @@ are the remaining verified findings, not yet specced.
 
 > **B1 DONE** (merged `6383a7b`, 2026-06-25): the HIGH tool-call-id panic + the LOW
 > `message_tokens` undercount are fixed (spec `2026-06-25-loop-tool-call-id-contract-design.md`,
-> plan `docs/superpowers/plans/2026-06-25-loop-tool-call-id-contract.md`). Remaining
-> Cluster B work: **B2** (OpenAI stream robustness) and **B3** (live cancellation wiring),
-> each its own spec.
+> plan `docs/superpowers/plans/2026-06-25-loop-tool-call-id-contract.md`).
+> **B2 DONE** (merged `ee74971`, 2026-06-25): OpenAI stream robustness — truncation
+> detection, skip-malformed-SSE-line, in-band 200-body error surfacing (spec
+> `2026-06-25-openai-stream-robustness-design.md`, plan
+> `…/plans/2026-06-25-openai-stream-robustness.md`). Remaining Cluster B work:
+> **B3** (live cancellation wiring), its own spec.
 
 - **HIGH — panic on duplicate/empty tool-call ids** (`agent-core/src/loop_.rs`, the
   `results.remove(...).expect("every gated call id has a result")` path). `results` is a HashMap
