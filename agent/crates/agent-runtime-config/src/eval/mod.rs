@@ -6,8 +6,10 @@ pub mod admissibility;
 pub mod config;
 pub mod gate;
 pub mod result;
+pub mod task;
 
 pub use admissibility::{admit, Admissibility};
 pub use config::CandidateConfig;
 pub use gate::{gate, heldout_ok, Verdict};
 pub use result::{BatchResult, RunResult};
+pub use task::{SeedFile, SessionSpec, TaskSpec};
