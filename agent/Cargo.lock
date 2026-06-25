@@ -138,12 +138,15 @@ dependencies = [
  "agent-mcp",
  "agent-memory",
  "agent-model",
+ "agent-policy",
  "agent-sandbox",
  "agent-skills",
  "agent-tools",
+ "async-trait",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 
