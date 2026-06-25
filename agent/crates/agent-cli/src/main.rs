@@ -1,11 +1,10 @@
 mod approval;
 mod render;
 
-use agent_core::{AgentLoop, LoopConfig, WindowContext};
+use agent_core::WindowContext;
 use agent_model::Message;
-use agent_policy::RulePolicy;
-use agent_runtime_config::{backend_name_is_valid, build_memory_full, build_registry, build_model,
-    build_sandbox, build_skills, default_allowlist, default_denylist, pick_protocol};
+use agent_runtime_config::{assemble_loop, backend_name_is_valid, build_memory_full, build_model,
+    build_sandbox, default_allowlist, default_denylist, LoopParts, RuntimeConfig};
 use approval::TerminalApproval;
 use clap::Parser;
 use render::TerminalSink;
@@ -16,6 +15,44 @@ use std::time::Duration;
 const BASE_SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided tools to \
 inspect and modify the workspace. Think step by step. When the task is complete, reply with a \
 summary and no tool call.";
+
+/// Map CLI flags to a complete `RuntimeConfig` so the loop is assembled the same
+/// way as the server (via `agent_runtime_config::assemble_loop`).
+fn runtime_config_from_cli(cli: &Cli, protocol_name: &str) -> RuntimeConfig {
+    let mut c = RuntimeConfig::from_launch(
+        cli.backend.clone(), cli.base_url.clone(), cli.model.clone(),
+        protocol_name.to_string(), cli.context_limit);
+    // Sandbox
+    c.sandbox_mode = cli.sandbox_mode.clone();
+    c.sandbox_image = cli.sandbox_image.clone();
+    c.sandbox_network = cli.sandbox_network;
+    c.sandbox_memory = cli.sandbox_memory.clone();
+    c.sandbox_cpus = cli.sandbox_cpus.clone();
+    c.sandbox_pids = cli.sandbox_pids;
+    c.sandbox_fsize = cli.sandbox_fsize.clone();
+    c.sandbox_tmp_size = cli.sandbox_tmp_size.clone();
+    c.sandbox_extra_rw = cli.sandbox_extra_rw.clone();
+    c.sandbox_extra_ro = cli.sandbox_extra_ro.clone();
+    // Sampling + thinking (the values the CLI used to hardcode into LoopConfig)
+    c.temperature = 0.2;
+    c.max_turns = 25;
+    c.max_tokens = 2048;
+    c.top_p = cli.top_p;
+    c.top_k = cli.top_k;
+    c.min_p = cli.min_p;
+    c.presence_penalty = cli.presence_penalty;
+    c.repeat_penalty = cli.repeat_penalty;
+    c.enable_thinking = !cli.no_thinking;
+    c.preserve_thinking = cli.preserve_thinking;
+    // Tools / skills / memory / network
+    c.http_allow_hosts = cli.allow_host.clone();
+    c.skills_dirs = cli.skills_dir.clone();
+    c.active_skills = cli.skill.clone();
+    c.memory = cli.memory;
+    c.command_allowlist = default_allowlist();
+    c.command_denylist = default_denylist();
+    c
+}
 
 #[derive(Parser)]
 #[command(name = "agent", about = "Local Rust agent core (CLI)")]
@@ -149,80 +186,45 @@ async fn main() {
     } else {
         cli.protocol.as_str()
     };
-    // Build the sandbox strategy early so it can be passed to both LoopConfig and (in Task 11)
-    // the MCP manager. We synthesise a RuntimeConfig purely as a carrier for the sandbox fields.
-    let mut sbcfg = agent_runtime_config::RuntimeConfig::from_launch(
-        cli.backend.clone(), cli.base_url.clone(), cli.model.clone(),
-        protocol_name.to_string(), cli.context_limit);
-    sbcfg.sandbox_mode = cli.sandbox_mode.clone();
-    sbcfg.sandbox_image = cli.sandbox_image.clone();
-    sbcfg.sandbox_network = cli.sandbox_network;
-    sbcfg.sandbox_memory = cli.sandbox_memory.clone();
-    sbcfg.sandbox_cpus = cli.sandbox_cpus.clone();
-    sbcfg.sandbox_pids = cli.sandbox_pids;
-    sbcfg.sandbox_fsize = cli.sandbox_fsize.clone();
-    sbcfg.sandbox_tmp_size = cli.sandbox_tmp_size.clone();
-    sbcfg.sandbox_extra_rw = cli.sandbox_extra_rw.clone();
-    sbcfg.sandbox_extra_ro = cli.sandbox_extra_ro.clone();
-    let sandbox = build_sandbox(&sbcfg);
-    let protocol = pick_protocol(protocol_name);
-    let mut registry = build_registry(&cli.allow_host);
-    // Connect MCP servers (if configured), register their tools, keep the manager alive.
+    // Map every loop-relevant flag into one RuntimeConfig, then assemble the loop
+    // through the same shared builder the server uses (no duplicated orchestration).
+    let rt = runtime_config_from_cli(&cli, protocol_name);
+    let sandbox = build_sandbox(&rt);
+
+    // MCP servers (if configured): collect tools, keep the manager alive for the session.
+    let mut mcp_tools: Vec<Arc<dyn agent_tools::Tool>> = Vec::new();
     let mcp_manager = match &cli.mcp_config {
         Some(path) => {
             let mgr = agent_runtime_config::connect_mcp(path, sandbox.clone()).await;
             println!("{}", mgr.summary_line());
-            for t in mgr.tools() {
-                registry.register(t);
-            }
+            mcp_tools = mgr.tools();
             Some(mgr)
         }
         None => None,
     };
-    // Skills: register the four skill tools, then compose any presets into the system prompt.
-    let (skill_registry, skill_tools) = build_skills(&cli.skills_dir, &workspace);
-    for t in skill_tools {
-        registry.register(t);
-    }
-    // Long-term memory: construct once (loads the embedding model), register the
-    // tools, and keep the retriever for auto-retrieval.
+
+    // Long-term memory: construct once (loads the embedding model); pass tools + retriever in.
     let memory = build_memory_full(cli.memory, cli.memory_db.clone(),
         cli.memory_model_dir.clone(), &workspace);
-    for t in memory.tools.iter().cloned() {
-        registry.register(t);
-    }
-    let system_prompt = match agent_skills::compose_system_prompt(
-        BASE_SYSTEM_PROMPT, &skill_registry, &cli.skill) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("skills: {e}");
-            std::process::exit(2);
-        }
-    };
-    let tools = Arc::new(registry);
-    let policy = Arc::new(RulePolicy {
-        workspace: workspace.clone(),
-        command_allowlist: default_allowlist(),
-        command_denylist: default_denylist(),
-    });
-    let sink = Arc::new(TerminalSink::default());
-    let agent = AgentLoop::new(model, protocol, tools, policy, Arc::new(TerminalApproval),
-        sink, LoopConfig {
-            model_limit: cli.context_limit, max_turns: 25, max_retries: 3, temperature: 0.2,
-            max_tokens: Some(2048), workspace, tool_timeout: Duration::from_secs(120),
-            stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
-            top_p: cli.top_p, top_k: cli.top_k, min_p: cli.min_p,
-            presence_penalty: cli.presence_penalty, repeat_penalty: cli.repeat_penalty,
-            enable_thinking: !cli.no_thinking, preserve_thinking: cli.preserve_thinking,
-            sandbox: Some(sandbox.clone()),
-            max_parallel_tools: 8,
-        });
-    let agent = match memory.retriever.clone() {
-        Some(r) => agent.with_retriever(r),
-        None => agent,
-    };
 
-    let mut ctx = WindowContext::new(Message::system(system_prompt))
+    let built = assemble_loop(&rt, LoopParts {
+        model,
+        sink: Arc::new(TerminalSink::default()),
+        approval: Arc::new(TerminalApproval),
+        workspace: workspace.clone(),
+        mcp_tools,
+        memory_tools: memory.tools.clone(),
+        memory_retriever: memory.retriever.clone(),
+        stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
+        base_system_prompt: BASE_SYSTEM_PROMPT.to_string(),
+    });
+    if !built.unknown_presets.is_empty() {
+        eprintln!("skills: unknown active skill(s): {}", built.unknown_presets.join(", "));
+        std::process::exit(2);
+    }
+    let agent = built.loop_;
+
+    let mut ctx = WindowContext::new(Message::system(built.system_prompt))
         .with_recall_budget(memory.recall_token_budget);
 
     println!("agent ready. Type a task, or 'exit'.");
@@ -285,5 +287,25 @@ mod tests {
         ]);
         assert_eq!(cli.sandbox_extra_rw, vec!["/data", "/mnt"]);
         assert_eq!(cli.sandbox_extra_ro, vec!["/etc/config"]);
+    }
+
+    #[test]
+    fn runtime_config_from_cli_carries_loop_fields() {
+        let cli = Cli::parse_from([
+            "agent", "--model", "m", "--base-url", "http://x",
+            "--top-p", "0.9", "--allow-host", "example.com",
+            "--skills-dir", "/sk", "--skill", "greeter", "--memory",
+        ]);
+        let rc = runtime_config_from_cli(&cli, "native");
+        assert_eq!(rc.model, "m");
+        assert_eq!(rc.base_url, "http://x");
+        assert_eq!(rc.protocol, "native");
+        assert_eq!(rc.top_p, Some(0.9));
+        assert!(rc.memory);
+        assert_eq!(rc.http_allow_hosts, vec!["example.com".to_string()]);
+        assert_eq!(rc.skills_dirs, vec!["/sk".to_string()]);
+        assert_eq!(rc.active_skills, vec!["greeter".to_string()]);
+        assert!(!rc.command_allowlist.is_empty());
+        assert!(!rc.command_denylist.is_empty());
     }
 }
