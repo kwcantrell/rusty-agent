@@ -4,6 +4,9 @@
 mod runtime_config;
 pub use runtime_config::{RuntimeConfig, HARD_FLOOR_DENYLIST};
 
+mod assemble;
+pub use assemble::{assemble_loop, loop_config_from, BuiltLoop, LoopParts};
+
 use agent_mcp::McpServersConfig;
 use agent_model::{ClaudeCliClient, ModelClient, NativeProtocol, OpenAiCompatClient,
                   PromptedJsonProtocol, ToolCallProtocol};

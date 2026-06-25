@@ -1,15 +1,12 @@
 use crate::approval::WsApprovalChannel;
 use crate::sink::WsEventSink;
 use crate::wire::{DiscoveredSkill, WireBody, WireEnvelope, PROTOCOL_VERSION};
-use agent_core::{AgentLoop, LoopConfig, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT};
-use agent_policy::RulePolicy;
-use agent_runtime_config::{build_model, build_registry, build_sandbox, build_skills, pick_protocol, RuntimeConfig, HARD_FLOOR_DENYLIST};
-use agent_skills::{compose_system_prompt, SkillRegistry};
+use agent_core::{AgentLoop, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT};
+use agent_runtime_config::{assemble_loop, build_model, BuiltLoop, LoopParts, RuntimeConfig, HARD_FLOOR_DENYLIST};
+use agent_skills::SkillRegistry;
 use agent_tools::Tool;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Holds the live `AgentLoop` plus everything needed to rebuild it on a settings
@@ -145,22 +142,10 @@ impl RuntimeState {
     }
 }
 
-/// The result of (re)building the loop: the loop itself, the composed system
-/// prompt, and any `active_skills` names that were not found (dropped from the
-/// prompt). Callers decide whether unknown presets are fatal (wire) or tolerated
-/// (startup).
-struct BuiltLoop {
-    loop_: Arc<AgentLoop>,
-    system_prompt: String,
-    unknown_presets: Vec<String>,
-    /// Tool names registered at build time, retained so tests can assert injection.
-    #[cfg(test)]
-    registered_names: Vec<String>,
-}
-
-/// Assemble an `AgentLoop` from a config + the persistent seams, building the
-/// skill registry/tools from `cfg.skills_dirs` and composing the system prompt
-/// from `cfg.active_skills`. The one place a `RuntimeConfig` becomes a loop.
+/// Build the loop for the current config. Thin wrapper over the shared
+/// `agent_runtime_config::assemble_loop`; this crate supplies the per-frontend
+/// parts (WebSocket sink/approval, the model, injected tools). The one place a
+/// `RuntimeConfig` becomes a loop now lives in `agent-runtime-config`.
 #[allow(clippy::too_many_arguments)]
 fn build_loop(
     cfg: &RuntimeConfig,
@@ -175,91 +160,17 @@ fn build_loop(
     base_system_prompt: &str,
 ) -> BuiltLoop {
     let model = build_model(&cfg.backend, &cfg.base_url, &cfg.model, claude_binary, api_key.clone());
-    let policy = Arc::new(RulePolicy {
-        workspace: workspace.to_path_buf(),
-        command_allowlist: cfg.command_allowlist.clone(),
-        command_denylist: cfg.effective_denylist(),
-    });
-    let mut registry = build_registry(&cfg.http_allow_hosts);
-    for t in mcp_tools {
-        registry.register(t.clone());
-    }
-    if cfg.memory {
-        for t in memory_tools {
-            registry.register(t.clone());
-        }
-    }
-    // Skills: build the registry + the 4 tools from the configured roots.
-    let (skill_registry, skill_tools) = build_skills(&cfg.skills_dirs, workspace);
-    for t in skill_tools {
-        registry.register(t);
-    }
-    // Compose the prompt: keep only presets that actually exist; warn + drop the rest.
-    let available: HashSet<String> =
-        skill_registry.scan().into_iter().map(|s| s.name).collect();
-    let mut presets = Vec::new();
-    let mut unknown_presets = Vec::new();
-    for name in &cfg.active_skills {
-        if available.contains(name) {
-            presets.push(name.clone());
-        } else {
-            tracing::warn!(skill = %name, "active skill not found; dropping from system prompt");
-            unknown_presets.push(name.clone());
-        }
-    }
-    // All names in `presets` are known, so compose cannot error here.
-    let system_prompt = match compose_system_prompt(base_system_prompt, &skill_registry, &presets) {
-        Ok(p) => p,
-        Err(e) => {
-            // Unreachable today (presets are pre-filtered against scan()), but surface it
-            // rather than silently dropping all presets if that ever changes. Never panic
-            // here — startup must stay lenient.
-            tracing::error!(error = %e, "compose_system_prompt failed unexpectedly; using base prompt");
-            base_system_prompt.to_string()
-        }
-    };
-
-    #[cfg(test)]
-    let registered_names: Vec<String> = registry.schemas().into_iter().map(|s| s.name).collect();
-    let agent = AgentLoop::new(
+    assemble_loop(cfg, LoopParts {
         model,
-        pick_protocol(&cfg.protocol),
-        Arc::new(registry),
-        policy,
-        approval.clone(),
-        sink.clone(),
-        LoopConfig {
-            model_limit: cfg.context_limit,
-            max_turns: cfg.max_turns,
-            max_retries: 3,
-            temperature: cfg.temperature,
-            max_tokens: Some(cfg.max_tokens),
-            workspace: workspace.to_path_buf(),
-            tool_timeout: Duration::from_secs(120),
-            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
-            top_p: cfg.top_p,
-            top_k: cfg.top_k,
-            min_p: cfg.min_p,
-            presence_penalty: cfg.presence_penalty,
-            repeat_penalty: cfg.repeat_penalty,
-            enable_thinking: cfg.enable_thinking,
-            preserve_thinking: cfg.preserve_thinking,
-            sandbox: Some(build_sandbox(cfg)),
-            max_parallel_tools: 8,
-        },
-    );
-    let agent = match (cfg.memory, memory_retriever) {
-        (true, Some(r)) => agent.with_retriever(r.clone()),
-        _ => agent,
-    };
-    let loop_ = Arc::new(agent);
-    BuiltLoop {
-        loop_,
-        system_prompt,
-        unknown_presets,
-        #[cfg(test)]
-        registered_names,
-    }
+        sink: sink.clone(),
+        approval: approval.clone(),
+        workspace: workspace.to_path_buf(),
+        mcp_tools: mcp_tools.to_vec(),
+        memory_tools: memory_tools.to_vec(),
+        memory_retriever: memory_retriever.cloned(),
+        stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+        base_system_prompt: base_system_prompt.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -465,100 +376,4 @@ mod tests {
         let _loop = result.loop_;
     }
 
-    #[test]
-    fn build_loop_registers_injected_memory_tools() {
-        use agent_tools::{Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolSchema};
-        use async_trait::async_trait;
-
-        struct FakeMem;
-        #[async_trait]
-        impl Tool for FakeMem {
-            fn name(&self) -> &str { "remember" }
-            fn description(&self) -> &str { "fake" }
-            fn schema(&self) -> ToolSchema {
-                ToolSchema {
-                    name: "remember".into(),
-                    description: "fake".into(),
-                    parameters: serde_json::json!({"type": "object"}),
-                }
-            }
-            fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
-                Ok(ToolIntent {
-                    tool: "remember".into(),
-                    access: Access::Read,
-                    paths: vec![],
-                    command: None,
-                    summary: "x".into(),
-                })
-            }
-            async fn execute(
-                &self,
-                _a: serde_json::Value,
-                _c: &ToolCtx,
-            ) -> Result<ToolOutput, ToolError> {
-                Ok(ToolOutput { content: "ok".into(), display: None })
-            }
-        }
-
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let session = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::new(WsEventSink::new(tx.clone(), session.clone()));
-        let approval = Arc::new(WsApprovalChannel::new(
-            tx.clone(), session.clone(), Duration::from_secs(1)));
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
-
-        let result = build_loop(
-            &cfg, &sink, &approval, dir.path(), &None, "claude",
-            &[], &[Arc::new(FakeMem)], None, crate::daemon::SYSTEM_PROMPT);
-
-        assert!(
-            result.registered_names.iter().any(|n| n == "remember"),
-            "memory tool \"remember\" must be registered; got: {:?}",
-            result.registered_names,
-        );
-    }
-
-    #[test]
-    fn build_loop_skips_memory_tools_when_disabled() {
-        use agent_tools::{Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolSchema};
-        use async_trait::async_trait;
-
-        struct FakeMem;
-        #[async_trait]
-        impl Tool for FakeMem {
-            fn name(&self) -> &str { "remember" }
-            fn description(&self) -> &str { "fake" }
-            fn schema(&self) -> ToolSchema {
-                ToolSchema { name: "remember".into(), description: "fake".into(),
-                    parameters: serde_json::json!({"type": "object"}) }
-            }
-            fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
-                Ok(ToolIntent { tool: "remember".into(), access: Access::Read,
-                    paths: vec![], command: None, summary: "x".into() })
-            }
-            async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx)
-                -> Result<ToolOutput, ToolError> {
-                Ok(ToolOutput { content: "ok".into(), display: None })
-            }
-        }
-
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let session = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::new(WsEventSink::new(tx.clone(), session.clone()));
-        let approval = Arc::new(WsApprovalChannel::new(tx, session, Duration::from_secs(1)));
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
-        cfg.memory = false; // disabled
-
-        let result = build_loop(
-            &cfg, &sink, &approval, dir.path(), &None, "claude",
-            &[], &[Arc::new(FakeMem)], None, crate::daemon::SYSTEM_PROMPT);
-
-        assert!(!result.registered_names.iter().any(|n| n == "remember"),
-            "memory tools must not register when cfg.memory is false; got: {:?}",
-            result.registered_names);
-    }
 }
