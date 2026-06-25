@@ -24,6 +24,7 @@ dependencies = [
  "serde_json",
  "similar",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
