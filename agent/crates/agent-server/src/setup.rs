@@ -1,5 +1,5 @@
 //! Build a `DaemonParams` for the fully-local desktop bridge (no Worker, no
-//! pairing, no MCP/memory). Llama defaults are seeded here; the Settings UI can
+//! MCP/memory). Llama defaults are seeded here; the Settings UI can
 //! still edit them live via the persisted `config_path`.
 use crate::daemon::{DaemonParams, SYSTEM_PROMPT};
 use agent_runtime_config::RuntimeConfig;
