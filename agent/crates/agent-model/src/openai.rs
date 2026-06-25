@@ -262,7 +262,7 @@ impl ModelClient for OpenAiCompatClient {
                                 yield Ok(chunk);
                             }
                             if is_done {
-                                saw_terminal = true;
+                                // (terminal: we return here, so saw_terminal need not be set)
                                 for chunk in splitter.flush() { yield Ok(chunk); }
                                 return;
                             }

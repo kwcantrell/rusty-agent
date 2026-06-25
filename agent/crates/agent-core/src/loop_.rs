@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 pub enum AgentError {
     #[error("model error after retries: {0}")]
     Model(String),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// Default idle timeout for model-stream consumption. Generous enough to cover
@@ -82,18 +84,26 @@ impl AgentLoop {
     }
 
     /// Drive one streamed completion to an `AssistantTurn`, emitting tokens as they arrive.
-    async fn one_completion(&self, req: CompletionRequest) -> Result<AssistantTurn, ModelError> {
+    async fn one_completion(&self, req: CompletionRequest, cancel: &CancellationToken)
+        -> Result<AssistantTurn, ModelError> {
         let idle = self.config.stream_idle_timeout;
-        let mut stream = match tokio::time::timeout(idle, self.model.stream(req)).await {
-            Err(_) => return Err(ModelError::Timeout(idle)),
-            Ok(opened) => opened?,
+        let mut stream = tokio::select! {
+            _ = cancel.cancelled() => return Err(ModelError::Stream("cancelled".into())),
+            opened = tokio::time::timeout(idle, self.model.stream(req)) => match opened {
+                Err(_) => return Err(ModelError::Timeout(idle)),
+                Ok(opened) => opened?,
+            },
         };
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut raw_tool_calls: Vec<RawToolCall> = Vec::new();
         let mut stop = StopReason::Stop;
         loop {
-            match tokio::time::timeout(idle, stream.next()).await {
+            let step = tokio::select! {
+                _ = cancel.cancelled() => return Err(ModelError::Stream("cancelled".into())),
+                s = tokio::time::timeout(idle, stream.next()) => s,
+            };
+            match step {
                 // Stalled: dropping `stream` on return fires kill_on_drop / tears down the connection.
                 Err(_) => return Err(ModelError::Timeout(idle)),
                 Ok(None) => break,
@@ -109,15 +119,16 @@ impl AgentLoop {
     }
 
     /// Stream with retry/backoff on transport errors.
-    async fn completion_with_retry(&self, base: &CompletionRequest)
+    async fn completion_with_retry(&self, base: &CompletionRequest, cancel: &CancellationToken)
         -> Result<AssistantTurn, AgentError> {
         let mut attempt = 0;
         loop {
             let mut req = base.clone();
             self.protocol.prepare(&mut req);
-            match self.one_completion(req).await {
+            match self.one_completion(req, cancel).await {
                 Ok(turn) => return Ok(turn),
                 Err(e) => {
+                    if cancel.is_cancelled() { return Err(AgentError::Cancelled); }
                     attempt += 1;
                     if attempt > self.config.max_retries {
                         self.sink.emit(AgentEvent::Error(e.to_string()));
@@ -130,8 +141,15 @@ impl AgentLoop {
         }
     }
 
+    /// Convenience entry point with no external cancel source (server + tests).
+    /// Live cancellation goes through [`Self::run_with_cancel`].
     pub async fn run(&self, ctx: &mut dyn ContextManager, user_input: String)
         -> Result<(), AgentError> {
+        self.run_with_cancel(ctx, user_input, CancellationToken::new()).await
+    }
+
+    pub async fn run_with_cancel(&self, ctx: &mut dyn ContextManager, user_input: String,
+                                 cancel: CancellationToken) -> Result<(), AgentError> {
         if let Some(retriever) = &self.retriever {
             let lines = retriever.retrieve(&user_input).await;
             if !lines.is_empty() {
@@ -148,6 +166,10 @@ impl AgentLoop {
         let preserve_thinking = self.config.preserve_thinking || !self.tools.schemas().is_empty();
 
         for turn in 0..self.config.max_turns {
+            if cancel.is_cancelled() {
+                self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
+                return Ok(());
+            }
             let messages = ctx.build(self.config.model_limit);
             self.sink.emit(AgentEvent::Usage {
                 prompt_tokens: built_tokens(&messages),
@@ -168,7 +190,14 @@ impl AgentLoop {
                 enable_thinking: self.config.enable_thinking,
                 preserve_thinking,
             };
-            let assistant = self.completion_with_retry(&base).await?;
+            let assistant = match self.completion_with_retry(&base, &cancel).await {
+                Ok(t) => t,
+                Err(AgentError::Cancelled) => {
+                    self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
 
             let mut parsed = match self.protocol.parse(&assistant) {
                 Ok(p) => { protocol_repairs = 0; p }
@@ -209,7 +238,7 @@ impl AgentLoop {
             let mut results: HashMap<String, (String, Resolved)> = HashMap::new();
             let mut ready: Vec<ReadyCall> = Vec::new();
             for call in parsed.tool_calls {
-                match self.gate_tool(call).await {
+                match self.gate_tool(call, &cancel).await {
                     GateOutcome::Rejected { id, name, content } => {
                         order.push(id.clone());
                         results.insert(id, (name, Resolved::Err(content)));
@@ -265,7 +294,7 @@ impl AgentLoop {
 
     /// Resolve, policy-check, and (if needed) get approval for one call — but do NOT
     /// execute it. Sequential by design so approval prompts never overlap.
-    async fn gate_tool(&self, call: ToolCall) -> GateOutcome {
+    async fn gate_tool(&self, call: ToolCall, cancel: &CancellationToken) -> GateOutcome {
         self.sink.emit(AgentEvent::ToolStart { name: call.name.clone(), args: call.args.clone() });
         let tool = match self.tools.get(&call.name) {
             Some(t) => t,
@@ -307,13 +336,12 @@ impl AgentLoop {
             return GateOutcome::Rejected { id: call.id, name: call.name,
                 content: format!("ERROR: {}", ToolError::Denied("user declined".into())) };
         }
-        // NOTE: this token is currently inert — it is not wired to any external
-        // cancel source (e.g. Ctrl-C / SIGINT). Live cancellation is not yet
-        // functional; this is a stub for future wiring.
+        // The live run token: a tool that honors `ctx.cancel` (shell/git/fetch_url)
+        // aborts when the caller cancels the run (Ctrl-C / SIGINT via the CLI).
         let sandbox = self.config.sandbox.clone()
             .unwrap_or_else(|| std::sync::Arc::new(agent_tools::HostExecutor));
         let ctx = ToolCtx { workspace: self.config.workspace.clone(),
-            timeout: self.config.tool_timeout, cancel: CancellationToken::new(),
+            timeout: self.config.tool_timeout, cancel: cancel.clone(),
             sandbox };
         GateOutcome::Ready(ReadyCall { tool, args: call.args, id: call.id, name: call.name, ctx })
     }
@@ -479,6 +507,86 @@ mod tests {
 
     fn policy(ws: std::path::PathBuf) -> Arc<RulePolicy> {
         Arc::new(RulePolicy { workspace: ws, command_allowlist: vec![], command_denylist: vec![] })
+    }
+
+    #[tokio::test]
+    async fn precancelled_token_stops_before_calling_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("should never run".into())]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // already cancelled before the run starts
+
+        agent.run_with_cancel(&mut ctx, "go".into(), cancel).await.unwrap();
+
+        // Stopped at the turn boundary: only the terminal Done(Cancelled) event, no
+        // Usage / Token events (the model was never consulted).
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events, vec!["done".to_string()], "events were: {events:?}");
+    }
+
+    struct HangsUntilCancel { started: Arc<tokio::sync::Notify> }
+
+    #[async_trait::async_trait]
+    impl Tool for HangsUntilCancel {
+        fn name(&self) -> &str { "hang" }
+        fn description(&self) -> &str { "hangs until cancelled" }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema { name: "hang".into(), description: "".into(),
+                parameters: serde_json::json!({"type":"object"}) }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<agent_tools::ToolIntent, ToolError> {
+            Ok(agent_tools::ToolIntent { tool: "hang".into(), access: agent_tools::Access::Read,
+                paths: vec![], command: None, summary: "hang".into() })
+        }
+        async fn execute(&self, _args: serde_json::Value, ctx: &ToolCtx)
+            -> Result<agent_tools::ToolOutput, ToolError> {
+            self.started.notify_one();
+            ctx.cancel.cancelled().await; // blocks until the loop's token is cancelled
+            Err(ToolError::Timeout)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_a_hung_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(HangsUntilCancel { started: started.clone() }));
+        let registry = Arc::new(reg);
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "hang".into(), "{}".into()),
+            Scripted::Text("after".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry, policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        // Cancel as soon as the tool reports it has started and is blocking.
+        let waiter = tokio::spawn(async move { started.notified().await; c2.cancel(); });
+
+        // Without cancellation this never returns (the tool blocks forever); returning
+        // at all proves the hang was aborted.
+        agent.run_with_cancel(&mut ctx, "go".into(), cancel).await.unwrap();
+        waiter.await.unwrap();
+
+        assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
     }
 
     #[tokio::test]
