@@ -237,7 +237,16 @@ async fn main() {
         let input = line.trim();
         if input.is_empty() { continue; }
         if input == "exit" || input == "quit" { break; }
-        if let Err(e) = agent.run(&mut ctx, input.to_string()).await {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let run = agent.run_with_cancel(&mut ctx, input.to_string(), cancel.clone());
+        tokio::pin!(run);
+        let result = loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => { cancel.cancel(); eprintln!("\n^C cancelling…"); }
+                r = &mut run => break r,
+            }
+        };
+        if let Err(e) = result {
             eprintln!("\x1b[31mfatal: {e}\x1b[0m");
         }
     }
