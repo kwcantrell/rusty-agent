@@ -4,6 +4,7 @@ edition.workspace = true
 
 [dependencies]
 agent-tools = { path = "../agent-tools" }
+agent-core = { path = "../agent-core" }
 agent-sandbox = { path = "../agent-sandbox" }
 agent-model = { path = "../agent-model" }
 agent-mcp = { path = "../agent-mcp" }

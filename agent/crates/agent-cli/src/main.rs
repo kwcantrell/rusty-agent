@@ -4,7 +4,7 @@ mod render;
 use agent_core::{AgentLoop, LoopConfig, WindowContext};
 use agent_model::Message;
 use agent_policy::RulePolicy;
-use agent_runtime_config::{backend_name_is_valid, build_memory, build_registry, build_model,
+use agent_runtime_config::{backend_name_is_valid, build_memory_full, build_registry, build_model,
     build_sandbox, build_skills, default_allowlist, default_denylist, pick_protocol};
 use approval::TerminalApproval;
 use clap::Parser;
@@ -184,8 +184,11 @@ async fn main() {
     for t in skill_tools {
         registry.register(t);
     }
-    // Long-term memory: construct once (loads the embedding model) and register.
-    for t in build_memory(cli.memory, cli.memory_db.clone(), cli.memory_model_dir.clone(), &workspace) {
+    // Long-term memory: construct once (loads the embedding model), register the
+    // tools, and keep the retriever for auto-retrieval.
+    let memory = build_memory_full(cli.memory, cli.memory_db.clone(),
+        cli.memory_model_dir.clone(), &workspace);
+    for t in memory.tools.iter().cloned() {
         registry.register(t);
     }
     let system_prompt = match agent_skills::compose_system_prompt(
@@ -214,8 +217,13 @@ async fn main() {
             sandbox: Some(sandbox.clone()),
             max_parallel_tools: 8,
         });
+    let agent = match memory.retriever.clone() {
+        Some(r) => agent.with_retriever(r),
+        None => agent,
+    };
 
-    let mut ctx = WindowContext::new(Message::system(system_prompt));
+    let mut ctx = WindowContext::new(Message::system(system_prompt))
+        .with_recall_budget(memory.recall_token_budget);
 
     println!("agent ready. Type a task, or 'exit'.");
     let stdin = std::io::stdin();
