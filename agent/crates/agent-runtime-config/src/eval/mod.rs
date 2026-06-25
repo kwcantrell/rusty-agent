@@ -3,7 +3,9 @@
 //! two-sided task admissibility, and the task manifest. The live driver lives in
 //! `tests/eval_context.rs`.
 pub mod config;
+pub mod gate;
 pub mod result;
 
 pub use config::CandidateConfig;
+pub use gate::{gate, heldout_ok, Verdict};
 pub use result::{BatchResult, RunResult};
