@@ -1,4 +1,4 @@
-use crate::{built_tokens, AgentEvent, ContextManager, EventSink};
+use crate::{built_tokens, AgentEvent, ContextManager, EventSink, Retriever};
 use agent_model::{AssistantTurn, Chunk, CompletionRequest, Message, ModelClient, ModelError,
                   RawToolCall, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse, Decision, PolicyEngine};
@@ -57,6 +57,7 @@ pub struct AgentLoop {
     approval: Arc<dyn ApprovalChannel>,
     sink: Arc<dyn EventSink>,
     config: LoopConfig,
+    retriever: Option<Arc<dyn Retriever>>,
 }
 
 impl AgentLoop {
@@ -70,7 +71,14 @@ impl AgentLoop {
         sink: Arc<dyn EventSink>,
         config: LoopConfig,
     ) -> Self {
-        Self { model, protocol, tools, policy, approval, sink, config }
+        Self { model, protocol, tools, policy, approval, sink, config, retriever: None }
+    }
+
+    /// Attach a memory retriever. When set, each turn auto-retrieves relevant
+    /// memories and injects them into the context before the model runs.
+    pub fn with_retriever(mut self, retriever: Arc<dyn Retriever>) -> Self {
+        self.retriever = Some(retriever);
+        self
     }
 
     /// Drive one streamed completion to an `AssistantTurn`, emitting tokens as they arrive.
@@ -124,6 +132,12 @@ impl AgentLoop {
 
     pub async fn run(&self, ctx: &mut dyn ContextManager, user_input: String)
         -> Result<(), AgentError> {
+        if let Some(retriever) = &self.retriever {
+            let lines = retriever.retrieve(&user_input).await;
+            if !lines.is_empty() {
+                ctx.set_recall(lines);
+            }
+        }
         ctx.append(Message::user(user_input));
         let mut protocol_repairs = 0;
 
@@ -410,6 +424,55 @@ mod tests {
 
     fn policy(ws: std::path::PathBuf) -> Arc<RulePolicy> {
         Arc::new(RulePolicy { workspace: ws, command_allowlist: vec![], command_denylist: vec![] })
+    }
+
+    struct FakeRetriever(Vec<String>);
+    #[async_trait::async_trait]
+    impl crate::Retriever for FakeRetriever {
+        async fn retrieve(&self, _q: &str) -> Vec<String> { self.0.clone() }
+    }
+
+    #[tokio::test]
+    async fn auto_retrieval_injects_recall_block_into_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("ok".into())]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() })
+            .with_retriever(Arc::new(FakeRetriever(vec!["user prefers rust 2021".into()])));
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "hello".into()).await.unwrap();
+
+        let built = ctx.build(100_000);
+        assert!(built.iter().any(|m|
+            m.content.contains("Relevant memories from past sessions:")
+            && m.content.contains("user prefers rust 2021")));
+    }
+
+    #[tokio::test]
+    async fn empty_retrieval_injects_no_block_and_turn_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("ok".into())]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() })
+            .with_retriever(Arc::new(FakeRetriever(vec![])));
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "hello".into()).await.unwrap();
+
+        let built = ctx.build(100_000);
+        assert!(!built.iter().any(|m| m.content.contains("Relevant memories")));
+        assert!(sink.events.lock().unwrap().last().unwrap() == "done");
     }
 
     #[tokio::test]
