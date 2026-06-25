@@ -29,7 +29,7 @@ Pixel-driving the window is the **last resort** here (see §This machine for why
 - **cargo / node on PATH** — they are; do NOT `source ~/.cargo/env`.
 - **llama-server on :8080** for any live/model run: `curl -s -m 2 localhost:8080/health`
   must return `{"status":"ok"}`. Model is `qwen3.6-35b-a3b`, launched `-np 1`
-  (no `n>1`). Drive it manually with `scripts/chat.sh`. Note: `:8080` is where the
+  (no `n>1`). Drive it manually with `agent/scripts/chat.sh`. Note: `:8080` is where the
   server actually runs — some on-disk/CLI defaults say `:30000`; the desktop bridge
   and `e2e_live.rs` both override to `:8080`, so trust `:8080`.
 - A clean build exists (`agent/`, `src-tauri/`, `web/` all build). First `cargo test`
