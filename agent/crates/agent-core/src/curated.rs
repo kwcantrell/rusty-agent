@@ -1,3 +1,4 @@
+use crate::compactor::{compaction_is_worthwhile, run_compaction};
 use crate::context::{
     message_tokens, recall_block, ContextManager, MaintCtx, MaintReport,
     DEFAULT_RECALL_TOKEN_BUDGET,
@@ -7,7 +8,7 @@ use crate::offload::OffloadStore;
 use crate::offload_policy::{placeholder_for, select_offloads, OffloadConfig};
 use agent_model::Message;
 use async_trait::async_trait;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Default fraction of `model_limit` at which `maintain` triggers a compaction pass.
@@ -142,7 +143,46 @@ impl ContextManager for CuratedContext {
                 .emit(AgentEvent::Context(ContextEvent::Offloaded { id, bytes, tool }));
         }
 
-        // (b) Compaction added in Task 5.
+        // (b) Compaction — async, gated by the high-water mark or an explicit request.
+        let requested = self.compact_flag.swap(false, Ordering::SeqCst);
+        let over_high_water = {
+            let built = self.build(deps.model_limit);
+            let used: usize = built.iter().map(message_tokens).sum();
+            (used as f32) > (deps.model_limit as f32 * self.high_water_pct)
+        };
+        if (requested || over_high_water) && self.history.len() > self.config.keep_recent + 1 {
+            let split = self.history.len() - self.config.keep_recent;
+            // Carry prior summary forward so its information isn't lost on re-compaction.
+            let mut span: Vec<Message> = Vec::new();
+            if let Some(prev) = &self.compaction_summary {
+                span.push(prev.clone());
+            }
+            span.extend_from_slice(&self.history[..split]);
+            let tokens_before: usize = span.iter().map(message_tokens).sum();
+            match run_compaction(&span, self.goal_text(), deps.model, deps.cancel).await {
+                Ok(summary) if compaction_is_worthwhile(&summary, &span) => {
+                    let tokens_after = message_tokens(&summary);
+                    let recent = self.history.split_off(split);
+                    self.history = recent;
+                    self.compaction_summary = Some(summary);
+                    report.compacted_turns = split;
+                    deps.sink.emit(AgentEvent::Context(ContextEvent::Compacted {
+                        turns_replaced: split,
+                        tokens_before,
+                        tokens_after,
+                    }));
+                }
+                Ok(_) => {
+                    tracing::debug!("compaction not worthwhile; discarded");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "compaction failed; leaving history intact");
+                    deps.sink.emit(AgentEvent::Context(ContextEvent::CompactionFailed {
+                        reason: e.to_string(),
+                    }));
+                }
+            }
+        }
         report
     }
 }
@@ -153,7 +193,7 @@ mod tests {
     use crate::context::MaintCtx;
     use crate::event::EventSink;
     use crate::offload::InMemoryOffloadStore;
-    use crate::testkit::{CollectingSink, ScriptedModel};
+    use crate::testkit::{CollectingSink, Scripted, ScriptedModel};
     use agent_model::{ModelClient, Role};
     use tokio_util::sync::CancellationToken;
 
@@ -250,5 +290,44 @@ mod tests {
         let report2 = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
         assert_eq!(report2.offloaded, 0, "second pass must not re-offload");
         assert_eq!(c.store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn maintain_compacts_old_span_when_over_high_water() {
+        let mut c = ctx();
+        c.high_water_pct = 0.0; // force compaction regardless of size
+        c.config.keep_recent = 1;
+        for i in 0..6 {
+            c.append(Message::user(format!("turn {i} with a fair bit of padding text here")));
+        }
+        let model: Arc<dyn ModelClient> =
+            Arc::new(ScriptedModel::new(vec![Scripted::Text("compact summary".into())]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+
+        assert!(report.compacted_turns > 0);
+        let built = c.build(100_000);
+        // A compaction summary block is present and the most-recent turn survives verbatim.
+        assert!(built.iter().any(|m| m.content.contains("compact summary")));
+        assert!(built.iter().any(|m| m.content.contains("turn 5")));
+    }
+
+    #[tokio::test]
+    async fn maintain_leaves_history_intact_when_compaction_fails() {
+        let mut c = ctx();
+        c.high_water_pct = 0.0;
+        c.config.keep_recent = 1;
+        for i in 0..6 {
+            c.append(Message::user(format!("turn {i} with padding text")));
+        }
+        let before = c.history().len();
+        // Empty script => stream yields nothing => empty summary => not worthwhile => discarded.
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(String::new())]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        assert_eq!(report.compacted_turns, 0);
+        assert_eq!(c.history().len(), before, "history must be untouched on failed/empty compaction");
     }
 }
