@@ -7,6 +7,7 @@ mod offload;
 mod offload_policy;
 mod curated;
 mod compactor;
+mod context_tools;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub use context::*;
@@ -17,3 +18,4 @@ pub use offload::*;
 pub use offload_policy::*;
 pub use curated::*;
 pub use compactor::*;
+pub use context_tools::*;
