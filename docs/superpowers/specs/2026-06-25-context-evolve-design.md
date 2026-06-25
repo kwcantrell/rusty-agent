@@ -99,6 +99,49 @@ A task is authored red-first, exactly like a test you must see fail before trust
 The first task targets a **drift / re-grounding** weakness: long-horizon, the window fills, and the
 re-grounding block is what should keep the agent anchored to the original goal.
 
+### The favorable and realistic configs (concrete)
+
+The two-sided test contrasts two fixed reference configs. Both reuse the existing runtime knobs —
+`context_limit` (→ `model_limit`), `high_water_pct`, `OffloadConfig`, `recall_budget` — so no new code
+is needed to express them.
+
+**Favorable config — "the context manager neutralized."** Nothing is ever dropped, summarized, or
+offloaded; the model sees the entire transcript verbatim with the goal pinned. The only way it can still
+fail is genuine incapability.
+
+- **Window:** `context_limit` = the server's full physical context. For the local Qwen3.6 / llama.cpp
+  setup that is **196608** (`-c 196608`). This is the *largest* window the server actually serves.
+- **Compaction: off.** `high_water_pct = 1.0` (per `with_high_water_pct`, `>= 1.0` effectively disables
+  automatic compaction — it can only fire once `used` exceeds the full window, which the task-size
+  invariant forbids).
+- **Offload: off.** `OffloadConfig { error_min_bytes: usize::MAX, output_min_bytes: usize::MAX, .. }` so
+  no tool result ever qualifies; every result stays verbatim in-window.
+- **Re-grounding: on.** The goal block stays pinned. Favorable means *best-case good context*, and a
+  pinned goal is pure upside; it also limits lost-in-the-middle drift in a long verbatim window.
+- **Recall budget:** generous/irrelevant (nothing is offloaded, so nothing is recalled).
+- Favorable runs are allowed to be maximally expensive in tokens. Favorable is a **correctness** probe
+  only ("can the model do this at all?"); it is never used for the token objective.
+
+**Realistic config — what creates the curation pressure.** This is the **champion** context-management
+config (the thing the loop mutates). The weakness must bite here: under realistic curation the run fails
+the correctness gate (red).
+
+**Task-size invariant (what makes a favorable run meaningful).** A synthetic task is only admissible if
+its *entire uncurated transcript fits within the favorable `context_limit` with headroom* (target
+≤ ~75% of the window, both to avoid `build()` silently windowing and to limit lost-in-the-middle
+degradation that could make a context-bound task *look* capability-bound). If the favorable run itself
+overflows the window, the task is rejected as **ill-sized** — not labeled capability-bound. Scope note:
+this means the skill optimizes *curation quality within a window*, not infinite-context behavior.
+
+**Cheap pressure for synthetic tasks (decision, override if undesired).** To keep synthetic tasks small
+and fast, their *realistic* config uses a **scaled-down** `context_limit` (e.g. 16–32K) so the weakness
+bites with a modest transcript, while their favorable config uses a window just large enough to hold
+that transcript verbatim. The **locked real-commit tasks** run the realistic config at the **true
+deployment window (196608)** — they are the check that improvements found at the scaled window actually
+transfer to the regime the runtime ships in. (Concurrency caveat: the server runs `-np 4` with unified
+KV; running several admissibility/eval runs at once shares that 196608-token pool, so either run
+favorable/locked-window checks with lower concurrency or size tasks to a fraction of the window.)
+
 ### Locked real-commit tasks
 
 For the locked set: check out a challenging commit's **parent** into an isolated eval workspace, move
@@ -221,6 +264,11 @@ saw.** That line in `program.md` is what "we actually improved the context manag
 - Tasks: training/held-out are **weakness-first synthetic** tasks (TDD-style, red before admitted);
   locked are **real commits** (independent source). Admissibility is **two-sided** (red under realistic
   config AND green under favorable config) and **correctness-only**.
+- **Favorable config** = curation neutralized: `context_limit` at the server's full window (196608),
+  `high_water_pct = 1.0`, offload thresholds at `usize::MAX`, re-grounding on. Subject to the
+  **task-size invariant** (uncurated transcript fits the window with headroom). Synthetic tasks use a
+  **scaled-down realistic window**; locked real-commit tasks run at the **true deployment window** to
+  confirm transfer.
 - Optimizer is **agent-driven** (autoresearch-style reasoning loop), not automated search.
 - Token metric uses **server-reported usage**, not the internal estimate.
 
