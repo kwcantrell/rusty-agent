@@ -57,10 +57,7 @@ fn targets_root(args: &[String]) -> bool {
 
 /// Structural catastrophe check for a single simple command (argv vector).
 fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
-    let prog = match argv.first() {
-        Some(p) => p,
-        None => return None,
-    };
+    let prog = argv.first()?;
     let name = basename(prog);
     let rest = &argv[1..];
 
