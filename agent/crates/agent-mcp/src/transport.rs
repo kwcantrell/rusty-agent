@@ -23,6 +23,8 @@ pub struct StdioTransport {
     stdin: AsyncMutex<ChildStdin>,
     inbound: AsyncMutex<mpsc::UnboundedReceiver<Value>>,
     child: Mutex<Option<agent_tools::SandboxedChild>>,
+    reader: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    stderr: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl StdioTransport {
@@ -40,17 +42,17 @@ impl StdioTransport {
         let mut child = sandbox.launch(cspec).map_err(|e| McpError::Io(e.to_string()))?;
         let stdin = child.take_stdin().ok_or_else(|| McpError::Io("no stdin".into()))?;
         let stdout = child.take_stdout().ok_or_else(|| McpError::Io("no stdout".into()))?;
-        if let Some(stderr) = child.take_stderr() {
+        let stderr_handle = child.take_stderr().map(|stderr| {
             // Drain server diagnostics to tracing so they never block the pipe.
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(l)) = lines.next_line().await {
                     tracing::debug!(target: "mcp.server", "{l}");
                 }
-            });
-        }
+            })
+        });
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        let reader_handle = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.trim().is_empty() {
@@ -70,6 +72,8 @@ impl StdioTransport {
             stdin: AsyncMutex::new(stdin),
             inbound: AsyncMutex::new(rx),
             child: Mutex::new(Some(child)),
+            reader: Mutex::new(Some(reader_handle)),
+            stderr: Mutex::new(stderr_handle),
         })
     }
 }
@@ -94,6 +98,9 @@ impl McpTransport for StdioTransport {
         if let Some(mut c) = child {
             c.kill().await;
         }
+        // Deterministically tear down the reader/stderr tasks (don't wait for EOF).
+        if let Some(h) = self.reader.lock().unwrap().take() { h.abort(); }
+        if let Some(h) = self.stderr.lock().unwrap().take() { h.abort(); }
     }
 }
 
@@ -101,6 +108,9 @@ impl Drop for StdioTransport {
     fn drop(&mut self) {
         // SandboxedChild's own Drop handles teardown — just drop it.
         let _ = self.child.lock().unwrap().take();
+        // Abort the reader/stderr tasks (abort is sync — safe in Drop).
+        if let Some(h) = self.reader.lock().unwrap().take() { h.abort(); }
+        if let Some(h) = self.stderr.lock().unwrap().take() { h.abort(); }
     }
 }
 
@@ -173,5 +183,30 @@ mod tests {
         assert_eq!(got["id"], 1);
         assert_eq!(got["method"], "ping");
         t.close().await;
+    }
+
+    #[tokio::test]
+    async fn close_tears_down_the_reader_task() {
+        let sandbox = host_sandbox();
+        let t = StdioTransport::spawn(&cat_spec(), &sandbox).expect("spawn cat");
+        // Sanity: the transport works before teardown.
+        t.send(json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await.unwrap();
+        let _ = t.recv().await.expect("a message");
+
+        t.close().await;
+
+        // After close, the reader task is gone (its tx dropped) -> recv yields None.
+        let after = tokio::time::timeout(std::time::Duration::from_secs(5), t.recv())
+            .await
+            .expect("recv must resolve promptly after close, not hang");
+        assert!(after.is_none(), "recv after close should be None, got: {after:?}");
+    }
+
+    #[tokio::test]
+    async fn close_is_idempotent() {
+        let sandbox = host_sandbox();
+        let t = StdioTransport::spawn(&cat_spec(), &sandbox).expect("spawn cat");
+        t.close().await;
+        t.close().await; // must not panic
     }
 }
