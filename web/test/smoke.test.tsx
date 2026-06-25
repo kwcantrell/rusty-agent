@@ -5,8 +5,8 @@ import App from "../src/App";
 beforeEach(() => localStorage.clear());
 
 describe("App", () => {
-  it("renders the pairing screen when no session is stored", () => {
+  it("shows the desktop-app notice when not running under Tauri", () => {
     render(<App />);
-    expect(screen.getByText(/pair with your agent/i)).toBeInTheDocument();
+    expect(screen.getByText(/desktop app/i)).toBeInTheDocument();
   });
 });

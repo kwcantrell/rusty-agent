@@ -6,7 +6,6 @@ vi.mock("./transport", () => ({
   resolveTransport: async () => ({
     wsUrl: "ws://127.0.0.1:5/agent",
     sessionId: "11111111-1111-1111-1111-111111111111",
-    needsPairing: false,
   }),
 }));
 
@@ -22,16 +21,16 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: async () => null }));
 describe("App in Tauri mode", () => {
   beforeEach(() => localStorage.clear());
 
-  it("skips the pairing screen and shows the main UI", async () => {
+  it("skips the non-Tauri notice and connects to the local bridge", async () => {
     const App = (await import("./App")).default;
     render(<App />);
-    // PairingScreen renders <h1>Pair with your agent</h1>; in Tauri mode it must
-    // never appear (we connect to the local bridge without pairing).
+    // In Tauri mode the app connects to the local bridge; the "desktop app"
+    // notice (shown only outside Tauri) must never appear.
     await waitFor(() => {
-      expect(screen.queryByText(/pair with your agent/i)).toBeNull();
+      expect(screen.queryByText(/desktop app/i)).toBeNull();
     });
-    // Give the resolveTransport() microtasks a tick; the heading stays absent.
+    // Give the resolveTransport() microtasks a tick; the notice stays absent.
     await new Promise((r) => setTimeout(r, 0));
-    expect(screen.queryByText(/pair with your agent/i)).toBeNull();
+    expect(screen.queryByText(/desktop app/i)).toBeNull();
   });
 });
