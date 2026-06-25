@@ -28,3 +28,4 @@ agent-core = { path = "../agent/crates/agent-core" }
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
+tauri = { version = "2", features = ["test"] }

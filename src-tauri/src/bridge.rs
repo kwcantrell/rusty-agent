@@ -1,38 +1,38 @@
-//! Localhost WebSocket bridge: accepts the webview's connection and drives the
-//! embedded agent runtime via `agent_server::daemon::serve`.
+//! Holds the app-lifetime agent Session. Workspace switches reset the live
+//! Session's context rather than dropping a socket.
+use agent_server::session::Session;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 pub struct Bridge {
-    pub port: u16,
-    current: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    workspace: Arc<Mutex<PathBuf>>,
+    session: Arc<Session>,
+    workspace: Mutex<PathBuf>,
+    // Retained for a future per-workspace Session rebuild (not needed for ctx reset).
+    #[allow(dead_code)]
     config_path: PathBuf,
+    #[allow(dead_code)]
     base_url: String,
+    #[allow(dead_code)]
     model: String,
+    #[allow(dead_code)]
     memory_parts: Option<agent_memory::MemoryParts>,
 }
 
 impl Bridge {
-    pub fn ws_url(&self) -> String {
-        format!("ws://127.0.0.1:{}/agent", self.port)
+    pub fn session(&self) -> Arc<Session> {
+        self.session.clone()
     }
 
-    /// The workspace the next/active connection runs against (defaults to the
-    /// value passed at `start`, e.g. $HOME on first launch).
     pub async fn current_workspace(&self) -> PathBuf {
         self.workspace.lock().await.clone()
     }
 
-    /// Point the runtime at a new workspace: drop the active connection so the
-    /// webview auto-reconnects into a fresh `serve()` bound to `dir`.
+    /// Switch workspace: caller persists; reset the live Session's context bound
+    /// to `dir`.
     pub async fn set_workspace(&self, dir: PathBuf) {
-        *self.workspace.lock().await = dir;
-        if let Some(task) = self.current.lock().await.take() {
-            task.abort();
-        }
+        *self.workspace.lock().await = dir.clone();
+        self.session.set_workspace(dir).await;
     }
 }
 
@@ -42,9 +42,6 @@ pub async fn start(
     base_url: String,
     model: String,
 ) -> std::io::Result<Arc<Bridge>> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-
     // Memory is loaded once (model + DB), gated on the effective (persisted) flag.
     let eff = agent_runtime_config::RuntimeConfig::load_over(
         agent_runtime_config::RuntimeConfig::from_launch(
@@ -59,40 +56,17 @@ pub async fn start(
         None
     };
 
-    let bridge = Arc::new(Bridge {
-        port,
-        current: Mutex::new(None),
-        workspace: Arc::new(Mutex::new(workspace)),
+    let params = agent_server::setup::local_params(
+        workspace.clone(), config_path.clone(), base_url.clone(), model.clone(),
+        memory_parts.as_ref());
+    let session = Session::from_params(params);
+
+    Ok(Arc::new(Bridge {
+        session,
+        workspace: Mutex::new(workspace),
         config_path,
         base_url,
         model,
         memory_parts,
-    });
-
-    let b = bridge.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
-            };
-            let ws = match tokio_tungstenite::accept_async(stream).await {
-                Ok(ws) => ws,
-                Err(_) => continue,
-            };
-            let dir = b.workspace.lock().await.clone();
-            let params = agent_server::setup::local_params(
-                dir,
-                b.config_path.clone(),
-                b.base_url.clone(),
-                b.model.clone(),
-                b.memory_parts.as_ref(),
-            );
-            let task = tokio::spawn(async move {
-                let _ = agent_server::daemon::serve(ws, params).await;
-            });
-            *b.current.lock().await = Some(task);
-        }
-    });
-
-    Ok(bridge)
+    }))
 }

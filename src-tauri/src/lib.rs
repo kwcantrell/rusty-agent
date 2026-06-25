@@ -1,9 +1,15 @@
 pub mod bridge;
+mod channel_out;
 pub mod llama;
 pub mod workspace;
 
+use agent_runtime_config::RuntimeConfig;
+use agent_server::session::{SendOutcome, Session};
+use agent_server::wire::{Decision, ServerEvent, SettingsState};
+use channel_out::ChannelOut;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::ipc::Channel;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
@@ -12,9 +18,48 @@ struct AppState {
     config_path: PathBuf, // app.json (persisted workspace)
 }
 
+fn session(state: &tauri::State<'_, AppState>) -> Arc<Session> {
+    state.bridge.session()
+}
+
+/// Register/replace the outbound event channel for this webview.
 #[tauri::command]
-fn get_local_ws_url(state: tauri::State<'_, AppState>) -> String {
-    state.bridge.ws_url()
+fn subscribe(state: tauri::State<'_, AppState>, channel: Channel<ServerEvent>) {
+    session(&state).set_event_out(Arc::new(ChannelOut(channel)));
+}
+
+/// Start a run. Rejects with `busy` if one is already in flight (A1 guard).
+#[tauri::command]
+fn send_input(state: tauri::State<'_, AppState>, text: String) -> Result<(), String> {
+    match session(&state).send_input(text) {
+        SendOutcome::Started => Ok(()),
+        SendOutcome::Busy => Err("busy".into()),
+    }
+}
+
+/// Resolve a pending approval by correlation id.
+#[tauri::command]
+fn approve(state: tauri::State<'_, AppState>, id: String, decision: Decision) {
+    session(&state).approve(&id, decision);
+}
+
+/// Trip the active run's cancellation token (B3 interactive cancel).
+#[tauri::command]
+fn cancel(state: tauri::State<'_, AppState>) {
+    session(&state).cancel();
+}
+
+#[tauri::command]
+fn settings_get(state: tauri::State<'_, AppState>) -> SettingsState {
+    session(&state).settings_get()
+}
+
+#[tauri::command]
+fn settings_update(
+    state: tauri::State<'_, AppState>,
+    settings: RuntimeConfig,
+) -> Result<SettingsState, String> {
+    session(&state).settings_update(settings)
 }
 
 #[tauri::command]
@@ -79,7 +124,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            get_local_ws_url,
+            subscribe,
+            send_input,
+            approve,
+            cancel,
+            settings_get,
+            settings_update,
             get_workspace,
             pick_workspace,
             llama_health
@@ -90,4 +140,55 @@ pub fn run() {
 
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod cmd_tests {
+    use super::*;
+    use tauri::test::{mock_builder, mock_context, noop_assets};
+
+    fn app() -> tauri::App<tauri::test::MockRuntime> {
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = tauri::async_runtime::block_on(bridge::start(
+            dir.path().to_path_buf(),
+            dir.path().join("rt.json"),
+            "http://localhost:8080".into(),
+            "m".into(),
+        ))
+        .unwrap();
+        std::mem::forget(dir); // keep the temp dir alive for the test process
+        mock_builder()
+            .manage(AppState { bridge, config_path: PathBuf::from("/tmp/app.json") })
+            .invoke_handler(tauri::generate_handler![
+                subscribe, send_input, approve, cancel, settings_get, settings_update
+            ])
+            .build(mock_context(noop_assets()))
+            .expect("failed to build mock app")
+    }
+
+    /// Smoke test: a registered command returns Ok over the mock IPC and the
+    /// payload deserializes back to `SettingsState`. Behavioral coverage (run
+    /// guard, cancel, approval, settings) lives in the agent-server Session tests.
+    #[test]
+    fn settings_get_returns_state_over_ipc() {
+        let app = app();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let res = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "settings_get".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::default(),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        );
+        assert!(res.is_ok(), "settings_get should resolve: {res:?}");
+        let state = res.unwrap().deserialize::<SettingsState>().unwrap();
+        assert!(!state.api_key_set);
+    }
 }
