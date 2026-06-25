@@ -138,3 +138,35 @@ async fn b3_precancelled_token_stops_assembled_loop() {
     assert_eq!(events, vec!["done:Cancelled".to_string()], "events: {events:?}");
     assert!(sink.text.lock().unwrap().is_empty(), "no model text should stream");
 }
+
+struct DenyAll;
+#[async_trait::async_trait]
+impl ApprovalChannel for DenyAll {
+    async fn request(&self, _r: ApprovalRequest) -> ApprovalResponse {
+        ApprovalResponse::Deny
+    }
+}
+
+// T3 — C: a `..`-escaping read now routes through approval (the normalized engine
+// returns Ask instead of silently Allow). The sink witnesses the Approval event;
+// the channel denies, so the read is rejected and fed back as an error result.
+// (On pre-C code the gate returned Allow → no approval event.)
+#[tokio::test]
+async fn c_escaping_read_requests_approval_through_assembled_loop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().to_path_buf();
+    let model = Arc::new(ScriptedModel::new(vec![
+        Scripted::Call("c1".into(), "read_file".into(), r#"{"path":"../../escape.txt"}"#.into()),
+        Scripted::Text("ok".into()),
+    ]));
+    let (built, sink) = assemble_test(ws, model, Arc::new(DenyAll));
+    let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()));
+
+    built.loop_.run(&mut ctx, "read escaping".into()).await.unwrap();
+
+    let events = sink.events.lock().unwrap().clone();
+    assert!(
+        events.iter().any(|e| e.starts_with("approval:read_file")),
+        "escaping read must request approval (normalized gate); events: {events:?}"
+    );
+}
