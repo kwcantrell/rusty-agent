@@ -11,12 +11,12 @@ agent-mcp = { path = "../agent-mcp" }
 agent-http = { path = "../agent-http" }
 agent-skills = { path = "../agent-skills" }
 agent-memory = { path = "../agent-memory" }
+agent-policy = { path = "../agent-policy" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-agent-policy = { path = "../agent-policy" }
 tokio.workspace = true
 async-trait.workspace = true
