@@ -78,6 +78,11 @@ task, and no unbounded queue — which is what removes A2 structurally.
 envelope wrapper). `AgentEvent::Approval` continues to return nothing from the sink; the
 approval path emits its own `ServerEvent::ApprovalRequest` (see below), mirroring today.
 
+The sink reads `Session.event_sink` **live on each emit** (it holds an `Arc<Session>` or an
+`Arc<Mutex<Option<Channel>>>`, not a snapshot taken at run-start). So a re-`subscribe`
+mid-run redirects subsequent events to the new channel, and an absent channel drops. This
+keeps emit cheap and makes reconnect/strict-mode-remount transparent to an in-flight run.
+
 ### Inbound: typed commands
 
 The daemon read loop is replaced by typed Tauri commands:
