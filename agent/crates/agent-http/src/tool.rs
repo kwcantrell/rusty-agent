@@ -148,6 +148,13 @@ impl Tool for FetchUrl {
 
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let mut url = parse_url(&args)?;
+        // The host the caller's approval was granted for. Every redirect hop must land on
+        // this host or an allowlisted one; anything else needs a fresh approval the loop
+        // can't request mid-execute, so we deny it.
+        let approved_host = url
+            .host_str()
+            .ok_or_else(|| ToolError::InvalidArgs("url has no host".into()))?
+            .to_ascii_lowercase();
         let mut hops = 0usize;
 
         loop {
@@ -202,6 +209,18 @@ impl Tool for FetchUrl {
                         .map_err(|e| ToolError::Failed { message: format!("bad redirect '{loc}': {e}"), stderr: None })?;
                     if !matches!(url.scheme(), "http" | "https") {
                         return Err(ToolError::Denied(format!("redirect to non-http scheme '{}'", url.scheme())));
+                    }
+                    // Re-run the host policy for the new target (decide-at-execution).
+                    let new_host = url
+                        .host_str()
+                        .ok_or_else(|| ToolError::InvalidArgs("redirect url has no host".into()))?;
+                    let host_ok = matches!(self.policy.decide(new_host), HostDecision::Allow)
+                        || new_host.eq_ignore_ascii_case(&approved_host);
+                    if !host_ok {
+                        return Err(ToolError::Denied(format!(
+                            "redirect from {approved_host} to un-approved host {new_host}; \
+                             fetch it directly to approve"
+                        )));
                     }
                     continue; // re-resolve + re-validate the new target
                 }
@@ -336,6 +355,52 @@ mod tests {
         let out = permissive().execute(json!({ "url": url }), &ctx()).await.unwrap();
         assert!(out.content.contains("landed"));
         assert!(out.content.contains("/to"), "final_url should reflect the redirect target");
+    }
+
+    #[tokio::test]
+    async fn redirect_to_unapproved_host_is_denied() {
+        // Origin 127.0.0.1 (server) redirects to a different host not in the allowlist.
+        // The host check fires BEFORE the next hop's DNS resolution, so no network needed.
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/from"))
+            .respond_with(ResponseTemplate::new(302)
+                .insert_header("location", "http://blocked.invalid/to"))
+            .mount(&server).await;
+
+        let url = format!("{}/from", server.uri());
+        // permissive() has an EMPTY allowlist -> every host is Ask.
+        let err = permissive().execute(json!({ "url": url }), &ctx()).await.unwrap_err();
+        match &err {
+            ToolError::Denied(msg) => assert!(
+                msg.contains("un-approved host") && msg.contains("blocked.invalid"),
+                "expected un-approved-host denial, got: {msg}"
+            ),
+            other => panic!("expected Denied(un-approved host), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_to_allowlisted_host_passes_policy_gate() {
+        // Same different-host redirect, but the target IS allowlisted: the policy gate
+        // must let it through. allowed.invalid never resolves (RFC 6761 reserved TLD),
+        // so the hop proceeds past the gate and fails at DNS with NotFound — NOT a
+        // policy Denied. That distinguishes "gate passed" from "gate blocked".
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/from"))
+            .respond_with(ResponseTemplate::new(302)
+                .insert_header("location", "http://allowed.invalid/to"))
+            .mount(&server).await;
+
+        let t = FetchUrl::with_guard(
+            NetworkPolicy::new(&["allowed.invalid".to_string()]),
+            SsrfGuard::allow_all(),
+        );
+        let url = format!("{}/from", server.uri());
+        let err = t.execute(json!({ "url": url }), &ctx()).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::NotFound(_)),
+            "allowlisted host should pass the policy gate and fail later at DNS (NotFound), got {err:?}"
+        );
     }
 
     #[tokio::test]

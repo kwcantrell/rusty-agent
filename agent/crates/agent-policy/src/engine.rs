@@ -1,3 +1,4 @@
+use agent_tools::fs::resolve_in_workspace;
 use agent_tools::{Access, Display, ToolIntent};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -42,9 +43,11 @@ impl PolicyEngine for RulePolicy {
         // Otherwise judge by access + path boundary.
         match intent.access {
             Access::Read => {
+                // Decide "inside workspace?" with the SAME resolver execute() uses, so the
+                // approval gate and the execution guard can never disagree (resolve_in_workspace
+                // collapses `.`/`..` before the boundary check). An escaping read -> Ask.
                 let all_inside = intent.paths.iter().all(|p| {
-                    let abs = if p.is_absolute() { p.clone() } else { self.workspace.join(p) };
-                    abs.starts_with(&self.workspace)
+                    resolve_in_workspace(&self.workspace, &p.to_string_lossy()).is_ok()
                 });
                 if all_inside { Decision::Allow } else { Decision::Ask }
             }
@@ -81,6 +84,33 @@ mod tests {
         assert!(matches!(policy().check(&intent(Access::Read, vec!["/etc/passwd"], None)),
             Decision::Ask));
     }
+    #[test]
+    fn read_relative_dotdot_escape_asks() {
+        // ../../etc/passwd joined to /work escapes; must require approval, not Allow.
+        assert!(matches!(
+            policy().check(&intent(Access::Read, vec!["../../etc/passwd"], None)),
+            Decision::Ask
+        ));
+    }
+
+    #[test]
+    fn read_absolute_dotdot_escape_asks() {
+        // /work/../etc normalizes to /etc — outside the workspace.
+        assert!(matches!(
+            policy().check(&intent(Access::Read, vec!["/work/../etc/x"], None)),
+            Decision::Ask
+        ));
+    }
+
+    #[test]
+    fn read_dotdot_staying_inside_allows() {
+        // sub/../a.txt normalizes to /work/a.txt — still inside.
+        assert!(matches!(
+            policy().check(&intent(Access::Read, vec!["sub/../a.txt"], None)),
+            Decision::Allow
+        ));
+    }
+
     #[test]
     fn write_always_asks() {
         assert!(matches!(policy().check(&intent(Access::Write, vec!["/work/a.txt"], None)),
