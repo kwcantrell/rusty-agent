@@ -1,70 +1,81 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const { invoke, FakeChannel, channelInstances } = vi.hoisted(() => {
+  const channelInstances: Array<{ onmessage?: (e: unknown) => void }> = [];
+  class FakeChannel {
+    onmessage?: (e: unknown) => void;
+    constructor() { channelInstances.push(this); }
+  }
+  return { invoke: vi.fn(), FakeChannel, channelInstances };
+});
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...a: unknown[]) => invoke(...a),
+  Channel: FakeChannel,
+}));
+
 import { connect } from "../src/socket";
 import type { Inbound } from "../src/wire";
 import type { ConnectionStatus } from "../src/state";
 
-class FakeWS {
-  static instances: FakeWS[] = [];
-  onopen: (() => void) | null = null;
-  onclose: (() => void) | null = null;
-  onerror: (() => void) | null = null;
-  onmessage: ((e: { data: string }) => void) | null = null;
-  readyState = 0;
-  sent: string[] = [];
-  url: string;
-  constructor(url: string) { this.url = url; FakeWS.instances.push(this); }
-  send(d: string) { this.sent.push(d); }
-  close() { this.readyState = 3; this.onclose?.(); }
-  open() { this.readyState = 1; this.onopen?.(); }
-  message(o: unknown) { this.onmessage?.({ data: JSON.stringify(o) }); }
-}
+beforeEach(() => {
+  invoke.mockReset();
+  channelInstances.length = 0;
+  invoke.mockResolvedValue(undefined);
+});
 
-describe("socket", () => {
-  it("reports status open and delivers parsed frames", () => {
-    FakeWS.instances = [];
-    const frames: Inbound[] = []; const statuses: ConnectionStatus[] = [];
-    connect("ws://x/browser?token=t", { onFrame: (f) => frames.push(f), onStatus: (s) => statuses.push(s) },
-      { WebSocketImpl: FakeWS as unknown as typeof WebSocket });
-    const ws = FakeWS.instances[0];
-    ws.open();
-    ws.message({ v: 1, session_id: "s", kind: "presence", online: true });
+describe("ipc transport", () => {
+  it("subscribes a channel and reports online once open", async () => {
+    const frames: Inbound[] = [];
+    const statuses: ConnectionStatus[] = [];
+    connect({ onFrame: (f) => frames.push(f), onStatus: (s) => statuses.push(s) });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(invoke).toHaveBeenCalledWith("subscribe", expect.objectContaining({ channel: expect.any(FakeChannel) }));
     expect(statuses).toContain("open");
-    expect(frames).toEqual([{ v: 1, session_id: "s", kind: "presence", online: true }]);
+    expect(frames).toContainEqual({ v: 1, session_id: "", kind: "presence", online: true });
   });
 
-  it("doubles backoff on repeated closes and resets on open", () => {
-    vi.useFakeTimers();
-    FakeWS.instances = [];
-    connect("ws://x/browser?token=t", { onFrame: () => {}, onStatus: () => {} },
-      { WebSocketImpl: FakeWS as unknown as typeof WebSocket, backoffMs: 10 });
-    FakeWS.instances[0].open();        // backoff reset to 10
-    FakeWS.instances[0].close();       // unexpected -> reconnect in 10, next backoff 20
-    vi.advanceTimersByTime(10);
-    expect(FakeWS.instances.length).toBe(2);
-    FakeWS.instances[1].close();       // unexpected, no open -> reconnect in 20
-    vi.advanceTimersByTime(10);
-    expect(FakeWS.instances.length).toBe(2); // NOT yet: proves delay doubled to 20
-    vi.advanceTimersByTime(10);
-    expect(FakeWS.instances.length).toBe(3); // fired at 20
-    FakeWS.instances[2].open();        // resets backoff to 10
-    FakeWS.instances[2].close();       // reconnect in 10 again
-    vi.advanceTimersByTime(10);
-    expect(FakeWS.instances.length).toBe(4); // proves reset to base
-    vi.useRealTimers();
+  it("maps a token server event to an event frame", async () => {
+    const frames: Inbound[] = [];
+    connect({ onFrame: (f) => frames.push(f), onStatus: () => {} });
+    await Promise.resolve();
+    channelInstances[0].onmessage?.({ type: "token", text: "hi" });
+    expect(frames).toContainEqual({ v: 1, session_id: "", kind: "event", payload: { type: "token", text: "hi" } });
   });
 
-  it("reconnects on unexpected close but not after a deliberate close()", () => {
-    vi.useFakeTimers();
-    FakeWS.instances = [];
-    const handle = connect("ws://x/browser?token=t", { onFrame: () => {}, onStatus: () => {} },
-      { WebSocketImpl: FakeWS as unknown as typeof WebSocket, backoffMs: 10 });
-    FakeWS.instances[0].open();
-    FakeWS.instances[0].close(); // unexpected
-    vi.advanceTimersByTime(10);
-    expect(FakeWS.instances.length).toBe(2); // reconnected
-    handle.close(); // deliberate
-    vi.advanceTimersByTime(1000);
-    expect(FakeWS.instances.length).toBe(2); // no further reconnect
-    vi.useRealTimers();
+  it("maps an approval_request server event to an approval_request frame", async () => {
+    const frames: Inbound[] = [];
+    connect({ onFrame: (f) => frames.push(f), onStatus: () => {} });
+    await Promise.resolve();
+    channelInstances[0].onmessage?.({ type: "approval_request", id: "c0", summary: "run x" });
+    expect(frames).toContainEqual(expect.objectContaining({ kind: "approval_request", id: "c0", summary: "run x" }));
+  });
+
+  it("routes user_input to the send_input command", () => {
+    const sock = connect({ onFrame: () => {}, onStatus: () => {} });
+    sock.send({ kind: "user_input", text: "hello" });
+    expect(invoke).toHaveBeenCalledWith("send_input", { text: "hello" });
+  });
+
+  it("routes approval_response to the approve command", () => {
+    const sock = connect({ onFrame: () => {}, onStatus: () => {} });
+    sock.send({ kind: "approval_response", id: "c0", decision: "approve" });
+    expect(invoke).toHaveBeenCalledWith("approve", { id: "c0", decision: "approve" });
+  });
+
+  it("dispatches settings_get result as a settings_state frame", async () => {
+    invoke.mockReset();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "settings_get") {
+        return Promise.resolve({ settings: { model: "m" }, workspace: "/w", api_key_set: false, hard_floor: [], discovered_skills: [] });
+      }
+      return Promise.resolve(undefined);
+    });
+    const frames: Inbound[] = [];
+    const sock = connect({ onFrame: (f) => frames.push(f), onStatus: () => {} });
+    sock.send({ kind: "settings_get" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(frames).toContainEqual(expect.objectContaining({ kind: "settings_state", workspace: "/w", api_key_set: false }));
   });
 });

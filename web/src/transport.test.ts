@@ -1,32 +1,21 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-
-const invokeMock = vi.fn();
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
+import { describe, it, expect, beforeEach } from "vitest";
 
 describe("resolveTransport", () => {
   beforeEach(() => {
-    invokeMock.mockReset();
     localStorage.clear();
-    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
-  });
-  afterEach(() => {
-    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
   });
 
-  it("uses the local bridge URL in Tauri mode", async () => {
-    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
-    invokeMock.mockResolvedValue("ws://127.0.0.1:54321/agent");
+  it("returns a stable local session id (history key only)", async () => {
     const { resolveTransport } = await import("./transport");
-    const t = await resolveTransport();
-    expect(invokeMock).toHaveBeenCalledWith("get_local_ws_url");
-    expect(t.wsUrl).toBe("ws://127.0.0.1:54321/agent");
-    expect(t.sessionId).toMatch(/[0-9a-f-]{36}/);
+    const a = await resolveTransport();
+    expect(a.sessionId).toMatch(/[0-9a-f-]{36}/);
+    const b = await resolveTransport();
+    expect(b.sessionId).toBe(a.sessionId); // persisted in localStorage
   });
 
-  it("returns an empty wsUrl outside Tauri", async () => {
+  it("does not expose a wsUrl", async () => {
     const { resolveTransport } = await import("./transport");
     const t = await resolveTransport();
-    expect(t.wsUrl).toBe("");
-    expect(invokeMock).not.toHaveBeenCalled();
+    expect((t as Record<string, unknown>).wsUrl).toBeUndefined();
   });
 });
