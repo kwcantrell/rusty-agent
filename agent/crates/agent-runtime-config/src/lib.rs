@@ -13,7 +13,7 @@ use agent_tools::{git::{GitCommit, GitDiff, GitStatus}, shell::ExecuteCommand, T
 use agent_tools::{HostExecutor, Limits, Mode, RenderArtifact, SandboxStrategy, Tool};
 use agent_sandbox::{validate_mount, DockerSandbox, SandboxPolicy};
 use agent_skills::{CreateSkill, ListSkills, ReadSkillFile, SkillRegistry, UseSkill};
-use agent_memory::{build_tools, MemoryConfig};
+use agent_memory::{build_tools, build_tools_and_retriever, MemoryConfig};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,6 +117,47 @@ pub fn build_memory(
         Err(e) => {
             tracing::warn!(target: "memory", "disabled: {e}");
             Vec::new()
+        }
+    }
+}
+
+/// Result of building memory with auto-retrieval: the tools to register, an
+/// optional retriever to attach to the loop, and the recall-block token budget.
+pub struct MemoryBuild {
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub retriever: Option<Arc<dyn agent_core::Retriever>>,
+    pub recall_token_budget: usize,
+}
+
+/// Build memory tools AND an auto-retrieval retriever sharing the same store/embedder.
+/// Disabled, `auto_recall = false`, or a build failure all yield `retriever: None`
+/// (memory is best-effort — never fatal). `recall_token_budget` always reflects config.
+pub fn build_memory_full(
+    enabled: bool,
+    db_path: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
+    workspace: &Path,
+) -> MemoryBuild {
+    let mut cfg = MemoryConfig::default();
+    if let Some(p) = db_path {
+        cfg.db_path = p;
+    }
+    cfg.model_cache_dir = model_dir;
+    let recall_token_budget = cfg.recall_token_budget;
+    let auto_recall = cfg.auto_recall;
+
+    if !enabled {
+        return MemoryBuild { tools: Vec::new(), retriever: None, recall_token_budget };
+    }
+    match build_tools_and_retriever(cfg, workspace) {
+        Ok((tools, retriever)) => MemoryBuild {
+            tools,
+            retriever: if auto_recall { Some(retriever) } else { None },
+            recall_token_budget,
+        },
+        Err(e) => {
+            tracing::warn!(target: "memory", "disabled: {e}");
+            MemoryBuild { tools: Vec::new(), retriever: None, recall_token_budget }
         }
     }
 }
@@ -281,5 +322,23 @@ mod tests {
         for n in ["remember", "recall", "forget"] {
             assert!(names.contains(&n), "missing {n}");
         }
+    }
+
+    #[test]
+    fn build_memory_full_disabled_has_no_retriever() {
+        let mb = build_memory_full(false, None, None, std::path::Path::new("/tmp/ws"));
+        assert!(mb.tools.is_empty());
+        assert!(mb.retriever.is_none());
+        assert_eq!(mb.recall_token_budget, 512);
+    }
+
+    #[test]
+    #[ignore = "constructs the real embedding model (network/model download)"]
+    fn build_memory_full_enabled_has_retriever_and_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("memory.db");
+        let mb = build_memory_full(true, Some(db), None, tmp.path());
+        assert_eq!(mb.tools.len(), 3);
+        assert!(mb.retriever.is_some());
     }
 }

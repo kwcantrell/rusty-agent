@@ -61,6 +61,32 @@ pub fn build_tools(cfg: MemoryConfig, workspace: &Path) -> Result<Vec<Arc<dyn ag
     Ok(build_tools_with(embedder, Arc::new(store), Arc::new(cfg), scope))
 }
 
+/// Like `build_tools`, but also returns a `MemoryRetriever` sharing the SAME
+/// store + embedder, for auto-retrieval. Errors disable memory (caller falls back).
+pub fn build_tools_and_retriever(
+    cfg: MemoryConfig,
+    workspace: &Path,
+) -> Result<(Vec<Arc<dyn agent_tools::Tool>>, Arc<dyn agent_core::Retriever>), MemoryInitError> {
+    let store: Arc<dyn MemoryStore> =
+        Arc::new(SqliteStore::open(&cfg.db_path).map_err(|e| MemoryInitError::Store(e.to_string()))?);
+    #[cfg(feature = "onnx")]
+    let embedder: Arc<dyn Embedder> = Arc::new(
+        embedder::FastEmbedEmbedder::new(&cfg).map_err(|e| MemoryInitError::Embedder(e.to_string()))?);
+    #[cfg(not(feature = "onnx"))]
+    let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
+    let scope = project_scope(workspace);
+    let key = match &scope {
+        MemoryScope::Project(k) => k.clone(),
+        MemoryScope::Global => String::new(),
+    };
+    let cfg = Arc::new(cfg);
+    let tools = build_tools_with(embedder.clone(), store.clone(), cfg.clone(), scope);
+    let retriever: Arc<dyn agent_core::Retriever> = Arc::new(retriever::MemoryRetriever {
+        embedder, store, cfg, project_key: key,
+    });
+    Ok((tools, retriever))
+}
+
 #[cfg(test)]
 mod build_tests {
     use super::*;
