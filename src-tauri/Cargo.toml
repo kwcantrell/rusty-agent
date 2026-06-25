@@ -16,9 +16,7 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.24"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-futures = "0.3"
 agent-server = { path = "../agent/crates/agent-server" }
 agent-runtime-config = { path = "../agent/crates/agent-runtime-config" }
 agent-tools = { path = "../agent/crates/agent-tools" }
