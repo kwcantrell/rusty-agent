@@ -163,6 +163,7 @@ name = "agent-server"
 version = "0.0.0"
 dependencies = [
  "agent-core",
+ "agent-memory",
  "agent-model",
  "agent-policy",
  "agent-runtime-config",
