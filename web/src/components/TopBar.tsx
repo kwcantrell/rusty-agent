@@ -5,12 +5,13 @@ import { ThemeToggle } from "./ThemeToggle";
 
 export function TopBar({ projectLabel, online, status, theme, onToggleTheme,
   onOpenSettings, settingsDisabled, onSignOut, onToggleWorkspace, showWorkspaceToggle,
-  tauriWorkspace, onWorkspaceChanged }:
+  tauriWorkspace, onWorkspaceChanged, llamaOk, llamaModel }:
   { projectLabel: string; online: boolean; status: ConnectionStatus;
     theme: Theme; onToggleTheme: () => void;
     onOpenSettings?: () => void; settingsDisabled?: boolean; onSignOut: () => void;
     onToggleWorkspace?: () => void; showWorkspaceToggle?: boolean;
-    tauriWorkspace?: string; onWorkspaceChanged?: (path: string) => void }) {
+    tauriWorkspace?: string; onWorkspaceChanged?: (path: string) => void;
+    llamaOk?: boolean; llamaModel?: string }) {
   return (
     <div className="flex items-center justify-between px-4 py-2.5"
       style={{ background: "var(--surface-base)", borderBottom: "1px solid var(--border)" }}>
@@ -22,6 +23,14 @@ export function TopBar({ projectLabel, online, status, theme, onToggleTheme,
         <span className="text-xs" style={{ color: "var(--text-muted)" }}>· {status}</span>
       </div>
       <div className="flex items-center gap-3 text-sm">
+        {llamaOk !== undefined && (
+          <span className="flex items-center gap-1 text-xs" style={{ color: "var(--text-muted)" }}
+            title={llamaOk ? `llama-server ready: ${llamaModel ?? "model loaded"}` : "llama-server offline (localhost:8080)"}>
+            <span className="h-2 w-2 rounded-full"
+              style={{ background: llamaOk ? "var(--state-done)" : "var(--text-muted)" }} />
+            LLM
+          </span>
+        )}
         {tauriWorkspace !== undefined && (
           <div className="flex items-center gap-2 text-xs" style={{ color: "var(--text-muted)" }}>
             <span title={tauriWorkspace} className="max-w-[28ch] truncate">{tauriWorkspace}</span>

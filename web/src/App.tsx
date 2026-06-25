@@ -27,7 +27,23 @@ export default function App() {
   const sock = useRef<ReturnType<typeof connect> | null>(null);
   const [localUrl, setLocalUrl] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState<string | undefined>(undefined);
+  const [llama, setLlama] = useState<{ ok: boolean; model?: string } | null>(null);
   const tauri = isTauri();
+
+  useEffect(() => {
+    if (!tauri) return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const h = await invoke<{ ok: boolean; model?: string } | null>("llama_health");
+        if (active) setLlama(h ?? { ok: false });
+      } catch { if (active) setLlama({ ok: false }); }
+    };
+    poll();
+    const id = setInterval(poll, 10000);
+    return () => { active = false; clearInterval(id); };
+  }, [tauri]);
 
   useEffect(() => {
     if (!tauri) return;
@@ -37,8 +53,10 @@ export default function App() {
       setLocalUrl(t.wsUrl);
       setSessionId(t.sessionId); // satisfies the existing sessionId gate
     });
-    import("@tauri-apps/api/core").then(({ invoke }) =>
-      invoke<string | null>("get_workspace").then((w) => { if (active && w) setWorkspace(w); }));
+    import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke<string | null>("get_workspace"))
+      .then((w) => { if (active && w) setWorkspace(w); })
+      .catch(() => { /* no workspace available yet; TopBar simply won't show it */ });
     return () => { active = false; };
   }, [tauri]);
 
@@ -114,7 +132,9 @@ export default function App() {
         onSignOut={signOut}
         showWorkspaceToggle={narrow} onToggleWorkspace={() => setWorkspaceOpen((o) => !o)}
         tauriWorkspace={tauri ? workspace : undefined}
-        onWorkspaceChanged={(p) => setWorkspace(p)} />
+        onWorkspaceChanged={(p) => setWorkspace(p)}
+        llamaOk={tauri ? (llama?.ok ?? false) : undefined}
+        llamaModel={llama?.model} />
       {showSettings && state.settings && (
         <SettingsPanel settings={state.settings} meta={state.settingsMeta} error={state.settingsError}
           disabled={!connected} onSave={saveSettings} onClose={() => setShowSettings(false)} />
