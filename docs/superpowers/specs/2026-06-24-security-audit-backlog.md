@@ -10,6 +10,17 @@ are the remaining verified findings, not yet specced.
 
 ## Cluster A — Server concurrency & resource leaks (`agent-server`, `agent-mcp`)
 
+> Decomposed (2026-06-25) into 3 sub-specs: **A-a** bounded event channel + backpressure
+> (finding A2), **A-b** MCP process & task lifecycle (finding A3), **A-c** run lifecycle /
+> session identity / atomic `RuntimeState` + deferred B3 interactive server-cancel
+> (findings A1 + A4 + B3-cancel).
+> **A-b DONE** (merged `6d23647`, 2026-06-25): `StdioTransport` stores + aborts its
+> stdout-reader/stderr-drain `JoinHandle`s on `close()`/`Drop`; `SandboxedChild::kill()`
+> reaps via explicit `wait()` after `start_kill()`. Spec
+> `2026-06-25-mcp-process-lifecycle-design.md`, plan `…/plans/2026-06-25-mcp-process-lifecycle.md`.
+> (Honest framing: hardened already-`kill_on_drop`-mitigated teardown to be deterministic;
+> not an unbounded leak — no reconnect path exists.) Remaining: **A-a**, **A-c**.
+
 - **HIGH — concurrent `user_input` session/approval cross-talk** (`agent-server/src/daemon.rs:~104`).
   Each input spawns a detached task sharing one session id + one global approval-correlation
   space; a second input mid-run misattributes frames. No guard rejects a second concurrent run.
