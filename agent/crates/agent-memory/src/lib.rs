@@ -5,6 +5,7 @@ mod scope;
 mod embedder;
 mod store;
 mod tools;
+mod retriever;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ pub use store::{InMemoryStore, MemoryStore, SqliteStore, StoreError};
 pub use tools::Remember;
 pub use tools::Recall;
 pub use tools::Forget;
+pub use retriever::MemoryRetriever;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryInitError {

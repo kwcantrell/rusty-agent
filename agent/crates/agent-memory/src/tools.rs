@@ -43,6 +43,24 @@ fn first_embedding(vectors: Vec<Vec<f32>>) -> Result<Vec<f32>, ToolError> {
         .ok_or_else(|| embed_failed("embedder returned no vectors"))
 }
 
+/// Shared retrieval core for the `recall` tool and auto-retrieval: embed the
+/// query, search the project+global scope, drop sub-threshold hits, keep top-k.
+pub(crate) async fn query_memories(
+    embedder: &dyn Embedder,
+    store: &dyn MemoryStore,
+    cfg: &MemoryConfig,
+    project_key: &str,
+    query: &str,
+    k: usize,
+) -> Result<Vec<crate::record::Scored>, ToolError> {
+    let qv = first_embedding(embedder.embed(&[query.to_string()]).await.map_err(embed_failed)?)?;
+    let filter = ScopeFilter::ProjectAndGlobal { project_key: project_key.to_string() };
+    let mut hits = store.query(&qv, cfg.max_k, &filter).await.map_err(store_failed)?;
+    hits.retain(|h| h.score >= cfg.relevance_threshold);
+    hits.truncate(k);
+    Ok(hits)
+}
+
 pub struct Remember {
     pub embedder: Arc<dyn Embedder>,
     pub store: Arc<dyn MemoryStore>,
@@ -167,12 +185,9 @@ impl Tool for Recall {
             .ok_or_else(|| ToolError::InvalidArgs("missing non-empty 'query'".into()))?;
         let k = args.get("k").and_then(Value::as_u64).map(|n| n as usize)
             .unwrap_or(self.cfg.default_k).clamp(1, self.cfg.max_k);
-        let qv = first_embedding(self.embedder.embed(&[query.to_string()]).await.map_err(embed_failed)?)?;
-
-        let filter = ScopeFilter::ProjectAndGlobal { project_key: self.project_key.clone() };
-        let mut hits = self.store.query(&qv, self.cfg.max_k, &filter).await.map_err(store_failed)?;
-        hits.retain(|h| h.score >= self.cfg.relevance_threshold);
-        hits.truncate(k);
+        let hits = query_memories(
+            self.embedder.as_ref(), self.store.as_ref(), &self.cfg, &self.project_key, query, k,
+        ).await?;
         tracing::info!(target: "memory", returned = hits.len(),
             top = hits.first().map(|h| h.score).unwrap_or(0.0), "recall");
 

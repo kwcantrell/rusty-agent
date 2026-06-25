@@ -15,6 +15,8 @@ pub struct MemoryConfig {
     pub max_memories_per_scope: usize,
     pub max_recall_chars: usize,
     pub candidate_warn_threshold: usize,
+    pub auto_recall: bool,
+    pub recall_token_budget: usize,
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -38,6 +40,8 @@ impl Default for MemoryConfig {
             max_memories_per_scope: 10_000,
             max_recall_chars: 4 * 1024,
             candidate_warn_threshold: 50_000,
+            auto_recall: true,
+            recall_token_budget: 512,
         }
     }
 }
@@ -57,5 +61,7 @@ mod tests {
         assert!((c.dedup_threshold - 0.95).abs() < 1e-6);
         assert!((c.relevance_threshold - 0.3).abs() < 1e-6);
         assert!((c.forget_threshold - 0.85).abs() < 1e-6);
+        assert!(c.auto_recall);
+        assert_eq!(c.recall_token_budget, 512);
     }
 }
