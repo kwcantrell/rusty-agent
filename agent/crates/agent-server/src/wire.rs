@@ -92,6 +92,7 @@ fn stop_reason_str(r: &StopReason) -> &'static str {
         StopReason::ToolCalls => "tool_calls",
         StopReason::Length => "length",
         StopReason::BudgetExhausted => "budget_exhausted",
+        StopReason::Cancelled => "cancelled",
     }
 }
 
@@ -120,6 +121,11 @@ pub fn wire_event_from(event: AgentEvent) -> Option<WireEvent> {
 mod tests {
     use super::*;
     use agent_core::AgentEvent;
+
+    #[test]
+    fn cancelled_stop_reason_maps_to_wire_string() {
+        assert_eq!(super::stop_reason_str(&StopReason::Cancelled), "cancelled");
+    }
 
     #[test]
     fn tool_result_with_markdown_display_round_trips() {

@@ -59,7 +59,7 @@ pub struct CompletionRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StopReason { #[default] Stop, ToolCalls, Length, BudgetExhausted }
+pub enum StopReason { #[default] Stop, ToolCalls, Length, BudgetExhausted, Cancelled }
 
 #[derive(Debug, Clone, Default)]
 pub struct RawToolCall {
