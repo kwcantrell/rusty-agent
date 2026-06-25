@@ -19,7 +19,6 @@ export default function App() {
   const [activeArtifactKey, setActiveArtifactKey] = useState<string | null>(null);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const sock = useRef<ReturnType<typeof connect> | null>(null);
-  const [localUrl, setLocalUrl] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState<string | undefined>(undefined);
   const [llama, setLlama] = useState<{ ok: boolean; model?: string } | null>(null);
   const tauri = isTauri();
@@ -44,7 +43,6 @@ export default function App() {
     let active = true;
     resolveTransport().then((t) => {
       if (!active) return;
-      setLocalUrl(t.wsUrl);
       setSessionId(t.sessionId);
     });
     import("@tauri-apps/api/core")
@@ -70,16 +68,13 @@ export default function App() {
 
   useEffect(() => {
     if (!sessionId) return;
-    if (!localUrl) return;
     dispatch({ type: "reset", userMsgs: loadUserMsgs(sessionId) });
-    const WebSocketImpl = (window as unknown as { __WS__?: typeof WebSocket }).__WS__;
-    sock.current = connect(
-      localUrl,
-      { onFrame: (f) => dispatch({ type: "frame", frame: f }), onStatus: (s) => dispatch({ type: "status", status: s }) },
-      WebSocketImpl ? { WebSocketImpl } : undefined,
-    );
+    sock.current = connect({
+      onFrame: (f) => dispatch({ type: "frame", frame: f }),
+      onStatus: (s) => dispatch({ type: "status", status: s }),
+    });
     return () => { sock.current?.close(); sock.current = null; };
-  }, [sessionId, localUrl]);
+  }, [sessionId]);
 
   // Not running inside the desktop shell (plain browser / tests): there is no
   // local bridge to connect to, so render a notice instead of hanging.
@@ -102,11 +97,11 @@ export default function App() {
   const send = (text: string) => {
     appendUserMsg(sessionId, text);
     dispatch({ type: "user_send", text });
-    sock.current?.send({ v: 1, session_id: sessionId, kind: "user_input", text });
+    sock.current?.send({ kind: "user_input", text });
   };
   const decide = (d: Decision) => {
     if (!state.pendingApproval) return;
-    sock.current?.send({ v: 1, session_id: sessionId, id: state.pendingApproval.id, kind: "approval_response", decision: d });
+    sock.current?.send({ kind: "approval_response", id: state.pendingApproval.id, decision: d });
     dispatch({ type: "approval_sent" });
   };
   // Local desktop has no account/session token; "sign out" resets the local
@@ -118,10 +113,10 @@ export default function App() {
   };
   const openSettings = () => {
     setShowSettings(true);
-    sock.current?.send({ v: 1, session_id: sessionId, kind: "settings_get" });
+    sock.current?.send({ kind: "settings_get" });
   };
   const saveSettings = (s: RuntimeSettings) => {
-    sock.current?.send({ v: 1, session_id: sessionId, kind: "settings_update", settings: s });
+    sock.current?.send({ kind: "settings_update", settings: s });
   };
 
   const connected = state.status === "open";

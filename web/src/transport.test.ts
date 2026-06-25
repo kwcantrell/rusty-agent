@@ -16,6 +16,6 @@ describe("resolveTransport", () => {
   it("does not expose a wsUrl", async () => {
     const { resolveTransport } = await import("./transport");
     const t = await resolveTransport();
-    expect((t as Record<string, unknown>).wsUrl).toBeUndefined();
+    expect((t as unknown as Record<string, unknown>).wsUrl).toBeUndefined();
   });
 });
