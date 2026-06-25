@@ -17,8 +17,6 @@ pub fn local_params(
     config.preserve_thinking = true;
     config.enable_thinking = true;
     DaemonParams {
-        ws_url: String::new(),
-        agent_token: String::new(),
         config,
         api_key: std::env::var("AGENT_API_KEY").ok(),
         claude_binary: "claude".into(),
