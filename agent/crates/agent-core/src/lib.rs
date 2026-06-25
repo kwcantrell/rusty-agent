@@ -3,9 +3,11 @@ mod event;
 mod context;
 mod loop_;
 mod recall;
+mod offload;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub use context::*;
 pub use event::*;
 pub use loop_::*;
 pub use recall::*;
+pub use offload::*;
