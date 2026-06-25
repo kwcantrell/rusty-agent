@@ -29,8 +29,13 @@ are the remaining verified findings, not yet specced.
 > **B2 DONE** (merged `ee74971`, 2026-06-25): OpenAI stream robustness — truncation
 > detection, skip-malformed-SSE-line, in-band 200-body error surfacing (spec
 > `2026-06-25-openai-stream-robustness-design.md`, plan
-> `…/plans/2026-06-25-openai-stream-robustness.md`). Remaining Cluster B work:
-> **B3** (live cancellation wiring), its own spec.
+> `…/plans/2026-06-25-openai-stream-robustness.md`).
+> **B3 DONE** (merged `9e5681f`, 2026-06-25): live cancellation — caller-owned
+> `CancellationToken` through `run_with_cancel` (turn boundary + model-stream
+> select + every `ToolCtx`), `Done(StopReason::Cancelled)` on cancel, CLI Ctrl-C
+> source; interactive server cancel deferred to Cluster A (spec
+> `2026-06-25-live-cancellation-design.md`, plan `…/plans/2026-06-25-live-cancellation.md`).
+> **Cluster B is COMPLETE.** Only Cluster A remains.
 
 - **HIGH — panic on duplicate/empty tool-call ids** (`agent-core/src/loop_.rs`, the
   `results.remove(...).expect("every gated call id has a result")` path). `results` is a HashMap
