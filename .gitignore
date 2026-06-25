@@ -1,6 +1,15 @@
 # Local daemon enrollment config (holds an agent token) — never commit
 agent-server.json
 
+# Environment / secret files (catch-all; cloud/.dev.vars has its own rule too)
+.env
+.env.*
+
+# Editor / OS junk
+.DS_Store
+.idea/
+.vscode/
+
 # Graphify local caches + generated outputs — rebuild with `/graphify .`
 # (this also covers the .graphify_* temp files and manifest.json it writes inside)
 graphify-out/
