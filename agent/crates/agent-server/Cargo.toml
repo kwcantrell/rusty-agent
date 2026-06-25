@@ -13,6 +13,7 @@ agent-policy = { path = "../agent-policy" }
 agent-model = { path = "../agent-model" }
 agent-runtime-config = { path = "../agent-runtime-config" }
 agent-skills = { path = "../agent-skills" }
+agent-memory = { path = "../agent-memory" }
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 async-trait.workspace = true
