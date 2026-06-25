@@ -233,6 +233,7 @@ impl ModelClient for OpenAiCompatClient {
         let stream = async_stream::stream! {
             let mut lines = SseLineBuffer::default();
             let mut splitter = ThinkingSplitter::default();
+            let mut saw_terminal = false;
             loop {
                 // Drain any complete lines before fetching more bytes.
                 if let Some(line) = lines.next_line() {
@@ -257,9 +258,11 @@ impl ModelClient for OpenAiCompatClient {
                             // NOT a content delta that merely contains "[DONE]".
                             let is_done = line.strip_prefix("data:").map(str::trim) == Some("[DONE]");
                             for chunk in chunks {
+                                if matches!(chunk, Chunk::Done(_)) { saw_terminal = true; }
                                 yield Ok(chunk);
                             }
                             if is_done {
+                                saw_terminal = true;
                                 for chunk in splitter.flush() { yield Ok(chunk); }
                                 return;
                             }
@@ -275,6 +278,14 @@ impl ModelClient for OpenAiCompatClient {
                         return;
                     }
                     None => {
+                        // Byte stream ended. If no terminal marker (finish_reason or
+                        // [DONE]) was ever seen, the response was truncated — surface it
+                        // as a retryable error instead of a silent clean finish.
+                        if !saw_terminal {
+                            yield Err(ModelError::Stream(
+                                "stream ended before a completion marker (truncated response)".into()));
+                            return;
+                        }
                         for chunk in splitter.flush() { yield Ok(chunk); }
                         return;
                     }
@@ -543,6 +554,36 @@ mod tests {
         match err {
             Some(ModelError::Stream(m)) => assert!(m.contains("boom"), "message was: {m}"),
             other => panic!("expected Stream error carrying the in-band message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_without_terminal_marker_errors() {
+        let server = MockServer::start().await;
+        // A content delta, then the body just ends — no finish_reason, no [DONE].
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body))
+            .mount(&server).await;
+        let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
+        let req = CompletionRequest { messages: vec![Message::user("hi")], ..Default::default() };
+        let mut stream = client.stream(req).await.unwrap();
+
+        let mut text = String::new();
+        let mut err = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(Chunk::Text(t)) => text.push_str(&t),
+                Ok(_) => {}
+                Err(e) => { err = Some(e); break; }
+            }
+        }
+        assert_eq!(text, "partial", "deltas before the cut-off are still delivered");
+        match err {
+            Some(ModelError::Stream(m)) => assert!(m.contains("truncat"), "message was: {m}"),
+            other => panic!("expected a truncation Stream error, got {other:?}"),
         }
     }
 
