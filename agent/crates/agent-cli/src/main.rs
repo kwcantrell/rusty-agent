@@ -212,6 +212,7 @@ async fn main() {
             presence_penalty: cli.presence_penalty, repeat_penalty: cli.repeat_penalty,
             enable_thinking: !cli.no_thinking, preserve_thinking: cli.preserve_thinking,
             sandbox: Some(sandbox.clone()),
+            max_parallel_tools: 8,
         });
 
     let mut ctx = WindowContext::new(Message::system(system_prompt));

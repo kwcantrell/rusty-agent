@@ -239,6 +239,7 @@ fn build_loop(
             enable_thinking: cfg.enable_thinking,
             preserve_thinking: cfg.preserve_thinking,
             sandbox: Some(build_sandbox(cfg)),
+            max_parallel_tools: 8,
         },
     ));
     BuiltLoop {

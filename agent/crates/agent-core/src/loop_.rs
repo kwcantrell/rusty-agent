@@ -2,8 +2,9 @@ use crate::{built_tokens, AgentEvent, ContextManager, EventSink};
 use agent_model::{AssistantTurn, Chunk, CompletionRequest, Message, ModelClient, ModelError,
                   RawToolCall, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse, Decision, PolicyEngine};
-use agent_tools::{ToolCall, ToolCtx, ToolError, ToolRegistry};
+use agent_tools::{Tool, ToolCall, ToolCtx, ToolError, ToolRegistry};
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,10 @@ pub enum AgentError {
 /// Default idle timeout for model-stream consumption. Generous enough to cover
 /// claude-cli cold-start + `thinking` blocks before the first token.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Default bound on how many of a turn's tool calls execute concurrently.
+/// A `LoopConfig.max_parallel_tools` of 0 (the `Default`) resolves to this.
+pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
 
 #[derive(Default)]
 pub struct LoopConfig {
@@ -39,6 +44,9 @@ pub struct LoopConfig {
     pub enable_thinking: bool,
     pub preserve_thinking: bool,
     pub sandbox: Option<std::sync::Arc<dyn agent_tools::SandboxStrategy>>,
+    /// Max tool calls from one assistant turn to execute concurrently.
+    /// 0 (the default) means `DEFAULT_MAX_PARALLEL_TOOLS`.
+    pub max_parallel_tools: usize,
 }
 
 pub struct AgentLoop {
@@ -178,31 +186,80 @@ impl AgentLoop {
                 return Ok(());
             }
 
+            // Phase 1 — gate every call sequentially (one approval prompt at a time).
+            let mut order: Vec<String> = Vec::with_capacity(parsed.tool_calls.len());
+            let mut results: HashMap<String, (String, Resolved)> = HashMap::new();
+            let mut ready: Vec<ReadyCall> = Vec::new();
             for call in parsed.tool_calls {
-                let result = self.run_tool(call.clone()).await;
-                let content = match result {
-                    Ok(output) => {
+                match self.gate_tool(call).await {
+                    GateOutcome::Rejected { id, name, content } => {
+                        order.push(id.clone());
+                        results.insert(id, (name, Resolved::Err(content)));
+                    }
+                    GateOutcome::Ready(rc) => {
+                        order.push(rc.id.clone());
+                        ready.push(rc);
+                    }
+                }
+            }
+
+            // Phase 2 — execute approved calls concurrently, bounded.
+            let cap = if self.config.max_parallel_tools == 0 {
+                DEFAULT_MAX_PARALLEL_TOOLS } else { self.config.max_parallel_tools };
+            let executed: Vec<(String, String, Result<agent_tools::ToolOutput, ToolError>)> =
+                futures::stream::iter(ready.into_iter().map(|rc| {
+                    let ReadyCall { tool, args, id, name, ctx } = rc;
+                    async move { (id, name, tool.execute(args, &ctx).await) }
+                }))
+                .buffer_unordered(cap)
+                .collect()
+                .await;
+            for (id, name, out) in executed {
+                let resolved = match out {
+                    Ok(o) => Resolved::Ok(o),
+                    Err(e) => Resolved::Err(format!("ERROR: {e}")),
+                };
+                results.insert(id, (name, resolved));
+            }
+
+            // Phase 3 — append one tool message per call, in the model's call order.
+            for id in order {
+                let (name, resolved) = results.remove(&id)
+                    .expect("every gated call id has a result");
+                let content = match resolved {
+                    Resolved::Ok(output) => {
                         self.sink.emit(AgentEvent::ToolResult {
-                            name: call.name.clone(), output: output.clone() });
+                            name: name.clone(), output: output.clone() });
                         output.content
                     }
-                    Err(e) => format!("ERROR: {e}"),
+                    Resolved::Err(content) => content,
                 };
-                ctx.append(Message::tool(call.id, call.name, content));
+                ctx.append(Message::tool(id, name, content));
             }
         }
         self.sink.emit(AgentEvent::Done(StopReason::BudgetExhausted));
         Ok(())
     }
 
-    async fn run_tool(&self, call: ToolCall) -> Result<agent_tools::ToolOutput, ToolError> {
+    /// Resolve, policy-check, and (if needed) get approval for one call — but do NOT
+    /// execute it. Sequential by design so approval prompts never overlap.
+    async fn gate_tool(&self, call: ToolCall) -> GateOutcome {
         self.sink.emit(AgentEvent::ToolStart { name: call.name.clone(), args: call.args.clone() });
-        let tool = self.tools.get(&call.name)
-            .ok_or_else(|| ToolError::NotFound(format!("unknown tool {}", call.name)))?;
-        let intent = tool.intent(&call.args)?;
+        let tool = match self.tools.get(&call.name) {
+            Some(t) => t,
+            None => return GateOutcome::Rejected { id: call.id, name: call.name.clone(),
+                content: format!("ERROR: {}",
+                    ToolError::NotFound(format!("unknown tool {}", call.name))) },
+        };
+        let intent = match tool.intent(&call.args) {
+            Ok(i) => i,
+            Err(e) => return GateOutcome::Rejected { id: call.id, name: call.name,
+                content: format!("ERROR: {e}") },
+        };
         let allowed = match self.policy.check(&intent) {
             Decision::Allow => true,
-            Decision::Deny(reason) => return Err(ToolError::Denied(reason)),
+            Decision::Deny(reason) => return GateOutcome::Rejected { id: call.id, name: call.name,
+                content: format!("ERROR: {}", ToolError::Denied(reason)) },
             Decision::Ask => {
                 let d = self.config.sandbox.as_ref()
                     .map(|s| s.describe())
@@ -225,7 +282,8 @@ impl AgentLoop {
             }
         };
         if !allowed {
-            return Err(ToolError::Denied("user declined".into()));
+            return GateOutcome::Rejected { id: call.id, name: call.name,
+                content: format!("ERROR: {}", ToolError::Denied("user declined".into())) };
         }
         // NOTE: this token is currently inert — it is not wired to any external
         // cancel source (e.g. Ctrl-C / SIGINT). Live cancellation is not yet
@@ -235,8 +293,32 @@ impl AgentLoop {
         let ctx = ToolCtx { workspace: self.config.workspace.clone(),
             timeout: self.config.tool_timeout, cancel: CancellationToken::new(),
             sandbox };
-        tool.execute(call.args, &ctx).await
+        GateOutcome::Ready(ReadyCall { tool, args: call.args, id: call.id, name: call.name, ctx })
     }
+}
+
+/// A call that passed policy/approval and is ready to execute.
+struct ReadyCall {
+    tool: Arc<dyn Tool>,
+    args: serde_json::Value,
+    id: String,
+    name: String,
+    ctx: ToolCtx,
+}
+
+/// Outcome of gating a single call before execution.
+enum GateOutcome {
+    Ready(ReadyCall),
+    /// Rejected before execution (unknown tool / intent error / denied). `content`
+    /// is the final `ERROR: …` text to append as this call's tool result.
+    Rejected { id: String, name: String, content: String },
+}
+
+/// Final per-call result feeding the tool-result message.
+enum Resolved {
+    Ok(agent_tools::ToolOutput),
+    /// Terminal `ERROR: …` content (rejected, failed, or timed out).
+    Err(String),
 }
 
 /// Merge a streamed tool-call delta into the accumulator (handles fragmented args).
@@ -779,5 +861,121 @@ mod tests {
         let events = sink.events.lock().unwrap().clone();
         assert!(!events.iter().any(|e| e.starts_with("error:")));
         assert_eq!(events.last().unwrap(), "done");
+    }
+
+    // ---- Parallel tool-call execution -------------------------------------
+    use agent_tools::{Tool, Access, ToolOutput, ToolSchema};
+    use agent_model::Role;
+
+    struct AllowAll;
+    impl PolicyEngine for AllowAll {
+        fn check(&self, _i: &ToolIntent) -> Decision { Decision::Allow }
+    }
+
+    /// Tool that blocks on a shared 2-party barrier — only completes if a sibling
+    /// call runs concurrently. Sequential execution deadlocks it.
+    struct BarrierTool { name: String, barrier: Arc<tokio::sync::Barrier> }
+    #[async_trait::async_trait]
+    impl Tool for BarrierTool {
+        fn name(&self) -> &str { &self.name }
+        fn description(&self) -> &str { "waits on a shared barrier" }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema { name: self.name.clone(), description: "barrier".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}) }
+        }
+        fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+            Ok(ToolIntent { tool: self.name.clone(), access: Access::Read,
+                paths: vec![], command: None, summary: "barrier".into() })
+        }
+        async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx)
+            -> Result<ToolOutput, ToolError> {
+            self.barrier.wait().await;
+            Ok(ToolOutput { content: format!("{} done", self.name), display: None })
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_execute_concurrently() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(BarrierTool { name: "wait_a".into(), barrier: barrier.clone() }));
+        r.register(Arc::new(BarrierTool { name: "wait_b".into(), barrier: barrier.clone() }));
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                ("c1".into(), "wait_a".into(), "{}".into()),
+                ("c2".into(), "wait_b".into(), "{}".into())]),
+            Scripted::Text("both done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: std::env::temp_dir(),
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        // Sequential execution would block wait_a forever (wait_b never starts) -> timeout.
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5),
+            agent.run(&mut ctx, "go".into())).await;
+        assert!(res.is_ok(), "parallel calls did not run concurrently (barrier deadlock)");
+        res.unwrap().unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.iter().filter(|e| e.starts_with("tool_result:")).count(), 2);
+    }
+
+    /// Deterministic tool: sleeps `delay_ms`, then returns `body` as its content.
+    struct FakeTool { name: String, delay_ms: u64, body: String }
+    #[async_trait::async_trait]
+    impl Tool for FakeTool {
+        fn name(&self) -> &str { &self.name }
+        fn description(&self) -> &str { "fake" }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema { name: self.name.clone(), description: "fake".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}) }
+        }
+        fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+            Ok(ToolIntent { tool: self.name.clone(), access: Access::Read,
+                paths: vec![], command: None, summary: "fake".into() })
+        }
+        async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx)
+            -> Result<ToolOutput, ToolError> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            Ok(ToolOutput { content: self.body.clone(), display: None })
+        }
+    }
+
+    fn tool_messages(ctx: &WindowContext) -> Vec<(String, String)> {
+        ctx.build(usize::MAX).into_iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| (m.tool_call_id.unwrap_or_default(), m.content))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tool_results_keep_model_call_order_despite_completion_order() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(FakeTool { name: "slow".into(), delay_ms: 150, body: "SLOW".into() }));
+        r.register(Arc::new(FakeTool { name: "fast".into(), delay_ms: 5, body: "FAST".into() }));
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                ("c1".into(), "slow".into(), "{}".into()),   // finishes LAST
+                ("c2".into(), "fast".into(), "{}".into())]), // finishes FIRST
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
+            Arc::new(AlwaysApprove), sink,
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: std::env::temp_dir(),
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let msgs = tool_messages(&ctx);
+        assert_eq!(msgs, vec![
+            ("c1".into(), "SLOW".into()),
+            ("c2".into(), "FAST".into())]);
     }
 }
