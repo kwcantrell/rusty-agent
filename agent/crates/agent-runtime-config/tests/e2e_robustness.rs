@@ -78,6 +78,8 @@ fn assemble_test(
             memory_retriever: None,
             stream_idle_timeout: Duration::from_secs(10),
             base_system_prompt: "You are a test agent.".into(),
+            offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
+            compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     );
     (built, sink)

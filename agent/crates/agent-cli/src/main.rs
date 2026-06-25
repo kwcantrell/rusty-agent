@@ -1,7 +1,7 @@
 mod approval;
 mod render;
 
-use agent_core::WindowContext;
+use agent_core::CuratedContext;
 use agent_model::Message;
 use agent_runtime_config::{assemble_loop, backend_name_is_valid, build_memory_full, build_model,
     build_sandbox, default_allowlist, default_denylist, LoopParts, RuntimeConfig};
@@ -207,6 +207,9 @@ async fn main() {
     let memory = build_memory_full(cli.memory, cli.memory_db.clone(),
         cli.memory_model_dir.clone(), &workspace);
 
+    let offload_store: Arc<dyn agent_core::OffloadStore> =
+        Arc::new(agent_core::InMemoryOffloadStore::new());
+    let compact_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let built = assemble_loop(&rt, LoopParts {
         model,
         sink: Arc::new(TerminalSink::default()),
@@ -217,6 +220,8 @@ async fn main() {
         memory_retriever: memory.retriever.clone(),
         stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
         base_system_prompt: BASE_SYSTEM_PROMPT.to_string(),
+        offload_store: offload_store.clone(),
+        compact_flag: compact_flag.clone(),
     });
     if !built.unknown_presets.is_empty() {
         eprintln!("skills: unknown active skill(s): {}", built.unknown_presets.join(", "));
@@ -224,8 +229,12 @@ async fn main() {
     }
     let agent = built.loop_;
 
-    let mut ctx = WindowContext::new(Message::system(built.system_prompt))
-        .with_recall_budget(memory.recall_token_budget);
+    let mut ctx = CuratedContext::new(
+        Message::system(built.system_prompt),
+        offload_store,
+        compact_flag,
+    )
+    .with_recall_budget(memory.recall_token_budget);
 
     println!("agent ready. Type a task, or 'exit'.");
     let stdin = std::io::stdin();

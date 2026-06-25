@@ -5,7 +5,7 @@ use crate::daemon::DaemonParams;
 use crate::runtime::RuntimeState;
 use crate::sink::{ChannelEventSink, EventSlot};
 use crate::wire::{Decision, EventOut, SettingsState};
-use agent_core::{ContextManager, WindowContext};
+use agent_core::{ContextManager, CuratedContext};
 use agent_model::Message;
 use agent_runtime_config::RuntimeConfig;
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ pub enum SendOutcome { Started, Busy }
 
 pub struct Session {
     runtime: Arc<RuntimeState>,
-    ctx: Arc<AsyncMutex<WindowContext>>,
+    ctx: Arc<AsyncMutex<CuratedContext>>,
     slot: EventSlot,
     approval: Arc<IpcApprovalChannel>,
     active: Arc<Mutex<Option<CancellationToken>>>,
@@ -39,8 +39,12 @@ impl Session {
             params.mcp_tools.clone(), params.memory_tools.clone(),
             params.memory_retriever.clone(), params.system_prompt.clone()));
         let ctx = Arc::new(AsyncMutex::new(
-            WindowContext::new(Message::system(params.system_prompt.clone()))
-                .with_recall_budget(params.recall_token_budget)));
+            CuratedContext::new(
+                Message::system(params.system_prompt.clone()),
+                runtime.offload_store(),
+                runtime.compact_flag(),
+            )
+            .with_recall_budget(params.recall_token_budget)));
         Arc::new(Self { runtime, ctx, slot, approval,
             active: Arc::new(Mutex::new(None)), recall_budget: params.recall_token_budget })
     }
@@ -97,8 +101,12 @@ impl Session {
     pub async fn set_workspace(self: &Arc<Self>, _dir: PathBuf) {
         self.cancel();
         let mut guard = self.ctx.lock().await;
-        *guard = WindowContext::new(Message::system(self.runtime.current_system_prompt()))
-            .with_recall_budget(self.recall_budget);
+        *guard = CuratedContext::new(
+            Message::system(self.runtime.current_system_prompt()),
+            self.runtime.offload_store(),
+            self.runtime.compact_flag(),
+        )
+        .with_recall_budget(self.recall_budget);
     }
 
     #[cfg(test)]

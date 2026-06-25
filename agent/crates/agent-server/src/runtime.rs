@@ -1,11 +1,12 @@
 use crate::approval::IpcApprovalChannel;
 use crate::sink::ChannelEventSink;
 use crate::wire::{DiscoveredSkill, SettingsState};
-use agent_core::{AgentLoop, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT};
+use agent_core::{AgentLoop, OffloadStore, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT};
 use agent_runtime_config::{assemble_loop, build_model, BuiltLoop, LoopParts, RuntimeConfig, HARD_FLOOR_DENYLIST};
 use agent_skills::SkillRegistry;
 use agent_tools::Tool;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// Holds the live `AgentLoop` plus everything needed to rebuild it on a settings
@@ -25,6 +26,10 @@ pub struct RuntimeState {
     memory_retriever: Option<Arc<dyn Retriever>>,
     base_system_prompt: String,
     system_prompt: Mutex<String>,
+    /// Conversation-stable context-management handles. Reused across loop rebuilds
+    /// so a settings change never orphans the offload table from its tools.
+    offload_store: Arc<dyn OffloadStore>,
+    compact_flag: Arc<AtomicBool>,
 }
 
 impl RuntimeState {
@@ -43,9 +48,13 @@ impl RuntimeState {
         base_system_prompt: String,
     ) -> Self {
         let config = config.normalized();
+        let offload_store: Arc<dyn OffloadStore> =
+            Arc::new(agent_core::InMemoryOffloadStore::new());
+        let compact_flag = Arc::new(AtomicBool::new(false));
         let built = build_loop(
             &config, &sink, &approval, &workspace, &api_key, &claude_binary, &mcp_tools,
-            &memory_tools, memory_retriever.as_ref(), &base_system_prompt);
+            &memory_tools, memory_retriever.as_ref(), &base_system_prompt,
+            &offload_store, &compact_flag);
         // Startup is lenient: an unknown persisted preset is already warned + dropped
         // inside build_loop, so the daemon always boots.
         Self {
@@ -54,7 +63,18 @@ impl RuntimeState {
             system_prompt: Mutex::new(built.system_prompt),
             sink, approval, workspace, api_key, claude_binary, config_path,
             mcp_tools, memory_tools, memory_retriever, base_system_prompt,
+            offload_store, compact_flag,
         }
+    }
+
+    /// Conversation-stable offload table (shared with the session's `CuratedContext`).
+    pub fn offload_store(&self) -> Arc<dyn OffloadStore> {
+        self.offload_store.clone()
+    }
+
+    /// Conversation-stable compaction-request flag (shared with the session's context).
+    pub fn compact_flag(&self) -> Arc<AtomicBool> {
+        self.compact_flag.clone()
     }
 
     /// Clone the current loop `Arc` (lock held only for the clone, never across await).
@@ -76,7 +96,8 @@ impl RuntimeState {
         let built = build_loop(
             &cfg, &self.sink, &self.approval, &self.workspace, &self.api_key,
             &self.claude_binary, &self.mcp_tools, &self.memory_tools,
-            self.memory_retriever.as_ref(), &self.base_system_prompt);
+            self.memory_retriever.as_ref(), &self.base_system_prompt,
+            &self.offload_store, &self.compact_flag);
         if !built.unknown_presets.is_empty() {
             // Strict on the wire: a typo'd / missing active skill is a hard error.
             return Err(format!("unknown active skill(s): {}", built.unknown_presets.join(", ")));
@@ -121,6 +142,8 @@ fn build_loop(
     memory_tools: &[Arc<dyn Tool>],
     memory_retriever: Option<&Arc<dyn Retriever>>,
     base_system_prompt: &str,
+    offload_store: &Arc<dyn OffloadStore>,
+    compact_flag: &Arc<AtomicBool>,
 ) -> BuiltLoop {
     let model = build_model(&cfg.backend, &cfg.base_url, &cfg.model, claude_binary, api_key.clone());
     assemble_loop(cfg, LoopParts {
@@ -133,6 +156,8 @@ fn build_loop(
         memory_retriever: memory_retriever.cloned(),
         stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
         base_system_prompt: base_system_prompt.to_string(),
+        offload_store: offload_store.clone(),
+        compact_flag: compact_flag.clone(),
     })
 }
 
@@ -278,9 +303,11 @@ mod tests {
             "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
         cfg.sandbox_mode = "off".into();
         // build_loop must succeed — off → HostExecutor, no Docker required.
+        let store: Arc<dyn OffloadStore> = Arc::new(agent_core::InMemoryOffloadStore::new());
+        let flag = Arc::new(AtomicBool::new(false));
         let result = build_loop(
             &cfg, &sink, &approval, dir.path(), &None, "claude",
-            &[], &[], None, crate::daemon::SYSTEM_PROMPT);
+            &[], &[], None, crate::daemon::SYSTEM_PROMPT, &store, &flag);
         // If we get here without panic/error the strategy was constructed OK.
         let _loop = result.loop_; // just confirm it's built
     }
@@ -293,9 +320,11 @@ mod tests {
         let mut cfg = RuntimeConfig::from_launch(
             "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
         cfg.sandbox_mode = "auto".into();
+        let store: Arc<dyn OffloadStore> = Arc::new(agent_core::InMemoryOffloadStore::new());
+        let flag = Arc::new(AtomicBool::new(false));
         let result = build_loop(
             &cfg, &sink, &approval, dir.path(), &None, "claude",
-            &[], &[], None, crate::daemon::SYSTEM_PROMPT);
+            &[], &[], None, crate::daemon::SYSTEM_PROMPT, &store, &flag);
         let _loop = result.loop_;
     }
 
