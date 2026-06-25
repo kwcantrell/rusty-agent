@@ -6,10 +6,21 @@
 ## Goal
 
 An [autoresearch](https://github.com/karpathy/autoresearch)-style optimization loop, packaged as a
-skill, where a Claude agent iteratively improves this runtime's context-management subsystem
-(`CuratedContext` and friends) so that the *running* model (Qwen3.6 on the local llama.cpp server)
-can solve a hard, long-horizon task **without drifting from the original goal** and in **as few total
-tokens as possible**.
+skill, where a Claude agent iteratively improves this runtime's context-management subsystem so that the
+*running* model (Qwen3.6 on the local llama.cpp server) can solve a hard, long-horizon task **without
+drifting from the original goal** and in **as few total tokens as possible**.
+
+**Scope of "context-management subsystem"** — two cooperating curation surfaces, both in scope for
+optimization:
+
+- **In-window curation** (`agent-core`): `CuratedContext` — offload table, compaction, re-grounding,
+  windowing.
+- **Long-term semantic memory** (`agent-memory`): a SQLite vector store with `remember`/`recall`/
+  `forget` tools and **auto-retrieval** (`MemoryRetriever` injects relevant stored facts into context
+  each turn). This is what lets a task survive a window reset or span sessions — the backbone of
+  "long-running tasks without drifting." A bad memory policy fails in two directions: **under-recall**
+  (a needed stored fact is never surfaced → drift/failure) and **over-recall** (irrelevant facts flood
+  the window → token bloat + distraction). Both are squarely in the objective.
 
 The optimization objective is lexicographic, never blended:
 
@@ -47,12 +58,16 @@ A new Rust **test-binary** `eval_context` in `agent/crates/agent-runtime-config/
 directly on the existing `soak_live.rs` (same live-server client, `SafeApproval` blast-radius gate,
 throwaway temp-workspace pattern). One invocation = **one run**:
 
-1. Read a **candidate config** from env/file: the Tier-A parameters
-   (`high_water_pct`, `keep_recent`, `error_min_bytes`, `output_min_bytes`, `recall_budget`,
-   window size).
-2. Drive the real `assemble_loop` against the live server on the frozen task prompt.
+1. Read a **candidate config** from env/file: the Tier-A parameters across **both** surfaces —
+   *in-window* (`high_water_pct`, `keep_recent`, `error_min_bytes`, `output_min_bytes`, `recall_budget`,
+   window size) and *memory* (`default_k`, `relevance_threshold`, `dedup_threshold`, `forget_threshold`,
+   `max_recall_chars`, `recall_token_budget`, `auto_recall`).
+2. Drive the real `assemble_loop` against the live server on the frozen task prompt. For **cross-session**
+   tasks the harness drives multiple sessions that **share one memory store** but start with **fresh
+   (empty) windows** — facts must survive via `agent-memory`, not the live window (see failure modes).
+   The memory store is seeded/reset deterministically per task so a run is reproducible.
 3. After the agent stops, **restore the hidden tests** and run them in a sealed step the agent never
-   sees. Pass = the commit's frozen test subset goes from red to green.
+   sees. Pass = the task's frozen test subset goes from red to green.
 4. Emit one JSON line: `{ "passed": bool, "tokens": int, "turns": int }`.
 
 **Runtime-injected params (no rebuild for Tier A).** The Tier-A parameters are injected at runtime via
@@ -63,7 +78,9 @@ rebuild. The server's parallel slots (`-np 4`) let the N runs partly overlap, cu
 **Token metric.** Total tokens = sum over all turns of **server-reported** `usage.prompt_tokens +
 usage.completion_tokens`. The internal `message_tokens` estimate is *not* used: it is known to
 undercount (it ignores reasoning content and `tool_calls`). Optimizing against a metric that undercounts
-the very bloat (reasoning + tool churn) we are trying to reduce would be self-defeating.
+the very bloat (reasoning + tool churn) we are trying to reduce would be self-defeating. Auto-retrieved
+memory facts are injected into the prompt each turn, so they land in `prompt_tokens` automatically — the
+`memory-over-recall` failure mode is captured by this metric without special handling.
 
 ## prepare.md — authoring trustworthy tasks
 
@@ -119,6 +136,12 @@ fail is genuine incapability.
 - **Re-grounding: on.** The goal block stays pinned. Favorable means *best-case good context*, and a
   pinned goal is pure upside; it also limits lost-in-the-middle drift in a long verbatim window.
 - **Recall budget:** generous/irrelevant (nothing is offloaded, so nothing is recalled).
+- **Memory: maximally generous retrieval.** `auto_recall = true`, `default_k` high, `relevance_threshold
+  → 0`, large `recall_token_budget`/`max_recall_chars` — so any fact ever stored is reliably surfaced.
+  For **cross-session** memory tasks this is the part of "favorable" that carries the load: the needed
+  fact is *not* in the current window (it was stored earlier), so favorable proves capability only by
+  guaranteeing the memory layer hands it back. (In-window verbatim covers single-session tasks; generous
+  retrieval covers cross-session ones; together they mean **neither subsystem hides anything**.)
 - Favorable runs are allowed to be maximally expensive in tokens. Favorable is a **correctness** probe
   only ("can the model do this at all?"); it is never used for the token objective.
 
@@ -133,12 +156,11 @@ degradation that could make a context-bound task *look* capability-bound). If th
 overflows the window, the task is rejected as **ill-sized** — not labeled capability-bound. Scope note:
 this means the skill optimizes *curation quality within a window*, not infinite-context behavior.
 
-**Cheap pressure for synthetic tasks (decision, override if undesired).** To keep synthetic tasks small
-and fast, their *realistic* config uses a **scaled-down** `context_limit` (e.g. 16–32K) so the weakness
-bites with a modest transcript, while their favorable config uses a window just large enough to hold
-that transcript verbatim. The **locked real-commit tasks** run the realistic config at the **true
-deployment window (196608)** — they are the check that improvements found at the scaled window actually
-transfer to the regime the runtime ships in. (Concurrency caveat: the server runs `-np 4` with unified
+**Cheap pressure for synthetic tasks (decided).** Synthetic tasks' *realistic* config uses a
+**scaled-down** `context_limit` (e.g. 16–32K) so the weakness bites with a modest transcript, while
+their favorable config uses a window just large enough to hold that transcript verbatim. The **locked
+real-commit tasks** run the realistic config at the **true deployment window (196608)** — they are the
+check that improvements found at the scaled window actually transfer to the regime the runtime ships in. (Concurrency caveat: the server runs `-np 4` with unified
 KV; running several admissibility/eval runs at once shares that 196608-token pool, so either run
 favorable/locked-window checks with lower concurrency or size tasks to a fraction of the window.)
 
@@ -164,8 +186,10 @@ Each iteration the agent:
    at 0.85 and large resolved sub-tasks sit in-window."
 3. Makes **one** targeted change:
    - **Tier A (params):** edit the candidate config. No rebuild.
-   - **Tier B (code):** rewrite `curated.rs` / `offload_policy.rs` / `compactor.rs` logic, then
-     `cargo build`. Unlocked only after the signal is proven on Tier A.
+   - **Tier B (code):** rewrite curation logic, then `cargo build`. Unlocked only after the signal is
+     proven on Tier A. Surface spans both crates: in-window (`curated.rs` / `offload_policy.rs` /
+     `compactor.rs`) and memory (`agent-memory`'s `retriever.rs` ranking, `tools.rs` query/dedup,
+     remember/forget policy).
 4. Runs the eval **N = 5–8×** on the **training** set.
 5. Applies the gate (next section).
 6. Promotes to champion iff gated-better; **appends the hypothesis + N raw results + verdict to
@@ -190,6 +214,14 @@ Each task is tagged with the context-mgmt mechanism it stresses:
 - `offload` — huge tool outputs create offload pressure.
 - `compaction` — many resolved sub-tasks; compaction must fire well.
 - `recall` — an exact offloaded value is needed verbatim later.
+- `memory-under-recall` — a fact must persist past a window reset (or across sessions) and be
+  surfaced by auto-retrieval when needed; weak memory loses it.
+- `memory-over-recall` — distractor facts in the store must *not* be injected; a too-eager retrieval
+  policy floods the window (token bloat) and pulls the agent off-goal.
+
+The `memory-*` modes can be **cross-session**: the fact is stored in an earlier session and must be
+recalled in a later one whose window starts empty — solvable only via `agent-memory`, never by an
+in-window verbatim transcript. This is the regime that most directly models "long-running tasks."
 
 Held-out tasks that are merely *more drift tasks* prove nothing. Generalization is only real if a change
 tuned on some modes is shown not to wreck another mode.
@@ -271,6 +303,10 @@ saw.** That line in `program.md` is what "we actually improved the context manag
   confirm transfer.
 - Optimizer is **agent-driven** (autoresearch-style reasoning loop), not automated search.
 - Token metric uses **server-reported usage**, not the internal estimate.
+- The **memory system (`agent-memory`) is part of the context-management subsystem** and in scope for
+  optimization: its params are Tier-A knobs, its retriever/policy is Tier-B code, it adds `memory-*`
+  failure modes, and it enables **cross-session** tasks. Favorable config neutralizes *both* surfaces
+  (full window + maximally generous retrieval).
 
 ## Risks and open items
 
