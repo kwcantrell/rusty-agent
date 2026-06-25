@@ -1,4 +1,8 @@
-use agent_model::Message;
+use crate::EventSink;
+use agent_model::{Message, ModelClient};
+use async_trait::async_trait;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Cheap, tokenizer-agnostic estimate (~4 chars/token). Swap for a real
 /// tokenizer later behind the same call site.
@@ -6,7 +10,7 @@ pub fn estimate_tokens(s: &str) -> usize {
     (s.chars().count() / 4).max(1)
 }
 
-fn message_tokens(m: &Message) -> usize {
+pub(crate) fn message_tokens(m: &Message) -> usize {
     let mut t = estimate_tokens(&m.content) + 4; // per-message overhead
     if let Some(r) = &m.reasoning {
         t += estimate_tokens(r);
@@ -30,6 +34,43 @@ pub fn built_tokens(messages: &[Message]) -> usize {
 /// `WindowContext::with_recall_budget`.
 pub const DEFAULT_RECALL_TOKEN_BUDGET: usize = 512;
 
+/// Build a capped recall/notes block: greedily keep lines under `budget` tokens,
+/// always including at least the first line if any are present (soft cap).
+/// Shared by `WindowContext` and `CuratedContext`.
+pub(crate) fn recall_block(lines: &[String], budget: usize) -> Option<Message> {
+    if lines.is_empty() {
+        return None;
+    }
+    const HEADER: &str = "Relevant memories from past sessions:";
+    let mut body = String::from(HEADER);
+    for line in lines {
+        let candidate = format!("{body}\n- {line}");
+        if estimate_tokens(&candidate) > budget && body != HEADER {
+            break;
+        }
+        body = candidate;
+    }
+    Some(Message::system(body))
+}
+
+/// What one `maintain` pass did, for telemetry/tests.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaintReport {
+    pub offloaded: usize,
+    pub offloaded_bytes: usize,
+    pub compacted_turns: usize,
+}
+
+/// Dependencies a context manager needs to run maintenance (compaction needs a
+/// model; offload does not). Borrowed for the duration of the call.
+pub struct MaintCtx<'a> {
+    pub model_limit: usize,
+    pub model: &'a Arc<dyn ModelClient>,
+    pub sink: &'a Arc<dyn EventSink>,
+    pub cancel: &'a CancellationToken,
+}
+
+#[async_trait]
 pub trait ContextManager: Send + Sync {
     fn append(&mut self, msg: Message);
     fn build(&self, model_limit: usize) -> Vec<Message>;
@@ -37,6 +78,13 @@ pub trait ContextManager: Send + Sync {
     /// Replace the auto-retrieved recall lines surfaced this turn. Default no-op
     /// so non-memory implementations are unaffected.
     fn set_recall(&mut self, _items: Vec<String>) {}
+    /// Record the original goal for re-grounding. Default no-op; set-once impls.
+    fn set_goal(&mut self, _goal: String) {}
+    /// Best-effort per-turn curation (offload + compaction). Default no-op so
+    /// `WindowContext` and other simple impls are unaffected.
+    async fn maintain(&mut self, _deps: &MaintCtx<'_>) -> MaintReport {
+        MaintReport::default()
+    }
 }
 
 /// Sliding-window context: always keeps the system prompt; evicts oldest
@@ -69,19 +117,7 @@ impl WindowContext {
     /// Build the recall block message, greedily keeping lines under `recall_budget`.
     /// Always includes at least the first line if any are present (soft cap).
     fn recall_message(&self) -> Option<Message> {
-        if self.recall.is_empty() {
-            return None;
-        }
-        const HEADER: &str = "Relevant memories from past sessions:";
-        let mut body = String::from(HEADER);
-        for line in &self.recall {
-            let candidate = format!("{body}\n- {line}");
-            if estimate_tokens(&candidate) > self.recall_budget && body != HEADER {
-                break;
-            }
-            body = candidate;
-        }
-        Some(Message::system(body))
+        recall_block(&self.recall, self.recall_budget)
     }
 }
 
