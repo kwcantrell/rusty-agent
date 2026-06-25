@@ -19,17 +19,31 @@ impl std::fmt::Display for CompactError {
     }
 }
 
-const COMPACTION_SYSTEM: &str = "You are a context compaction engine. Compress the \
-conversation excerpt below into a dense, high-fidelity summary that preserves: \
-decisions made, unresolved problems, key facts, and file/identifier names. Drop \
-redundant tool output and chatter. Be terse. Output only the summary.";
+const COMPACTION_SYSTEM: &str = "You are a context compaction engine. You are given the prior \
+RUNNING SUMMARY (may be empty) and the NEW conversation turns since it. Output an updated \
+running summary that strictly contains all information from the prior summary PLUS the new \
+turns. Rules: (1) Carry forward every fact, decision, unresolved problem, and file/identifier \
+name from the prior summary — and especially every number, count, and running total. Never \
+drop or paraphrase them away; a later summary must never lose information an earlier one held. \
+(2) Preserve enumerated or step-wise items individually (e.g. 'step 1 adds 5; step 2 adds 12'); \
+never collapse them into a vague phrase like 'several steps'. (3) Drop only redundant tool \
+output and chatter. (4) Output ONLY the updated summary text — do NOT repeat these \
+instructions or the section labels. Be terse.";
 
-fn render_span(span: &[Message], goal: Option<&str>) -> String {
+const PRIOR_PREFIX: &str = "Summary of earlier conversation:\n";
+
+fn render_span(span: &[Message], prior: Option<&Message>) -> String {
     let mut s = String::new();
-    if let Some(g) = goal {
-        s.push_str(&format!("Original goal: {g}\n\n"));
+    match prior {
+        Some(p) => {
+            let body = p.content.strip_prefix(PRIOR_PREFIX).unwrap_or(&p.content);
+            s.push_str("PRIOR RUNNING SUMMARY:\n");
+            s.push_str(body);
+            s.push_str("\n\n");
+        }
+        None => s.push_str("PRIOR RUNNING SUMMARY: (none)\n\n"),
     }
-    s.push_str("Conversation excerpt to compact:\n");
+    s.push_str("NEW TURNS:\n");
     for m in span {
         let role = match m.role {
             Role::System => "system",
@@ -74,20 +88,20 @@ async fn collect_stream(
 /// caller decides whether to commit the result.
 pub async fn run_compaction(
     span: &[Message],
-    goal: Option<&str>,
+    prior: Option<&Message>,
     model: &Arc<dyn ModelClient>,
     cancel: &CancellationToken,
 ) -> Result<Message, CompactError> {
     let req = CompletionRequest {
         messages: vec![
             Message::system(COMPACTION_SYSTEM),
-            Message::user(render_span(span, goal)),
+            Message::user(render_span(span, prior)),
         ],
         temperature: 0.0,
         ..Default::default()
     };
     let summary = collect_stream(model, req, cancel).await?;
-    let body = format!("Summary of earlier conversation:\n{}", summary.trim());
+    let body = format!("{PRIOR_PREFIX}{}", summary.trim());
     Ok(Message::system(body))
 }
 
@@ -115,7 +129,7 @@ mod tests {
         let model: Arc<dyn ModelClient> =
             Arc::new(ScriptedModel::new(vec![Scripted::Text("decided X; bug Y open".into())]));
         let cancel = CancellationToken::new();
-        let msg = run_compaction(&span, Some("do the thing"), &model, &cancel).await.unwrap();
+        let msg = run_compaction(&span, None, &model, &cancel).await.unwrap();
         assert!(matches!(msg.role, Role::System));
         assert!(msg.content.contains("decided X; bug Y open"));
     }

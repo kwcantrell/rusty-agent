@@ -323,12 +323,25 @@ async fn repeated_compaction_keeps_history_bounded_and_coherent() {
         built.iter().any(|m| m.content.starts_with(&format!("ack {}", TURNS - 1))),
         "the newest assistant turn must be kept verbatim"
     );
-    // INVARIANT: history stayed bounded — compaction collapsed the long tail rather
-    // than letting it grow turn-over-turn. (system + summary + ~KEEP recent + slack.)
+    // INVARIANT: the live context never exceeds the token budget — this, not message
+    // count, is the real "bounded" guarantee (build() truncates newest-first).
+    assert!(built_tokens(&built) <= MODEL_LIMIT, "built context must fit the budget");
+    // INVARIANT: assistant/tool CHATTER is collapsed into the summary rather than
+    // accumulating — only the keep_recent newest non-user turns survive verbatim.
+    let assistant_kept = built.iter().filter(|m| matches!(m.role, Role::Assistant)).count();
     assert!(
-        built.len() <= KEEP + 6,
-        "compacted context should be small; got {} messages",
-        built.len()
+        assistant_kept <= KEEP + 2,
+        "assistant chatter must be summarized away, not accumulate; kept {assistant_kept}"
+    );
+    // INVARIANT: user instructions are DURABLE — kept verbatim across every compaction,
+    // never routed through the lossy summarizer. Both the first and last survive.
+    assert!(
+        built.iter().any(|m| m.content.starts_with("turn 0:")),
+        "the earliest user instruction must survive compaction verbatim"
+    );
+    assert!(
+        built.iter().any(|m| m.content.starts_with(&format!("turn {}:", TURNS - 1))),
+        "the latest user instruction must survive compaction verbatim"
     );
 }
 
