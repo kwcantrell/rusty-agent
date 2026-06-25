@@ -60,6 +60,14 @@ impl CuratedContext {
         self
     }
 
+    /// Override the fraction of `model_limit` at which `maintain` triggers a
+    /// compaction pass (default `DEFAULT_HIGH_WATER_PCT`). A value `>= 1.0`
+    /// effectively disables automatic compaction.
+    pub fn with_high_water_pct(mut self, pct: f32) -> Self {
+        self.high_water_pct = pct;
+        self
+    }
+
     /// The pinned blocks, in assembly order, that precede windowed history.
     fn pinned(&self) -> Vec<Message> {
         let mut out = vec![self.system.clone()];
