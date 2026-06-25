@@ -14,6 +14,8 @@ pub enum Scripted {
     Text(String),
     /// A native tool call: (id, name, json-args-string).
     Call(String, String, String),
+    /// One assistant turn emitting several native tool calls: each (id, name, json-args).
+    Calls(Vec<(String, String, String)>),
     /// Force a transport error this turn.
     Error,
     /// `stream()` succeeds but the returned stream never yields (inter-chunk stall).
@@ -45,6 +47,15 @@ impl ModelClient for ScriptedModel {
                 Ok(Chunk::ToolCallDelta(RawToolCall { index: None, id: Some(id), name: Some(name),
                     args_fragment: args })),
                 Ok(Chunk::Done(StopReason::ToolCalls))]).boxed()),
+            Scripted::Calls(calls) => {
+                let mut chunks: Vec<Result<Chunk, ModelError>> = Vec::new();
+                for (i, (id, name, args)) in calls.into_iter().enumerate() {
+                    chunks.push(Ok(Chunk::ToolCallDelta(RawToolCall {
+                        index: Some(i), id: Some(id), name: Some(name), args_fragment: args })));
+                }
+                chunks.push(Ok(Chunk::Done(StopReason::ToolCalls)));
+                Ok(stream::iter(chunks).boxed())
+            }
             Scripted::Reasoning(reasoning, answer) => Ok(stream::iter(vec![
                 Ok(Chunk::Reasoning(reasoning)), Ok(Chunk::Text(answer)),
                 Ok(Chunk::Done(StopReason::Stop))]).boxed()),

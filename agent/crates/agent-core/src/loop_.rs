@@ -310,6 +310,22 @@ mod tests {
         assert_eq!(acc.len(), 1);
         assert_eq!(acc[0].args_fragment, "{}");
     }
+
+    #[tokio::test]
+    async fn scripted_calls_yields_multiple_native_tool_calls() {
+        let model = ScriptedModel::new(vec![Scripted::Calls(vec![
+            ("c1".into(), "f0".into(), "{}".into()),
+            ("c2".into(), "f1".into(), "{}".into())])]);
+        let mut stream = model.stream(CompletionRequest::default()).await.unwrap();
+        let mut raw = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let Chunk::ToolCallDelta(rc) = item.unwrap() { raw.push(rc); }
+        }
+        assert_eq!(raw.len(), 2);
+        assert_eq!(raw[0].name.as_deref(), Some("f0"));
+        assert_eq!(raw[1].id.as_deref(), Some("c2"));
+    }
+
     fn policy(ws: std::path::PathBuf) -> Arc<RulePolicy> {
         Arc::new(RulePolicy { workspace: ws, command_allowlist: vec![], command_denylist: vec![] })
     }
