@@ -607,9 +607,14 @@ Replace the body of `validate_mount` in `mounts.rs` (keep the `~` expansion bloc
             format!("path contains ':': {}", canon.display())));
     }
 
+    // The filesystem root is rejected on exact match only (every absolute path is a
+    // descendant of "/", so a prefix check there would reject everything).
+    if canon == Path::new("/") {
+        return Err(SandboxError::InvalidMount("refusing to mount /".into()));
+    }
     // System roots whose mount (or any descendant) would breach the sandbox boundary.
     const SYSTEM_ROOTS: &[&str] = &[
-        "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot",
+        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot",
         "/sys", "/proc", "/dev", "/var/lib/docker",
         "/run", "/var/run", "/var/run/docker.sock", "/run/docker.sock",
     ];
