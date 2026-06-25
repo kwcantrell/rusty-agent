@@ -84,7 +84,8 @@ hardcode.
 | Fact | Value | Consequence |
 |------|-------|-------------|
 | Session | **Wayland**, KDE Plasma / **KWin** (`kwin_wayland`) | no X11 global input; XTEST-based tools don't see Wayland surfaces |
-| Input tools installed | **only `xdotool`** (X11) | no `ydotool`/`wtype`/`kdotool`/`wmctrl` → native Wayland input is unavailable |
+| Input tools installed | `xdotool` CLI + **`libxdo-dev`** (X11 headers, installed 2026-06-24) | enables X11/XWayland input via the CLI **or** a Rust `enigo` helper (links `-lxdo`); still no `ydotool`/`wtype`/`kdotool`/`wmctrl` → native-Wayland input unavailable |
+| Tauri Linux system deps | **all satisfied** (incl. `libxdo-dev` as of 2026-06-24) | `tauri build` and input/global-shortcut/tray plugins that link `libxdo` now compile |
 | AT-SPI (semantic layer) | bus runs, but **no Python `Atspi` binding**, `toolkit-accessibility=false` | Layer-1 a11y driving is not usable as-is; WebKitGTK web a11y is unreliable anyway |
 | Webview | WebKitGTK 2.52.3 | renders as a Wayland client under this session |
 | Screenshot tool | **`spectacle`** (no `grim`) | use spectacle for captures |
@@ -110,8 +111,11 @@ If you genuinely must drive the rendered window:
    externally, find its ephemeral port: `ss -tlnp | grep <app-pid>`.
 
 Without `GDK_BACKEND=x11`, `xdotool` will silently fail to find/drive the window
-(it's a native Wayland surface). To stay pure-Wayland instead, you must first
-install `ydotool` (uinput, needs root) or `kdotool` — neither is present today.
+(it's a native Wayland surface). Now that `libxdo-dev` is installed you can also
+drive X11/XWayland input from Rust via the `enigo` crate (links `-lxdo`) instead
+of shelling out to `xdotool` — but it is still **X11-only**, not native Wayland.
+To stay pure-Wayland instead, you must first install `ydotool` (uinput, needs
+root) or `kdotool` — neither is present today.
 
 ## Common mistakes
 
