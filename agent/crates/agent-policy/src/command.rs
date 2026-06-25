@@ -33,6 +33,75 @@ pub fn split_simple_commands(cmd: &str) -> Option<Vec<Vec<String>>> {
     Some(simple)
 }
 
+/// The basename of a program token (`/usr/bin/sudo` -> `sudo`).
+fn basename(prog: &str) -> &str {
+    prog.rsplit('/').next().unwrap_or(prog)
+}
+
+/// Collapse runs of ASCII whitespace to single spaces and trim. Used by the substring
+/// backstop so extra spacing (`rm -rf  /`) cannot dodge a denylist literal.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_recursive_flag(arg: &str) -> bool {
+    arg == "--recursive"
+        // bundled short flags like -rf / -fr / -R (single dash, not a long option)
+        || (arg.starts_with('-') && !arg.starts_with("--")
+            && arg.chars().skip(1).any(|c| c == 'r' || c == 'R'))
+}
+
+fn targets_root(args: &[String]) -> bool {
+    args.iter().any(|a| a == "/" || a == "/*" || a == "--no-preserve-root")
+}
+
+/// Structural catastrophe check for a single simple command (argv vector).
+fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
+    let prog = match argv.first() {
+        Some(p) => p,
+        None => return None,
+    };
+    let name = basename(prog);
+    let rest = &argv[1..];
+
+    if matches!(name, "sudo" | "doas" | "su") {
+        return Some(format!("privilege escalation via `{name}` is denied"));
+    }
+    if name == "rm" && rest.iter().any(|a| is_recursive_flag(a)) && targets_root(rest) {
+        return Some("recursive delete of a root path is denied".to_string());
+    }
+    if name == "dd" && rest.iter().any(|a| a.strip_prefix("of=")
+        .is_some_and(|v| v.starts_with("/dev/")))
+    {
+        return Some("`dd` writing to a block device is denied".to_string());
+    }
+    None
+}
+
+/// Hard floor: a command that is denied even if a user would approve it. Two layers:
+/// (A) structural per-simple-command checks, (B) an always-on normalized-substring
+/// backstop against the configured denylist. Either firing means deny.
+pub fn hard_floor_violation(cmd: &str, denylist: &[String]) -> Option<String> {
+    // Layer A: structural (only when the string tokenizes).
+    if let Some(simples) = split_simple_commands(cmd) {
+        for argv in &simples {
+            if let Some(reason) = simple_command_is_catastrophic(argv) {
+                return Some(reason);
+            }
+        }
+    }
+    // Layer B: always-on substring backstop (catches no-space operators, parse failures,
+    // and configured denylist literals). Fail-safe.
+    let norm = normalize_ws(cmd);
+    for pat in denylist {
+        let pnorm = normalize_ws(pat);
+        if !pnorm.is_empty() && norm.contains(&pnorm) {
+            return Some(format!("command matches denylist: {pat}"));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +133,54 @@ mod tests {
     #[test]
     fn unbalanced_quotes_returns_none() {
         assert!(split_simple_commands(r#"echo "unterminated"#).is_none());
+    }
+
+    fn floor(cmd: &str) -> Option<String> {
+        // Default hard-floor denylist literals (mirrors the runtime's HARD_FLOOR set).
+        let deny = vec!["sudo".to_string(), "rm -rf /".to_string(),
+            "dd if=".to_string(), ":(){".to_string()];
+        hard_floor_violation(cmd, &deny)
+    }
+
+    #[test]
+    fn floor_denies_rm_flag_and_spacing_variants() {
+        assert!(floor("rm -rf /").is_some());
+        assert!(floor("rm -fr /").is_some());
+        assert!(floor("rm --recursive --force /").is_some());
+        assert!(floor("rm -rf  /").is_some()); // double space
+        assert!(floor("rm -rf --no-preserve-root /").is_some());
+    }
+
+    #[test]
+    fn floor_denies_privilege_escalation_by_basename() {
+        assert!(floor("sudo reboot").is_some());
+        assert!(floor("/usr/bin/sudo reboot").is_some());
+        assert!(floor("echo hi && sudo reboot").is_some());
+    }
+
+    #[test]
+    fn floor_denies_no_space_operator_via_backstop() {
+        // No spaces around && — tokenizes as one token; caught by the substring backstop.
+        assert!(floor("echo x&&sudo reboot").is_some());
+    }
+
+    #[test]
+    fn floor_denies_dd_and_fork_bomb() {
+        assert!(floor("dd if=/dev/zero of=/dev/sda").is_some());
+        assert!(floor(":(){ :|:& };:").is_some());
+    }
+
+    #[test]
+    fn floor_denies_unparseable_with_denylisted_literal() {
+        // Unbalanced quote -> tokenization fails -> backstop still matches "sudo".
+        assert!(floor(r#"sudo "oops"#).is_some());
+    }
+
+    #[test]
+    fn floor_allows_benign_commands() {
+        assert!(floor("ls -la").is_none());
+        assert!(floor("git status").is_none());
+        assert!(floor("cat file.txt").is_none());
+        assert!(floor("rm file.txt").is_none()); // rm without recursive+root
     }
 }
