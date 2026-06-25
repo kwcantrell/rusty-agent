@@ -75,7 +75,8 @@ impl CuratedContext {
         out
     }
 
-    /// Borrow history (used by the compaction-failure test in Task 5).
+    /// Borrow history (used by the compaction-failure test).
+    #[cfg(test)]
     pub(crate) fn history(&self) -> &[Message] {
         &self.history
     }
