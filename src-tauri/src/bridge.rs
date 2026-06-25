@@ -19,6 +19,12 @@ impl Bridge {
         format!("ws://127.0.0.1:{}/agent", self.port)
     }
 
+    /// The workspace the next/active connection runs against (defaults to the
+    /// value passed at `start`, e.g. $HOME on first launch).
+    pub async fn current_workspace(&self) -> PathBuf {
+        self.workspace.lock().await.clone()
+    }
+
     /// Point the runtime at a new workspace: drop the active connection so the
     /// webview auto-reconnects into a fresh `serve()` bound to `dir`.
     pub async fn set_workspace(&self, dir: PathBuf) {

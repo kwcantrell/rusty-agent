@@ -18,10 +18,17 @@ fn get_local_ws_url(state: tauri::State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
-fn get_workspace(state: tauri::State<'_, AppState>) -> Option<String> {
-    workspace::AppConfig::load(&state.config_path)
-        .workspace
-        .map(|p| p.to_string_lossy().into_owned())
+async fn get_workspace(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
+    // Return the EFFECTIVE workspace (defaults to $HOME on first launch) so the
+    // TopBar always shows it + the Change… picker, even before one is persisted.
+    Ok(Some(
+        state
+            .bridge
+            .current_workspace()
+            .await
+            .to_string_lossy()
+            .into_owned(),
+    ))
 }
 
 #[tauri::command]
