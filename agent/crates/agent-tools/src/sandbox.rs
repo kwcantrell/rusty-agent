@@ -63,7 +63,7 @@ impl SandboxedChild {
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }
-    /// Kill the container (docker kill) or the local child; idempotent best-effort.
+    /// Kill the container (docker kill) or the local child, then reap it; idempotent best-effort.
     pub async fn kill(&mut self) {
         if let Some(name) = &self.container {
             let _ = tokio::process::Command::new("docker")
@@ -72,6 +72,8 @@ impl SandboxedChild {
         // Intentional dual-kill: docker kill stops the container; start_kill reaps
         // the local foreground `docker run` client process.
         let _ = self.child.start_kill();
+        // Reap now instead of relying on the kill_on_drop orphan reaper.
+        let _ = self.child.wait().await;
     }
 }
 
@@ -128,6 +130,36 @@ mod tests {
         CommandSpec { program: program.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: std::env::temp_dir(), env: Default::default(), kind: ProcKind::OneShot }
+    }
+
+    fn service_spec(program: &str, args: &[&str]) -> CommandSpec {
+        CommandSpec {
+            program: program.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            cwd: std::env::temp_dir(),
+            env: Default::default(),
+            kind: ProcKind::Service,
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_reaps_a_long_running_child() {
+        // A 30s sleeper: kill() must return almost immediately (kill + reap), not
+        // block until the process would naturally exit.
+        let mut sb = HostExecutor.launch(service_spec("sh", &["-c", "sleep 30"])).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), sb.kill())
+            .await
+            .expect("kill() must return promptly, not wait out the sleep");
+    }
+
+    #[tokio::test]
+    async fn kill_is_idempotent() {
+        let mut sb = HostExecutor.launch(service_spec("sh", &["-c", "sleep 30"])).unwrap();
+        sb.kill().await;
+        // A second kill on an already-reaped child returns promptly and does not panic.
+        tokio::time::timeout(Duration::from_secs(5), sb.kill())
+            .await
+            .expect("second kill() must return promptly");
     }
 
     #[tokio::test]
