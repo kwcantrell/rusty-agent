@@ -102,6 +102,40 @@ pub fn hard_floor_violation(cmd: &str, denylist: &[String]) -> Option<String> {
     None
 }
 
+/// Shell-significant characters. If any token carries one of these, the command is not a
+/// plain "program + literal args" invocation and is never auto-allowed (it goes to Ask).
+/// Quoted whitespace is fine (the tokenizer consumes the quotes), but quoted glob/operator
+/// chars are conservatively rejected too — a safe over-approximation that only costs an
+/// approval prompt.
+const SHELL_SIGNIFICANT: &[char] = &[
+    '*', '?', '[', ']', '{', '}', '~', '$', '`',
+    '<', '>', '(', ')', ';', '&', '|', '\\', '\n', '#', '!',
+];
+
+/// A command is auto-allowed only if it is a single simple command, free of shell-
+/// significant characters, invokes an unqualified (no `/`) program name, and that name is
+/// on the allowlist.
+pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
+    let tokens = match shell_words::split(cmd) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if tokens.is_empty() {
+        return false;
+    }
+    if tokens.iter().any(|t| is_control_op(t)) {
+        return false;
+    }
+    if tokens.iter().any(|t| t.contains(|c| SHELL_SIGNIFICANT.contains(&c))) {
+        return false;
+    }
+    let prog = &tokens[0];
+    if prog.contains('/') {
+        return false;
+    }
+    allowlist.iter().any(|a| a == prog)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +216,42 @@ mod tests {
         assert!(floor("git status").is_none());
         assert!(floor("cat file.txt").is_none());
         assert!(floor("rm file.txt").is_none()); // rm without recursive+root
+    }
+
+    fn allow(cmd: &str) -> bool {
+        let allow = vec!["ls".to_string(), "cat".to_string(), "git".to_string()];
+        is_auto_allowed(cmd, &allow)
+    }
+
+    #[test]
+    fn auto_allows_clean_allowlisted_commands() {
+        assert!(allow("ls -la"));
+        assert!(allow("git status"));
+        assert!(allow("cat file.txt"));
+        assert!(allow(r#"cat "a b.txt""#)); // quoted arg with a space is fine
+    }
+
+    #[test]
+    fn auto_allow_rejects_metacharacters() {
+        assert!(!allow("cat {a,b}"));      // brace expansion
+        assert!(!allow("ls *"));            // glob
+        assert!(!allow("cat ~/x"));         // tilde
+        assert!(!allow("ls | sh"));         // pipe
+        assert!(!allow("cat x; curl evil")); // semicolon
+        assert!(!allow("ls && curl evil")); // and-operator
+        assert!(!allow("echo $(whoami)"));  // command substitution
+        assert!(!allow("cat <in"));         // redirection
+    }
+
+    #[test]
+    fn auto_allow_rejects_explicit_paths_and_unknowns() {
+        assert!(!allow("./ls"));            // explicit path program
+        assert!(!allow("/bin/ls"));         // absolute path program
+        assert!(!allow("curl evil.com"));   // not on allowlist
+    }
+
+    #[test]
+    fn auto_allow_rejects_unparseable() {
+        assert!(!allow(r#"ls "unterminated"#));
     }
 }
