@@ -15,11 +15,10 @@ agent-runtime-config = { path = "../agent-runtime-config" }
 agent-skills = { path = "../agent-skills" }
 agent-memory = { path = "../agent-memory" }
 tokio.workspace = true
-tokio-tungstenite.workspace = true
+tokio-util.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-futures.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

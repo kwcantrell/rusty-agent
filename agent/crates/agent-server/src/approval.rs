@@ -1,33 +1,29 @@
-use crate::wire::{WireBody, WireEnvelope, PROTOCOL_VERSION};
+use crate::sink::EventSlot;
+use crate::wire::ServerEvent;
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
-/// `ApprovalChannel` that sends an `approval_request` frame and awaits an
-/// `approval_response` matched by correlation id. A disconnect/timeout
-/// resolves to `Deny` (safe default).
-pub struct WsApprovalChannel {
-    tx: mpsc::UnboundedSender<WireEnvelope>,
-    session: Arc<Mutex<String>>,
+/// `ApprovalChannel` that emits an `ApprovalRequest` over the live-read event
+/// slot and awaits an `approve` command matched by correlation id. A timeout or
+/// an absent channel resolves to `Deny` (safe default).
+pub struct IpcApprovalChannel {
+    slot: EventSlot,
     pending: Mutex<HashMap<String, oneshot::Sender<ApprovalResponse>>>,
     counter: AtomicU64,
     timeout: Duration,
 }
 
-impl WsApprovalChannel {
-    pub fn new(
-        tx: mpsc::UnboundedSender<WireEnvelope>,
-        session: Arc<Mutex<String>>,
-        timeout: Duration,
-    ) -> Self {
-        Self { tx, session, pending: Mutex::new(HashMap::new()), counter: AtomicU64::new(0), timeout }
+impl IpcApprovalChannel {
+    pub fn new(slot: EventSlot, timeout: Duration) -> Self {
+        Self { slot, pending: Mutex::new(HashMap::new()), counter: AtomicU64::new(0), timeout }
     }
 
-    /// Complete a pending approval, called by the daemon read loop.
+    /// Complete a pending approval, called by the `approve` command.
     pub fn resolve(&self, id: &str, decision: ApprovalResponse) {
         if let Some(tx) = self.pending.lock().unwrap().remove(id) {
             let _ = tx.send(decision);
@@ -36,24 +32,23 @@ impl WsApprovalChannel {
 }
 
 #[async_trait]
-impl ApprovalChannel for WsApprovalChannel {
+impl ApprovalChannel for IpcApprovalChannel {
     async fn request(&self, req: ApprovalRequest) -> ApprovalResponse {
         let id = format!("c{}", self.counter.fetch_add(1, Ordering::Relaxed));
         let (otx, orx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id.clone(), otx);
-        let env = WireEnvelope {
-            v: PROTOCOL_VERSION,
-            session_id: self.session.lock().unwrap().clone(),
-            id: Some(id.clone()),
-            body: WireBody::ApprovalRequest {
-                summary: req.intent.summary.clone(),
-                command: req.intent.command.clone(),
-                display: req.display.clone(),
-            },
+        let ev = ServerEvent::ApprovalRequest {
+            id: id.clone(),
+            summary: req.intent.summary.clone(),
+            command: req.intent.command.clone(),
+            display: req.display.clone(),
         };
-        if self.tx.send(env).is_err() {
-            self.pending.lock().unwrap().remove(&id);
-            return ApprovalResponse::Deny;
+        match self.slot.lock().unwrap().clone() {
+            Some(out) => out.send(ev),
+            None => {
+                self.pending.lock().unwrap().remove(&id);
+                return ApprovalResponse::Deny;
+            }
         }
         match tokio::time::timeout(self.timeout, orx).await {
             Ok(Ok(resp)) => resp,
@@ -68,35 +63,53 @@ impl ApprovalChannel for WsApprovalChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::{EventOut, ServerEvent};
     use agent_tools::{Access, ToolIntent};
+    use std::sync::{Arc, Mutex};
 
+    #[derive(Default)]
+    struct Captured(Mutex<Vec<ServerEvent>>);
+    impl EventOut for Captured {
+        fn send(&self, ev: ServerEvent) { self.0.lock().unwrap().push(ev); }
+    }
+    fn slot_with(out: Arc<Captured>) -> crate::sink::EventSlot {
+        Arc::new(Mutex::new(Some(out as Arc<dyn EventOut>)))
+    }
     fn req() -> ApprovalRequest {
         ApprovalRequest {
             intent: ToolIntent { tool: "execute_command".into(), access: Access::Write,
                 paths: vec![], command: Some("touch x".into()), summary: "run touch x".into() },
-            display: None,
-        }
+            display: None }
     }
 
     #[tokio::test]
-    async fn resolves_when_response_arrives() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let ch = Arc::new(WsApprovalChannel::new(tx, Arc::new(Mutex::new("s".into())),
-            Duration::from_secs(5)));
+    async fn emits_request_and_resolves() {
+        let cap = Arc::new(Captured::default());
+        let ch = Arc::new(IpcApprovalChannel::new(slot_with(cap.clone()), Duration::from_secs(5)));
         let ch2 = ch.clone();
         let h = tokio::spawn(async move { ch2.request(req()).await });
-        // The channel sent an approval_request; pull its correlation id.
-        let env = rx.recv().await.unwrap();
-        let id = env.id.clone().unwrap();
+        // Spin until the request frame appears, then pull its id.
+        let id = loop {
+            if let Some(ServerEvent::ApprovalRequest { id, .. }) = cap.0.lock().unwrap().first() {
+                break id.clone();
+            }
+            tokio::task::yield_now().await;
+        };
         ch.resolve(&id, ApprovalResponse::ApproveAlways);
         assert_eq!(h.await.unwrap(), ApprovalResponse::ApproveAlways);
     }
 
     #[tokio::test]
     async fn times_out_to_deny() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let ch = WsApprovalChannel::new(tx, Arc::new(Mutex::new("s".into())),
-            Duration::from_millis(20));
+        let cap = Arc::new(Captured::default());
+        let ch = IpcApprovalChannel::new(slot_with(cap), Duration::from_millis(20));
+        assert_eq!(ch.request(req()).await, ApprovalResponse::Deny);
+    }
+
+    #[tokio::test]
+    async fn absent_slot_denies() {
+        let slot: crate::sink::EventSlot = Arc::new(Mutex::new(None));
+        let ch = IpcApprovalChannel::new(slot, Duration::from_secs(5));
         assert_eq!(ch.request(req()).await, ApprovalResponse::Deny);
     }
 }

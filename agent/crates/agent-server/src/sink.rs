@@ -1,60 +1,88 @@
-use crate::wire::{wire_event_from, WireBody, WireEnvelope, PROTOCOL_VERSION};
+use crate::wire::{server_event_from, EventOut};
 use agent_core::{AgentEvent, EventSink};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 
-/// `EventSink` that serialises events as `WireEnvelope`s onto a channel.
-/// `emit` is synchronous (core requirement); a writer task drains the channel.
-pub struct WsEventSink {
-    tx: mpsc::UnboundedSender<WireEnvelope>,
-    session: Arc<Mutex<String>>,
+/// The live-read outbound slot, swapped by the `subscribe` command. Reading it
+/// per-emit (not snapshotting) lets a re-subscribe redirect an in-flight run.
+pub type EventSlot = Arc<Mutex<Option<Arc<dyn EventOut>>>>;
+
+/// `EventSink` that maps core events to `ServerEvent` and forwards them to the
+/// currently-registered `EventOut`. Absent slot → drop (infallible emit).
+pub struct ChannelEventSink {
+    slot: EventSlot,
 }
 
-impl WsEventSink {
-    pub fn new(tx: mpsc::UnboundedSender<WireEnvelope>, session: Arc<Mutex<String>>) -> Self {
-        Self { tx, session }
+impl ChannelEventSink {
+    pub fn new(slot: EventSlot) -> Self {
+        Self { slot }
     }
 }
 
-impl EventSink for WsEventSink {
+impl EventSink for ChannelEventSink {
     fn emit(&self, event: AgentEvent) {
-        let Some(payload) = wire_event_from(event) else { return };
-        let env = WireEnvelope {
-            v: PROTOCOL_VERSION,
-            session_id: self.session.lock().unwrap().clone(),
-            id: None,
-            body: WireBody::Event { payload },
-        };
-        let _ = self.tx.send(env);
+        let Some(ev) = server_event_from(event) else { return };
+        if let Some(out) = self.slot.lock().unwrap().clone() {
+            out.send(ev);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::ServerEvent;
+    use agent_core::{AgentEvent, EventSink};
+    use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn emits_token_envelope_with_session() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let session = Arc::new(Mutex::new("sess-1".to_string()));
-        let sink = WsEventSink::new(tx, session);
-        sink.emit(AgentEvent::Token("hello".into()));
-        let env = rx.try_recv().expect("one envelope");
-        assert_eq!(env.session_id, "sess-1");
-        assert!(matches!(env.body, WireBody::Event { .. }));
+    #[derive(Default)]
+    struct Captured(Mutex<Vec<ServerEvent>>);
+    impl crate::wire::EventOut for Captured {
+        fn send(&self, ev: ServerEvent) { self.0.lock().unwrap().push(ev); }
+    }
+
+    fn slot_with(out: Arc<Captured>) -> EventSlot {
+        Arc::new(Mutex::new(Some(out as Arc<dyn crate::wire::EventOut>)))
     }
 
     #[test]
-    fn approval_event_is_not_emitted() {
+    fn token_is_forwarded_as_server_event() {
+        let cap = Arc::new(Captured::default());
+        let sink = ChannelEventSink::new(slot_with(cap.clone()));
+        sink.emit(AgentEvent::Token("hello".into()));
+        let got = cap.0.lock().unwrap();
+        assert!(matches!(got.as_slice(), [ServerEvent::Token { text }] if text == "hello"));
+    }
+
+    #[test]
+    fn approval_event_is_not_forwarded() {
         use agent_policy::ApprovalRequest;
         use agent_tools::{Access, ToolIntent};
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = WsEventSink::new(tx, Arc::new(Mutex::new("s".into())));
+        let cap = Arc::new(Captured::default());
+        let sink = ChannelEventSink::new(slot_with(cap.clone()));
         sink.emit(AgentEvent::Approval(ApprovalRequest {
             intent: ToolIntent { tool: "x".into(), access: Access::Read, paths: vec![],
                 command: None, summary: "s".into() },
-            display: None,
-        }));
-        assert!(rx.try_recv().is_err());
+            display: None }));
+        assert!(cap.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn emit_with_empty_slot_is_a_noop() {
+        let slot: EventSlot = Arc::new(Mutex::new(None));
+        let sink = ChannelEventSink::new(slot);
+        sink.emit(AgentEvent::Token("x".into())); // must not panic
+    }
+
+    #[test]
+    fn relinks_to_a_new_out_live() {
+        let first = Arc::new(Captured::default());
+        let slot = slot_with(first.clone());
+        let sink = ChannelEventSink::new(slot.clone());
+        sink.emit(AgentEvent::Token("a".into()));
+        let second = Arc::new(Captured::default());
+        *slot.lock().unwrap() = Some(second.clone() as Arc<dyn crate::wire::EventOut>);
+        sink.emit(AgentEvent::Token("b".into()));
+        assert_eq!(first.0.lock().unwrap().len(), 1);
+        assert_eq!(second.0.lock().unwrap().len(), 1);
     }
 }
