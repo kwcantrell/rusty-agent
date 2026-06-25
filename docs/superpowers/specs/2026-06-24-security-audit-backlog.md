@@ -36,7 +36,14 @@ are the remaining verified findings, not yet specced.
   `tool_calls`, so the window-eviction budget and `Usage` events underestimate; amplified by
   auto-preserve. (Long-standing; known.)
 
-## Cluster C — HTTP redirect policy bypass (`agent-http`) — fast-follow to the boundary spec
+## Cluster C — HTTP redirect policy bypass (`agent-http`) — PROMOTED TO SPEC
+
+> Promoted (2026-06-25) to `2026-06-25-policy-boundary-consistency-design.md`,
+> together with a newly-found sibling: the read-path approval gate in
+> `agent-policy/src/engine.rs:43-50` uses a non-normalizing `starts_with`, so a
+> `../`-escaping relative read returns `Decision::Allow` and skips the approval
+> prompt (execute() still hard-blocks via `resolve_in_workspace`). Same root
+> cause — fixed by reusing `resolve_in_workspace` for the decision.
 
 - **HIGH — redirects bypass the allowlist/approval policy** (`agent-http/src/tool.rs:~190-207`).
   Approval is computed from the original URL's host; the redirect loop re-runs only the SSRF guard,
