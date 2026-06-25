@@ -80,6 +80,8 @@ pub struct AssistantTurn {
     pub raw_tool_calls: Vec<RawToolCall>,
     pub stop: StopReason,
     pub reasoning: String,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
 }
 
 #[derive(Debug, Clone)]
