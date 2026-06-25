@@ -84,15 +84,26 @@ retries a logged dead end.
   `agent-server` — `AgentEvent::ServerUsage` (added by the eval-harness merge) is unhandled
   in its match. Reproduces on clean `HEAD`. `agent-core`/`agent-runtime-config` are clean.
 
-## Held-out tasks (still none — validation pending)
+## Held-out tasks
 
-- The v1 promotion was gated only on `drift-ledger` (the sole admitted task). Before trusting
-  generalization, add weakness-first held-out tasks for **other modes** — especially:
-  - an `offload`-pressure task (large tool outputs), to confirm v1 didn't regress offload;
-  - a **long-horizon** compaction task (many user turns) to exercise the deferred
-    build()-truncation-drops-old-user-turns tradeoff;
-  - a `memory-under-recall` task.
-  Then re-run v1 vs v0 on them and require `heldout_ok` (no per-task pass-rate regression).
+- **offload-recall** (mode=`offload`, `tasks/offload-recall/`) — added 2026-06-25 to guard the
+  offload→`context_recall` path (a *different* mode from drift-ledger's compaction). The agent
+  reads 3 large files (each >1024B → offloaded), **overwrites** alpha.txt (so the original
+  secret survives ONLY in the offloaded read result — re-reading the file returns 'archived'),
+  then must write alpha's original `SECRET CODE`. This defeats the re-read escape hatch, so a
+  pass means the model genuinely recalled offloaded content.
+  - **Validation result (N=5 each):** favorable **5/5**; v0 realistic@4000 **5/5**;
+    v1 realistic@4000 **5/5** (also 5/5 at tighter windows 2500). `heldout_ok(v0,v1)` =
+    **PASS** (1.0 ≥ 1.0) → **v1 does not regress offload**.
+  - **Finding:** v1's compaction summarizes the `Role::Tool` placeholder (tool turns aren't
+    kept verbatim), yet recall still works — the model recovers the secret even with the file
+    overwritten. The offload round-trip is robust under v1's cumulative summaries.
+  - **Admit verdict = `NoWeakness`** (realistic passes for BOTH v0 and v1). So this is a
+    **regression guard**, not a discriminator: neither version finds offload+recall hard at
+    these windows. A truly weakness-first offload task would need a harder retrieval barrier
+    (e.g. multiple competing placeholders + a derived multi-file answer) — deferred.
+- Still missing: a **long-horizon** compaction task (many user turns) to exercise the deferred
+  build()-truncation-drops-old-user-turns tradeoff; a `memory-under-recall` task.
 
 ## Iteration log
 
