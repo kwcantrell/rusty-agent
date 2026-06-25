@@ -97,33 +97,58 @@ hands you a clean protocol socket.
 
 ## GUI driving — last resort (only to validate actual rendering/UX)
 
-If you genuinely must drive the rendered window:
+This path **works on this machine** — verified 2026-06-24 end-to-end: typed a prompt
+into the composer, clicked Send, and saw the model's `pong` render in the transcript.
+But it only works after clearing **two gates** and using XTEST correctly:
 
-1. Force the webview onto **XWayland** so the only installed input tool works:
-   `GDK_BACKEND=x11 npm run desktop:dev`.
-2. Find the window and drive it with `xdotool` (confirm the actual title first —
-   `xdotool search --name .` or check `tauri.conf.json`'s window `title`):
-   `xdotool search --name 'rust-agent-runtime' windowactivate --sync key --clearmodifiers Return`
-   (type with `xdotool type`, click with `xdotool mousemove`/`click`).
-3. Capture state with `spectacle -b -n -o /tmp/shot.png` (background, no-notify).
-4. **Still assert via the WS bridge or app logs, not the screenshot** — `xdotool`
-   can inject input but cannot read the web DOM. To watch the running app's bridge
-   externally, find its ephemeral port: `ss -tlnp | grep <app-pid>`.
+1. **Run the webview on XWayland** so `xdotool` can see it:
+   `GDK_BACKEND=x11 npm run desktop:dev`. Without this the window is a native
+   Wayland surface and `xdotool` silently no-ops. Then grab the id:
+   `WID=$(DISPLAY=:0 xdotool search --name 'rust-agent-runtime' | head -1)`
+   (title comes from `tauri.conf.json`; window is 1280×820).
 
-Without `GDK_BACKEND=x11`, `xdotool` will silently fail to find/drive the window
-(it's a native Wayland surface). Now that `libxdo-dev` is installed you can also
-drive X11/XWayland input from Rust via the `enigo` crate (links `-lxdo`) instead
-of shelling out to `xdotool` — but it is still **X11-only**, not native Wayland.
-To stay pure-Wayland instead, you must first install `ydotool` (uinput, needs
-root) or `kdotool` — neither is present today.
+2. **Approve KWin's input-control consent ONCE per session.** The first synthetic
+   event raises a KDE *"Remote Control — An application is asking for special
+   privileges: Control input devices"* Approve/Deny dialog (KWin gating XTEST
+   fake-input). Until a **human** clicks Approve, no injected input reaches any
+   app — your keystrokes just raise the prompt. You cannot reliably self-approve
+   it (that click is itself gated); ask the user to click Approve. The grant
+   persists for the rest of the session.
+
+3. **Inject the way WebKit accepts it** (the load-bearing gotcha):
+   - Position the pointer **window-relative** (sidesteps the HiDPI screen-coord mess
+     — xdotool's logical space is 3840×2160 but the framebuffer is 6400×2160):
+     `xdotool mousemove --window "$WID" <x> <y>`
+   - Click/type with **XTEST — NO `--window`**: `xdotool click 1`; to focus an
+     input, click it, then `xdotool type --delay 50 "your text"`.
+   - **Never** `xdotool type/key --window <id>` into the webview — that uses
+     `XSendEvent`, which WebKitGTK **silently ignores** (text never lands). This is
+     the #1 reason a "successful" type does nothing.
+   - Coord mapping for the 1280×820 window: window-relative ≈
+     `(screenshot_x − ~40, screenshot_y − ~95)`; calibrate against a screenshot.
+
+4. **Assert with a screenshot** — `xdotool` can inject input but cannot read the DOM:
+   `spectacle -b -n -a -o /tmp/shot.png` (background, no-notify, active-window;
+   captures at logical scale ~1410×978, readable). Read the PNG to verify layout /
+   that a click did the right thing. To watch the running app's bridge externally
+   instead, find its ephemeral port: `ss -tlnp | grep <app-pid>`.
+
+`libxdo-dev` is installed, so you can alternatively drive X11/XWayland input from
+Rust via the `enigo` crate (links `-lxdo`) — still X11-only, still behind gate 2.
+For pure-Wayland input you'd need `ydotool` (uinput, root) or `kdotool` — neither is
+present today.
 
 ## Common mistakes
 
 - Trying to `xdotool` the window in the default Wayland session → no-op. Use
   `GDK_BACKEND=x11`, or better, drive the bridge.
+- `xdotool type/key --window <id>` into the webview → silently ignored
+  (`XSendEvent`). Click to focus, then type with XTEST (no `--window`).
+- First synthetic input "does nothing" → it raised KWin's "Control input devices"
+  prompt; a human must click Approve once per session before input flows.
 - Running L1/e2e without `llama-server` on :8080 → hang/timeout. Check
   `curl localhost:8080/health` first.
 - `source ~/.cargo/env` → unnecessary; cargo is on PATH.
 - Hardcoding a bridge port → it's ephemeral; read `bridge.ws_url()`.
-- Asserting on screenshots → flaky and can't see the DOM; assert on `event`
-  frames (`done`/`error`/`token`).
+- Asserting on screenshots for L0/L1 → assert on `event` frames
+  (`done`/`error`/`token`); screenshots are only for L2 GUI rendering checks.
