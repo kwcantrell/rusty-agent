@@ -95,6 +95,7 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
         AgentEvent::Error(m) => ServerEvent::Error { message: m },
         AgentEvent::Done(r) => ServerEvent::Done { reason: stop_reason_str(&r).into() },
         AgentEvent::Approval(_) => return None,
+        AgentEvent::Context(_) => return None, // curation telemetry; not forwarded to clients in v1
     })
 }
 

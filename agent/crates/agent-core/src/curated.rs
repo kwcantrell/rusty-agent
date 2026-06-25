@@ -1,7 +1,12 @@
-use crate::context::{message_tokens, recall_block, ContextManager, DEFAULT_RECALL_TOKEN_BUDGET};
+use crate::context::{
+    message_tokens, recall_block, ContextManager, MaintCtx, MaintReport,
+    DEFAULT_RECALL_TOKEN_BUDGET,
+};
+use crate::event::{AgentEvent, ContextEvent};
 use crate::offload::OffloadStore;
-use crate::offload_policy::OffloadConfig;
+use crate::offload_policy::{placeholder_for, select_offloads, OffloadConfig};
 use agent_model::Message;
+use async_trait::async_trait;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -78,6 +83,7 @@ impl CuratedContext {
     }
 }
 
+#[async_trait]
 impl ContextManager for CuratedContext {
     fn append(&mut self, msg: Message) {
         self.history.push(msg);
@@ -117,14 +123,39 @@ impl ContextManager for CuratedContext {
         out.extend(kept_rev);
         out
     }
-    // `maintain` uses the trait default until Task 4 overrides it.
+
+    async fn maintain(&mut self, deps: &MaintCtx<'_>) -> MaintReport {
+        let mut report = MaintReport::default();
+
+        // (a) Deterministic offload — sync, cheap, every turn.
+        let hits = select_offloads(&self.history, &self.config);
+        for hit in hits {
+            let idx = hit.history_index;
+            let tool = hit.entry.tool_name.clone();
+            let kind = hit.entry.kind.clone();
+            let bytes = hit.entry.bytes;
+            let id = self.store.put(hit.entry);
+            self.history[idx].content = placeholder_for(id, &tool, &kind, bytes);
+            report.offloaded += 1;
+            report.offloaded_bytes += bytes;
+            deps.sink
+                .emit(AgentEvent::Context(ContextEvent::Offloaded { id, bytes, tool }));
+        }
+
+        // (b) Compaction added in Task 5.
+        report
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::MaintCtx;
+    use crate::event::EventSink;
     use crate::offload::InMemoryOffloadStore;
-    use agent_model::Role;
+    use crate::testkit::{CollectingSink, ScriptedModel};
+    use agent_model::{ModelClient, Role};
+    use tokio_util::sync::CancellationToken;
 
     fn ctx() -> CuratedContext {
         CuratedContext::new(
@@ -132,6 +163,14 @@ mod tests {
             Arc::new(InMemoryOffloadStore::new()),
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    fn maint_deps<'a>(
+        model: &'a Arc<dyn ModelClient>,
+        sink: &'a Arc<dyn EventSink>,
+        cancel: &'a CancellationToken,
+    ) -> MaintCtx<'a> {
+        MaintCtx { model_limit: 100_000, model, sink, cancel }
     }
 
     #[test]
@@ -175,5 +214,41 @@ mod tests {
         c.append(Message::user("hi"));
         let built = c.build(100_000);
         assert_eq!(built.len(), 2); // system + history (no goal/recall set)
+    }
+
+    #[tokio::test]
+    async fn maintain_offloads_stale_large_error_to_store_and_leaves_placeholder() {
+        let mut c = ctx().with_offload_config(OffloadConfig {
+            keep_recent: 0,
+            ..Default::default()
+        });
+        let big_err = format!("ERROR: {}", "x".repeat(400));
+        c.append(Message::tool("call-1", "shell", big_err.clone()));
+
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+
+        assert_eq!(report.offloaded, 1);
+        assert_eq!(c.store.len(), 1);
+        // Live message is now a placeholder; full content recoverable from the store.
+        let built = c.build(100_000);
+        let tool_msg = built.iter().find(|m| matches!(m.role, Role::Tool)).unwrap();
+        assert!(tool_msg.content.starts_with("[tool_result#1 offloaded"));
+        assert_eq!(c.store.get(1).unwrap().content, big_err);
+    }
+
+    #[tokio::test]
+    async fn maintain_is_idempotent() {
+        let mut c = ctx().with_offload_config(OffloadConfig { keep_recent: 0, ..Default::default() });
+        c.append(Message::tool("call-1", "shell", format!("ERROR: {}", "x".repeat(400))));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        let report2 = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        assert_eq!(report2.offloaded, 0, "second pass must not re-offload");
+        assert_eq!(c.store.len(), 1);
     }
 }
