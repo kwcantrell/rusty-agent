@@ -117,3 +117,24 @@ async fn b1_duplicate_tool_call_ids_through_assembled_loop() {
     assert_eq!(tool_ids.len(), 2, "two tool messages expected: {tool_ids:?}");
     assert_ne!(tool_ids[0], tool_ids[1], "duplicate ids must normalize to distinct");
 }
+
+// T2 — B3: a pre-cancelled token stops the assembled loop cleanly, before the
+// model is ever consulted. (run_with_cancel is the B3 entry point.)
+#[tokio::test]
+async fn b3_precancelled_token_stops_assembled_loop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().to_path_buf();
+    let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("should not run".into())]));
+    let (built, sink) = assemble_test(ws, model, Arc::new(AlwaysApprove));
+    let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()));
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel(); // cancelled before the run starts
+
+    built.loop_.run_with_cancel(&mut ctx, "go".into(), cancel).await.unwrap();
+
+    // Only the terminal Done(Cancelled); no Usage/Token (model never consulted).
+    let events = sink.events.lock().unwrap().clone();
+    assert_eq!(events, vec!["done:Cancelled".to_string()], "events: {events:?}");
+    assert!(sink.text.lock().unwrap().is_empty(), "no model text should stream");
+}
