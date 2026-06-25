@@ -14,6 +14,9 @@ pub enum AgentEvent {
     Token(String),
     Reasoning(String),
     Usage { prompt_tokens: usize, context_limit: usize, turn: usize, max_turns: usize },
+    /// Server-reported token usage for a completed turn (the faithful metric;
+    /// `Usage.prompt_tokens` above is the pre-request local estimate).
+    ServerUsage { prompt_tokens: u32, completion_tokens: u32, turn: usize },
     ToolStart { name: String, args: serde_json::Value },
     ToolResult { name: String, output: ToolOutput },
     Approval(ApprovalRequest),

@@ -72,7 +72,7 @@ pub struct RawToolCall {
 }
 
 #[derive(Debug, Clone)]
-pub enum Chunk { Text(String), Reasoning(String), ToolCallDelta(RawToolCall), Done(StopReason) }
+pub enum Chunk { Text(String), Reasoning(String), ToolCallDelta(RawToolCall), Done(StopReason), Usage { prompt_tokens: u32, completion_tokens: u32 } }
 
 #[derive(Debug, Clone, Default)]
 pub struct AssistantTurn {
@@ -80,6 +80,8 @@ pub struct AssistantTurn {
     pub raw_tool_calls: Vec<RawToolCall>,
     pub stop: StopReason,
     pub reasoning: String,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
 }
 
 #[derive(Debug, Clone)]

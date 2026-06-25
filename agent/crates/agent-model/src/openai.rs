@@ -123,6 +123,7 @@ impl OpenAiCompatClient {
                 })
                 .collect::<Vec<_>>());
         }
+        b["stream_options"] = json!({ "include_usage": true });
         b
     }
 }
@@ -200,6 +201,12 @@ fn parse_sse_line(line: &str, splitter: &mut ThinkingSplitter) -> Option<Result<
             _ => StopReason::Stop,
         };
         out.push(Chunk::Done(stop));
+    }
+    if let Some(u) = v.get("usage").and_then(Value::as_object) {
+        out.push(Chunk::Usage {
+            prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+            completion_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+        });
     }
     Some(Ok(out))
 }
@@ -321,6 +328,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_sse_line_extracts_server_usage() {
+        let mut s = ThinkingSplitter::default();
+        let line = r#"data: {"choices":[],"usage":{"prompt_tokens":1234,"completion_tokens":56}}"#;
+        let out = parse_sse_line(line, &mut s).unwrap().unwrap();
+        assert!(matches!(
+            out.as_slice(),
+            [Chunk::Usage { prompt_tokens: 1234, completion_tokens: 56 }]
+        ));
+    }
+
+    #[test]
     fn sse_line_buffer_preserves_multibyte_char_split_across_chunks() {
         let mut b = SseLineBuffer::default();
         // "5°C" — '°' is 0xC2 0xB0; split the two bytes across separate pushes,
@@ -399,6 +417,7 @@ mod tests {
                 Chunk::Done(r) => done = Some(r),
                 Chunk::ToolCallDelta(_) => {}
                 Chunk::Reasoning(_) => {}
+                Chunk::Usage { .. } => {}
             }
         }
         assert_eq!(text, "Hello");
@@ -495,6 +514,7 @@ mod tests {
                 Chunk::Reasoning(r) => reasoning.push_str(&r),
                 Chunk::Done(r) => done = Some(r),
                 Chunk::ToolCallDelta(_) => {}
+                Chunk::Usage { .. } => {}
             }
         }
         assert_eq!(reasoning, "thinking hard");

@@ -98,6 +98,7 @@ impl AgentLoop {
         let mut reasoning = String::new();
         let mut raw_tool_calls: Vec<RawToolCall> = Vec::new();
         let mut stop = StopReason::Stop;
+        let mut usage = (0u32, 0u32);
         loop {
             let step = tokio::select! {
                 _ = cancel.cancelled() => return Err(ModelError::Stream("cancelled".into())),
@@ -112,10 +113,13 @@ impl AgentLoop {
                     Chunk::Reasoning(r) => { self.sink.emit(AgentEvent::Reasoning(r.clone())); reasoning.push_str(&r); }
                     Chunk::ToolCallDelta(rc) => merge_tool_call(&mut raw_tool_calls, rc),
                     Chunk::Done(r) => stop = r,
+                    Chunk::Usage { prompt_tokens, completion_tokens } => {
+                        usage = (prompt_tokens, completion_tokens);
+                    }
                 },
             }
         }
-        Ok(AssistantTurn { text, raw_tool_calls, stop, reasoning })
+        Ok(AssistantTurn { text, raw_tool_calls, stop, reasoning, prompt_tokens: usage.0, completion_tokens: usage.1 })
     }
 
     /// Stream with retry/backoff on transport errors.
@@ -199,6 +203,11 @@ impl AgentLoop {
                 }
                 Err(e) => return Err(e),
             };
+            self.sink.emit(AgentEvent::ServerUsage {
+                prompt_tokens: assistant.prompt_tokens,
+                completion_tokens: assistant.completion_tokens,
+                turn: turn + 1,
+            });
 
             let mut parsed = match self.protocol.parse(&assistant) {
                 Ok(p) => { protocol_repairs = 0; p }
@@ -524,6 +533,25 @@ mod tests {
 
     fn policy(ws: std::path::PathBuf) -> Arc<RulePolicy> {
         Arc::new(RulePolicy { workspace: ws, command_allowlist: vec![], command_denylist: vec![] })
+    }
+
+    #[tokio::test]
+    async fn server_usage_event_carries_token_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::TextWithUsage("done".into(), 900, 12)]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "hi".into()).await.unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        assert!(events.iter().any(|e| e == "server_usage:900:12"),
+            "expected server_usage event with real token totals; got {events:?}");
     }
 
     #[tokio::test]

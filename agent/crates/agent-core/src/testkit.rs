@@ -24,6 +24,8 @@ pub enum Scripted {
     HangOpen,
     /// Emits a reasoning chunk then a final answer (no tool calls): (reasoning, answer).
     Reasoning(String, String),
+    /// Final text plus a server usage chunk: (answer, prompt_tokens, completion_tokens).
+    TextWithUsage(String, u32, u32),
 }
 
 pub struct ScriptedModel { turns: Mutex<std::collections::VecDeque<Scripted>> }
@@ -58,6 +60,10 @@ impl ModelClient for ScriptedModel {
             }
             Scripted::Reasoning(reasoning, answer) => Ok(stream::iter(vec![
                 Ok(Chunk::Reasoning(reasoning)), Ok(Chunk::Text(answer)),
+                Ok(Chunk::Done(StopReason::Stop))]).boxed()),
+            Scripted::TextWithUsage(answer, prompt_tokens, completion_tokens) => Ok(stream::iter(vec![
+                Ok(Chunk::Text(answer)),
+                Ok(Chunk::Usage { prompt_tokens, completion_tokens }),
                 Ok(Chunk::Done(StopReason::Stop))]).boxed()),
             Scripted::Hang => Ok(stream::pending().boxed()),
             Scripted::HangOpen => {
@@ -94,6 +100,9 @@ impl EventSink for CollectingSink {
             AgentEvent::Token(t) => format!("token:{t}"),
             AgentEvent::Reasoning(r) => format!("reasoning:{r}"),
             AgentEvent::Usage { prompt_tokens, .. } => format!("usage:{prompt_tokens}"),
+            AgentEvent::ServerUsage { prompt_tokens, completion_tokens, .. } => {
+                format!("server_usage:{prompt_tokens}:{completion_tokens}")
+            }
             AgentEvent::ToolStart { name, .. } => format!("tool_start:{name}"),
             AgentEvent::ToolResult { name, .. } => format!("tool_result:{name}"),
             AgentEvent::Approval(_) => "approval".into(),
