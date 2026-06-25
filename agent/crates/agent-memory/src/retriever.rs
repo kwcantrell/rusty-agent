@@ -72,4 +72,32 @@ mod tests {
         };
         assert!(r.retrieve("anything").await.is_empty());
     }
+
+    /// The unit tests above use `StubEmbedder`, which only scores *exact* text
+    /// above threshold — so they never prove semantic retrieval, the whole point
+    /// of auto-retrieval. This test uses the real BGE-Small model: it seeds
+    /// distinctly-worded memories and queries with related-but-not-identical text,
+    /// asserting the semantically-matching memory comes back. Ignored by default
+    /// (downloads the model on first run); run with `cargo test -- --ignored`.
+    #[cfg(feature = "onnx")]
+    #[tokio::test]
+    #[ignore = "downloads/loads the real BGE-Small embedding model (network on first run)"]
+    async fn real_embedder_retrieves_semantically_related_memory() {
+        let cfg = Arc::new(MemoryConfig::default());
+        let embedder: Arc<dyn Embedder> =
+            Arc::new(crate::embedder::FastEmbedEmbedder::new(&cfg).expect("load BGE model"));
+        let store = Arc::new(InMemoryStore::new());
+        seed(&store, embedder.as_ref(), "K", "the user's favorite programming language is Rust").await;
+        seed(&store, embedder.as_ref(), "K", "deployments happen on Friday afternoons").await;
+        seed(&store, embedder.as_ref(), "K", "the production database is PostgreSQL 16").await;
+
+        let r = MemoryRetriever { embedder, store, cfg, project_key: "K".into() };
+        // Related to the Rust memory but NOT its stored wording — exactly what a
+        // StubEmbedder cannot match.
+        let lines = r.retrieve("which language should I write this service in?").await;
+        assert!(
+            lines.iter().any(|l| l.contains("Rust")),
+            "expected the Rust memory retrieved by semantic similarity; got: {lines:?}"
+        );
+    }
 }
