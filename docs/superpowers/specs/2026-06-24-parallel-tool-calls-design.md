@@ -113,8 +113,25 @@ Correctness lock (1–2), concurrency guarantees (3–5), real-world (6):
    assert `tool` messages are still appended in order 1, 2.
 5. **Approval serialization** — two `Ask` calls → an approval channel that records in-flight
    count asserts it never exceeds 1.
-6. **e2e (optional, gated like `tests/e2e_sglang.rs`)** — live-server prompt
-   (weather Paris + Tokyo) → 2 id-matched tool results.
+6. **e2e smoke (opt-in, non-blocking)** — mirror `tests/e2e_sglang.rs` exactly:
+   `#[ignore = "requires AGENT_E2E_URL / AGENT_E2E_MODEL and a live server"]`, driven by
+   the `AGENT_E2E_URL` / `AGENT_E2E_MODEL` (+ optional `AGENT_API_KEY`) env vars, run via
+   `cargo test -p agent-core --test <file> -- --ignored --nocapture`. Invisible to normal
+   `cargo test`; it is **not** a required/CI-blocking gate. Design for a clean manual
+   signal:
+   - **Deterministic local tools** — read two distinct workspace files (or one tool
+     invoked with two different args), so result content is checkable without an external
+     API.
+   - **Low temperature + an unambiguous "do BOTH" prompt** to coax two parallel calls.
+   - **Distinguish a loop bug from model behavior:** assert that for however many calls
+     came back, the loop produced exactly that many correctly-id-matched `tool` messages
+     in order. If the model emits `<2` calls, **fail with an explicit "model did not emit
+     parallel calls — inconclusive" message** rather than a misleading pass.
+
+   Rationale for opt-in (not required): emitting *parallel* calls is probabilistic, and the
+   test needs a live server + host-network boundary. Tests 1–5 are the deterministic
+   correctness lock that runs everywhere; #6 only adds confirmation that the real chat
+   template + SSE wire format still round-trips multiple `tool_calls`.
 
 ## Verification
 
