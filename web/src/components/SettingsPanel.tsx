@@ -169,6 +169,11 @@ export function SettingsPanel({ settings, meta, error, disabled, onSave, onClose
               onChange={(e) => set("preserve_thinking", e.target.checked)} />
             Preserve thinking in history
           </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input id="memory" type="checkbox" checked={form.memory}
+              onChange={(e) => set("memory", e.target.checked)} />
+            Long-term memory (remember/recall across sessions)
+          </label>
         </section>
 
         <section className="mb-4 space-y-3">

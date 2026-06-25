@@ -8,7 +8,7 @@ const base: RuntimeSettings = {
   command_allowlist: [], command_denylist: [], temperature: 0.2, max_tokens: 2048,
   max_turns: 25, context_limit: 8192,
   top_p: null, top_k: null, min_p: null, presence_penalty: null, repeat_penalty: null,
-  enable_thinking: true, preserve_thinking: false,
+  enable_thinking: true, preserve_thinking: false, memory: true,
   skills_dirs: [], active_skills: [],
 };
 
@@ -53,5 +53,14 @@ describe("SettingsPanel sampling inputs", () => {
     fireEvent.click(screen.getByLabelText("Enable thinking"));
     fireEvent.click(screen.getByText("Save"));
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ enable_thinking: false }));
+  });
+
+  it("toggles memory off and saves it", () => {
+    const onSave = vi.fn();
+    render(<SettingsPanel settings={base} meta={null} error={null} disabled={false}
+      onSave={onSave} onClose={() => {}} />);
+    fireEvent.click(screen.getByLabelText("Long-term memory (remember/recall across sessions)"));
+    fireEvent.click(screen.getByText("Save"));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ memory: false }));
   });
 });

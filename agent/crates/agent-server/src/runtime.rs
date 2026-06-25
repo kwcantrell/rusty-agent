@@ -1,7 +1,7 @@
 use crate::approval::WsApprovalChannel;
 use crate::sink::WsEventSink;
 use crate::wire::{DiscoveredSkill, WireBody, WireEnvelope, PROTOCOL_VERSION};
-use agent_core::{AgentLoop, LoopConfig, DEFAULT_STREAM_IDLE_TIMEOUT};
+use agent_core::{AgentLoop, LoopConfig, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT};
 use agent_policy::RulePolicy;
 use agent_runtime_config::{build_model, build_registry, build_sandbox, build_skills, pick_protocol, RuntimeConfig, HARD_FLOOR_DENYLIST};
 use agent_skills::{compose_system_prompt, SkillRegistry};
@@ -28,6 +28,7 @@ pub struct RuntimeState {
     tx: mpsc::UnboundedSender<WireEnvelope>,
     mcp_tools: Arc<[Arc<dyn Tool>]>,
     memory_tools: Arc<[Arc<dyn Tool>]>,
+    memory_retriever: Option<Arc<dyn Retriever>>,
     base_system_prompt: String,
     system_prompt: Mutex<String>,
 }
@@ -46,12 +47,13 @@ impl RuntimeState {
         tx: mpsc::UnboundedSender<WireEnvelope>,
         mcp_tools: Arc<[Arc<dyn Tool>]>,
         memory_tools: Arc<[Arc<dyn Tool>]>,
+        memory_retriever: Option<Arc<dyn Retriever>>,
         base_system_prompt: String,
     ) -> Self {
         let config = config.normalized();
         let built = build_loop(
             &config, &sink, &approval, &workspace, &api_key, &claude_binary, &mcp_tools,
-            &memory_tools, &base_system_prompt);
+            &memory_tools, memory_retriever.as_ref(), &base_system_prompt);
         // Startup is lenient: an unknown persisted preset is already warned + dropped
         // inside build_loop, so the daemon always boots.
         Self {
@@ -59,7 +61,7 @@ impl RuntimeState {
             config: Mutex::new(config),
             system_prompt: Mutex::new(built.system_prompt),
             sink, approval, workspace, api_key, claude_binary, config_path, session, tx,
-            mcp_tools, memory_tools, base_system_prompt,
+            mcp_tools, memory_tools, memory_retriever, base_system_prompt,
         }
     }
 
@@ -81,7 +83,8 @@ impl RuntimeState {
         cfg.validate()?;
         let built = build_loop(
             &cfg, &self.sink, &self.approval, &self.workspace, &self.api_key,
-            &self.claude_binary, &self.mcp_tools, &self.memory_tools, &self.base_system_prompt);
+            &self.claude_binary, &self.mcp_tools, &self.memory_tools,
+            self.memory_retriever.as_ref(), &self.base_system_prompt);
         if !built.unknown_presets.is_empty() {
             // Strict on the wire: a typo'd / missing active skill is a hard error.
             return Err(format!("unknown active skill(s): {}", built.unknown_presets.join(", ")));
@@ -168,6 +171,7 @@ fn build_loop(
     claude_binary: &str,
     mcp_tools: &[Arc<dyn Tool>],
     memory_tools: &[Arc<dyn Tool>],
+    memory_retriever: Option<&Arc<dyn Retriever>>,
     base_system_prompt: &str,
 ) -> BuiltLoop {
     let model = build_model(&cfg.backend, &cfg.base_url, &cfg.model, claude_binary, api_key.clone());
@@ -180,8 +184,10 @@ fn build_loop(
     for t in mcp_tools {
         registry.register(t.clone());
     }
-    for t in memory_tools {
-        registry.register(t.clone());
+    if cfg.memory {
+        for t in memory_tools {
+            registry.register(t.clone());
+        }
     }
     // Skills: build the registry + the 4 tools from the configured roots.
     let (skill_registry, skill_tools) = build_skills(&cfg.skills_dirs, workspace);
@@ -215,7 +221,7 @@ fn build_loop(
 
     #[cfg(test)]
     let registered_names: Vec<String> = registry.schemas().into_iter().map(|s| s.name).collect();
-    let loop_ = Arc::new(AgentLoop::new(
+    let agent = AgentLoop::new(
         model,
         pick_protocol(&cfg.protocol),
         Arc::new(registry),
@@ -241,7 +247,12 @@ fn build_loop(
             sandbox: Some(build_sandbox(cfg)),
             max_parallel_tools: 8,
         },
-    ));
+    );
+    let agent = match (cfg.memory, memory_retriever) {
+        (true, Some(r)) => agent.with_retriever(r.clone()),
+        _ => agent,
+    };
+    let loop_ = Arc::new(agent);
     BuiltLoop {
         loop_,
         system_prompt,
@@ -273,7 +284,7 @@ mod tests {
             "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
         let rs = RuntimeState::new(cfg, sink, approval, dir.path().to_path_buf(), None,
             "claude".into(), path, session, tx, Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            Arc::from(Vec::<Arc<dyn Tool>>::new()), None,
             crate::daemon::SYSTEM_PROMPT.to_string());
         (rs, rx, dir)
     }
@@ -381,7 +392,7 @@ mod tests {
         cfg.active_skills = vec!["ghost".into()];
         let rs = RuntimeState::new(cfg, sink, approval, dir.path().to_path_buf(), None,
             "claude".into(), path, session, tx, Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            Arc::from(Vec::<Arc<dyn Tool>>::new()), None,
             crate::daemon::SYSTEM_PROMPT.to_string());
         // Booted: base prompt present, the ghost preset silently dropped.
         assert!(rs.current_system_prompt().contains("local coding agent"));
@@ -405,7 +416,7 @@ mod tests {
             "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
         let rs = RuntimeState::new(cfg, sink, approval, dir.path().to_path_buf(), None,
             "claude".into(), path, session, tx, Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            Arc::from(Vec::<Arc<dyn Tool>>::new()), None,
             crate::daemon::SYSTEM_PROMPT.to_string());
         assert!(rs.handle(&WireBody::SettingsGet));
         let env = rx.try_recv().expect("a frame");
@@ -431,7 +442,7 @@ mod tests {
         // build_loop must succeed — off → HostExecutor, no Docker required.
         let result = build_loop(
             &cfg, &sink, &approval, dir.path(), &None, "claude",
-            &[], &[], crate::daemon::SYSTEM_PROMPT);
+            &[], &[], None, crate::daemon::SYSTEM_PROMPT);
         // If we get here without panic/error the strategy was constructed OK.
         // Verify the loop describes itself as using host execution.
         let _loop = result.loop_; // just confirm it's built
@@ -450,7 +461,7 @@ mod tests {
         cfg.sandbox_mode = "auto".into();
         let result = build_loop(
             &cfg, &sink, &approval, dir.path(), &None, "claude",
-            &[], &[], crate::daemon::SYSTEM_PROMPT);
+            &[], &[], None, crate::daemon::SYSTEM_PROMPT);
         let _loop = result.loop_;
     }
 
@@ -500,12 +511,54 @@ mod tests {
 
         let result = build_loop(
             &cfg, &sink, &approval, dir.path(), &None, "claude",
-            &[], &[Arc::new(FakeMem)], crate::daemon::SYSTEM_PROMPT);
+            &[], &[Arc::new(FakeMem)], None, crate::daemon::SYSTEM_PROMPT);
 
         assert!(
             result.registered_names.iter().any(|n| n == "remember"),
             "memory tool \"remember\" must be registered; got: {:?}",
             result.registered_names,
         );
+    }
+
+    #[test]
+    fn build_loop_skips_memory_tools_when_disabled() {
+        use agent_tools::{Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolSchema};
+        use async_trait::async_trait;
+
+        struct FakeMem;
+        #[async_trait]
+        impl Tool for FakeMem {
+            fn name(&self) -> &str { "remember" }
+            fn description(&self) -> &str { "fake" }
+            fn schema(&self) -> ToolSchema {
+                ToolSchema { name: "remember".into(), description: "fake".into(),
+                    parameters: serde_json::json!({"type": "object"}) }
+            }
+            fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+                Ok(ToolIntent { tool: "remember".into(), access: Access::Read,
+                    paths: vec![], command: None, summary: "x".into() })
+            }
+            async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx)
+                -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput { content: "ok".into(), display: None })
+            }
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::new(WsEventSink::new(tx.clone(), session.clone()));
+        let approval = Arc::new(WsApprovalChannel::new(tx, session, Duration::from_secs(1)));
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = RuntimeConfig::from_launch(
+            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
+        cfg.memory = false; // disabled
+
+        let result = build_loop(
+            &cfg, &sink, &approval, dir.path(), &None, "claude",
+            &[], &[Arc::new(FakeMem)], None, crate::daemon::SYSTEM_PROMPT);
+
+        assert!(!result.registered_names.iter().any(|n| n == "remember"),
+            "memory tools must not register when cfg.memory is false; got: {:?}",
+            result.registered_names);
     }
 }

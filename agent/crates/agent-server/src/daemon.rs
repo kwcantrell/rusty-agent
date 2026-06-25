@@ -2,7 +2,7 @@ use crate::approval::WsApprovalChannel;
 use crate::runtime::RuntimeState;
 use crate::sink::WsEventSink;
 use crate::wire::{WireBody, WireEnvelope};
-use agent_core::{ContextManager, WindowContext};
+use agent_core::{ContextManager, Retriever, WindowContext};
 use agent_model::Message;
 use agent_runtime_config::RuntimeConfig;
 use agent_tools::Tool;
@@ -26,6 +26,8 @@ pub struct DaemonParams {
     pub system_prompt: String,
     pub mcp_tools: Arc<[Arc<dyn Tool>]>,
     pub memory_tools: Arc<[Arc<dyn Tool>]>,
+    pub memory_retriever: Option<Arc<dyn Retriever>>,
+    pub recall_token_budget: usize,
 }
 
 pub const SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided tools to inspect \
@@ -61,10 +63,12 @@ where
         tx.clone(),
         params.mcp_tools.clone(),
         params.memory_tools.clone(),
+        params.memory_retriever.clone(),
         params.system_prompt.clone(),
     ));
     let ctx = Arc::new(tokio::sync::Mutex::new(
-        WindowContext::new(Message::system(params.system_prompt.clone()))));
+        WindowContext::new(Message::system(params.system_prompt.clone()))
+            .with_recall_budget(params.recall_token_budget)));
 
     let (mut write, mut read) = ws.split();
 

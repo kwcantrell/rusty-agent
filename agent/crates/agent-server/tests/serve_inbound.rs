@@ -31,6 +31,8 @@ async fn serve_answers_settings_get_over_accepted_socket() {
         system_prompt: agent_server::daemon::SYSTEM_PROMPT.to_string(),
         mcp_tools: Arc::from(Vec::<Arc<dyn agent_tools::Tool>>::new()),
         memory_tools: Arc::from(Vec::<Arc<dyn agent_tools::Tool>>::new()),
+        memory_retriever: None,
+        recall_token_budget: 512,
     };
 
     let agent = tokio::spawn(async move {

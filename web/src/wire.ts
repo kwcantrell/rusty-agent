@@ -29,6 +29,7 @@ export interface RuntimeSettings {
   repeat_penalty: number | null;
   enable_thinking: boolean;
   preserve_thinking: boolean;
+  memory: boolean;
   skills_dirs: string[];
   active_skills: string[];
 }
