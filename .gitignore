@@ -29,3 +29,7 @@ src-tauri/target/
 src-tauri/gen/
 
 node_modules/
+
+# Downloaded embedding-model cache (BGE-Small ONNX, ~128M) created by agent-memory
+# tests/runs with the `onnx` feature — never commit model binaries.
+.fastembed_cache/
