@@ -170,7 +170,7 @@ impl AgentLoop {
             };
             let assistant = self.completion_with_retry(&base).await?;
 
-            let parsed = match self.protocol.parse(&assistant) {
+            let mut parsed = match self.protocol.parse(&assistant) {
                 Ok(p) => { protocol_repairs = 0; p }
                 Err(e) if protocol_repairs < 1 => {
                     protocol_repairs += 1;
@@ -184,6 +184,10 @@ impl AgentLoop {
                     return Ok(());
                 }
             };
+
+            // Enforce the per-call id invariant for EVERY protocol before the ids
+            // feed the assistant message and the Phase-3 tool-result drain.
+            normalize_tool_call_ids(&mut parsed.tool_calls);
 
             let mut msg = Message::assistant(parsed.text.clone(),
                 if parsed.tool_calls.is_empty() { None } else { Some(parsed.tool_calls.clone()) });
@@ -238,8 +242,12 @@ impl AgentLoop {
 
             // Phase 3 — append one tool message per call, in the model's call order.
             for id in order {
-                let (name, resolved) = results.remove(&id)
-                    .expect("every gated call id has a result");
+                // Normalization guarantees a slot per id; if that invariant is ever
+                // violated, drop the result rather than crash on untrusted input.
+                let (name, resolved) = match results.remove(&id) {
+                    Some(v) => v,
+                    None => continue,
+                };
                 let content = match resolved {
                     Resolved::Ok(output) => {
                         self.sink.emit(AgentEvent::ToolResult {
@@ -335,6 +343,27 @@ enum Resolved {
     Err(String),
 }
 
+/// Guarantee every tool call in a turn has a unique, non-empty id. Model-supplied
+/// ids are passed through verbatim by the protocols, so a model can send duplicate
+/// or empty ids; the per-call result contract (one `order` entry + one `results`
+/// slot per call) requires uniqueness. Rewrites only offending ids, order-stable
+/// and deterministically (no clock/random), and bumps the synthetic id if it would
+/// collide with a literal the model also supplied.
+fn normalize_tool_call_ids(calls: &mut [ToolCall]) {
+    let mut seen = std::collections::HashSet::new();
+    for (i, c) in calls.iter_mut().enumerate() {
+        if c.id.is_empty() || !seen.insert(c.id.clone()) {
+            let mut candidate = format!("call_{i}");
+            let mut n = 1;
+            while !seen.insert(candidate.clone()) {
+                candidate = format!("call_{i}_{n}");
+                n += 1;
+            }
+            c.id = candidate;
+        }
+    }
+}
+
 /// Merge a streamed tool-call delta into the accumulator (handles fragmented args).
 ///
 /// Prefers the streaming `index` to correlate fragments, so parallel tool calls
@@ -367,13 +396,39 @@ mod tests {
     use crate::{WindowContext};
     use agent_model::Message;
     use agent_policy::RulePolicy;
-    use agent_tools::{fs::ReadFile, ToolRegistry};
+    use agent_tools::{fs::ReadFile, ToolCall, ToolRegistry};
     use std::sync::Arc;
 
     fn registry() -> Arc<ToolRegistry> {
         let mut r = ToolRegistry::new();
         r.register(Arc::new(ReadFile));
         Arc::new(r)
+    }
+
+    fn tc(id: &str) -> ToolCall {
+        ToolCall { id: id.into(), name: "read_file".into(), args: serde_json::json!({}) }
+    }
+
+    #[test]
+    fn normalize_ids_makes_empty_and_duplicate_ids_unique() {
+        let mut calls = vec![tc(""), tc(""), tc("x"), tc("x")];
+        normalize_tool_call_ids(&mut calls);
+        let ids: Vec<&str> = calls.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids.len(), 4);
+        assert!(ids.iter().all(|s| !s.is_empty()), "no empty ids: {ids:?}");
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), 4, "all ids distinct: {ids:?}");
+        assert_eq!(ids[2], "x", "an already-unique id is left intact when first seen");
+    }
+
+    #[test]
+    fn normalize_ids_synthetic_avoids_collision_with_model_supplied_literal() {
+        // id-less first call AND a model literally sending "call_0" -> still distinct.
+        let mut calls = vec![tc(""), tc("call_0")];
+        normalize_tool_call_ids(&mut calls);
+        assert_ne!(calls[0].id, calls[1].id, "synthetic id must not collide: {:?}",
+            calls.iter().map(|c| c.id.clone()).collect::<Vec<_>>());
+        assert!(!calls[0].id.is_empty() && !calls[1].id.is_empty());
     }
 
     #[test]
@@ -424,6 +479,46 @@ mod tests {
 
     fn policy(ws: std::path::PathBuf) -> Arc<RulePolicy> {
         Arc::new(RulePolicy { workspace: ws, command_allowlist: vec![], command_denylist: vec![] })
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_call_ids_do_not_panic_and_yield_distinct_tool_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "BODY").unwrap();
+        let ws = dir.path().to_path_buf();
+        // Two calls share id "c1" — collides under the order/results contract and
+        // panics the Phase-3 drain on current code.
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                ("c1".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()),
+                ("c1".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()),
+            ]),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+
+        // Must NOT panic.
+        agent.run(&mut ctx, "read twice".into()).await.unwrap();
+
+        // Both calls produced a result — the second was not dropped by a collision.
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.iter().filter(|e| *e == "tool_result:read_file").count(), 2);
+
+        // The transcript carries two DISTINCT tool ids.
+        let built = ctx.build(100_000);
+        let tool_ids: Vec<String> = built.iter()
+            .filter(|m| matches!(m.role, agent_model::Role::Tool))
+            .map(|m| m.tool_call_id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(tool_ids.len(), 2, "two tool messages expected: {tool_ids:?}");
+        assert_ne!(tool_ids[0], tool_ids[1], "duplicate ids must normalize to distinct");
     }
 
     struct FakeRetriever(Vec<String>);

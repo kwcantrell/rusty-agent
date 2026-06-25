@@ -7,7 +7,16 @@ pub fn estimate_tokens(s: &str) -> usize {
 }
 
 fn message_tokens(m: &Message) -> usize {
-    estimate_tokens(&m.content) + 4 // per-message overhead
+    let mut t = estimate_tokens(&m.content) + 4; // per-message overhead
+    if let Some(r) = &m.reasoning {
+        t += estimate_tokens(r);
+    }
+    if let Some(calls) = &m.tool_calls {
+        for c in calls {
+            t += estimate_tokens(&c.name) + estimate_tokens(&c.args.to_string());
+        }
+    }
+    t
 }
 
 /// Total estimated tokens for a built context (system + kept history),
@@ -128,6 +137,24 @@ mod tests {
         let msgs = vec![Message::system("SYS"), Message::user("hello world")];
         let expected = message_tokens(&msgs[0]) + message_tokens(&msgs[1]);
         assert_eq!(built_tokens(&msgs), expected);
+    }
+
+    #[test]
+    fn message_tokens_counts_tool_calls_and_reasoning() {
+        let plain = Message::assistant("hi", None);
+        let heavy = Message::assistant(
+            "hi",
+            Some(vec![agent_tools::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                args: serde_json::json!({"path": "some/long/path/to/a/file/name.txt"}),
+            }]),
+        )
+        .with_reasoning("a fairly long chain of reasoning that should add tokens");
+        assert!(
+            message_tokens(&heavy) > message_tokens(&plain),
+            "tool_calls + reasoning must increase the estimate"
+        );
     }
 
     #[test]
