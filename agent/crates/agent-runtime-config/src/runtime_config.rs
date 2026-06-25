@@ -21,6 +21,8 @@ pub struct RuntimeConfig {
     pub max_tokens: u32,
     pub max_turns: usize,
     pub context_limit: usize,
+    #[serde(default = "default_true")]
+    pub memory: bool,
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -119,6 +121,7 @@ impl RuntimeConfig {
             max_tokens: 2048,
             max_turns: 25,
             context_limit,
+            memory: true,
             top_p: None,
             top_k: None,
             min_p: None,
@@ -292,6 +295,23 @@ mod tests {
         assert_eq!(c.max_turns, 25);
         assert!(c.command_denylist.is_empty()); // floor is added by effective_denylist, not stored
         assert!(!c.command_allowlist.is_empty());
+    }
+
+    #[test]
+    fn memory_defaults_on() {
+        let c = RuntimeConfig::from_launch(
+            "openai".into(), "http://x".into(), "m".into(), "native".into(), 8192);
+        assert!(c.memory, "memory should default on");
+    }
+
+    #[test]
+    fn memory_absent_in_json_defaults_true() {
+        // A persisted config written before the field existed must deserialize to memory=true.
+        let json = r#"{"backend":"openai","base_url":"http://x","model":"m","protocol":"native",
+            "command_allowlist":[],"command_denylist":[],"http_allow_hosts":[],
+            "temperature":0.2,"max_tokens":2048,"max_turns":25,"context_limit":8192}"#;
+        let c: RuntimeConfig = serde_json::from_str(json).unwrap();
+        assert!(c.memory);
     }
 
     #[test]
