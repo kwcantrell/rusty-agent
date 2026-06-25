@@ -4,9 +4,9 @@ import App from "./App";
 
 describe("App shell", () => {
   beforeEach(() => localStorage.clear());
-  it("renders the pairing screen (not the two-pane shell) when unauthenticated", () => {
+  it("renders the desktop-app notice (not the two-pane shell) when not under Tauri", () => {
     render(<App />);
-    // The authenticated shell shows a "sign out" control; unauthenticated must not.
+    // The connected shell shows a "sign out" control; the notice must not.
     expect(screen.queryByText(/sign out/i)).toBeNull();
   });
 });

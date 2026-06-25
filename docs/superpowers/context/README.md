@@ -27,7 +27,7 @@ After the agent core works end-to-end from the CLI, a sensible sequence (each is
 | 2 | OS-level sandboxing | [`os-sandboxing.md`](./os-sandboxing.md) | `intent()`/exec boundary | deferred (top hardening priority) |
 | 3 | MCP client support | _(spec/plan below)_ | `Tool`/`ToolRegistry` | ✅ **built & merged** |
 | 4 | Vector / long-term memory | [`memory-system.md`](./memory-system.md) | `ContextManager` + `Tool` | ✅ **built & merged** |
-| 5 | Cloudflare control plane | _(spec/plan below)_ | `EventSink` + WS `ApprovalChannel` | ✅ **built & merged** |
+| 5 | Cloudflare control plane | _(spec/plan below)_ | `EventSink` + WS `ApprovalChannel` | ✅ built & merged — **removed 2026-06-24** (superseded by [remove-cloud-fully-local](../specs/2026-06-24-remove-cloud-fully-local-design.md)); the app is now desktop-only |
 | 6 | React frontend | _(spec/plan below)_ | consumes #5's API (same-origin) | ✅ **built & merged** |
 
 **#1, #3, #4, #5, and #6 are done** — the browser experience works end-to-end (validated live against the real model), the http-tool (#1) + MCP client (#3) deepeners have shipped, and long-term semantic memory (#4) is fully wired into both binaries. What remains from the deferred list is **#2 (OS-level sandboxing — the top production-hardening priority)**. Several enhancements beyond the original list have also shipped (Settings, sampling/thinking controls, the skills subsystem + runtime-config persistence, the stream-timeout hardening, the Claude CLI backend — see the tables below).

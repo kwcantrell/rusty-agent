@@ -17,8 +17,6 @@ async fn serve_answers_settings_get_over_accepted_socket() {
     let workspace = tempfile::tempdir().unwrap();
     let config_path = workspace.path().join("agent-runtime.json");
     let params = agent_server::daemon::DaemonParams {
-        ws_url: String::new(),       // unused by serve()
-        agent_token: String::new(),  // unused by serve()
         config: RuntimeConfig::from_launch(
             "openai".into(),
             "http://127.0.0.1:1".into(),

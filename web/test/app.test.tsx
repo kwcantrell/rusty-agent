@@ -1,7 +1,16 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { render, screen, act } from "@testing-library/react";
-import App from "../src/App";
-import { saveSession } from "../src/storage";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { render, screen, act, waitFor } from "@testing-library/react";
+
+// Force Tauri mode and a fixed bridge URL; the connected render is what we test.
+vi.mock("../src/transport", () => ({
+  isTauri: () => true,
+  resolveTransport: async () => ({
+    wsUrl: "ws://127.0.0.1:5/agent",
+    sessionId: "11111111-1111-1111-1111-111111111111",
+  }),
+}));
+// App dynamically imports invoke() for llama_health/get_workspace; stub it.
+vi.mock("@tauri-apps/api/core", () => ({ invoke: async () => null }));
 
 // A controllable WebSocket the App will use (App reads a window-injected impl in tests).
 class TestWS {
@@ -19,28 +28,23 @@ class TestWS {
 
 beforeEach(() => {
   localStorage.clear();
+  TestWS.last = null;
   (window as unknown as { __WS__?: unknown }).__WS__ = TestWS;
 });
 
-describe("App", () => {
-  it("with a stored token, connects and renders streamed frames", () => {
-    saveSession("sess-1", "tok-1");
+describe("App (Tauri mode)", () => {
+  it("connects to the local bridge and renders streamed frames", async () => {
+    const App = (await import("../src/App")).default;
     render(<App />);
+    // resolveTransport() resolves a microtask later, then the connect effect runs.
+    await waitFor(() => expect(TestWS.last).not.toBeNull());
+    const SID = "11111111-1111-1111-1111-111111111111";
     act(() => { TestWS.last!.onopen?.(); });
     act(() => {
-      TestWS.last!.onmessage?.({ data: JSON.stringify({ v: 1, session_id: "sess-1", kind: "presence", online: true }) });
-      TestWS.last!.onmessage?.({ data: JSON.stringify({ v: 1, session_id: "sess-1", kind: "event", payload: { type: "token", text: "hello world" } }) });
-      // Complete the stream so the assistant text is fully revealed (no longer mid-stream
-      // animating char-by-char via useStreamingText).
-      TestWS.last!.onmessage?.({ data: JSON.stringify({ v: 1, session_id: "sess-1", kind: "event", payload: { type: "done", reason: "stop" } }) });
+      TestWS.last!.onmessage?.({ data: JSON.stringify({ v: 1, session_id: SID, kind: "event", payload: { type: "token", text: "hello world" } }) });
+      // Complete the stream so the assistant text is fully revealed.
+      TestWS.last!.onmessage?.({ data: JSON.stringify({ v: 1, session_id: SID, kind: "event", payload: { type: "done", reason: "stop" } }) });
     });
-    // The two-pane TopBar conveys presence via the status dot's title (not visible text).
-    expect(screen.getByTitle(/agent online/i)).toBeInTheDocument();
-    expect(screen.getByText("hello world")).toBeInTheDocument();
-  });
-
-  it("without a token, shows the pairing screen", () => {
-    render(<App />);
-    expect(screen.getByRole("button", { name: /pair/i })).toBeInTheDocument();
+    expect(await screen.findByText("hello world")).toBeInTheDocument();
   });
 });

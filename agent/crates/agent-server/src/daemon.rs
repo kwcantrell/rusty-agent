@@ -12,15 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::WebSocketStream;
 
 type DynErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct DaemonParams {
-    pub ws_url: String, // ws://host/agent
-    pub agent_token: String,
     pub config: RuntimeConfig, // flag-derived base; the file at config_path overlays it
     pub api_key: Option<String>,
     pub claude_binary: String,
@@ -35,19 +32,8 @@ pub const SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided 
 and modify the workspace. Think step by step. When the task is complete, reply with a summary \
 and no tool call.";
 
-pub async fn run(params: DaemonParams) -> Result<(), DynErr> {
-    // Cloud path: dial the Worker, then hand the socket to the transport-agnostic
-    // serve() below.
-    let mut req = params.ws_url.clone().into_client_request()?;
-    req.headers_mut().insert("Authorization",
-        format!("Bearer {}", params.agent_token).parse()?);
-    let (ws, _resp) = tokio_tungstenite::connect_async(req).await?;
-    serve(ws, params).await
-}
-
-/// Drive the runtime over an already-established WebSocket. Transport-agnostic:
-/// the cloud path (`run`) dials the Worker; the desktop bridge accepts a local
-/// connection. Everything from here down is the original `run()` body.
+/// Drive the runtime over an already-established WebSocket. The desktop bridge
+/// (`src-tauri/src/bridge.rs`) accepts a local connection and hands the socket here.
 pub async fn serve<S>(ws: WebSocketStream<S>, params: DaemonParams) -> Result<(), DynErr>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
