@@ -85,6 +85,8 @@ async fn auto_retrieval_feeds_a_seeded_fact_to_the_real_model() {
         mcp_tools: vec![], memory_tools: mem_tools, memory_retriever: Some(retriever),
         stream_idle_timeout: Duration::from_secs(120),
         base_system_prompt: "You are a helpful assistant. Use any relevant memories provided.".into(),
+        offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
+        compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()))
         .with_recall_budget(512);
@@ -119,6 +121,8 @@ async fn memory_off_suppresses_recall() {
         mcp_tools: vec![], memory_tools: mem_tools, memory_retriever: Some(retriever),
         stream_idle_timeout: Duration::from_secs(120),
         base_system_prompt: "You are a helpful assistant. Use any relevant memories provided.".into(),
+        offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
+        compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()))
         .with_recall_budget(512);
@@ -154,6 +158,8 @@ async fn assemble_loop_drives_a_real_tool_call() {
         mcp_tools: vec![], memory_tools: vec![], memory_retriever: None,
         stream_idle_timeout: Duration::from_secs(120),
         base_system_prompt: "You are a coding agent. Use the provided tools to inspect the workspace.".into(),
+        offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
+        compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()));
     built.loop_.run(&mut ctx, "Read the file a.txt and tell me its exact contents.".into())

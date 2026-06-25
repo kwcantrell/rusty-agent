@@ -156,6 +156,7 @@ impl AgentLoop {
                 ctx.set_recall(lines);
             }
         }
+        ctx.set_goal(user_input.clone());
         ctx.append(Message::user(user_input));
         let mut protocol_repairs = 0;
 
@@ -286,6 +287,22 @@ impl AgentLoop {
                     Resolved::Err(content) => content,
                 };
                 ctx.append(Message::tool(id, name, content));
+            }
+
+            let deps = crate::MaintCtx {
+                model_limit: self.config.model_limit,
+                model: &self.model,
+                sink: &self.sink,
+                cancel: &cancel,
+            };
+            let report = ctx.maintain(&deps).await;
+            if report.offloaded > 0 || report.compacted_turns > 0 {
+                tracing::debug!(
+                    offloaded = report.offloaded,
+                    offloaded_bytes = report.offloaded_bytes,
+                    compacted_turns = report.compacted_turns,
+                    "context maintained"
+                );
             }
         }
         self.sink.emit(AgentEvent::Done(StopReason::BudgetExhausted));

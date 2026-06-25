@@ -1,5 +1,5 @@
 //! Test doubles for driving the loop deterministically.
-use crate::{AgentEvent, EventSink};
+use crate::{AgentEvent, ContextEvent, EventSink};
 use agent_model::{AssistantTurn, Chunk, CompletionRequest, ModelClient, ModelError,
                   ParsedTurn, ProtocolError, RawToolCall, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse};
@@ -99,6 +99,11 @@ impl EventSink for CollectingSink {
             AgentEvent::Approval(_) => "approval".into(),
             AgentEvent::Error(e) => format!("error:{e}"),
             AgentEvent::Done(_) => "done".into(),
+            AgentEvent::Context(ContextEvent::Offloaded { id, .. }) => format!("offloaded:{id}"),
+            AgentEvent::Context(ContextEvent::Compacted { turns_replaced, .. }) => {
+                format!("compacted:{turns_replaced}")
+            }
+            AgentEvent::Context(ContextEvent::CompactionFailed { .. }) => "compaction_failed".into(),
         };
         self.events.lock().unwrap().push(label);
     }

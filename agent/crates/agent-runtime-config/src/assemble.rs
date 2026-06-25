@@ -24,6 +24,12 @@ pub struct LoopParts {
     pub memory_retriever: Option<Arc<dyn Retriever>>,
     pub stream_idle_timeout: Duration,
     pub base_system_prompt: String,
+    /// Offload table the `context_recall` tool reads. The caller owns it and
+    /// shares the same handle with its `CuratedContext`. On a loop rebuild (server
+    /// settings change), pass the SAME handle so the conversation's table survives.
+    pub offload_store: Arc<dyn agent_core::OffloadStore>,
+    /// Flag the `context_compact` tool sets; the caller's `CuratedContext` reads it.
+    pub compact_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Result of assembling a loop: the loop itself, the composed system prompt, and
@@ -79,6 +85,12 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     }
     let (skill_registry, skill_tools) = build_skills(&cfg.skills_dirs, &parts.workspace);
     for t in skill_tools {
+        registry.register(t);
+    }
+
+    // Context-management tools share the caller-owned offload store + compact flag
+    // with the frontend's CuratedContext (passed in via LoopParts).
+    for t in agent_core::context_tools(parts.offload_store.clone(), parts.compact_flag.clone()) {
         registry.register(t);
     }
 
@@ -186,6 +198,8 @@ mod tests {
             memory_retriever: None,
             stream_idle_timeout: Duration::from_secs(99),
             base_system_prompt: "BASE".into(),
+            offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
+            compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -199,6 +213,14 @@ mod tests {
         let mut c = cfg(); c.memory = true;
         let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![fake_mem("remember")]));
         assert!(built.registered_names.iter().any(|n| n == "remember"));
+    }
+
+    #[test]
+    fn registers_context_management_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        assert!(built.registered_names.iter().any(|n| n == "context_recall"));
+        assert!(built.registered_names.iter().any(|n| n == "context_compact"));
     }
 
     #[test]
