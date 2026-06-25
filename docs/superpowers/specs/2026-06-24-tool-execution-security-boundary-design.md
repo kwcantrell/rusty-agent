@@ -111,18 +111,27 @@ detection is separate from argv splitting).
 
 **Decision order:**
 
-1. **Hard-floor deny** (cannot be approved away). Deny if **any** simple command matches a
-   structural rule:
-   - program *basename* ∈ {`sudo`, `doas`, `su`}  (basename match catches `/usr/bin/sudo`)
-   - program basename `rm` with a recursive flag — `-r`, `-R`, `--recursive`, or any
-     bundled short flag containing `r` (e.g. `-rf`, `-fr`) — **and** a root target (`/`,
-     `/*`, or an argument that canonicalizes to `/`)
-   - program basename `dd` with an `of=` argument naming a block device (`/dev/...`)
-   - the fork-bomb token sequence `:(){`
-   - **Parse-failure backstop:** if the whole string cannot be tokenized (e.g. unbalanced
-     quotes), fall back to matching the floor patterns against a whitespace-normalized
-     form of the string. This is fail-safe (an obfuscated dangerous command degrades to
-     Deny or Ask, never silent Allow).
+1. **Hard-floor deny** (cannot be approved away). Two complementary layers; deny if
+   **either** fires:
+   - **Layer A — structural**, per simple command. Deny if any simple command matches:
+     - program *basename* ∈ {`sudo`, `doas`, `su`}  (basename match catches `/usr/bin/sudo`)
+     - program basename `rm` with a recursive flag — `-r`, `-R`, `--recursive`, or any
+       bundled short flag containing `r` (e.g. `-rf`, `-fr`) — **and** a root target (`/`,
+       `/*`, or `--no-preserve-root` present)
+     - program basename `dd` with an `of=` argument naming a block device (`/dev/...`)
+     - the fork-bomb token sequence `:(){`
+   - **Layer B — always-on substring backstop.** Independent of Layer A (not only on
+     parse failure), match each denylist pattern against a whitespace-normalized form of
+     the command. This catches no-space operators (`echo x&&sudo`), unparseable strings
+     (unbalanced quotes), and configured denylist literals. It is fail-safe and preserves
+     today's behavior (`cmd.contains(pattern)`), only normalized so `rm -rf  /` with extra
+     spaces still matches `rm -rf /`.
+
+   Layer A upgrades detection of flag/spacing *variants* of known-dangerous programs that
+   substring matching cannot see (`rm -fr /`, `rm --recursive --force /`); Layer B retains
+   coverage of operator-hidden and unparseable cases. The known cost of Layer B is the
+   pre-existing false-positive property (a benign mention of a denylisted literal is
+   denied) — acceptable for a conservative floor and unchanged from current behavior.
 
 2. **Auto-allow** (deny-by-default posture). Allow **only if all** hold:
    - the command tokenized cleanly,
