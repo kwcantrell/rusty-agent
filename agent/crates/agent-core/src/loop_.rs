@@ -978,4 +978,116 @@ mod tests {
             ("c1".into(), "SLOW".into()),
             ("c2".into(), "FAST".into())]);
     }
+
+    #[tokio::test]
+    async fn multiple_tool_calls_produce_matched_results_in_order() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(FakeTool { name: "ta".into(), delay_ms: 0, body: "AAA".into() }));
+        r.register(Arc::new(FakeTool { name: "tb".into(), delay_ms: 0, body: "BBB".into() }));
+        r.register(Arc::new(FakeTool { name: "tc".into(), delay_ms: 0, body: "CCC".into() }));
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                ("c1".into(), "ta".into(), "{}".into()),
+                ("c2".into(), "tb".into(), "{}".into()),
+                ("c3".into(), "tc".into(), "{}".into())]),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: std::env::temp_dir(),
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(tool_messages(&ctx), vec![
+            ("c1".into(), "AAA".into()),
+            ("c2".into(), "BBB".into()),
+            ("c3".into(), "CCC".into())]);
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.iter().filter(|e| e.starts_with("tool_result:")).count(), 3);
+    }
+
+    #[tokio::test]
+    async fn one_failing_call_does_not_abort_the_others() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(FakeTool { name: "ta".into(), delay_ms: 0, body: "AAA".into() }));
+        r.register(Arc::new(FakeTool { name: "tc".into(), delay_ms: 0, body: "CCC".into() }));
+        // "tb" is intentionally NOT registered -> unknown-tool rejection for c2.
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                ("c1".into(), "ta".into(), "{}".into()),
+                ("c2".into(), "tb".into(), "{}".into()),
+                ("c3".into(), "tc".into(), "{}".into())]),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: std::env::temp_dir(),
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let msgs = tool_messages(&ctx);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0], ("c1".into(), "AAA".into()));
+        assert_eq!(msgs[1].0, "c2");
+        assert!(msgs[1].1.starts_with("ERROR:"), "got {:?}", msgs[1].1);
+        assert_eq!(msgs[2], ("c3".into(), "CCC".into()));
+        // Only the two successes emit ToolResult; the loop still completes.
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.iter().filter(|e| e.starts_with("tool_result:")).count(), 2);
+        assert_eq!(events.last().unwrap(), "done");
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct AskAll;
+    impl PolicyEngine for AskAll {
+        fn check(&self, _i: &ToolIntent) -> Decision { Decision::Ask }
+    }
+
+    /// Approval channel that records the peak number of concurrent in-flight requests.
+    struct CountingApproval { inflight: AtomicUsize, peak: AtomicUsize }
+    #[async_trait::async_trait]
+    impl ApprovalChannel for CountingApproval {
+        async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+            let n = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(n, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await; // widen any overlap
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            ApprovalResponse::Approve
+        }
+    }
+
+    #[tokio::test]
+    async fn approvals_are_serialized_across_parallel_calls() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(FakeTool { name: "ta".into(), delay_ms: 0, body: "AAA".into() }));
+        r.register(Arc::new(FakeTool { name: "tb".into(), delay_ms: 0, body: "BBB".into() }));
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                ("c1".into(), "ta".into(), "{}".into()),
+                ("c2".into(), "tb".into(), "{}".into())]),
+            Scripted::Text("done".into()),
+        ]));
+        let approval = Arc::new(CountingApproval {
+            inflight: AtomicUsize::new(0), peak: AtomicUsize::new(0) });
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AskAll),
+            approval.clone(), Arc::new(CollectingSink::default()),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: std::env::temp_dir(),
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(approval.peak.load(Ordering::SeqCst), 1,
+            "approval prompts must never overlap");
+    }
 }
