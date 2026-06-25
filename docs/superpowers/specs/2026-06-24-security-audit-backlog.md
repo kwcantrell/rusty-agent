@@ -19,14 +19,28 @@ are the remaining verified findings, not yet specced.
 > reaps via explicit `wait()` after `start_kill()`. Spec
 > `2026-06-25-mcp-process-lifecycle-design.md`, plan `…/plans/2026-06-25-mcp-process-lifecycle.md`.
 > (Honest framing: hardened already-`kill_on_drop`-mitigated teardown to be deterministic;
-> not an unbounded leak — no reconnect path exists.) Remaining: **A-a**, **A-c**.
+> not an unbounded leak — no reconnect path exists.)
+> **A-a DONE — by dissolution** (branch `feat/tauri-ipc-transport`, 2026-06-25): rather than
+> bound a cloud-shaped channel, the loopback WebSocket transport was replaced with native
+> Tauri IPC (typed `#[command]`s in + one live-read `ipc::Channel<ServerEvent>` out). There is
+> no longer an `mpsc` event channel or writer task, so **A2 cannot recur**. The migration also
+> closed **A1** (single-active-run guard rejects concurrent `user_input` with `Busy`) and the
+> **deferred B3 interactive server-cancel** (`cancel()` command trips the run's
+> `CancellationToken`). `session_id` identity (part of A-c) is gone as a side effect — the wire
+> envelope/`PROTOCOL_VERSION`/`session_id` were deleted. Spec
+> `2026-06-25-tauri-ipc-transport-design.md`, plan `…/plans/2026-06-25-tauri-ipc-transport.md`.
+> **Remaining: A-c reduced to the `RuntimeState` three-mutex atomicity refactor only**
+> (finding A4); A1 + identity already resolved here.
 
 - **HIGH — concurrent `user_input` session/approval cross-talk** (`agent-server/src/daemon.rs:~104`).
-  Each input spawns a detached task sharing one session id + one global approval-correlation
-  space; a second input mid-run misattributes frames. No guard rejects a second concurrent run.
+  ~~Each input spawns a detached task sharing one session id + one global approval-correlation
+  space; a second input mid-run misattributes frames. No guard rejects a second concurrent run.~~
+  **RESOLVED (A-a, Tauri IPC):** `send_input` is single-active-run-guarded (`Busy` on a second
+  concurrent input); `session_id` removed entirely.
 - **HIGH — unbounded event channel (memory-exhaustion DoS)** (`daemon.rs:~44`, `sink.rs:~9`).
-  `mpsc::unbounded_channel` carries every token/chunk/frame; `emit` is infallible. A slow/stalled
-  WebSocket client lets the queue grow without bound. Needs bounded channel + backpressure policy.
+  ~~`mpsc::unbounded_channel` carries every token/chunk/frame; `emit` is infallible. A slow/stalled
+  WebSocket client lets the queue grow without bound.~~ **RESOLVED by dissolution (A-a):** the WS
+  transport + `mpsc` channel were removed; events now stream over a Tauri `ipc::Channel`.
 - **HIGH — MCP stdio reader tasks never aborted; children killed but never `wait()`ed**
   (`agent-mcp/src/transport.rs:~53-97`). Reconnect cycles leak detached tasks and zombie processes.
 - **MED — `RuntimeState` god object with three independent mutexes updated non-atomically**

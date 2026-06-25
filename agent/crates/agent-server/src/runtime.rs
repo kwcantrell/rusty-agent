@@ -1,13 +1,12 @@
-use crate::approval::WsApprovalChannel;
-use crate::sink::WsEventSink;
-use crate::wire::{DiscoveredSkill, WireBody, WireEnvelope, PROTOCOL_VERSION};
+use crate::approval::IpcApprovalChannel;
+use crate::sink::ChannelEventSink;
+use crate::wire::{DiscoveredSkill, SettingsState};
 use agent_core::{AgentLoop, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT};
 use agent_runtime_config::{assemble_loop, build_model, BuiltLoop, LoopParts, RuntimeConfig, HARD_FLOOR_DENYLIST};
 use agent_skills::SkillRegistry;
 use agent_tools::Tool;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 
 /// Holds the live `AgentLoop` plus everything needed to rebuild it on a settings
 /// change. The loop is swapped atomically; an in-flight run keeps the `Arc` it
@@ -15,14 +14,12 @@ use tokio::sync::mpsc;
 pub struct RuntimeState {
     loop_cell: Mutex<Arc<AgentLoop>>,
     config: Mutex<RuntimeConfig>,
-    sink: Arc<WsEventSink>,
-    approval: Arc<WsApprovalChannel>,
+    sink: Arc<ChannelEventSink>,
+    approval: Arc<IpcApprovalChannel>,
     workspace: PathBuf,
     api_key: Option<String>,
     claude_binary: String,
     config_path: PathBuf,
-    session: Arc<Mutex<String>>,
-    tx: mpsc::UnboundedSender<WireEnvelope>,
     mcp_tools: Arc<[Arc<dyn Tool>]>,
     memory_tools: Arc<[Arc<dyn Tool>]>,
     memory_retriever: Option<Arc<dyn Retriever>>,
@@ -34,14 +31,12 @@ impl RuntimeState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: RuntimeConfig,
-        sink: Arc<WsEventSink>,
-        approval: Arc<WsApprovalChannel>,
+        sink: Arc<ChannelEventSink>,
+        approval: Arc<IpcApprovalChannel>,
         workspace: PathBuf,
         api_key: Option<String>,
         claude_binary: String,
         config_path: PathBuf,
-        session: Arc<Mutex<String>>,
-        tx: mpsc::UnboundedSender<WireEnvelope>,
         mcp_tools: Arc<[Arc<dyn Tool>]>,
         memory_tools: Arc<[Arc<dyn Tool>]>,
         memory_retriever: Option<Arc<dyn Retriever>>,
@@ -57,7 +52,7 @@ impl RuntimeState {
             loop_cell: Mutex::new(built.loop_),
             config: Mutex::new(config),
             system_prompt: Mutex::new(built.system_prompt),
-            sink, approval, workspace, api_key, claude_binary, config_path, session, tx,
+            sink, approval, workspace, api_key, claude_binary, config_path,
             mcp_tools, memory_tools, memory_retriever, base_system_prompt,
         }
     }
@@ -93,51 +88,19 @@ impl RuntimeState {
         Ok(())
     }
 
-    fn state_body(&self) -> WireBody {
+    pub fn settings_state(&self) -> SettingsState {
         let cfg = self.config.lock().unwrap().clone();
         let discovered = SkillRegistry::from_config(&cfg.skills_dirs, &self.workspace)
             .scan()
             .into_iter()
             .map(|s| DiscoveredSkill { name: s.name, description: s.description })
             .collect();
-        WireBody::SettingsState {
+        SettingsState {
             settings: cfg,
             workspace: self.workspace.display().to_string(),
             api_key_set: self.api_key.is_some(),
             hard_floor: HARD_FLOOR_DENYLIST.iter().map(|s| s.to_string()).collect(),
             discovered_skills: discovered,
-        }
-    }
-
-    fn send(&self, body: WireBody) {
-        let env = WireEnvelope {
-            v: PROTOCOL_VERSION,
-            session_id: self.session.lock().unwrap().clone(),
-            id: None,
-            body,
-        };
-        let _ = self.tx.send(env);
-    }
-
-    /// Dispatch a settings_* frame. Returns true if it was handled (a settings frame).
-    pub fn handle(&self, body: &WireBody) -> bool {
-        match body {
-            WireBody::SettingsGet => {
-                let s = self.state_body();
-                self.send(s);
-                true
-            }
-            WireBody::SettingsUpdate { settings } => {
-                match self.apply(settings.clone()) {
-                    Ok(()) => {
-                        let s = self.state_body();
-                        self.send(s);
-                    }
-                    Err(message) => self.send(WireBody::SettingsError { message }),
-                }
-                true
-            }
-            _ => false,
         }
     }
 }
@@ -149,8 +112,8 @@ impl RuntimeState {
 #[allow(clippy::too_many_arguments)]
 fn build_loop(
     cfg: &RuntimeConfig,
-    sink: &Arc<WsEventSink>,
-    approval: &Arc<WsApprovalChannel>,
+    sink: &Arc<ChannelEventSink>,
+    approval: &Arc<IpcApprovalChannel>,
     workspace: &Path,
     api_key: &Option<String>,
     claude_binary: &str,
@@ -176,33 +139,35 @@ fn build_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approval::WsApprovalChannel;
-    use crate::sink::WsEventSink;
-    use crate::wire::WireBody;
     use agent_runtime_config::RuntimeConfig;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::sync::mpsc;
 
-    fn make() -> (RuntimeState, mpsc::UnboundedReceiver<crate::wire::WireEnvelope>, tempfile::TempDir) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let session = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::new(WsEventSink::new(tx.clone(), session.clone()));
-        let approval = Arc::new(WsApprovalChannel::new(tx.clone(), session.clone(), Duration::from_secs(1)));
+    fn slot() -> crate::sink::EventSlot { Arc::new(Mutex::new(None)) }
+
+    fn parts() -> (Arc<ChannelEventSink>, Arc<IpcApprovalChannel>) {
+        let s = slot();
+        let sink = Arc::new(ChannelEventSink::new(s.clone()));
+        let approval = Arc::new(IpcApprovalChannel::new(s, Duration::from_secs(1)));
+        (sink, approval)
+    }
+
+    fn make() -> (RuntimeState, tempfile::TempDir) {
+        let (sink, approval) = parts();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rt.json");
         let cfg = RuntimeConfig::from_launch(
             "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
         let rs = RuntimeState::new(cfg, sink, approval, dir.path().to_path_buf(), None,
-            "claude".into(), path, session, tx, Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            "claude".into(), path, Arc::from(Vec::<Arc<dyn Tool>>::new()),
             Arc::from(Vec::<Arc<dyn Tool>>::new()), None,
             crate::daemon::SYSTEM_PROMPT.to_string());
-        (rs, rx, dir)
+        (rs, dir)
     }
 
     #[test]
     fn apply_swaps_the_loop_and_persists() {
-        let (rs, _rx, dir) = make();
+        let (rs, dir) = make();
         let before = rs.current_loop();
         let mut next = RuntimeConfig::from_launch(
             "openai".into(), "http://localhost:8080".into(), "m2".into(), "native".into(), 8192);
@@ -215,7 +180,7 @@ mod tests {
 
     #[test]
     fn apply_rejects_invalid_without_swapping() {
-        let (rs, _rx, _dir) = make();
+        let (rs, _dir) = make();
         let before = rs.current_loop();
         let mut bad = RuntimeConfig::from_launch(
             "openai".into(), "   ".into(), "m".into(), "native".into(), 8192); // empty base_url
@@ -226,40 +191,17 @@ mod tests {
     }
 
     #[test]
-    fn handle_settings_get_emits_state() {
-        let (rs, mut rx, _dir) = make();
-        assert!(rs.handle(&WireBody::SettingsGet));
-        let env = rx.try_recv().expect("a frame");
-        match env.body {
-            WireBody::SettingsState { api_key_set, hard_floor, .. } => {
-                assert!(!api_key_set);
-                assert!(hard_floor.iter().any(|d| d == "sudo"));
-            }
-            _ => panic!("expected settings_state"),
-        }
-    }
-
-    #[test]
-    fn handle_invalid_update_emits_error() {
-        let (rs, mut rx, _dir) = make();
-        let mut bad = RuntimeConfig::from_launch(
-            "openai".into(), "".into(), "m".into(), "native".into(), 8192);
-        bad.base_url = "".into();
-        assert!(rs.handle(&WireBody::SettingsUpdate { settings: bad }));
-        let env = rx.try_recv().expect("a frame");
-        assert!(matches!(env.body, WireBody::SettingsError { .. }));
-    }
-
-    #[test]
-    fn handle_ignores_non_settings_frames() {
-        let (rs, _rx, _dir) = make();
-        assert!(!rs.handle(&WireBody::UserInput { text: "hi".into() }));
+    fn settings_state_reports_floor_and_no_api_key() {
+        let (rs, _dir) = make();
+        let st = rs.settings_state();
+        assert!(!st.api_key_set);
+        assert!(st.hard_floor.iter().any(|d| d == "sudo"));
     }
 
     #[test]
     fn apply_with_valid_active_skill_updates_system_prompt() {
         use std::fs;
-        let (rs, _rx, dir) = make();
+        let (rs, dir) = make();
         // Author a skill under the workspace default writable root.
         let sdir = dir.path().join(".agent").join("skills").join("greeter");
         fs::create_dir_all(&sdir).unwrap();
@@ -279,7 +221,7 @@ mod tests {
 
     #[test]
     fn apply_rejects_unknown_active_skill_without_swapping() {
-        let (rs, _rx, _dir) = make();
+        let (rs, _dir) = make();
         let before = rs.current_loop();
         let mut bad = RuntimeConfig::from_launch(
             "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
@@ -292,17 +234,14 @@ mod tests {
     #[test]
     fn startup_drops_unknown_persisted_preset_without_panicking() {
         // A persisted config naming a non-existent preset must still boot (lenient).
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let session = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::new(WsEventSink::new(tx.clone(), session.clone()));
-        let approval = Arc::new(WsApprovalChannel::new(tx.clone(), session.clone(), Duration::from_secs(1)));
+        let (sink, approval) = parts();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rt.json");
         let mut cfg = RuntimeConfig::from_launch(
             "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
         cfg.active_skills = vec!["ghost".into()];
         let rs = RuntimeState::new(cfg, sink, approval, dir.path().to_path_buf(), None,
-            "claude".into(), path, session, tx, Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            "claude".into(), path, Arc::from(Vec::<Arc<dyn Tool>>::new()),
             Arc::from(Vec::<Arc<dyn Tool>>::new()), None,
             crate::daemon::SYSTEM_PROMPT.to_string());
         // Booted: base prompt present, the ghost preset silently dropped.
@@ -313,10 +252,7 @@ mod tests {
     #[test]
     fn settings_state_includes_discovered_skills() {
         use std::fs;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let session = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::new(WsEventSink::new(tx.clone(), session.clone()));
-        let approval = Arc::new(WsApprovalChannel::new(tx.clone(), session.clone(), Duration::from_secs(1)));
+        let (sink, approval) = parts();
         let dir = tempfile::tempdir().unwrap();
         // Put a skill in <workspace>/.agent/skills/greeter (the default writable root).
         let sdir = dir.path().join(".agent").join("skills").join("greeter");
@@ -326,26 +262,17 @@ mod tests {
         let cfg = RuntimeConfig::from_launch(
             "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
         let rs = RuntimeState::new(cfg, sink, approval, dir.path().to_path_buf(), None,
-            "claude".into(), path, session, tx, Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            "claude".into(), path, Arc::from(Vec::<Arc<dyn Tool>>::new()),
             Arc::from(Vec::<Arc<dyn Tool>>::new()), None,
             crate::daemon::SYSTEM_PROMPT.to_string());
-        assert!(rs.handle(&WireBody::SettingsGet));
-        let env = rx.try_recv().expect("a frame");
-        match env.body {
-            WireBody::SettingsState { discovered_skills, .. } => {
-                assert!(discovered_skills.iter().any(|s| s.name == "greeter" && s.description == "says hi"));
-            }
-            _ => panic!("expected settings_state"),
-        }
+        let st = rs.settings_state();
+        assert!(st.discovered_skills.iter().any(|s| s.name == "greeter" && s.description == "says hi"));
     }
 
     #[test]
     fn build_loop_with_sandbox_mode_off_succeeds() {
         // sandbox_mode = "off" resolves to HostExecutor (no Docker probe needed).
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let session = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::new(WsEventSink::new(tx.clone(), session.clone()));
-        let approval = Arc::new(WsApprovalChannel::new(tx.clone(), session.clone(), Duration::from_secs(1)));
+        let (sink, approval) = parts();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = RuntimeConfig::from_launch(
             "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
@@ -355,17 +282,13 @@ mod tests {
             &cfg, &sink, &approval, dir.path(), &None, "claude",
             &[], &[], None, crate::daemon::SYSTEM_PROMPT);
         // If we get here without panic/error the strategy was constructed OK.
-        // Verify the loop describes itself as using host execution.
         let _loop = result.loop_; // just confirm it's built
     }
 
     #[test]
     fn build_loop_with_sandbox_mode_auto_constructs_loop() {
         // "auto" probes Docker but still returns a valid loop regardless of Docker availability.
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let session = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::new(WsEventSink::new(tx.clone(), session.clone()));
-        let approval = Arc::new(WsApprovalChannel::new(tx.clone(), session.clone(), Duration::from_secs(1)));
+        let (sink, approval) = parts();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = RuntimeConfig::from_launch(
             "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);

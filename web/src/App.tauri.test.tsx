@@ -4,12 +4,11 @@ import { render, screen, waitFor } from "@testing-library/react";
 vi.mock("./transport", () => ({
   isTauri: () => true,
   resolveTransport: async () => ({
-    wsUrl: "ws://127.0.0.1:5/agent",
     sessionId: "11111111-1111-1111-1111-111111111111",
   }),
 }));
 
-// A no-op socket so connect() doesn't open a real WebSocket in jsdom.
+// A no-op socket so connect() doesn't touch real Tauri IPC in jsdom.
 vi.mock("./socket", () => ({
   connect: () => ({ send: vi.fn(), close: vi.fn() }),
 }));

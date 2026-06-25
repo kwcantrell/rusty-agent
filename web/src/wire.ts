@@ -55,10 +55,10 @@ export type Inbound =
 export type Decision = "approve" | "approve_always" | "deny";
 
 export type Outbound =
-  | { v: number; session_id: string; kind: "user_input"; text: string }
-  | { v: number; session_id: string; id: string; kind: "approval_response"; decision: Decision }
-  | { v: number; session_id: string; kind: "settings_get" }
-  | { v: number; session_id: string; kind: "settings_update"; settings: RuntimeSettings };
+  | { kind: "user_input"; text: string }
+  | { kind: "approval_response"; id: string; decision: Decision }
+  | { kind: "settings_get" }
+  | { kind: "settings_update"; settings: RuntimeSettings };
 
 /** Parse a raw WS text frame into an Inbound, or null if malformed/unknown. */
 export function parseInbound(raw: string): Inbound | null {
