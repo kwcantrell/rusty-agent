@@ -130,6 +130,7 @@ name = "agent-server"
 version = "0.0.0"
 dependencies = [
  "agent-core",
+ "agent-memory",
  "agent-model",
  "agent-policy",
  "agent-runtime-config",
@@ -4396,6 +4397,8 @@ dependencies = [
 name = "rust-agent-runtime-desktop"
 version = "0.1.0"
 dependencies = [
+ "agent-core",
+ "agent-memory",
  "agent-runtime-config",
  "agent-server",
  "agent-tools",

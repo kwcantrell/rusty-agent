@@ -12,6 +12,7 @@ pub struct Bridge {
     config_path: PathBuf,
     base_url: String,
     model: String,
+    memory_parts: Option<agent_memory::MemoryParts>,
 }
 
 impl Bridge {
@@ -43,6 +44,21 @@ pub async fn start(
 ) -> std::io::Result<Arc<Bridge>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
+
+    // Memory is loaded once (model + DB), gated on the effective (persisted) flag.
+    let eff = agent_runtime_config::RuntimeConfig::load_over(
+        agent_runtime_config::RuntimeConfig::from_launch(
+            "openai".into(), base_url.clone(), model.clone(), "native".into(), 262_144),
+        &config_path);
+    let memory_parts = if eff.memory {
+        match agent_memory::open_memory_parts(agent_memory::MemoryConfig::default()) {
+            Ok(parts) => Some(parts),
+            Err(e) => { eprintln!("warning: desktop memory disabled: {e}"); None }
+        }
+    } else {
+        None
+    };
+
     let bridge = Arc::new(Bridge {
         port,
         current: Mutex::new(None),
@@ -50,6 +66,7 @@ pub async fn start(
         config_path,
         base_url,
         model,
+        memory_parts,
     });
 
     let b = bridge.clone();
@@ -68,6 +85,7 @@ pub async fn start(
                 b.config_path.clone(),
                 b.base_url.clone(),
                 b.model.clone(),
+                b.memory_parts.as_ref(),
             );
             let task = tokio::spawn(async move {
                 let _ = agent_server::daemon::serve(ws, params).await;
