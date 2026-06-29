@@ -116,12 +116,31 @@ retries a logged dead end.
     long-horizon fact retention is robust — forcing a real failure would require extreme scale
     (≫13 distinct facts, overflowing even the cumulative summary). Kept as a regression guard;
     a discriminating long-horizon task is **deferred** (needs the harsher design).
-- Still missing: a discriminating long-horizon task (extreme scale) and a `memory-under-recall`
-  task.
+- **memory-recall** (mode=`memory`, `tasks/memory-recall/`) — added 2026-06-29. **The first
+  ADMITTED, genuinely discriminating held-out task** (besides drift-ledger). Cross-session: in
+  session 1 the agent `remember`s `the deployment token is ZX-99-QUASAR`; session 2 (fresh
+  window — the fact is NOT in-window, only in the SqliteStore) must recall it and write it. Run
+  with **memory-mode configs** (`/tmp/mem_fav.json`, `/tmp/mem_real.json` = favorable/champion
+  params but `memory_enabled=true`).
+  - **Admit verdict = `Admitted`:** favorable (generous: `relevance_threshold=0.0`, `k=20`,
+    `auto_recall`) **5/5**; realistic (champion: `relevance_threshold=0.3`, `k=5`) **0/5**.
+  - **Mechanism:** the eval's `StubEmbedder` is FNV-hash, exact-match only (identical text→1.0,
+    distinct→near-orthogonal). A natural session-2 query is near-orthogonal to the stored fact,
+    so `query_memories` retains it only when `relevance_threshold≈0`. At 0.3 the match is
+    filtered → nothing recalled → drift. (Real BGE embeddings would behave differently — this
+    weakness is partly a stub artifact, but the params it exercises — `relevance_threshold`,
+    `default_k` — are exactly what context-evolve may tune.)
+  - **Validation:** v0 realistic **0/5**, v1 realistic **0/5** → `heldout_ok(v0,v1)` = **PASS**
+    (0 ≥ 0). v1's compaction change doesn't touch the memory path; both fail identically on the
+    stingy recall config.
+  - **Future optimization target:** lowering `relevance_threshold` / raising `default_k` in the
+    realistic config would lift this from 0/5 — a real Tier-A *memory* iteration (watch for
+    trade-offs vs other tasks: looser recall = more tokens, possible noise injection).
 
-**Across 3 held-out probes (offload-recall, longhaul-codename) v1 is robustly non-regressing**
-— no mode tested drops v1 below v0. The v1 compaction change generalizes beyond the
-drift-ledger it was tuned on; no regression surfaced.
+**Across 3 held-out probes (offload-recall, longhaul-codename, memory-recall) v1 is robustly
+non-regressing** — no mode drops v1 below v0. The compaction change generalizes beyond the
+drift-ledger it was tuned on; no regression surfaced. memory-recall additionally gives the
+campaign its first non-drift-ledger task with real headroom to optimize.
 
 **Operational note (2026-06-29):** the `llama-agent` server was down (container removed); all
 runs returned `{"passed":false,"tokens":0,"turns":0}` until relaunched. Zero tokens/turns ⇒
