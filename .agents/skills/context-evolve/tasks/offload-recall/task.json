@@ -1,0 +1,33 @@
+{
+  "id": "offload-recall",
+  "mode": "offload",
+  "realistic_window": 16000,
+  "favorable_window": 196608,
+  "memory_enabled": false,
+  "seed_files": [
+    {
+      "path": "alpha.txt",
+      "contents": "Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. \nSECRET CODE: QH7-ZEBRA-4413\nAlpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. Alpha reference manual: configuration notes, deployment checklists, and operational filler text. "
+    },
+    {
+      "path": "beta.txt",
+      "contents": "Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. Beta reference manual: configuration notes, deployment checklists, and operational filler text. "
+    },
+    {
+      "path": "gamma.txt",
+      "contents": "Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. Gamma reference manual: configuration notes, deployment checklists, and operational filler text. "
+    }
+  ],
+  "test_cmd": "bash hidden_tests/check.sh",
+  "sessions": [
+    {
+      "prompts": [
+        "Read alpha.txt in full with read_file, then acknowledge in one sentence. Do not write any files yet.",
+        "Read beta.txt in full with read_file, then acknowledge in one sentence. Do not write any files yet.",
+        "Read gamma.txt in full with read_file, then acknowledge in one sentence. Do not write any files yet.",
+        "Now overwrite alpha.txt: use write_file to replace its entire contents with the single line 'archived: original contents rotated out'. Acknowledge when done.",
+        "Write a file named found.txt whose single final line is EXACTLY the SECRET CODE that was ORIGINALLY in alpha.txt before you overwrote it (the bare code, format like AB1-CDEF-2345, nothing else on that line). Note: alpha.txt on disk no longer contains it."
+      ]
+    }
+  ]
+}
