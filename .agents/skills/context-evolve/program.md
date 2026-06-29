@@ -65,10 +65,27 @@ retries a logged dead end.
     NOT fill the window. The drift pressure comes from a small `context_limit` (4000)
     forcing compaction of the early "+N" instruction turns. 16000 does NOT discriminate.
 
-## Locked tasks (real commits)
+## Locked tasks (real commits) — generalization report (run 2026-06-29)
 
-- (none yet — add 1–2 real-commit tasks; run once at campaign end for the honest
-  generalization report.)
+- **locked-hostpolicy** (mode=`code`, `tasks/locked-hostpolicy/`) — a **real** unit of this
+  codebase: `agent-http`'s `NetworkPolicy` host allowlist (commit `fbe1312`). Seeded as a
+  std-only mini-crate (`Cargo.toml` + `src/lib.rs` with `decide()` stubbed = parent state);
+  the agent implements the 3 matching rules (empty→Ask; exact case-insensitive, NOT substring;
+  leading-dot→apex+subdomains but `notrust-lang.org`→Ask) delivered across turns under
+  noise/offload pressure. **Graded by real `cargo test`** against the module's actual tests
+  (sealed oracle copied into `tests/` at grading). Required harness changes (committed): allow
+  `cargo` in the agent command allowlist (std-only crate, no deps/build.rs → bounded) and
+  `create_dir_all` for nested seed paths (`src/lib.rs`).
+- **Result (run ONCE, N=10 each, window 4000):** favorable (full window) ≈ **2/3**;
+  **champion (v1 code + v2 config) 6/10  ==  v0 6/10** — a statistical tie.
+  - **Honest conclusion:** the champion **does not regress** on real coding work, but shows
+    **no measurable improvement** here. The task turned out **capability-bound** (favorable only
+    ~2/3 — the 3B-active model is unreliable on the subtle Rust even with full context), so the
+    model's coding ability, not context retention, is the bottleneck; failures track *longer/
+    harder* runs, not compaction loss. The champion's context-management win is real where
+    **context is the bottleneck** (drift-ledger 0/6→3/6) and simply doesn't surface where it
+    isn't. A cleaner locked task would need favorable ≈ 5/5 (simpler code, or a stronger
+    model) to isolate the curation effect — noted for a future run.
 
 ## Learnings (accumulated; never re-tried)
 
