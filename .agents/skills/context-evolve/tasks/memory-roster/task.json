@@ -1,0 +1,33 @@
+{
+  "id": "memory-roster",
+  "mode": "memory",
+  "realistic_window": 196608,
+  "favorable_window": 196608,
+  "memory_enabled": true,
+  "seed_files": [
+    {
+      "path": "facts.txt",
+      "contents": "pending\n"
+    }
+  ],
+  "test_cmd": "bash hidden_tests/check.sh",
+  "sessions": [
+    {
+      "prompts": [
+        "Remember this in long-term memory as its own separate entry, verbatim: 'registry token ZK-301 maps to value 14'. Acknowledge in one sentence; do not write any files.",
+        "Remember this in long-term memory as its own separate entry, verbatim: 'registry token QW-882 maps to value 7'. Acknowledge in one sentence; do not write any files.",
+        "Remember this in long-term memory as its own separate entry, verbatim: 'registry token HX-457 maps to value 23'. Acknowledge in one sentence; do not write any files.",
+        "Remember this in long-term memory as its own separate entry, verbatim: 'registry token RV-219 maps to value 5'. Acknowledge in one sentence; do not write any files.",
+        "Remember this in long-term memory as its own separate entry, verbatim: 'registry token TP-640 maps to value 31'. Acknowledge in one sentence; do not write any files.",
+        "Remember this in long-term memory as its own separate entry, verbatim: 'registry token MB-073 maps to value 9'. Acknowledge in one sentence; do not write any files.",
+        "Remember this in long-term memory as its own separate entry, verbatim: 'registry token LN-915 maps to value 18'. Acknowledge in one sentence; do not write any files.",
+        "Remember this in long-term memory as its own separate entry, verbatim: 'registry token CF-528 maps to value 2'. Acknowledge in one sentence; do not write any files."
+      ]
+    },
+    {
+      "prompts": [
+        "In earlier sessions you stored several 'registry token' entries in long-term memory. Retrieve ALL of them and write a file named facts.txt with one line per entry in the form '<TOKEN>: <value>'. Include every registry token you can find in memory; if you can only find some, write the ones you found."
+      ]
+    }
+  ]
+}
