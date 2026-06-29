@@ -1,0 +1,26 @@
+{
+  "id": "memory-recall",
+  "mode": "memory",
+  "realistic_window": 16000,
+  "favorable_window": 196608,
+  "memory_enabled": true,
+  "seed_files": [
+    {
+      "path": "token.txt",
+      "contents": "pending\n"
+    }
+  ],
+  "test_cmd": "bash hidden_tests/check.sh",
+  "sessions": [
+    {
+      "prompts": [
+        "Use the remember tool to store this fact in long-term memory, verbatim: 'the deployment token is ZX-99-QUASAR'. Then confirm in one sentence that you stored it. Do not write any files."
+      ]
+    },
+    {
+      "prompts": [
+        "Earlier (in a previous session) you stored a deployment token in long-term memory. Retrieve that token from memory, then write a file named token.txt whose single final line is EXACTLY the token \u2014 the bare value (format like AB-00-FOO), nothing else on that line. If you cannot find it in memory, write the single line UNKNOWN instead."
+      ]
+    }
+  ]
+}
