@@ -102,8 +102,31 @@ retries a logged dead end.
     **regression guard**, not a discriminator: neither version finds offload+recall hard at
     these windows. A truly weakness-first offload task would need a harder retrieval barrier
     (e.g. multiple competing placeholders + a derived multi-file answer) — deferred.
-- Still missing: a **long-horizon** compaction task (many user turns) to exercise the deferred
-  build()-truncation-drops-old-user-turns tradeoff; a `memory-under-recall` task.
+- **longhaul-codename** (mode=`compaction`, `tasks/longhaul-codename/`) — added 2026-06-29 to
+  probe the v1 truncation tradeoff: an early user turn plants a codename (FALCON-9), followed by
+  13 large filler user turns (~280 tok each) meant to overflow a 4000-tok window; the final turn
+  must recover the codename. Because the fact arrives as a USER turn (not a tool result),
+  `context_recall` cannot save it — if truncated, it is gone.
+  - **Validation result (N=5 each):** favorable **5/5**; v0 realistic@4000 **5/5**;
+    v1 realistic@4000 **5/5**. `heldout_ok(v0,v1)` = **PASS** (1.0 ≥ 1.0).
+  - **Admit verdict = `NoWeakness`**, and notably v0 == v1 == 5/5: the codename survives under
+    BOTH versions, so this scale does NOT exercise the truncation tradeoff. The model echoes
+    the codename in its first ack and compaction (v0 and v1 alike) preserves it as a key
+    fact/identifier; v1 additionally keeps the user turns verbatim. **Finding:** v1's
+    long-horizon fact retention is robust — forcing a real failure would require extreme scale
+    (≫13 distinct facts, overflowing even the cumulative summary). Kept as a regression guard;
+    a discriminating long-horizon task is **deferred** (needs the harsher design).
+- Still missing: a discriminating long-horizon task (extreme scale) and a `memory-under-recall`
+  task.
+
+**Across 3 held-out probes (offload-recall, longhaul-codename) v1 is robustly non-regressing**
+— no mode tested drops v1 below v0. The v1 compaction change generalizes beyond the
+drift-ledger it was tuned on; no regression surfaced.
+
+**Operational note (2026-06-29):** the `llama-agent` server was down (container removed); all
+runs returned `{"passed":false,"tokens":0,"turns":0}` until relaunched. Zero tokens/turns ⇒
+suspect the server, not the curation. Exact relaunch command is in the [[local-llama-server]]
+memory.
 
 ## Iteration log
 
