@@ -48,11 +48,6 @@ retries a logged dead end.
     NOT fill the window. The drift pressure comes from a small `context_limit` (4000)
     forcing compaction of the early "+N" instruction turns. 16000 does NOT discriminate.
 
-## Held-out tasks
-
-- (none yet — add weakness-first tasks targeting *different* modes before trusting any
-  accepted change; e.g. `offload`, `compaction`, `memory-under-recall`.)
-
 ## Locked tasks (real commits)
 
 - (none yet — add 1–2 real-commit tasks; run once at campaign end for the honest
@@ -157,19 +152,49 @@ retries a logged dead end.
     embeddings: many stored memories + low `default_k`/`max_recall_chars` so the RIGHT one is
     crowded out — that would be a legitimate discriminator.)
 
-**Across 3 held-out probes (offload-recall, longhaul-codename, memory-recall) v1 is robustly
-non-regressing** — no mode drops v1 below v0. The compaction change generalizes beyond the
-drift-ledger it was tuned on; no regression surfaced. All three are NoWeakness regression guards
-(under their correct embedder for memory-recall); drift-ledger remains the only genuinely
-discriminating task with optimization headroom. A real memory discriminator is still TODO (see
-memory-recall note: many-memories crowd-out under real embeddings).
+- **memory-roster** (mode=`memory`, `tasks/memory-roster/`) — added 2026-06-29. **The
+  many-memories crowd-out discriminator** the memory-recall note called for, and the **first
+  ADMITTED task under REAL embeddings.** Session 1 stores **8 HOMOGENEOUS** facts
+  (`registry token <CODE> maps to value <N>` — no topical sub-structure); session 2 (fresh
+  window) must recall ALL 8 and write them. Run with `EVAL_REAL_EMBEDDINGS=1` and the
+  `tasks/memory-roster/{favorable,realistic}.json` configs (`dedup_threshold=0.99` so the
+  near-template roster coexists — a construction necessity, orthogonal to the `default_k` lever).
+  - **Why homogeneous matters:** a first attempt used topically-distinct facts (db/deploys/
+    backups) and came back **NoWeakness** — the model worked around `default_k=5` by issuing
+    *multiple topical `recall` calls* (realistic used 21–25 turns vs favorable's 19). Homogeneous
+    facts give no query handles, so every recall returns the *same* top-5 → the cap bites.
+  - **Admit verdict = `Admitted`:** favorable (`default_k=20`) **5/5**; realistic
+    (`default_k=5`) **1/5**. Mechanism: `default_k=5 < 8` needed → only 5 retrievable, model
+    can't separate them → incomplete → fail. A *genuine* weakness of the shipping `default_k=5`.
+  - **Validation:** v0 realistic **1/5**, v1 realistic **1/5** → `heldout_ok` PASS (compaction is
+    inert here — storage is per-prompt, session-2 retrieval is a single-prompt fresh window).
+
+**Across 4 held-out probes (offload-recall, longhaul-codename, memory-recall, memory-roster) v1 is
+robustly non-regressing.** drift-ledger and memory-roster are the genuinely discriminating tasks
+with optimization headroom; the rest are regression guards.
+
+## Iteration log (Tier-A — memory)
+
+- **#M1 — `default_k` 5→10** (hypothesis: `default_k=5` under-recalls when a task needs >5
+  distinct memories; raise it). Candidate vs champion on **memory-roster** (real embeddings, N=5):
+  champion(k=5) **1/5** → candidate(k=10) **5/5**. `gate` printed `Reject: tokens not improved
+  (56208 ≥ 55570)` — the **passes-increased gate artifact** (median-token compare assumes equal
+  correctness; here passes jumped 1→5). **PROMOTE on correctness** (5 > 1; +1.1% tokens is the
+  tiny, expected cost of recalling 8 vs 5). Held-out check: memory-recall (single fact) **5/5 →
+  5/5** at k=10 (no regression, no token change); non-memory tasks have memory off (unaffected).
+  - **Status: validated, NOT yet promoted into the shipping champion.** Bumping the shipping
+    `default_k` 5→10 has a **production token trade-off** the eval understates: with a *populated*
+    memory store, `auto_recall` would inject up to 10 memories every turn instead of 5 (~2× recall
+    tokens), justified only when tasks genuinely need >5. Left for an explicit call (the eval
+    stores few memories, so it barely sees this cost). To apply: set `default_k` in
+    `tasks/drift-ledger/champion_v0.json` (and re-derive the memory configs).
 
 **Operational note (2026-06-29):** the `llama-agent` server was down (container removed); all
 runs returned `{"passed":false,"tokens":0,"turns":0}` until relaunched. Zero tokens/turns ⇒
 suspect the server, not the curation. Exact relaunch command is in the [[local-llama-server]]
 memory.
 
-## Iteration log
+## Iteration log (Tier-B — compaction, v0→v1)
 
 <!-- one entry per hypothesis: change | N raw results (or pass-rate + median) | gate verdict | kept? -->
 - **Tier-A (skipped, by diagnosis).** Instrumented one champion run: compaction summaries
