@@ -7,8 +7,8 @@
 //!   cargo test -p agent-runtime-config --test eval_context -- --ignored --nocapture
 use agent_core::{AgentEvent, CuratedContext, EventSink, InMemoryOffloadStore, OffloadStore, Retriever};
 use agent_memory::{
-    build_tools_with, project_scope, Embedder, MemoryConfig, MemoryRetriever, MemoryScope,
-    MemoryStore, SqliteStore, StubEmbedder,
+    build_tools_with, project_scope, Embedder, FastEmbedEmbedder, MemoryConfig, MemoryRetriever,
+    MemoryScope, MemoryStore, SqliteStore, StubEmbedder,
 };
 use agent_model::{Message, OpenAiCompatClient};
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse};
@@ -108,11 +108,20 @@ async fn eval_context_run() {
         cfg.sandbox_mode = "off".into();
         cfg.max_turns = 12;
 
-        // Memory: shared SqliteStore so facts persist across sessions; StubEmbedder
-        // is deterministic (build with the `onnx` feature for real embeddings).
+        // Memory: shared SqliteStore so facts persist across sessions. Default embedder
+        // is the deterministic StubEmbedder (exact-match only, no network). Set
+        // EVAL_REAL_EMBEDDINGS=1 (+ optional FASTEMBED_CACHE=<dir>) to use the real
+        // BGE-Small model — required for any task that tests *semantic* recall, since the
+        // stub scores distinct text near-orthogonal regardless of meaning.
         let (mem_tools, retriever) = if cfg.memory {
             let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open(&mem_db).unwrap());
-            let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
+            let embedder: Arc<dyn Embedder> = if std::env::var("EVAL_REAL_EMBEDDINGS").is_ok() {
+                let mut ecfg = MemoryConfig::default();
+                ecfg.model_cache_dir = std::env::var("FASTEMBED_CACHE").ok().map(std::path::PathBuf::from);
+                Arc::new(FastEmbedEmbedder::new(&ecfg).expect("load BGE-Small embedder"))
+            } else {
+                Arc::new(StubEmbedder::d384())
+            };
             let mut mcfg = MemoryConfig::default();
             mcfg.default_k = cc.default_k;
             mcfg.relevance_threshold = cc.relevance_threshold;

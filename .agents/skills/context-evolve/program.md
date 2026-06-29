@@ -130,17 +130,39 @@ retries a logged dead end.
     filtered → nothing recalled → drift. (Real BGE embeddings would behave differently — this
     weakness is partly a stub artifact, but the params it exercises — `relevance_threshold`,
     `default_k` — are exactly what context-evolve may tune.)
-  - **Validation:** v0 realistic **0/5**, v1 realistic **0/5** → `heldout_ok(v0,v1)` = **PASS**
-    (0 ≥ 0). v1's compaction change doesn't touch the memory path; both fail identically on the
-    stingy recall config.
-  - **Future optimization target:** lowering `relevance_threshold` / raising `default_k` in the
-    realistic config would lift this from 0/5 — a real Tier-A *memory* iteration (watch for
-    trade-offs vs other tasks: looser recall = more tokens, possible noise injection).
+  - **Validation (stub):** v0 realistic **0/5**, v1 realistic **0/5** → `heldout_ok` PASS (0≥0).
+
+  **CORRECTION (2026-06-29) — the stub "weakness" was an EVAL ARTIFACT, not a real one.**
+  Optimizing the realistic config was investigated and **rejected as gaming the metric.** The
+  offline `StubEmbedder` cosine of the session-2 query vs the stored fact is **+0.016** (and an
+  explicit `recall("deployment token")` is **−0.016**) — i.e. *near-orthogonal regardless of
+  meaning*, because the stub is FNV-hash exact-match, not semantic. So `0.3` filtered it and only
+  `threshold≈0` admits it — but at ≈0 the stub admits *everything* (all cosines cluster at 0),
+  which is degenerate and would **mis-tune the production default** (real BGE gives related
+  memories ~0.4–0.6; `0.3` is correct there). The honest fix is to the **eval, not the config**:
+  - Wired an env-gated real-embedder path into the harness (`eval_context.rs`):
+    `EVAL_REAL_EMBEDDINGS=1` (+ `FASTEMBED_CACHE=<dir>`) → real BGE-Small (onnx, default feature;
+    model cached at `src-tauri/.fastembed_cache`). Default stays the deterministic stub.
+  - **Under real embeddings, realistic@0.3 passes 5/5** (favorable 5/5; v0 5/5, v1 5/5 →
+    `heldout_ok` PASS). Real-embedding runs are also *cheaper* (~12K vs ~21K tok): recall
+    succeeds immediately instead of the model retrying a failing `recall`.
+  - **Conclusion:** `relevance_threshold=0.3` needs **no change** — it is correct for the
+    production embedder. memory-recall is therefore **NoWeakness under real embeddings** (a
+    recall regression guard, not a discriminator) and **MUST be run with `EVAL_REAL_EMBEDDINGS=1`**
+    to be meaningful; the stub run is misleading. Configs persisted at
+    `tasks/memory-recall/{favorable,realistic}.json`.
+  - **Lesson for the campaign:** never tune memory params (`relevance_threshold`, `default_k`,
+    `dedup/forget_threshold`) against the stub embedder — its scores are non-semantic. Memory-mode
+    tasks require the real embedder. (Still-open *genuine* memory weakness to author under real
+    embeddings: many stored memories + low `default_k`/`max_recall_chars` so the RIGHT one is
+    crowded out — that would be a legitimate discriminator.)
 
 **Across 3 held-out probes (offload-recall, longhaul-codename, memory-recall) v1 is robustly
 non-regressing** — no mode drops v1 below v0. The compaction change generalizes beyond the
-drift-ledger it was tuned on; no regression surfaced. memory-recall additionally gives the
-campaign its first non-drift-ledger task with real headroom to optimize.
+drift-ledger it was tuned on; no regression surfaced. All three are NoWeakness regression guards
+(under their correct embedder for memory-recall); drift-ledger remains the only genuinely
+discriminating task with optimization headroom. A real memory discriminator is still TODO (see
+memory-recall note: many-memories crowd-out under real embeddings).
 
 **Operational note (2026-06-29):** the `llama-agent` server was down (container removed); all
 runs returned `{"passed":false,"tokens":0,"turns":0}` until relaunched. Zero tokens/turns ⇒
