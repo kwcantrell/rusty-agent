@@ -84,8 +84,24 @@ retries a logged dead end.
     model's coding ability, not context retention, is the bottleneck; failures track *longer/
     harder* runs, not compaction loss. The champion's context-management win is real where
     **context is the bottleneck** (drift-ledger 0/6→3/6) and simply doesn't surface where it
-    isn't. A cleaner locked task would need favorable ≈ 5/5 (simpler code, or a stronger
-    model) to isolate the curation effect — noted for a future run.
+    isn't. A cleaner locked task would need favorable ≈ 5/5 to isolate the curation effect —
+    delivered next (locked-portmap).
+
+- **locked-portmap** (mode=`code`, `tasks/locked-portmap/`) — the **clean** locked task: same
+  curation pressure as drift-ledger (8 `service→port` facts delivered across turns, each behind a
+  noise read, at window 4000) but a **near-zero capability bar** — the code is a trivial `match`
+  *transcribing* the given values (no logic to derive), graded by real `cargo test`. Parent state
+  stubs `port_for()→None`. This **isolates context management**: any realistic-window failure is
+  context LOSS, not capability.
+  - **Result (run ONCE, N=10, window 4000):** favorable (full window) **5/5**;
+    **champion (v1+v2) 4/10**; **v0 0/10**.
+  - **The generalization win, finally on real cargo-tested code.** v0's lossy compaction loses the
+    early service→port mappings → an incomplete/wrong `match` → **every** run fails (0/10). v1's
+    verbatim user-turn retention + cumulative summary keeps them → **4/10** — a clear, no-overlap
+    advantage (0→4) that mirrors drift-ledger's 0/6→3/6 on a real coding task. Champion is below
+    favorable's 5/5, so some context degradation remains at 4000 even with v1 (partial recovery,
+    not full) — but the compaction improvement is decisively better than v0 here, not just on the
+    synthetic ledger.
 
 ## Learnings (accumulated; never re-tried)
 
