@@ -40,6 +40,10 @@ impl ApprovalChannel for SafeApproval {
                         base,
                         "ls" | "cat" | "wc" | "head" | "tail" | "echo" | "grep" | "find" | "pwd"
                             | "sort" | "uniq" | "true" | "date" | "nl"
+                            // `cargo` for code tasks (e.g. locked-hostpolicy): lets the agent
+                            // build/check its work. Bounded: eval crates are std-only, no deps,
+                            // no build.rs — so cargo only invokes rustc on trusted local source.
+                            | "cargo"
                     )
                 })
                 .unwrap_or(false),
@@ -89,7 +93,11 @@ async fn eval_context_run() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().to_path_buf();
     for sf in &task.seed_files {
-        std::fs::write(ws.join(&sf.path), &sf.contents).unwrap();
+        let dest = ws.join(&sf.path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).unwrap(); // support nested seed paths (e.g. src/lib.rs)
+        }
+        std::fs::write(dest, &sf.contents).unwrap();
     }
 
     let mem_db = ws.join("memory.db");
