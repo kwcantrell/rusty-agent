@@ -16,14 +16,18 @@ describe("computeBreakdown", () => {
     expect(b.total).toBe(100);
     const un = b.slices.find((s) => s.category === "unattributed");
     expect(un?.tokens).toBe(40); // 100 - 60
+    expect(b.slices.find((s) => s.category === "unattributed")?.pct).toBe(40); // 40/100 = 40%
+    expect(b.slices.find((s) => s.category === "system")?.pct).toBe(40); // 40/100 = 40%
   });
   it("clamps unattributed at zero when estimate exceeds real total", () => {
     const b = computeBreakdown(snap, 50);
     expect(b.slices.find((s) => s.category === "unattributed")).toBeUndefined();
-    expect(b.total).toBe(60); // falls back to estimate when no faithful total
+    expect(b.total).toBe(60); // realTotal (50) < estTotal (60) → use estTotal as total
   });
   it("uses estimate as total when realTotal is null", () => {
     const b = computeBreakdown(snap, null);
     expect(b.total).toBe(60);
+    expect(b.slices.find((s) => s.category === "unattributed")).toBeUndefined();
+    expect(b.slices).toHaveLength(2);
   });
 });
