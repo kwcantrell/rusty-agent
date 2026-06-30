@@ -88,6 +88,20 @@ impl CuratedContext {
     pub(crate) fn history(&self) -> &[Message] {
         &self.history
     }
+
+    /// Per-category breakdown of the current context window, for the explorer UI.
+    /// Token figures are estimates; the faithful total comes from server usage.
+    pub fn snapshot(&self, model_limit: usize, turn: usize) -> crate::ContextSnapshot {
+        crate::snapshot::build_snapshot(
+            turn,
+            model_limit,
+            &self.system,
+            self.goal.as_ref(),
+            &self.recall,
+            self.compaction_summary.as_ref(),
+            &self.history,
+        )
+    }
 }
 
 #[async_trait]
@@ -366,6 +380,23 @@ mod tests {
         }
         // And a compaction summary block exists for the chatter.
         assert!(built.iter().any(|m| m.content.contains("chatter summary")));
+    }
+
+    #[test]
+    fn curated_snapshot_reports_system_recall_and_messages() {
+        let mut c = CuratedContext::new(
+            Message::system("SYS"),
+            Arc::new(crate::offload::InMemoryOffloadStore::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        c.set_recall(vec!["user likes rust".into()]);
+        c.append(Message::user("hello"));
+        let snap = c.snapshot(10_000, 7);
+        assert_eq!(snap.turn, 7);
+        assert!(snap.segments.iter().any(|s| s.category == "system"));
+        assert!(snap.segments.iter().any(|s| s.category == "memory"));
+        let msgs = snap.segments.iter().find(|s| s.category == "messages").unwrap();
+        assert_eq!(msgs.count, 1);
     }
 
     #[tokio::test]
