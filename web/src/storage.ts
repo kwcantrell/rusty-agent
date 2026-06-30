@@ -75,3 +75,12 @@ export function loadDashExpanded(): boolean {
 export function saveDashExpanded(v: boolean): void {
   try { localStorage.setItem(DASH_EXPANDED, v ? "1" : "0"); } catch { /* ignore */ }
 }
+
+const RIGHT_TAB = "rightTab";
+export type RightTab = "workspace" | "context";
+export function loadRightTab(): RightTab {
+  return localStorage.getItem(RIGHT_TAB) === "context" ? "context" : "workspace";
+}
+export function saveRightTab(t: RightTab): void {
+  try { localStorage.setItem(RIGHT_TAB, t); } catch { /* ignore */ }
+}
