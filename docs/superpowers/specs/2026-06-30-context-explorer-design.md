@@ -4,6 +4,15 @@
 **Status:** Approved for planning
 **Related:** `2026-06-24-context-dashboard-design.md`, `2026-06-23-memory-system-design.md`, `2026-06-24-memory-auto-retrieval-design.md`, `2026-06-23-skills-subsystem-design.md`, `2026-06-25-tauri-ipc-transport-design.md`, `2026-06-23-react-frontend-design.md`
 
+## Plan-time corrections (2026-06-30)
+
+Two assumptions in this spec were corrected while writing the implementation plan (`docs/superpowers/plans/2026-06-30-context-explorer.md`):
+
+1. **SqliteStore is already wired.** The desktop bridge (`src-tauri/src/bridge.rs::start`) already opens `SqliteStore` via `open_memory_parts` → `SqliteStore::open(default_db_path())`. The `InMemoryStore` referenced below was test-only. The "swap to SqliteStore" task is therefore **dropped** — memory is already durable.
+2. **Pull, not push.** The `context_snapshot` is delivered by a pull-based `context_get` command (invoked by the frontend each turn), not a pushed event — lower risk, reuses the `settings_get` pattern, and leaves the agent loop untouched. Per-turn recall **cosine scores** come from an off-loop `memory_recall_preview` command that re-runs the deterministic retrieval, rather than threading `Scored` through the hot loop. User-visible behavior is unchanged.
+
+Also note: `message_tokens` already counts `reasoning` + `tool_calls` (an earlier concern that it undercounts is stale); estimates remain ~4 chars/token, so the `unattributed` reconciliation against the faithful `ServerUsage` total still applies.
+
 ## Summary
 
 A new right-side pane/tab in the existing `web/` React app that turns the live **context window** into an interactive explorer. The context window is the spine; the **memory** and **skill** systems are two categories *inside* it, each drillable into a full management console. v1 ships visualization **and** CRUD together.
