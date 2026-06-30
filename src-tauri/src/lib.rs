@@ -110,6 +110,30 @@ async fn llama_health() -> llama::LlamaHealth {
     llama::check_health("http://localhost:8080").await
 }
 
+#[tauri::command]
+async fn memory_list(state: tauri::State<'_, AppState>, limit: usize, offset: usize)
+    -> Result<Vec<agent_memory::MemoryRow>, String> {
+    session(&state).memory_list(limit, offset).await
+}
+
+#[tauri::command]
+async fn memory_update(state: tauri::State<'_, AppState>, id: String,
+    text: Option<String>, tags: Option<Vec<String>>)
+    -> Result<agent_memory::MemoryRow, String> {
+    session(&state).memory_update(id, text, tags).await
+}
+
+#[tauri::command]
+async fn memory_delete(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
+    session(&state).memory_delete(id).await
+}
+
+#[tauri::command]
+async fn memory_recall_preview(state: tauri::State<'_, AppState>, query: String)
+    -> Result<Vec<agent_memory::ScoredRow>, String> {
+    Ok(session(&state).memory_recall_preview(query).await)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -147,7 +171,11 @@ pub fn run() {
             context_get,
             get_workspace,
             pick_workspace,
-            llama_health
+            llama_health,
+            memory_list,
+            memory_update,
+            memory_delete,
+            memory_recall_preview
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -175,7 +203,8 @@ mod cmd_tests {
         mock_builder()
             .manage(AppState { bridge, config_path: PathBuf::from("/tmp/app.json") })
             .invoke_handler(tauri::generate_handler![
-                subscribe, send_input, approve, cancel, settings_get, settings_update, context_get
+                subscribe, send_input, approve, cancel, settings_get, settings_update, context_get,
+                memory_list, memory_update, memory_delete, memory_recall_preview
             ])
             .build(mock_context(noop_assets()))
             .expect("failed to build mock app")

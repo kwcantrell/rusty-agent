@@ -17,6 +17,7 @@ pub struct DaemonParams {
     pub memory_tools: Arc<[Arc<dyn Tool>]>,
     pub memory_retriever: Option<Arc<dyn Retriever>>,
     pub recall_token_budget: usize,
+    pub memory_parts: Option<agent_memory::MemoryParts>,
 }
 
 pub const SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided tools to inspect \

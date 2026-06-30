@@ -43,6 +43,7 @@ pub fn local_params(
         memory_tools,
         memory_retriever,
         recall_token_budget,
+        memory_parts: memory_parts.cloned(),
     }
 }
 
@@ -68,6 +69,7 @@ mod tests {
         assert!(p.mcp_tools.is_empty());
         assert!(p.memory_tools.is_empty());
         assert!(p.memory_retriever.is_none());
+        assert!(p.memory_parts.is_none());
     }
 
     #[test]
@@ -84,5 +86,6 @@ mod tests {
         assert_eq!(p.memory_tools.len(), 3);
         assert!(p.memory_retriever.is_some());
         assert_eq!(p.recall_token_budget, 512);
+        assert!(p.memory_parts.is_some());
     }
 }
