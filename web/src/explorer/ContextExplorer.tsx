@@ -11,7 +11,7 @@ const COLORS: Record<string, string> = {
 };
 
 export function ContextExplorer(
-  { realTotal, refreshKey }: { realTotal: number | null; refreshKey: number },
+  { realTotal, refreshKey, skills }: { realTotal: number | null; refreshKey: number; skills: { name: string; description: string }[] },
 ) {
   const [snap, setSnap] = useState<ContextSnapshot | null>(null);
   const [open, setOpen] = useState<string | null>(null);
@@ -56,7 +56,7 @@ export function ContextExplorer(
         <MemorySection
           recalled={snap.segments.find((x) => x.category === "memory")?.items ?? []}
         />
-        <SkillSection />
+        <SkillSection skills={skills} />
       </div>
     </div>
   );

@@ -14,7 +14,7 @@ vi.mock("./api", () => ({
 describe("ContextExplorer", () => {
   beforeEach(() => vi.clearAllMocks());
   it("renders the breakdown total after fetching a snapshot", async () => {
-    render(<ContextExplorer realTotal={100} refreshKey={0} />);
+    render(<ContextExplorer realTotal={100} refreshKey={0} skills={[]} />);
     expect(await screen.findByText(/100/)).toBeInTheDocument();
     expect(await screen.findByText(/system/i)).toBeInTheDocument();
   });

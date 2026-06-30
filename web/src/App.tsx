@@ -168,7 +168,7 @@ export default function App() {
               <div className="min-h-0 flex-1">
                 {rightTab === "workspace"
                   ? <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />
-                  : <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex} />}
+                  : <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex} skills={state.settingsMeta?.discoveredSkills ?? []} />}
               </div>
             </div>
           </div>
@@ -195,7 +195,7 @@ export default function App() {
                 <div className="min-h-0 flex-1">
                   {rightTab === "workspace"
                     ? <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />
-                    : <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex} />}
+                    : <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex} skills={state.settingsMeta?.discoveredSkills ?? []} />}
                 </div>
               </div>
             </div>
