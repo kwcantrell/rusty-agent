@@ -19,6 +19,8 @@ pub trait MemoryStore: Send + Sync {
     async fn delete(&self, id: &str) -> Result<bool, StoreError>;
     async fn count(&self, filter: &ScopeFilter) -> Result<usize, StoreError>;
     async fn evict_oldest(&self, scope: &MemoryScope) -> Result<Option<String>, StoreError>;
+    async fn list(&self, filter: &ScopeFilter, limit: usize, offset: usize)
+        -> Result<Vec<MemoryRecord>, StoreError>;
 }
 
 /// Score a candidate set against a query vector, skipping dimension-mismatched rows
@@ -81,6 +83,13 @@ impl MemoryStore for InMemoryStore {
             g.remove(id);
         }
         Ok(oldest)
+    }
+    async fn list(&self, filter: &ScopeFilter, limit: usize, offset: usize)
+        -> Result<Vec<MemoryRecord>, StoreError> {
+        let mut rows: Vec<MemoryRecord> = self.rows.lock().unwrap().values()
+            .filter(|r| filter.matches(&r.scope)).cloned().collect();
+        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
     }
 }
 
@@ -243,6 +252,26 @@ impl MemoryStore for SqliteStore {
         }
         Ok(id)
     }
+
+    async fn list(&self, filter: &ScopeFilter, limit: usize, offset: usize)
+        -> Result<Vec<MemoryRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let (where_sql, params) = scope_where(filter);
+        let sql = format!(
+            "SELECT * FROM memories WHERE {where_sql} ORDER BY updated_at DESC LIMIT ?{n1} OFFSET ?{n2}",
+            n1 = params.len() + 1, n2 = params.len() + 2);
+        let mut stmt = conn.prepare(&sql).map_err(|e| StoreError::Io(e.to_string()))?;
+        let limit_i = limit as i64;
+        let offset_i = offset as i64;
+        let mut pref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        pref.push(&limit_i);
+        pref.push(&offset_i);
+        let rows = stmt.query_map(pref.as_slice(), Self::row_to_record)
+            .map_err(|e| StoreError::Io(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +339,21 @@ mod tests {
     fn rec(id: &str, scope: MemoryScope, vector: Vec<f32>, updated: i64) -> MemoryRecord {
         MemoryRecord { id: id.into(), text: id.into(), scope, tags: vec![], vector,
                        created_at: updated, updated_at: updated, source: "test".into() }
+    }
+
+    #[tokio::test]
+    async fn list_returns_scope_filtered_newest_first() {
+        let s = InMemoryStore::new();
+        let mk = |id: &str, t: i64| MemoryRecord {
+            id: id.into(), text: format!("m{id}"), scope: MemoryScope::Project("K".into()),
+            tags: vec![], vector: vec![0.1, 0.2], created_at: t, updated_at: t, source: "x".into(),
+        };
+        s.upsert(mk("a", 100)).await.unwrap();
+        s.upsert(mk("b", 200)).await.unwrap();
+        let f = ScopeFilter::Exact(MemoryScope::Project("K".into()));
+        let rows = s.list(&f, 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "b"); // newest first
     }
 
     #[tokio::test]

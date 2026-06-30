@@ -22,6 +22,102 @@ pub use tools::Recall;
 pub use tools::Forget;
 pub use retriever::MemoryRetriever;
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRow {
+    pub id: String, pub text: String, pub tags: Vec<String>,
+    pub scope_kind: String, pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoredRow {
+    pub id: String, pub text: String, pub score: f32, pub scope_kind: String,
+}
+
+pub struct MemoryAdmin {
+    embedder: Arc<dyn Embedder>,
+    store: Arc<dyn MemoryStore>,
+    cfg: Arc<MemoryConfig>,
+    scope: MemoryScope,
+}
+
+impl MemoryAdmin {
+    pub fn new(embedder: Arc<dyn Embedder>, store: Arc<dyn MemoryStore>,
+        cfg: Arc<MemoryConfig>, scope: MemoryScope) -> Self {
+        Self { embedder, store, cfg, scope }
+    }
+
+    fn filter(&self) -> ScopeFilter {
+        match &self.scope {
+            MemoryScope::Project(k) => ScopeFilter::ProjectAndGlobal { project_key: k.clone() },
+            MemoryScope::Global => ScopeFilter::Exact(MemoryScope::Global),
+        }
+    }
+
+    fn editable(&self, rec: &MemoryScope) -> bool {
+        matches!(rec, MemoryScope::Global) || rec == &self.scope
+    }
+
+    pub async fn list(&self, limit: usize, offset: usize) -> Result<Vec<MemoryRow>, StoreError> {
+        Ok(self.store.list(&self.filter(), limit, offset).await?.into_iter().map(|r| MemoryRow {
+            id: r.id, text: r.text, tags: r.tags, scope_kind: r.scope.kind().into(),
+            updated_at: r.updated_at,
+        }).collect())
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Option<MemoryRow>, StoreError> {
+        match self.store.get(id).await? {
+            Some(rec) if self.editable(&rec.scope) => Ok(Some(MemoryRow {
+                id: rec.id, text: rec.text, tags: rec.tags,
+                scope_kind: rec.scope.kind().into(), updated_at: rec.updated_at,
+            })),
+            Some(_) => Err(StoreError::Io("refused: record belongs to another project".into())),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn delete(&self, id: &str) -> Result<bool, StoreError> {
+        match self.store.get(id).await? {
+            Some(rec) if self.editable(&rec.scope) => self.store.delete(id).await,
+            Some(_) => Err(StoreError::Io("refused: record belongs to another project".into())),
+            None => Ok(false),
+        }
+    }
+
+    pub async fn update(&self, id: &str, text: Option<String>, tags: Option<Vec<String>>)
+        -> Result<MemoryRow, StoreError> {
+        let mut rec = self.store.get(id).await?
+            .ok_or_else(|| StoreError::Io("not found".into()))?;
+        if !self.editable(&rec.scope) {
+            return Err(StoreError::Io("refused: record belongs to another project".into()));
+        }
+        if let Some(t) = text {
+            rec.vector = self.embedder.embed(&[t.clone()]).await
+                .map_err(|e| StoreError::Io(e.to_string()))?.remove(0);
+            rec.text = t;
+        }
+        if let Some(tg) = tags { rec.tags = tg; }
+        rec.updated_at = now_secs();
+        self.store.upsert(rec.clone()).await?;
+        Ok(MemoryRow { id: rec.id, text: rec.text, tags: rec.tags,
+            scope_kind: rec.scope.kind().into(), updated_at: rec.updated_at })
+    }
+
+    pub async fn recall_preview(&self, query: &str) -> Vec<ScoredRow> {
+        let key = match &self.scope {
+            MemoryScope::Project(k) => k.clone(), MemoryScope::Global => String::new(),
+        };
+        match crate::tools::query_memories(self.embedder.as_ref(), self.store.as_ref(),
+            &self.cfg, &key, query, self.cfg.default_k).await {
+            Ok(hits) => hits.into_iter().map(|h| ScoredRow {
+                id: h.record.id, text: h.record.text, score: h.score,
+                scope_kind: h.record.scope.kind().into() }).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryInitError {
     #[error("embedder init: {0}")]
@@ -112,6 +208,28 @@ pub fn assemble_memory(
         project_key: key,
     });
     (tools, retriever)
+}
+
+#[cfg(test)]
+mod admin_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn admin_lists_and_refuses_cross_project_delete() {
+        use crate::{Embedder, InMemoryStore, MemoryConfig, MemoryRecord, MemoryScope, StubEmbedder};
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let v = embedder.embed(&["hi".into()]).await.unwrap().remove(0);
+        store.upsert(MemoryRecord { id: "x".into(), text: "hi".into(),
+            scope: MemoryScope::Project("OTHER".into()), tags: vec![], vector: v,
+            created_at: 1, updated_at: 1, source: "t".into() }).await.unwrap();
+        let admin = MemoryAdmin::new(embedder, store, Arc::new(MemoryConfig::default()),
+            MemoryScope::Project("MINE".into()));
+        // Cross-project record is not listed in MINE's scope and cannot be deleted.
+        assert!(admin.list(20, 0).await.unwrap().is_empty());
+        assert!(admin.delete("x").await.is_err());
+    }
 }
 
 #[cfg(test)]
