@@ -134,6 +134,18 @@ async fn memory_recall_preview(state: tauri::State<'_, AppState>, query: String)
     Ok(session(&state).memory_recall_preview(query).await)
 }
 
+#[tauri::command]
+async fn skill_get(state: tauri::State<'_, AppState>, name: String)
+    -> Result<agent_server::session::SkillDto, String> {
+    session(&state).skill_get(name).await
+}
+
+#[tauri::command]
+async fn skill_save(state: tauri::State<'_, AppState>, name: String, body: String)
+    -> Result<(), String> {
+    session(&state).skill_save(name, body).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -175,7 +187,9 @@ pub fn run() {
             memory_list,
             memory_update,
             memory_delete,
-            memory_recall_preview
+            memory_recall_preview,
+            skill_get,
+            skill_save
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -204,7 +218,8 @@ mod cmd_tests {
             .manage(AppState { bridge, config_path: PathBuf::from("/tmp/app.json") })
             .invoke_handler(tauri::generate_handler![
                 subscribe, send_input, approve, cancel, settings_get, settings_update, context_get,
-                memory_list, memory_update, memory_delete, memory_recall_preview
+                memory_list, memory_update, memory_delete, memory_recall_preview,
+                skill_get, skill_save
             ])
             .build(mock_context(noop_assets()))
             .expect("failed to build mock app")
