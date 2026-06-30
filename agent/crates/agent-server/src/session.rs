@@ -14,6 +14,15 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
+/// DTO returned by `skill_get` / sent over Tauri IPC to the frontend.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SkillDto {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    pub files: Vec<String>,
+}
+
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub enum SendOutcome { Started, Busy }
@@ -139,6 +148,41 @@ impl Session {
         }
     }
 
+    /// Build a fresh `SkillRegistry` from the current config + workspace.
+    /// The workspace lock is released before returning.
+    fn skill_registry(&self) -> agent_skills::SkillRegistry {
+        let workspace = self.workspace.lock().unwrap().clone();
+        let cfg = self.runtime.settings_state().settings;
+        agent_skills::SkillRegistry::from_config(&cfg.skills_dirs, &workspace)
+    }
+
+    pub async fn skill_get(&self, name: String) -> Result<SkillDto, String> {
+        let reg = self.skill_registry();
+        let s = reg.find(&name).ok_or_else(|| format!("skill not found: {name}"))?;
+        Ok(SkillDto {
+            name: s.name,
+            description: s.description,
+            body: s.body,
+            files: s.files.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+        })
+    }
+
+    pub async fn skill_save(&self, name: String, body: String) -> Result<(), String> {
+        let slug = agent_skills::sanitize_slug(&name)?;
+        let reg = self.skill_registry();
+        let dir = reg.writable_root().join(&slug);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        // Preserve an existing description: try the original name first (consistent
+        // with skill_get), then the slug, then fall back to a generated default.
+        let desc = reg.find(&name)
+            .or_else(|| reg.find(&slug))
+            .map(|s| s.description)
+            .unwrap_or_else(|| format!("{slug} skill"));
+        let md = format!("---\nname: {slug}\ndescription: {desc}\n---\n{body}\n");
+        std::fs::write(dir.join("SKILL.md"), md).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Cancel any run, then reset the conversation context (workspace switch).
     pub async fn set_workspace(self: &Arc<Self>, dir: PathBuf) {
         self.cancel();
@@ -221,5 +265,45 @@ mod tests {
         let snap = sess.context_get().await;
         assert!(snap.segments.iter().any(|s| s.category == "system"));
         assert!(snap.model_limit > 0);
+    }
+
+    #[tokio::test]
+    async fn skill_save_then_get_roundtrips() {
+        let (sess, _cap) = session_with_scripted();
+        sess.skill_save("greeter".into(), "Say hello to the user.".into()).await.unwrap();
+        let got = sess.skill_get("greeter".into()).await.unwrap();
+        assert_eq!(got.name, "greeter");
+        assert!(got.body.contains("hello"));
+    }
+
+    /// When a skill's directory name is not already a lowercase slug (e.g. "Greeter"
+    /// → slug "greeter"), `skill_save` must still look up the existing description by
+    /// the ORIGINAL name, not the slug — otherwise the description is silently replaced
+    /// by the "{slug} skill" default on every body edit.
+    #[tokio::test]
+    async fn skill_save_edit_preserves_description_on_name_slug_mismatch() {
+        let (sess, _cap) = session_with_scripted();
+
+        // Seed a skill whose directory name is "Greeter" (has uppercase → slug is "greeter").
+        let ws = sess.settings_get().workspace;
+        let skills_root = std::path::Path::new(&ws).join(".agent").join("skills");
+        let skill_dir = skills_root.join("Greeter");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Greeter\ndescription: Greets the user warmly\n---\nSay hello.\n",
+        )
+        .unwrap();
+
+        // Simulate a body edit via skill_save using the same name "Greeter".
+        sess.skill_save("Greeter".into(), "Say hi to everyone.".into()).await.unwrap();
+
+        // The written file goes to writable_root/greeter (the slug).
+        // The description must be preserved from "Greeter", not defaulted to "greeter skill".
+        let got = sess.skill_get("greeter".into()).await.unwrap();
+        assert_eq!(
+            got.description, "Greets the user warmly",
+            "description was lost on edit; got: {:?}", got.description
+        );
     }
 }
