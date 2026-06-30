@@ -14,6 +14,9 @@ pub enum ServerEvent {
     Token { text: String },
     Reasoning { text: String },
     Usage { prompt_tokens: usize, context_limit: usize, turn: usize, max_turns: usize },
+    /// Faithful server-reported token totals for the completed turn; the web
+    /// Context Explorer uses this as ground truth for the prompt-token chart.
+    ServerUsage { prompt_tokens: u32, completion_tokens: u32, turn: usize },
     ToolStart { name: String, args: serde_json::Value },
     ToolResult {
         name: String,
@@ -96,6 +99,8 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
         AgentEvent::Done(r) => ServerEvent::Done { reason: stop_reason_str(&r).into() },
         AgentEvent::Approval(_) => return None,
         AgentEvent::Context(_) => return None, // curation telemetry; not forwarded to clients in v1
+        AgentEvent::ServerUsage { prompt_tokens, completion_tokens, turn } =>
+            ServerEvent::ServerUsage { prompt_tokens, completion_tokens, turn },
     })
 }
 
@@ -126,6 +131,20 @@ mod tests {
         let j = serde_json::to_string(&ar).unwrap();
         assert!(j.contains(r#""type":"approval_request""#));
         assert!(j.contains(r#""id":"c0""#));
+    }
+
+    #[test]
+    fn server_usage_serializes_with_type_tag() {
+        let ev = server_event_from(AgentEvent::ServerUsage {
+            prompt_tokens: 42,
+            completion_tokens: 7,
+            turn: 3,
+        }).unwrap();
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains(r#""type":"server_usage""#), "missing type tag: {j}");
+        assert!(j.contains(r#""prompt_tokens":42"#), "missing prompt_tokens: {j}");
+        assert!(j.contains(r#""completion_tokens":7"#), "missing completion_tokens: {j}");
+        assert!(j.contains(r#""turn":3"#), "missing turn: {j}");
     }
 
     #[test]
