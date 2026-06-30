@@ -6,19 +6,30 @@ export function SkillSection({ skills }: { skills: { name: string; description: 
   const [open, setOpen] = useState<SkillDto | null>(null);
   const [body, setBody] = useState("");
   const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const onOpen = async (name: string) => {
-    const s = await getSkill(name);
-    setOpen(s); setBody(s.body); setSaved(false);
+    try {
+      const s = await getSkill(name);
+      setOpen(s); setBody(s.body); setSaved(false); setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
   };
   const onSave = async () => {
     if (!open) return;
-    await saveSkill(open.name, body); setSaved(true);
+    try {
+      await saveSkill(open.name, body);
+      setSaved(true); setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   return (
     <div className="px-3 py-2 text-xs">
       <div className="font-semibold" style={{ color: "var(--text-strong)" }}>Skills</div>
+      {error && <div style={{ color: "var(--state-error)" }}>{error}</div>}
       <div className="mt-1 space-y-0.5">
         {skills.map((s) => (
           <button key={s.name} aria-label={`open ${s.name}`} onClick={() => onOpen(s.name)}

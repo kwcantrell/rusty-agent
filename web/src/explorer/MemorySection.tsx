@@ -1,19 +1,43 @@
 import { useEffect, useState } from "react";
-import type { MemoryRow } from "./types";
-import { listMemories, deleteMemory, updateMemory } from "./api";
+import type { MemoryRow, ScoredRow } from "./types";
+import { listMemories, deleteMemory, updateMemory, recallPreview } from "./api";
 
-export function MemorySection({ recalled }: { recalled: string[] }) {
+export function MemorySection({ recalled, lastQuery }: { recalled: string[]; lastQuery?: string | null }) {
   const [rows, setRows] = useState<MemoryRow[]>([]);
   const [q, setQ] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  const [scoredRows, setScoredRows] = useState<ScoredRow[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   const refresh = () => listMemories(50, 0).then(setRows).catch(() => {});
   useEffect(() => { refresh(); }, []);
 
-  const onDelete = async (id: string) => { await deleteMemory(id); refresh(); };
+  useEffect(() => {
+    if (!lastQuery) { setScoredRows([]); return; }
+    let active = true;
+    recallPreview(lastQuery).then((r) => { if (active) setScoredRows(r); }).catch(() => {});
+    return () => { active = false; };
+  }, [lastQuery]);
+
+  const onDelete = async (id: string) => {
+    try {
+      await deleteMemory(id);
+      setError(null);
+      refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
   const onSave = async (id: string) => {
-    await updateMemory(id, draft); setEditing(null); refresh();
+    try {
+      await updateMemory(id, draft);
+      setError(null);
+      setEditing(null);
+      refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   const shown = rows.filter((r) => r.text.toLowerCase().includes(q.toLowerCase()));
@@ -23,8 +47,21 @@ export function MemorySection({ recalled }: { recalled: string[] }) {
       <div className="font-semibold" style={{ color: "var(--text-strong)" }}>Memory</div>
 
       <div className="mt-1" style={{ color: "var(--text-muted)" }}>Recalled this turn</div>
-      {recalled.length === 0 ? <div style={{ color: "var(--text-muted)" }}>— none —</div>
-        : recalled.map((t, i) => <div key={i} style={{ color: "var(--text-strong)" }}>· {t}</div>)}
+      {scoredRows.length > 0 ? (
+        scoredRows.map((r) => (
+          <div key={r.id} className="flex gap-2" style={{ color: "var(--text-strong)" }}>
+            <span style={{ color: "var(--text-muted)" }}>{r.score.toFixed(2)}</span>
+            <span>{r.text}</span>
+            <span style={{ color: "var(--text-muted)" }}>[{r.scope_kind}]</span>
+          </div>
+        ))
+      ) : recalled.length === 0 ? (
+        <div style={{ color: "var(--text-muted)" }}>— none —</div>
+      ) : (
+        recalled.map((t, i) => <div key={i} style={{ color: "var(--text-strong)" }}>· {t}</div>)
+      )}
+
+      {error && <div style={{ color: "var(--state-error)" }}>{error}</div>}
 
       <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="filter memories…"
         className="mt-2 w-full rounded px-2 py-1"

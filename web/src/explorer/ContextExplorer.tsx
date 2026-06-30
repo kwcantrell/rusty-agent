@@ -11,7 +11,12 @@ const COLORS: Record<string, string> = {
 };
 
 export function ContextExplorer(
-  { realTotal, refreshKey, skills }: { realTotal: number | null; refreshKey: number; skills: { name: string; description: string }[] },
+  { realTotal, refreshKey, skills, lastQuery }: {
+    realTotal: number | null;
+    refreshKey: number;
+    skills: { name: string; description: string }[];
+    lastQuery: string | null;
+  },
 ) {
   const [snap, setSnap] = useState<ContextSnapshot | null>(null);
   const [open, setOpen] = useState<string | null>(null);
@@ -26,6 +31,7 @@ export function ContextExplorer(
     return <div className="p-3 text-xs" style={{ color: "var(--text-muted)" }}>No context yet.</div>;
   }
   const b = computeBreakdown(snap, realTotal);
+  const openSeg = open !== null ? (snap.segments.find((s) => s.category === open) ?? null) : null;
 
   return (
     <div className="flex h-full flex-col overflow-y-auto" style={{ background: "var(--surface-overlay)" }}>
@@ -50,11 +56,35 @@ export function ContextExplorer(
             </button>
           ))}
         </div>
+        {open !== null && (
+          <div className="mt-2 rounded p-2 text-xs"
+            style={{ background: "var(--surface-base)", border: "1px solid var(--border)" }}>
+            {openSeg ? (
+              <>
+                <div style={{ color: "var(--text-muted)" }}>
+                  {openSeg.category} — {openSeg.count} item{openSeg.count !== 1 ? "s" : ""}
+                </div>
+                {openSeg.items.length === 0
+                  ? <div style={{ color: "var(--text-muted)" }}>— none —</div>
+                  : openSeg.items.map((item, i) => (
+                      <div key={i} style={{ color: "var(--text-strong)" }}>· {item}</div>
+                    ))
+                }
+              </>
+            ) : (
+              <div style={{ color: "var(--text-muted)" }}>
+                Gap between server total and estimated sum
+                ({b.slices.find((s) => s.category === "unattributed")?.tokens ?? 0} tokens unaccounted)
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="mt-3 border-t" style={{ borderColor: "var(--border)" }}>
         <MemorySection
           recalled={snap.segments.find((x) => x.category === "memory")?.items ?? []}
+          lastQuery={lastQuery}
         />
         <SkillSection skills={skills} />
       </div>

@@ -126,6 +126,13 @@ export default function App() {
   const projectLabel = `session ${sessionId.slice(0, 8)}`;
   const model = state.settings?.model;
 
+  // Derive the most recent user message for recall scoring in MemorySection.
+  let lastQuery: string | null = null;
+  for (let i = state.items.length - 1; i >= 0; i--) {
+    const it = state.items[i];
+    if (it.kind === "user") { lastQuery = it.text; break; }
+  }
+
   return (
     <div className="flex h-screen flex-col" style={{ background: "var(--surface-base)" }}>
       <TopBar projectLabel={projectLabel} online={state.online} status={state.status}
@@ -168,7 +175,7 @@ export default function App() {
               <div className="min-h-0 flex-1">
                 {rightTab === "workspace"
                   ? <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />
-                  : <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex} skills={state.settingsMeta?.discoveredSkills ?? []} />}
+                  : <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex} skills={state.settingsMeta?.discoveredSkills ?? []} lastQuery={lastQuery} />}
               </div>
             </div>
           </div>
@@ -195,7 +202,7 @@ export default function App() {
                 <div className="min-h-0 flex-1">
                   {rightTab === "workspace"
                     ? <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />
-                    : <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex} skills={state.settingsMeta?.discoveredSkills ?? []} />}
+                    : <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex} skills={state.settingsMeta?.discoveredSkills ?? []} lastQuery={lastQuery} />}
                 </div>
               </div>
             </div>
