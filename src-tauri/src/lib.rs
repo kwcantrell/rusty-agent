@@ -206,4 +206,34 @@ mod cmd_tests {
         let state = res.unwrap().deserialize::<SettingsState>().unwrap();
         assert!(!state.api_key_set);
     }
+
+    /// Smoke test: `context_get` resolves over the mock IPC and the payload
+    /// deserializes to a `ContextSnapshot` with at least a `system` segment and
+    /// a non-zero `model_limit` (bridge::start seeds 262_144).
+    #[test]
+    fn context_get_returns_snapshot_over_ipc() {
+        let app = app();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "ctx", Default::default())
+            .build()
+            .unwrap();
+        let res = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "context_get".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::default(),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        );
+        assert!(res.is_ok(), "context_get should resolve: {res:?}");
+        let snap = res.unwrap().deserialize::<ContextSnapshot>().unwrap();
+        assert!(snap.model_limit > 0, "model_limit should be seeded by bridge::start");
+        assert!(
+            snap.segments.iter().any(|s| s.category == "system"),
+            "snapshot must contain a system segment"
+        );
+    }
 }
