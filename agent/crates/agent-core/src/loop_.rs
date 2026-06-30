@@ -211,6 +211,18 @@ impl AgentLoop {
 
             let mut parsed = match self.protocol.parse(&assistant) {
                 Ok(p) => { protocol_repairs = 0; p }
+                // The completion was cut off at `max_tokens` mid-tool-call (e.g.
+                // writing a large file), so the args are incomplete JSON. A
+                // "re-emit it correctly" repair is futile — it truncates again at
+                // the same limit — so surface the real cause instead of a cryptic
+                // JSON parse error.
+                Err(_) if assistant.stop == StopReason::Length => {
+                    self.sink.emit(AgentEvent::Error(
+                        "the model reached the max_tokens limit before it finished a \
+                         tool call (e.g. writing a large file); increase max_tokens in \
+                         settings and try again".into()));
+                    return Ok(());
+                }
                 Err(e) if protocol_repairs < 1 => {
                     protocol_repairs += 1;
                     ctx.append(Message::assistant(assistant.text.clone(), None));
@@ -749,6 +761,37 @@ mod tests {
         assert!(events.iter().any(|e| e == "tool_start:read_file"));
         assert!(events.iter().any(|e| e == "tool_result:read_file"));
         assert!(events.last().unwrap() == "done");
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_call_reports_max_tokens_not_bad_args() {
+        let ws = std::env::temp_dir();
+        // Both turns truncate mid-args (as a real re-emit of a large file would),
+        // so the loop can't recover by "re-emitting correctly".
+        let truncated = r##"{"path":"big.py","content":"#!/usr/bin/env python3\nprint('hi"##;
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::TruncatedCall("write_file".into(), truncated.into()),
+            Scripted::TruncatedCall("write_file".into(), truncated.into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
+                max_tokens: Some(2048), workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "write a big file".into()).await.unwrap();
+
+        let events = sink.events.lock().unwrap().clone();
+        let err = events.iter().find(|e| e.starts_with("error:"))
+            .expect("expected an error event for the truncated turn");
+        let low = err.to_lowercase();
+        assert!(low.contains("max_tokens") || low.contains("truncat"),
+            "error should explain the truncation cause, got: {err}");
+        assert!(!err.contains("EOF while parsing"),
+            "must not surface the raw JSON EOF parse error: {err}");
     }
 
     use agent_policy::PolicyEngine;

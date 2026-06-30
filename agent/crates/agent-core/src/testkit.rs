@@ -22,6 +22,10 @@ pub enum Scripted {
     Hang,
     /// The `stream()` call itself never resolves (stream-open stall).
     HangOpen,
+    /// A native tool call truncated by `max_tokens`: partial json-args + a
+    /// `finish_reason: "length"` stop. Models the real "write a large file"
+    /// case where the args JSON is cut off mid-string. (name, partial-json-args).
+    TruncatedCall(String, String),
     /// Emits a reasoning chunk then a final answer (no tool calls): (reasoning, answer).
     Reasoning(String, String),
     /// Final text plus a server usage chunk: (answer, prompt_tokens, completion_tokens).
@@ -58,6 +62,10 @@ impl ModelClient for ScriptedModel {
                 chunks.push(Ok(Chunk::Done(StopReason::ToolCalls)));
                 Ok(stream::iter(chunks).boxed())
             }
+            Scripted::TruncatedCall(name, partial) => Ok(stream::iter(vec![
+                Ok(Chunk::ToolCallDelta(RawToolCall { index: None, id: Some("c0".into()),
+                    name: Some(name), args_fragment: partial })),
+                Ok(Chunk::Done(StopReason::Length))]).boxed()),
             Scripted::Reasoning(reasoning, answer) => Ok(stream::iter(vec![
                 Ok(Chunk::Reasoning(reasoning)), Ok(Chunk::Text(answer)),
                 Ok(Chunk::Done(StopReason::Stop))]).boxed()),
