@@ -29,8 +29,15 @@ fn subscribe(state: tauri::State<'_, AppState>, channel: Channel<ServerEvent>) {
 }
 
 /// Start a run. Rejects with `busy` if one is already in flight (A1 guard).
+///
+/// MUST be `async`: `Session::send_input` calls `tokio::spawn`, which panics
+/// ("there is no reactor running") when invoked from a SYNC command — sync
+/// commands run on the WebKitGTK/glib main thread with no Tokio runtime entered,
+/// and that panic aborts across the C-FFI boundary ("non-unwinding panic").
+/// An `async` command runs on Tauri's managed Tokio runtime, so the inner
+/// `tokio::spawn` has a reactor.
 #[tauri::command]
-fn send_input(state: tauri::State<'_, AppState>, text: String) -> Result<(), String> {
+async fn send_input(state: tauri::State<'_, AppState>, text: String) -> Result<(), String> {
     match session(&state).send_input(text) {
         SendOutcome::Started => Ok(()),
         SendOutcome::Busy => Err("busy".into()),
