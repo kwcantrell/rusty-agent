@@ -229,6 +229,7 @@ mod admin_tests {
         // Cross-project record is not listed in MINE's scope and cannot be deleted.
         assert!(admin.list(20, 0).await.unwrap().is_empty());
         assert!(admin.delete("x").await.is_err());
+        assert!(admin.update("x", Some("new text".into()), None).await.is_err());
     }
 }
 
