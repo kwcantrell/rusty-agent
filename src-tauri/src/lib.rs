@@ -5,7 +5,7 @@ pub mod workspace;
 
 use agent_runtime_config::RuntimeConfig;
 use agent_server::session::{SendOutcome, Session};
-use agent_server::wire::{Decision, ServerEvent, SettingsState};
+use agent_server::wire::{ContextSnapshot, Decision, ServerEvent, SettingsState};
 use channel_out::ChannelOut;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -99,6 +99,13 @@ async fn pick_workspace(
 }
 
 #[tauri::command]
+async fn context_get(
+    state: tauri::State<'_, AppState>,
+) -> Result<ContextSnapshot, String> {
+    Ok(session(&state).context_get().await)
+}
+
+#[tauri::command]
 async fn llama_health() -> llama::LlamaHealth {
     llama::check_health("http://localhost:8080").await
 }
@@ -137,6 +144,7 @@ pub fn run() {
             cancel,
             settings_get,
             settings_update,
+            context_get,
             get_workspace,
             pick_workspace,
             llama_health
@@ -167,7 +175,7 @@ mod cmd_tests {
         mock_builder()
             .manage(AppState { bridge, config_path: PathBuf::from("/tmp/app.json") })
             .invoke_handler(tauri::generate_handler![
-                subscribe, send_input, approve, cancel, settings_get, settings_update
+                subscribe, send_input, approve, cancel, settings_get, settings_update, context_get
             ])
             .build(mock_context(noop_assets()))
             .expect("failed to build mock app")

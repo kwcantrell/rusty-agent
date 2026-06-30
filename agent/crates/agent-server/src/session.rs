@@ -92,6 +92,12 @@ impl Session {
         self.runtime.settings_state()
     }
 
+    pub async fn context_get(&self) -> agent_core::ContextSnapshot {
+        let model_limit = self.runtime.settings_state().settings.context_limit;
+        let guard = self.ctx.lock().await;
+        guard.snapshot(model_limit, 0)
+    }
+
     pub fn settings_update(&self, cfg: RuntimeConfig) -> Result<SettingsState, String> {
         self.runtime.apply(cfg)?;
         Ok(self.runtime.settings_state())
@@ -163,5 +169,13 @@ mod tests {
     async fn approve_unknown_id_is_noop() {
         let (sess, _cap) = session_with_scripted();
         sess.approve("nope", Decision::Approve); // must not panic
+    }
+
+    #[tokio::test]
+    async fn context_get_returns_snapshot_with_system_segment() {
+        let (sess, _cap) = session_with_scripted();
+        let snap = sess.context_get().await;
+        assert!(snap.segments.iter().any(|s| s.category == "system"));
+        assert!(snap.model_limit > 0);
     }
 }

@@ -1,5 +1,7 @@
 use agent_core::AgentEvent;
 use agent_model::StopReason;
+
+pub use agent_core::{ContextSegment, ContextSnapshot};
 use agent_policy::ApprovalResponse;
 use agent_runtime_config::RuntimeConfig;
 use agent_tools::Display;
