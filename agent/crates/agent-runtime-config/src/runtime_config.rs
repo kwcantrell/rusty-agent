@@ -118,7 +118,10 @@ impl RuntimeConfig {
             command_denylist: Vec::new(),
             http_allow_hosts: Vec::new(),
             temperature: 0.2,
-            max_tokens: 2048,
+            // Completion budget per turn. Sized for a reasoning model that also
+            // writes files in one turn (reasoning + a large tool-call args JSON);
+            // 2048 truncated mid-tool-call. Context (262k) leaves ample room.
+            max_tokens: 16384,
             max_turns: 25,
             context_limit,
             memory: true,
@@ -291,7 +294,7 @@ mod tests {
     fn from_launch_seeds_defaults() {
         let c = base();
         assert_eq!(c.temperature, 0.2);
-        assert_eq!(c.max_tokens, 2048);
+        assert_eq!(c.max_tokens, 16384);
         assert_eq!(c.max_turns, 25);
         assert!(c.command_denylist.is_empty()); // floor is added by effective_denylist, not stored
         assert!(!c.command_allowlist.is_empty());
