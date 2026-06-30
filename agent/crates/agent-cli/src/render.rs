@@ -77,6 +77,7 @@ impl EventSink for TerminalSink {
                 }
             }
             AgentEvent::Usage { .. } => {} // telemetry for the web context dashboard; not shown in the CLI
+            AgentEvent::ServerUsage { .. } => {} // server-reported usage telemetry; not shown in the CLI
             AgentEvent::Context(_) => {} // curation telemetry; not shown in the CLI
             AgentEvent::Approval(_) => {} // the TerminalApproval channel prints its own prompt
             AgentEvent::Error(e) => {
