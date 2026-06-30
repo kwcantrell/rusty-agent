@@ -40,6 +40,7 @@ export type WireEvent =
   | { type: "token"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "usage"; prompt_tokens: number; context_limit: number; turn: number; max_turns: number }
+  | { type: "server_usage"; prompt_tokens: number; completion_tokens: number; turn: number }
   | { type: "tool_start"; name: string; args: unknown }
   | { type: "tool_result"; name: string; content: string; display?: Display }
   | { type: "error"; message: string }
