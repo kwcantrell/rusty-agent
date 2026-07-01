@@ -94,7 +94,8 @@ impl Tool for GitCommit {
     fn schema(&self) -> ToolSchema {
         ToolSchema { name: self.name().into(), description: self.description().into(),
             parameters: json!({"type":"object","properties":{
-                "message":{"type":"string"}},"required":["message"]}) }
+                "message":{"type":"string","description":"The commit message."}},
+                "required":["message"]}) }
     }
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
         let msg = args.get("message").and_then(|v| v.as_str())

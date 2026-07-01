@@ -14,9 +14,15 @@ pub struct ReadFile;
 impl Tool for ReadFile {
     fn name(&self) -> &str { "read_file" }
     fn description(&self) -> &str { "Read the contents of a file within the workspace." }
+    fn when_not_to_call(&self) -> Option<&str> {
+        Some("Not for files bundled inside a loaded skill's directory — use \
+              read_skill_file for those. Use read_file for workspace paths.")
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema { name: self.name().into(), description: self.description().into(),
-            parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) }
+            parameters: json!({"type":"object","properties":{
+                "path":{"type":"string","description":"Workspace-relative path of the file to read."}},
+                "required":["path"]}) }
     }
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
         let path = arg_path(args)?;
@@ -41,7 +47,9 @@ impl Tool for ListDirectory {
     fn description(&self) -> &str { "List entries of a directory within the workspace." }
     fn schema(&self) -> ToolSchema {
         ToolSchema { name: self.name().into(), description: self.description().into(),
-            parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) }
+            parameters: json!({"type":"object","properties":{
+                "path":{"type":"string","description":"Workspace-relative path of the directory to list."}},
+                "required":["path"]}) }
     }
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
         let path = arg_path(args)?;

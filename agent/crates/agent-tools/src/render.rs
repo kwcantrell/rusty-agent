@@ -28,7 +28,8 @@ impl Tool for RenderArtifact {
                 "type": "object",
                 "properties": {
                     "kind": {"type": "string",
-                        "enum": ["markdown","code","html","mermaid","table","image"]},
+                        "enum": ["markdown","code","html","mermaid","table","image"],
+                        "description": "Which artifact kind to render; one of the allowed enum values."},
                     "title": {"type": "string"},
                     "id": {"type": "string", "description": "stable id; re-rendering the same id replaces the artifact"},
                     "content": {"type": "string",

@@ -18,10 +18,16 @@ pub struct WriteFile;
 impl Tool for WriteFile {
     fn name(&self) -> &str { "write_file" }
     fn description(&self) -> &str { "Create or overwrite a file within the workspace." }
+    fn when_not_to_call(&self) -> Option<&str> {
+        Some("Not for a small change to an existing file — use edit_file to replace \
+              a specific substring. Use write_file to create a new file or fully \
+              overwrite one.")
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema { name: self.name().into(), description: self.description().into(),
             parameters: json!({"type":"object","properties":{
-                "path":{"type":"string"},"content":{"type":"string"}},
+                "path":{"type":"string","description":"Workspace-relative path of the file to create or overwrite."},
+                "content":{"type":"string","description":"The full contents to write to the file."}},
                 "required":["path","content"]}) }
     }
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
@@ -52,10 +58,16 @@ pub struct EditFile;
 impl Tool for EditFile {
     fn name(&self) -> &str { "edit_file" }
     fn description(&self) -> &str { "Replace a unique substring in a workspace file." }
+    fn when_not_to_call(&self) -> Option<&str> {
+        Some("Not for creating a new file or rewriting a whole file — use write_file. \
+              Use edit_file to replace one unique existing substring.")
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema { name: self.name().into(), description: self.description().into(),
             parameters: json!({"type":"object","properties":{
-                "path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},
+                "path":{"type":"string","description":"Workspace-relative path of the file to edit."},
+                "old":{"type":"string","description":"The exact existing substring to replace; must occur exactly once in the file."},
+                "new":{"type":"string","description":"The replacement text."}},
                 "required":["path","old","new"]}) }
     }
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {

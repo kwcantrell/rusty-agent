@@ -16,7 +16,8 @@ impl Tool for ExecuteCommand {
     fn schema(&self) -> ToolSchema {
         ToolSchema { name: self.name().into(), description: self.description().into(),
             parameters: json!({"type":"object","properties":{
-                "command":{"type":"string"}},"required":["command"]}) }
+                "command":{"type":"string","description":"The shell command line to execute."}},
+                "required":["command"]}) }
     }
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
         let command = cmd_arg(args)?;
