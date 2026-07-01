@@ -178,58 +178,27 @@ co-design harness with eval, arXiv 2503.16416).
 
 ---
 
-## Example findings (last audit: 2026-06-30; re-stamped 2026-06-30 after both HIGHs fixed)
+## Example findings (last audit: 2026-06-30; re-stamped 2026-06-30 after Findings 1–2 fixed)
 
 *Illustrative snapshot from a 2026-06-30 six-component fan-out run — re-stamp or replace when you run the audit; these cite live line numbers that drift.*
 
 Record one finding block per gap discovered. Multiple gaps per component → multiple blocks.
 Update this section when the audit is re-run; stamp with the new date. On re-run: remove findings whose proposed fix has been applied, retain still-open ones, and add new ones.
 
-Re-stamp note (2026-06-30): both prior HIGH findings are **fixed and merged to `main`** and have been
-removed from the list below. The sandbox silent-degradation gap now emits a first-class
-`AgentEvent::SandboxDegraded` at run start (loud CLI line + web/desktop banner fed from
-`settings_state`); the lexical-only workspace path check now canonicalizes the existing path
-components (and chases dangling symlinks), closing the symlink escape. See
-`docs/superpowers/specs/2026-06-30-sandbox-degraded-signal-design.md` and commits `344a40c` (symlink)
-plus `9cf9562`/`262e764`/`9cf68e7` (degraded signal). The five findings below — all `med`/`low` —
-remain open and are renumbered 1–5.
+Re-stamp note (2026-06-30): the two prior HIGH findings (sandbox silent-degradation, symlink escape)
+**and** the two top `med` findings — parallel-dispatch failure-isolation and the tool "when NOT to
+call" contract — are all now **fixed and merged to `main`**, and have been removed from the list
+below. Parallel dispatch: each tool is panic- and timeout-isolated (`execute_isolated`, a grace-margin
+backstop), see `docs/superpowers/specs/2026-06-30-parallel-tool-dispatch-hardening-design.md` and
+commits `96ec134`/`7329bd1`. Tool contract: a `Tool::when_not_to_call()` folded into the model-facing
+schema + required-param descriptions + a curated-confusable enforcement ratchet, see
+`docs/superpowers/specs/2026-06-30-tool-when-not-to-call-contract-design.md` and commits
+`955fc15`/`76fc4ae`/`0dc6cc2`. The three findings below — two `med`, one `low` — remain open and are
+renumbered 1–3.
 
 ---
 
-**Finding 1 — Orchestration: parallel tool dispatch is not failure-isolated**
-
-```
-severity: med (high-impact reliability)
-file:line: agent/crates/agent-core/src/loop_.rs:275-311
-violated principle: "hand-off aggregates results explicitly; no silent discard of tool-call
-  outputs" — SKILL.md Spine A component 4 (judged from first principles + runtime conventions)
-concrete proposed fix: Three related gaps in the buffer_unordered path — (a) futures run inline with
-  no catch_unwind, so ONE tool panic aborts the whole AgentLoop; (b) no tokio::time::timeout wraps
-  tool.execute and fs/write/render ignore ctx.timeout, so one stalled tool hangs all parallel slots;
-  (c) the `None => continue` at :298 silently drops a tool result, leaving a tool_call_id with no tool
-  message (invalid conversation state). Wrap each execute in catch_unwind + timeout; replace the drop
-  with an explicit error result so every tool_call_id always yields exactly one message.
-```
-
----
-
-**Finding 2 — Tools: no "when NOT to call" contract in the Tool trait**
-
-```
-severity: med
-file:line: agent/crates/agent-tools/src/tool.rs:4-13 (+ types.rs:9-14, registry.rs:13)
-violated principle: "each tool has a clear name, tight description, and explicit 'when NOT to
-  call' guidance; no thin endpoint wrappers" — Anthropic: Writing Tools for Agents (tier: eng-blog)
-concrete proposed fix: [CONFIRMED from prior run] Trait exposes name/description/schema/intent/execute
-  with no exclusion-prose slot; ToolRegistry::register is a bare HashMap insert. Add
-  `when_not_to_call() -> Option<&str>` + a registration test requiring it for name-overlapping tools
-  (e.g. recall vs context_recall). Also: 7 of ~19 tools give required params `{"type":"string"}` with
-  no description — add descriptions to every required field.
-```
-
----
-
-**Finding 3 — Observability: tool failures, durations, and context events are invisible**
+**Finding 1 — Observability: tool failures, durations, and context events are invisible**
 
 ```
 severity: med
@@ -246,7 +215,7 @@ concrete proposed fix: [REFINED] prompt/completion tokens ARE emitted per turn (
 
 ---
 
-**Finding 4 — Guardrails: catastrophic-command denylist has structural gaps; CLI approval can hang**
+**Finding 2 — Guardrails: catastrophic-command denylist has structural gaps; CLI approval can hang**
 
 ```
 severity: med
@@ -263,7 +232,7 @@ concrete proposed fix: (a) Structural Layer-A detection covers sudo/rm/dd but NO
 
 ---
 
-**Finding 5 — Instructions: duplicated system prompt + skill files lack negative constraints**
+**Finding 3 — Instructions: duplicated system prompt + skill files lack negative constraints**
 
 ```
 severity: low
@@ -281,24 +250,24 @@ concrete proposed fix: The coding-agent system prompt is byte-identical but dupl
 
 ## Top 3 highest-leverage fixes
 
-Ranked by impact (severity × remediation cost). Both prior HIGH-severity entries (silent sandbox
-degradation, symlink escape) are **done** — the remaining `med` findings re-rank as follows:
+Ranked by impact (severity × remediation cost). The two HIGH findings and the top two `med` findings
+(parallel-dispatch isolation, tool "when NOT to call" contract) are **done** — the three remaining
+findings rank as follows:
 
-1. **[Component 4 — Orchestration] Harden the parallel-tool dispatch** (Finding 1)
-   `agent/crates/agent-core/src/loop_.rs:275-311` — one focused change closes three gaps at once:
-   catch per-tool panics (so one tool can't kill the session), wrap execute in
-   `tokio::time::timeout(ctx.timeout,…)` (so a stalled fs tool can't hang all slots), and replace the
-   silent `None => continue` with an explicit error result (so every tool_call_id yields one message).
-   Best reliability leverage per unit effort; complements the existing parallel-tool work.
-
-2. **[Component 5 — Guardrails] Close denylist gaps + the CLI approval hang** (Finding 4)
+1. **[Component 5 — Guardrails] Close denylist gaps + the CLI approval hang** (Finding 2)
    `agent/crates/agent-policy/src/command.rs:59-76`; `agent/crates/agent-cli/src/approval.rs:13-28` —
    add structural handlers (+ tests) for `mkfs` and the `:(){` forkbomb (currently substring-backstop
    only), and give `TerminalApproval`'s stdin read a timeout defaulting to Deny so a caller holding
-   stdin open can't hang the agent. Safety-adjacent, small, well-scoped.
+   stdin open can't hang the agent. Safety-adjacent, small, well-scoped — highest leverage of what
+   remains.
 
-3. **[Component 6 — Observability] Make tool failures + durations visible** (Finding 3)
+2. **[Component 6 — Observability] Make tool failures + durations visible** (Finding 1)
    `agent/crates/agent-core/src/loop_.rs:304-308`; `wire.rs:103`; `agent-model/src/openai.rs:205-209` —
    emit a tool-error/status event + `duration_ms`, count streamed `reasoning_tokens`, and forward
-   `ContextEvent`s to the wire so the web UI learns the window was truncated. Highest
-   diagnose-and-eval leverage; pairs with the eval-harness work.
+   `ContextEvent`s to the wire so the web UI learns the window was truncated. Pairs with the
+   eval-harness work.
+
+3. **[Component 1 — Instructions] De-duplicate the system prompt + add negative constraints** (Finding 3)
+   `agent/crates/agent-server/src/daemon.rs:23` + `agent/crates/agent-cli/src/main.rs:15`; `.agents/skills/`
+   — hoist the byte-identical coding-agent system prompt to one shared const, and add a
+   "Forbidden"/negative-constraint section to the skill files. `low` severity; polish.
