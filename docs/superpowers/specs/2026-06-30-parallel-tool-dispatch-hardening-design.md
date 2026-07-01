@@ -63,12 +63,26 @@ Non-goals: changing the concurrency cap, ordering, gating/approval flow, or the
 `ctx.timeout` value. No new config knob — the dispatch backstop reuses
 `ctx.timeout`.
 
-## Surfacing (decided during brainstorming: "both loud")
+## Surfacing
+
+Refined after the final-review finding (below): the dispatch timeout is a **true
+backstop** with a grace margin, so a tool that honors `ctx.timeout` itself hits
+its own deadline first and keeps its own message and cleanup. Loudness therefore
+splits:
 
 - **Panic:** error tool-result to the model + `AgentEvent::Error` (visible in
-  CLI/web) + `tracing::error!`.
-- **Timeout:** error tool-result to the model + `AgentEvent::Error` (visible in
-  CLI/web) + `tracing::warn!`.
+  CLI/web) + `tracing::error!`. Always loud.
+- **Backstop timeout** (tool ignored its own deadline and the grace-margin
+  timer fired): error tool-result + `AgentEvent::Error` + `tracing::warn!`. Loud.
+- **Tool-honored timeout** (the tool returned `ToolError::Timeout` before the
+  backstop): flows through the normal `ToolErr` path — model-visible tool-result
+  only, **quiet** (no `AgentEvent::Error`), preserving the tool's own message.
+  A tool self-timing-out is a normal outcome, not an operator-visible fault.
+
+(This refines the brainstorming "both loud" answer: the final review showed that
+arming the backstop at exactly `ctx.timeout` would preempt every tool's own
+timeout — racy at equal deadlines and discarding tool-specific messages — so the
+backstop is armed with a grace margin instead, and only *it* is loud.)
 
 The model-visible tool-result text is phrased so the model can recover
 ("tool '<name>' panicked" / "tool '<name>' timed out after <dur>").
@@ -104,13 +118,20 @@ async fn execute_isolated(
 ) -> Executed {
     use futures::FutureExt;
     let fut = std::panic::AssertUnwindSafe(tool.execute(args, ctx)).catch_unwind();
-    match tokio::time::timeout(ctx.timeout, fut).await {
+    // Grace margin: the backstop is armed at 2x the tool budget so a tool that
+    // honors `ctx.timeout` itself resolves first (returning ToolError::Timeout,
+    // routed quietly through ToolErr). The backstop only fires for a tool that
+    // ignores its deadline entirely — the only case that is surfaced loudly.
+    let backstop = ctx.timeout.saturating_mul(2);
+    match tokio::time::timeout(backstop, fut).await {
         Ok(Ok(Ok(output)))      => Executed::Ok(output),
+        // A tool's own ToolError::Timeout arrives here and stays quiet.
         Ok(Ok(Err(e)))          => Executed::ToolErr(format!("ERROR: {e}")),
         Ok(Err(_panic))         => Executed::Panicked(
             format!("ERROR: tool '{name}' panicked during execution")),
         Err(_elapsed)           => Executed::TimedOut(
-            format!("ERROR: tool '{name}' timed out after {:?}", ctx.timeout)),
+            format!("ERROR: tool '{name}' ignored its {:?} timeout and was \
+                     force-stopped by the dispatch backstop", ctx.timeout)),
     }
 }
 ```
@@ -184,26 +205,34 @@ let (name, resolved) = match results.remove(&id) {
 
 - **Panic isolation scope:** only the panicking tool's future is caught; siblings
   in the same `buffer_unordered` batch are unaffected and still collected.
-- **Timeout vs. tool self-timeout:** the dispatch backstop and a tool that honors
-  `ctx.timeout` share the same deadline; the backstop only fires when the tool
-  ignores it. No double-penalty, no new config.
+- **Timeout vs. tool self-timeout:** the dispatch backstop is armed at
+  `ctx.timeout * 2` (`saturating_mul`), a grace margin over the per-tool budget.
+  A tool that honors `ctx.timeout` fires its own timeout first and returns
+  `ToolError::Timeout` (quiet `ToolErr`, its own message preserved); the backstop
+  only fires for a tool that ignores its deadline entirely, and only that case is
+  loud. No double-penalty, no race at equal deadlines, no new config.
 - **Cancellation:** `ctx.cancel` (Ctrl-C / SIGINT) still propagates into tools
   that honor it; the timeout is an independent bound. Both coexist.
-- **A tool that legitimately exceeds `ctx.timeout`:** now cut at the budget. This
-  is the intended, accepted consequence (confirmed during brainstorming — use
-  `ctx.timeout`, no separate hard-cap).
+- **A tool that ignores `ctx.timeout` and runs forever:** force-stopped by the
+  backstop at `ctx.timeout * 2` and surfaced loudly. A tool that self-limits at
+  `ctx.timeout` is cut by its own timer first (quietly), never reaching the
+  backstop.
 - **`catch_unwind` and `panic=abort`:** if the build ever sets
   `panic = "abort"`, `catch_unwind` cannot intercept — the process aborts. The
   workspace uses the default `unwind`; note the assumption, do not add config.
 
 ## Testing
 
-**Unit (`execute_isolated`, no loop):** three fake `Tool`s —
+**Unit (`execute_isolated`, no loop):** fake `Tool`s —
 1. panics in `execute` → `Executed::Panicked`.
-2. `tokio::time::sleep` past a tiny `ctx.timeout` → `Executed::TimedOut`
-   (drive with `#[tokio::test(start_paused = true)]`).
+2. ignores `ctx.timeout` and `tokio::time::sleep`s past the `2x` backstop →
+   `Executed::TimedOut` (drive with `#[tokio::test(start_paused = true)]`).
 3. returns `Err(ToolError::Failed{..})` → `Executed::ToolErr`; returns `Ok` →
    `Executed::Ok`.
+4. **honors** its own timeout — wraps its body in
+   `tokio::time::timeout(ctx.timeout, …)` and returns `ToolError::Timeout` on
+   elapse → `Executed::ToolErr` (quiet), and it resolves before the `2x`
+   backstop (start_paused proves the grace margin lets the tool win the race).
 
 **Loop-level (modeled on `parallel_tool_calls_execute_concurrently`,
 `loop_.rs:1270`):**
@@ -211,10 +240,10 @@ let (name, resolved) = match results.remove(&id) {
   (`Ok(())`), the normal tool's result lands, the panicker's `tool_call_id` gets
   an `ERROR: … panicked` tool message, and an `AgentEvent::Error` is emitted
   (assert via `CollectingSink` label `error:…`).
-- A batch with one hanging tool (sleeps ≫ `tool_timeout`) + one normal tool under
-  `start_paused` time: the turn does not hang, the hanger yields an
-  `ERROR: … timed out` tool message + `AgentEvent::Error`, the normal tool's
-  result lands.
+- A batch with one deadline-ignoring tool (sleeps ≫ `2 * tool_timeout`) + one
+  normal tool under `start_paused` time: the turn does not hang, the backstop
+  force-stops the offender which yields an `ERROR: … backstop` tool message +
+  `AgentEvent::Error`, the normal tool's result lands.
 - Ordering preserved: reuse the intent of
   `tool_results_keep_model_call_order_despite_completion_order` — one tool
   panicking/timing out does not disturb the `order`-based Phase-3 append.
