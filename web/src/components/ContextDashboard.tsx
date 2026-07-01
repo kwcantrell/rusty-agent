@@ -1,15 +1,17 @@
 import { useState } from "react";
-import type { RuntimeSettings } from "../wire";
+import type { RuntimeSettings, SessionStats } from "../wire";
 import { loadDashExpanded, saveDashExpanded } from "../storage";
+import { StatsPanel } from "./StatsPanel";
 
 function fmt(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : `${n}`;
 }
 
 export function ContextDashboard(
-  { usage, settings, toolCount, artifactCount }:
+  { usage, settings, toolCount, artifactCount, stats }:
   { usage: { promptTokens: number; contextLimit: number; turn: number; maxTurns: number } | null;
-    settings: RuntimeSettings | null; toolCount: number; artifactCount: number },
+    settings: RuntimeSettings | null; toolCount: number; artifactCount: number;
+    stats: SessionStats | null },
 ) {
   const [expanded, setExpanded] = useState(loadDashExpanded);
   const toggle = () => setExpanded((e) => { const next = !e; saveDashExpanded(next); return next; });
@@ -49,6 +51,7 @@ export function ContextDashboard(
           {settings && settings.active_skills.length > 0 && (
             <div>skills: {settings.active_skills.join(", ")}</div>
           )}
+          <StatsPanel stats={stats} />
         </div>
       )}
     </div>

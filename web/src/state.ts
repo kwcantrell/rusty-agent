@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import type { Display, Inbound, RuntimeSettings } from "./wire";
+import type { Display, Inbound, RuntimeSettings, SessionStats } from "./wire";
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
 
@@ -7,7 +7,9 @@ export type Item =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string; done?: string }
   | { kind: "reasoning"; text: string }
-  | { kind: "tool"; name: string; args: unknown; status: "running" | "done"; content?: string; display?: Display }
+  | { kind: "tool"; name: string; args: unknown; status: "running" | "done";
+      content?: string; display?: Display; resultStatus?: string; durationMs?: number }
+  | { kind: "context"; text: string }
   | { kind: "error"; message: string };
 
 export interface PendingApproval {
@@ -32,6 +34,7 @@ export interface ConversationState {
   settingsMeta: { workspace: string; apiKeySet: boolean; hardFloor: string[]; discoveredSkills: import("./wire").DiscoveredSkill[] } | null;
   settingsError: string | null;
   sandboxDegraded: { mechanism: string; reason: string } | null;
+  stats: SessionStats | null;
 }
 
 export type Action =
@@ -44,7 +47,18 @@ export type Action =
 
 export function initialState(userMsgs: string[]): ConversationState {
   return { items: [], pendingApproval: null, usage: null, serverUsage: null, online: false, status: "connecting", userMsgs, turnIndex: 0, inTurn: false,
-    settings: null, settingsMeta: null, settingsError: null, sandboxDegraded: null };
+    settings: null, settingsMeta: null, settingsError: null, sandboxDegraded: null, stats: null };
+}
+
+/** One-line human summary of a context-management event, keyed by kind. */
+function describeContext(kind: string, detail: Record<string, unknown>): string {
+  switch (kind) {
+    case "offloaded": return `offloaded ${detail.tool} result #${detail.id}`;
+    case "compacted":
+      return `compacted ${detail.turns_replaced} turns: ${detail.tokens_before} → ${detail.tokens_after} tokens`;
+    case "compaction_failed": return `compaction failed: ${detail.reason}`;
+    default: return kind;
+  }
 }
 
 /** Emit the stored user message that heads the current turn, if not already emitted. */
@@ -126,12 +140,17 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
       for (let i = items.length - 1; i >= 0; i--) {
         const it = items[i];
         if (it.kind === "tool" && it.status === "running" && it.name === p.name) {
-          items[i] = { ...it, status: "done", content: p.content, display: p.display };
+          items[i] = { ...it, status: "done", content: p.content, display: p.display,
+            resultStatus: p.status, durationMs: p.duration_ms };
           break;
         }
       }
       return { ...s, items };
     }
+    case "context":
+      return { ...s, items: [...s.items, { kind: "context", text: describeContext(p.kind, p.detail) }] };
+    case "session_stats":
+      return { ...s, stats: p.stats };
     case "sandbox_degraded":
       return { ...s, sandboxDegraded: { mechanism: p.mechanism, reason: p.reason } };
     case "error":
@@ -145,6 +164,12 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
       // Close the turn: next event starts a new one and re-emits the next user message.
       return { ...s, items, turnIndex: s.turnIndex + 1, inTurn: false };
     }
+    // Forward compat: the backend may ship event types this UI doesn't know yet.
+    // Without this, an unknown payload falls off the switch and reduces state to
+    // undefined. Return the pre-startTurn state: an unrecognized event must not
+    // open a turn or mutate anything.
+    default:
+      return state;
   }
 }
 

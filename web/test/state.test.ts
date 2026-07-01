@@ -18,10 +18,10 @@ describe("reducer", () => {
 
   it("correlates tool_result to the running tool of the same name", () => {
     const s = run([
-      frame({ v: 1, session_id: "s", kind: "event", payload: { type: "tool_start", name: "execute_command", args: {} } }),
-      frame({ v: 1, session_id: "s", kind: "event", payload: { type: "tool_result", name: "execute_command", content: "exit=0" } }),
+      frame({ v: 1, session_id: "s", kind: "event", payload: { type: "tool_start", id: "c1", name: "execute_command", args: {} } }),
+      frame({ v: 1, session_id: "s", kind: "event", payload: { type: "tool_result", id: "c1", name: "execute_command", status: "ok", duration_ms: 12, content: "exit=0" } }),
     ]);
-    expect(s.items).toEqual([{ kind: "tool", name: "execute_command", args: {}, status: "done", content: "exit=0", display: undefined }]);
+    expect(s.items).toEqual([{ kind: "tool", name: "execute_command", args: {}, status: "done", content: "exit=0", display: undefined, resultStatus: "ok", durationMs: 12 }]);
   });
 
   it("stores the latest usage event and clears it on reset", () => {
@@ -94,6 +94,7 @@ describe("reducer", () => {
       top_p: null, top_k: null, min_p: null, presence_penalty: null, repeat_penalty: null,
       enable_thinking: false, preserve_thinking: false, memory: true,
       skills_dirs: [], active_skills: [],
+      trace: false, trace_dir: null, trace_max_mb: 64,
     };
     let st = initialState([]);
     st = reduce(st, { type: "frame", frame: { v: 1, session_id: "x", kind: "settings_error", message: "old" } });

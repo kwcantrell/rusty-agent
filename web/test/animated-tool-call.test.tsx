@@ -26,6 +26,26 @@ describe("AnimatedToolCall", () => {
     expect(screen.getByText("✓")).toBeInTheDocument();
   });
 
+  it("shows a failure badge with status and duration for a non-ok result", () => {
+    const item = {
+      kind: "tool", name: "read_file", args: { path: "a.txt" }, status: "done",
+      content: "ERROR: …", resultStatus: "timeout", durationMs: 60000,
+      ts: Date.now(), streaming: false, progress: 1,
+    } as ToolItem;
+    render(<AnimatedToolCall item={item} />);
+    expect(screen.getByText(/timeout · 60000ms/)).toBeInTheDocument();
+  });
+
+  it("shows no failure badge for an ok result", () => {
+    const item = {
+      kind: "tool", name: "read_file", args: { path: "a.txt" }, status: "done",
+      content: "ok", resultStatus: "ok", durationMs: 5,
+      ts: Date.now(), streaming: false, progress: 1,
+    } as ToolItem;
+    render(<AnimatedToolCall item={item} />);
+    expect(screen.queryByText(/ok · 5ms/)).not.toBeInTheDocument();
+  });
+
   it("is a clickable chip that focuses its artifact, without rendering output inline", () => {
     const onSelect = vi.fn();
     const item = {

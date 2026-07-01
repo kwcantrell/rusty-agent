@@ -32,6 +32,17 @@ export interface RuntimeSettings {
   memory: boolean;
   skills_dirs: string[];
   active_skills: string[];
+  trace: boolean;
+  trace_dir: string | null;
+  trace_max_mb: number;
+}
+
+export interface SessionStats {
+  turns: number; prompt_tokens: number; completion_tokens: number;
+  reasoning_tokens: number; cached_tokens: number; cost_usd: number;
+  tool_calls: number; tools_ok: number; tools_denied: number; tools_error: number;
+  tools_timeout: number; tools_panic: number; tool_time_ms: number;
+  turn_time_ms: number; context_events: number; errors: number;
 }
 
 export interface DiscoveredSkill { name: string; description: string }
@@ -40,9 +51,13 @@ export type WireEvent =
   | { type: "token"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "usage"; prompt_tokens: number; context_limit: number; turn: number; max_turns: number }
-  | { type: "server_usage"; prompt_tokens: number; completion_tokens: number; turn: number }
-  | { type: "tool_start"; name: string; args: unknown }
-  | { type: "tool_result"; name: string; content: string; display?: Display }
+  | { type: "server_usage"; prompt_tokens: number; completion_tokens: number; turn: number;
+      reasoning_tokens?: number; cached_tokens?: number; cost_usd?: number; turn_duration_ms?: number }
+  | { type: "tool_start"; id: string; name: string; args: unknown }
+  | { type: "tool_result"; id: string; name: string; status: string; duration_ms: number;
+      content: string; display?: Display }
+  | { type: "context"; kind: string; detail: Record<string, unknown> }
+  | { type: "session_stats"; stats: SessionStats }
   | { type: "error"; message: string }
   | { type: "done"; reason: string }
   | { type: "sandbox_degraded"; mechanism: string; reason: string };

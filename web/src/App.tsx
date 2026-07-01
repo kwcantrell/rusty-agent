@@ -162,7 +162,7 @@ export default function App() {
             pendingApproval={state.pendingApproval} onDecide={decide}
             composerDisabled={!connected} onSend={send}
             usage={state.usage} settings={state.settings}
-            toolCount={toolCount} artifactCount={artifacts.length} />
+            toolCount={toolCount} artifactCount={artifacts.length} stats={state.stats} />
         </div>
         {!narrow && (
           <div className="min-w-0 flex-1">

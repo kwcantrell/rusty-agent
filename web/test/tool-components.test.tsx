@@ -23,4 +23,9 @@ describe("tool components", () => {
     expect(screen.getByText(/execute_command/)).toBeInTheDocument();
     expect(screen.getByText("✓")).toBeInTheDocument();
   });
+  it("ToolCall shows a failure badge for a non-ok result", () => {
+    render(<ToolCall item={{ kind: "tool", name: "execute_command", args: {}, status: "done",
+      content: "ERROR", resultStatus: "error", durationMs: 42 }} />);
+    expect(screen.getByText(/error · 42ms/)).toBeInTheDocument();
+  });
 });

@@ -14,6 +14,7 @@ interface Props {
 // (diff/terminal/etc.) lives in the Inspector; clicking the chip focuses it.
 export function AnimatedToolCall({ item, artifactKey, active, onSelect }: Props) {
   const isRunning = item.status === "running";
+  const failed = !!item.resultStatus && item.resultStatus !== "ok";
   const clickable = !!artifactKey && !!onSelect;
   return (
     <motion.div
@@ -41,6 +42,12 @@ export function AnimatedToolCall({ item, artifactKey, active, onSelect }: Props)
             style={{ color: "var(--state-run)" }}>…</motion.span>
         ) : (
           <span style={{ color: "var(--state-done)" }}>✓</span>
+        )}
+        {failed && (
+          <span className="rounded-full px-1.5 text-[10px]"
+            style={{ border: "1px solid var(--state-error)", color: "var(--state-error)" }}>
+            {item.resultStatus} · {item.durationMs}ms
+          </span>
         )}
         {clickable && <span style={{ color: "var(--accent)" }}>{active ? "viewing →" : "view →"}</span>}
       </button>

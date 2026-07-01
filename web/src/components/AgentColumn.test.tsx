@@ -7,7 +7,7 @@ const base = {
   projectLabel: "studio-x", model: "qwen3", pendingApproval: null,
   onDecide: () => {}, composerDisabled: false, onSend: vi.fn(),
   usage: null as null | { promptTokens: number; contextLimit: number; turn: number; maxTurns: number },
-  settings: null, toolCount: 0, artifactCount: 0,
+  settings: null, toolCount: 0, artifactCount: 0, stats: null,
 };
 
 describe("AgentColumn", () => {

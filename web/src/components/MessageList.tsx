@@ -22,6 +22,9 @@ export function MessageList({ items, activeArtifactKey, onSelectArtifact }:
             return <AnimatedToolCall key={i} item={it} artifactKey={artifactKey}
               active={!!artifactKey && artifactKey === activeArtifactKey} onSelect={onSelectArtifact} />;
           }
+          case "context":
+            return <div key={i} className="my-1 text-center font-mono text-xs"
+              style={{ color: "var(--text-muted)" }}>· {it.text} ·</div>;
           case "error":
             return <AnimatedError key={i} item={it} />;
         }

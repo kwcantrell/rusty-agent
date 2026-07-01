@@ -9,6 +9,7 @@ const settings: RuntimeSettings = {
   top_p: null, top_k: null, min_p: null, presence_penalty: null, repeat_penalty: null,
   enable_thinking: false, preserve_thinking: false, memory: true,
   skills_dirs: [], active_skills: [],
+  trace: false, trace_dir: null, trace_max_mb: 64,
 };
 const meta = { workspace: "/home/me/proj", apiKeySet: true, hardFloor: ["sudo", "rm -rf /"],
   discoveredSkills: [] };

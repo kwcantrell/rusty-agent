@@ -13,7 +13,7 @@ describe("parseInbound", () => {
   it("parses a tool_result with a Terminal display", () => {
     const f = parseInbound(JSON.stringify({
       v: 1, session_id: "s", kind: "event",
-      payload: { type: "tool_result", name: "execute_command", content: "exit=0",
+      payload: { type: "tool_result", id: "c1", name: "execute_command", status: "ok", duration_ms: 12, content: "exit=0",
         display: { Terminal: { command: "echo hi", stdout: "hi\n", stderr: "", exit_code: 0 } } } }));
     expect(f?.kind).toBe("event");
     if (f?.kind === "event" && f.payload.type === "tool_result") {
@@ -23,7 +23,7 @@ describe("parseInbound", () => {
   it("parses a Diff display", () => {
     const f = parseInbound(JSON.stringify({
       v: 1, session_id: "s", kind: "event",
-      payload: { type: "tool_result", name: "edit_file", content: "ok",
+      payload: { type: "tool_result", id: "c2", name: "edit_file", status: "ok", duration_ms: 8, content: "ok",
         display: { Diff: { path: "a.txt", before: "x\n", after: "y\n" } } } }));
     if (f?.kind === "event" && f.payload.type === "tool_result") {
       expect(f.payload.display).toEqual({ Diff: { path: "a.txt", before: "x\n", after: "y\n" } });
@@ -48,6 +48,7 @@ const sampleSettings: RuntimeSettings = {
   top_p: null, top_k: null, min_p: null, presence_penalty: null, repeat_penalty: null,
   enable_thinking: false, preserve_thinking: false, memory: true,
   skills_dirs: [], active_skills: [],
+  trace: false, trace_dir: null, trace_max_mb: 64,
 };
 
 describe("settings frames", () => {

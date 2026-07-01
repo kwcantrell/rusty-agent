@@ -32,6 +32,12 @@ describe("MessageList", () => {
     expect(screen.getByText(/read_file/)).toBeInTheDocument();
   });
 
+  it("renders context items as a dim one-line marker", () => {
+    const items: AnimatedItem[] = [makeAnimated("context", { text: "compacted 3 turns: 900 → 200 tokens" })];
+    render(<MessageList items={items} />);
+    expect(screen.getByText(/compacted 3 turns: 900 → 200 tokens/)).toBeInTheDocument();
+  });
+
   it("renders error items with animated component", () => {
     const items: AnimatedItem[] = [makeAnimated("error", { message: "fail" })];
     render(<MessageList items={items} />);
