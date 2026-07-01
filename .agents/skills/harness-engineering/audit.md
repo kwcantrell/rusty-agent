@@ -62,8 +62,8 @@ Open these files fresh at audit time. Do not rely on remembered content — anch
 | 2. Tools | `agent/crates/agent-tools/src/tool.rs`, `agent/crates/agent-tools/src/types.rs`, `agent/crates/agent-core/src/context_tools.rs` |
 | 3. Sandboxes & execution | tool-execution path in `agent/crates/agent-tools/`, `agent/crates/agent-server/src/runtime.rs` |
 | 4. Orchestration logic | `agent/crates/agent-core/src/loop_.rs` (incl. parallel tool calls), `agent/crates/agent-model/src/protocol.rs` |
-| 5. Guardrails / Hooks | permission/limit checks across agent-core/agent-server; `agent/crates/agent-runtime-config/src/lib.rs` |
-| 6. Observability | logging/metering across agent-server/agent-core; offload/eval surfaces |
+| 5. Guardrails / Hooks | permission/limit checks across agent-core/agent-server; `agent/crates/agent-runtime-config/src/lib.rs`; `agent/crates/agent-policy/src/engine.rs` |
+| 6. Observability | logging/metering across agent-server/agent-core; offload/eval surfaces; `agent/crates/agent-server/src/runtime.rs` |
 | (Context engineering — Spine B) | `agent/crates/agent-core/src/context.rs`, `agent/crates/agent-core/src/context_tools.rs`, `agent/crates/agent-core/src/offload.rs`, `agent/crates/agent-core/src/offload_policy.rs` |
 
 ---
@@ -110,8 +110,7 @@ Open `agent/crates/agent-tools/src/tool.rs` (`ToolCtx`, `SandboxStrategy`), and
 `agent/crates/agent-server/src/runtime.rs` (`LoopConfig.sandbox` field wiring).
 
 Checklist:
-- [ ] Sandbox is **mandatory** by default — `sandbox` field in `LoopConfig` is not `Option<...>` or,
-      if it is, a safe-default executor is always installed before any tool runs.
+- [ ] Sandbox default is safe — open `LoopConfig` and check whether the `sandbox` field is optional; if it is `Option<...>`, verify a safe default sandbox is always installed before any tool call runs (a `None` must not silently fall back to unrestricted host execution).
 - [ ] Execution environment grants capabilities explicitly; ambient filesystem/network access is denied.
 - [ ] Network egress is gated per-tool (`NetworkPolicy` in agent-http) — not globally open at the
       runtime level.
@@ -182,7 +181,7 @@ co-design harness with eval, arXiv 2503.16416).
 ## Findings (last audit: 2026-06-30)
 
 Record one finding block per gap discovered. Multiple gaps per component → multiple blocks.
-Update this section when the audit is re-run; stamp with the new date.
+Update this section when the audit is re-run; stamp with the new date. On re-run: remove findings whose proposed fix has been applied, retain still-open ones, and add new ones.
 
 ---
 
