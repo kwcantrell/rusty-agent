@@ -30,7 +30,13 @@ async fn filesystem_server_tools_register_and_execute() {
 
     let sandbox: std::sync::Arc<dyn agent_tools::SandboxStrategy> =
         std::sync::Arc::new(agent_tools::HostExecutor);
-    let mgr = McpManager::connect(&cfg, Duration::from_secs(30), sandbox).await;
+    let mgr = McpManager::connect(
+        &cfg,
+        Duration::from_secs(30),
+        tmp.path().to_path_buf(),
+        sandbox,
+    )
+    .await;
     eprintln!("{}", mgr.summary_line());
     let tools = mgr.tools();
     assert!(!tools.is_empty(), "filesystem server should expose tools");

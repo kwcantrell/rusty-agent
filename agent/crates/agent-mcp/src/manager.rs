@@ -28,13 +28,15 @@ impl McpManager {
     pub async fn connect(
         cfg: &McpServersConfig,
         connect_timeout: Duration,
+        workspace: std::path::PathBuf,
         sandbox: std::sync::Arc<dyn agent_tools::SandboxStrategy>,
     ) -> Self {
         let futs = cfg.servers.iter().map(|(name, spec)| {
             let name = name.clone();
             let spec = spec.clone();
+            let workspace = workspace.clone();
             let sandbox = sandbox.clone();
-            async move { connect_one(&name, &spec, connect_timeout, &sandbox).await }
+            async move { connect_one(&name, &spec, connect_timeout, &workspace, &sandbox).await }
         });
         let results = futures_join_all(futs).await;
 
@@ -119,13 +121,16 @@ async fn connect_one(
     name: &str,
     spec: &McpServerSpec,
     timeout: Duration,
+    workspace: &std::path::Path,
     sandbox: &std::sync::Arc<dyn agent_tools::SandboxStrategy>,
 ) -> Result<(String, Arc<McpClient>, Vec<Arc<dyn Tool>>), (String, String)> {
     let name_owned = name.to_string();
     let spec_owned = spec.clone();
+    let workspace_owned = workspace.to_path_buf();
     let sandbox = sandbox.clone();
     let attempt = async move {
-        let transport = StdioTransport::spawn(&spec_owned, &sandbox).map_err(|e| e.to_string())?;
+        let transport = StdioTransport::spawn(&spec_owned, &workspace_owned, &sandbox)
+            .map_err(|e| e.to_string())?;
         let client = McpClient::new(Arc::new(transport));
         client
             .initialize(timeout)
@@ -187,11 +192,63 @@ mod tests {
         let mgr = McpManager::connect(
             &McpServersConfig::default(),
             Duration::from_secs(1),
+            std::env::temp_dir(),
             host_sandbox(),
         )
         .await;
         assert!(mgr.tools().is_empty());
         assert_eq!(mgr.summary_line(), "mcp: no servers configured");
+    }
+
+    #[tokio::test]
+    async fn degraded_sandbox_skips_server_not_fatal() {
+        struct RefusingSandbox;
+        impl agent_tools::SandboxStrategy for RefusingSandbox {
+            fn launch(
+                &self,
+                _spec: agent_tools::CommandSpec,
+            ) -> Result<agent_tools::SandboxedChild, agent_tools::SandboxError> {
+                Err(agent_tools::SandboxError::Unavailable(
+                    "docker unreachable (no daemon); command refused".into(),
+                ))
+            }
+            fn describe(&self) -> agent_tools::SandboxDescriptor {
+                agent_tools::SandboxDescriptor {
+                    mode: agent_tools::Mode::Auto,
+                    mechanism: "docker",
+                    image: None,
+                    network: false,
+                    degraded: Some("no daemon".into()),
+                }
+            }
+        }
+
+        let mut cfg = McpServersConfig::default();
+        cfg.servers.insert(
+            "fs".into(),
+            crate::config::McpServerSpec {
+                command: "cat".into(),
+                args: vec![],
+                env: Default::default(),
+                trust: crate::config::Trust::Ask,
+            },
+        );
+        let mgr = McpManager::connect(
+            &cfg,
+            Duration::from_secs(1),
+            std::env::temp_dir(),
+            std::sync::Arc::new(RefusingSandbox),
+        )
+        .await;
+        assert!(
+            mgr.tools().is_empty(),
+            "refused server must contribute no tools"
+        );
+        let line = mgr.summary_line();
+        assert!(
+            line.contains("fs \u{2717}") && line.contains("unavailable"),
+            "skip must be recorded and name the sandbox refusal: {line}"
+        );
     }
 
     #[test]
@@ -231,7 +288,13 @@ mod tests {
                 trust: crate::config::Trust::Ask,
             },
         );
-        let mgr = McpManager::connect(&cfg, Duration::from_secs(1), host_sandbox()).await;
+        let mgr = McpManager::connect(
+            &cfg,
+            Duration::from_secs(1),
+            std::env::temp_dir(),
+            host_sandbox(),
+        )
+        .await;
         assert!(mgr.tools().is_empty());
         assert!(mgr.summary_line().contains("broken \u{2717}"));
     }

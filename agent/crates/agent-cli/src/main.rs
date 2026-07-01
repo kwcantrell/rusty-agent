@@ -211,7 +211,7 @@ async fn main() {
     let mut mcp_tools: Vec<Arc<dyn agent_tools::Tool>> = Vec::new();
     let mcp_manager = match &cli.mcp_config {
         Some(path) => {
-            let mgr = agent_runtime_config::connect_mcp(path, sandbox.clone()).await;
+            let mgr = agent_runtime_config::connect_mcp(path, &workspace, sandbox.clone()).await;
             println!("{}", mgr.summary_line());
             mcp_tools = mgr.tools();
             Some(mgr)

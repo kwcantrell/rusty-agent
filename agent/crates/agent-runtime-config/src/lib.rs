@@ -37,12 +37,16 @@ pub use agent_mcp::{McpManager, ServerStatus};
 /// Load `mcp.json` at `path` and connect its servers. A missing file yields an
 /// empty manager (MCP disabled); a malformed file warns and yields empty. The
 /// returned `McpManager` owns the server processes — keep it alive for the session.
-pub async fn connect_mcp(path: &Path, sandbox: Arc<dyn SandboxStrategy>) -> McpManager {
+pub async fn connect_mcp(
+    path: &Path,
+    workspace: &Path,
+    sandbox: Arc<dyn SandboxStrategy>,
+) -> McpManager {
     let (cfg, warning) = McpServersConfig::load_or_empty(path);
     if let Some(w) = warning {
         eprintln!("warning: {} ({}); MCP disabled", w, path.display());
     }
-    McpManager::connect(&cfg, Duration::from_secs(15), sandbox).await
+    McpManager::connect(&cfg, Duration::from_secs(15), workspace.to_path_buf(), sandbox).await
 }
 
 pub fn protocol_name_is_valid(name: &str) -> bool {

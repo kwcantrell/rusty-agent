@@ -30,12 +30,15 @@ pub struct StdioTransport {
 impl StdioTransport {
     pub fn spawn(
         spec: &McpServerSpec,
+        workspace: &std::path::Path,
         sandbox: &std::sync::Arc<dyn agent_tools::SandboxStrategy>,
     ) -> Result<Self, McpError> {
         let cspec = agent_tools::CommandSpec {
             program: spec.command.clone(),
             args: spec.args.clone(),
-            cwd: std::env::current_dir().unwrap_or_else(|_| ".".into()),
+            // Confine the server to the same root the fs tools are confined to —
+            // never the daemon's incidental current_dir.
+            cwd: workspace.to_path_buf(),
             env: spec.env.clone().into_iter().collect(),
             kind: agent_tools::ProcKind::Service,
         };
@@ -196,9 +199,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_uses_workspace_as_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let sandbox = host_sandbox();
+        let spec = McpServerSpec {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                r#"printf '{"cwd":"%s"}\n' "$(pwd)""#.into(),
+            ],
+            env: BTreeMap::new(),
+            trust: crate::config::Trust::Ask,
+        };
+        let t = StdioTransport::spawn(&spec, dir.path(), &sandbox).expect("spawn");
+        let got = t.recv().await.expect("one JSON line");
+        let cwd = std::path::PathBuf::from(got["cwd"].as_str().unwrap());
+        assert_eq!(
+            cwd.canonicalize().unwrap(),
+            canonical,
+            "MCP child must run in the configured workspace"
+        );
+        t.close().await;
+    }
+
+    #[tokio::test]
     async fn stdio_roundtrips_newline_delimited_json_via_cat() {
         let sandbox = host_sandbox();
-        let t = StdioTransport::spawn(&cat_spec(), &sandbox).expect("spawn cat");
+        let t = StdioTransport::spawn(&cat_spec(), std::env::temp_dir().as_path(), &sandbox)
+            .expect("spawn cat");
         t.send(json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
             .await
             .unwrap();
@@ -211,7 +240,8 @@ mod tests {
     #[tokio::test]
     async fn close_tears_down_the_reader_task() {
         let sandbox = host_sandbox();
-        let t = StdioTransport::spawn(&cat_spec(), &sandbox).expect("spawn cat");
+        let t = StdioTransport::spawn(&cat_spec(), std::env::temp_dir().as_path(), &sandbox)
+            .expect("spawn cat");
         // Sanity: the transport works before teardown.
         t.send(json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
             .await
@@ -233,7 +263,8 @@ mod tests {
     #[tokio::test]
     async fn close_is_idempotent() {
         let sandbox = host_sandbox();
-        let t = StdioTransport::spawn(&cat_spec(), &sandbox).expect("spawn cat");
+        let t = StdioTransport::spawn(&cat_spec(), std::env::temp_dir().as_path(), &sandbox)
+            .expect("spawn cat");
         t.close().await;
         t.close().await; // must not panic
     }
