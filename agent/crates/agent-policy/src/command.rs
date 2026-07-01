@@ -202,8 +202,8 @@ pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
     //
     // KNOWN LIMITATION: a catastrophe wrapped in a quoted interpreter argument (`bash -c "sudo x"`)
     // is a single token whose basename != the catastrophe name, so this guard cannot see it. Under
-    // the default allowlist such interpreters aren't allowlisted, so those reach Ask. Do not add
-    // shell interpreters (bash/sh/zsh/dash/eval/xargs) to command_allowlist.
+    // the default allowlist such wrappers aren't allowlisted, so those reach Ask. Do not add shell
+    // interpreters or exec-capable arg runners (bash/sh/zsh/dash/eval/xargs) to command_allowlist.
     if tokens.iter().any(|t| program_name_is_catastrophic(basename(t)).is_some()) {
         return false;
     }
@@ -393,7 +393,6 @@ mod tests {
         let al = vec!["find".to_string(), "xargs".to_string(), "cat".to_string()];
         assert!(!is_auto_allowed("find . -exec sudo reboot +", &al));
         assert!(!is_auto_allowed("xargs mkfs", &al));
-        assert!(!is_auto_allowed("find / -name x -exec mkfs.ext4 {} +", &al) || true);
         // Name-exact: 'sudoku' is not the catastrophe name 'sudo' -> still auto-allowed.
         assert!(is_auto_allowed("cat sudoku.txt", &al));
     }
