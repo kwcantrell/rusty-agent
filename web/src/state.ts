@@ -90,6 +90,8 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
   switch (p.type) {
     case "usage":
       return { ...s, usage: { promptTokens: p.prompt_tokens, contextLimit: p.context_limit, turn: p.turn, maxTurns: p.max_turns } };
+    // The breakdown only needs the prompt total, so we intentionally keep only
+    // promptTokens here and drop completion_tokens. Revisit if a chart needs it.
     case "server_usage":
       return { ...s, serverUsage: { promptTokens: p.prompt_tokens, turn: p.turn } };
     case "token": {

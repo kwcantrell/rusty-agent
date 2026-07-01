@@ -14,6 +14,9 @@
   --state-run: #c4622d;
   --state-done: #4f7a52;
   --state-error: #b3402e;
+  --ctx-goal: #a78bfa;
+  --ctx-memory: #34d399;
+  --ctx-summary: #fbbf24;
   --ring: #4f7a52;
   --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-display: "Fraunces Variable", ui-serif, Georgia, "Times New Roman", serif;
@@ -33,6 +36,9 @@
   --state-run: #d9824f;
   --state-done: #6fae72;
   --state-error: #e0654f;
+  --ctx-goal: #a78bfa;
+  --ctx-memory: #34d399;
+  --ctx-summary: #fbbf24;
   --ring: #6fae72;
   --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-display: "Fraunces Variable", ui-serif, Georgia, "Times New Roman", serif;

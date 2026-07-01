@@ -6,8 +6,10 @@ const MSGS = (sid: string) => `agent.userMsgs.${sid}`;
 const THEME_KEY = "agent.theme";
 
 export function loadTheme(): Theme | null {
-  const v = localStorage.getItem(THEME_KEY);
-  return v === "light" || v === "dark" ? v : null;
+  try {
+    const v = localStorage.getItem(THEME_KEY);
+    return v === "light" || v === "dark" ? v : null;
+  } catch { return null; }
 }
 
 export function saveTheme(t: Theme): void {
@@ -19,19 +21,19 @@ export function saveSession(sessionId: string, token: string): void {
   localStorage.setItem(TOKEN, token);
 }
 export function loadToken(): string | null {
-  return localStorage.getItem(TOKEN);
+  try { return localStorage.getItem(TOKEN); } catch { return null; }
 }
 export function loadSessionId(): string | null {
-  return localStorage.getItem(SID);
+  try { return localStorage.getItem(SID); } catch { return null; }
 }
 export function clearSession(): void {
   localStorage.removeItem(TOKEN);
   localStorage.removeItem(SID);
 }
 export function loadUserMsgs(sessionId: string): string[] {
-  const raw = localStorage.getItem(MSGS(sessionId));
-  if (!raw) return [];
   try {
+    const raw = localStorage.getItem(MSGS(sessionId));
+    if (!raw) return [];
     const v = JSON.parse(raw);
     return Array.isArray(v) ? (v as string[]) : [];
   } catch {
@@ -52,9 +54,9 @@ const WORKSPACE_VIEW = "agent.workspaceView";
 const DEFAULT_VIEW: WorkspaceView = { mode: "preview", viewport: "desktop" };
 
 export function loadWorkspaceView(): WorkspaceView {
-  const raw = localStorage.getItem(WORKSPACE_VIEW);
-  if (!raw) return { ...DEFAULT_VIEW };
   try {
+    const raw = localStorage.getItem(WORKSPACE_VIEW);
+    if (!raw) return { ...DEFAULT_VIEW };
     const v = JSON.parse(raw) as Partial<WorkspaceView>;
     const mode = v.mode === "code" ? "code" : "preview";
     const viewport = v.viewport === "tablet" || v.viewport === "mobile" ? v.viewport : "desktop";
@@ -70,7 +72,7 @@ export function saveWorkspaceView(v: WorkspaceView): void {
 const DASH_EXPANDED = "agent.contextDashExpanded";
 
 export function loadDashExpanded(): boolean {
-  return localStorage.getItem(DASH_EXPANDED) === "1";
+  try { return localStorage.getItem(DASH_EXPANDED) === "1"; } catch { return false; }
 }
 export function saveDashExpanded(v: boolean): void {
   try { localStorage.setItem(DASH_EXPANDED, v ? "1" : "0"); } catch { /* ignore */ }
@@ -79,7 +81,8 @@ export function saveDashExpanded(v: boolean): void {
 const RIGHT_TAB = "rightTab";
 export type RightTab = "workspace" | "context";
 export function loadRightTab(): RightTab {
-  return localStorage.getItem(RIGHT_TAB) === "context" ? "context" : "workspace";
+  try { return localStorage.getItem(RIGHT_TAB) === "context" ? "context" : "workspace"; }
+  catch { return "workspace"; }
 }
 export function saveRightTab(t: RightTab): void {
   try { localStorage.setItem(RIGHT_TAB, t); } catch { /* ignore */ }

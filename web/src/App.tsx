@@ -8,9 +8,10 @@ import { TopBar } from "./components/TopBar";
 import { AgentColumn } from "./components/AgentColumn";
 import { WorkspacePane } from "./components/workspace/WorkspacePane";
 import { resolveInitialTheme, applyTheme, type Theme } from "./theme";
-import { appendUserMsg, loadSessionId, loadTheme, loadUserMsgs, saveTheme, loadRightTab, saveRightTab } from "./storage";
+import { appendUserMsg, loadSessionId, loadTheme, loadUserMsgs, saveTheme, loadRightTab } from "./storage";
 import type { RightTab } from "./storage";
 import { ContextExplorer } from "./explorer/ContextExplorer";
+import { RightPaneTabs } from "./components/RightPaneTabs";
 
 export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(loadSessionId());
@@ -161,17 +162,7 @@ export default function App() {
         {!narrow && (
           <div className="min-w-0 flex-1">
             <div className="flex h-full flex-col">
-              <div className="flex gap-1 px-2 pt-2" role="tablist" style={{ borderBottom: "1px solid var(--border)" }}>
-                {(["workspace", "context"] as const).map((t) => (
-                  <button key={t} role="tab" aria-selected={rightTab === t}
-                    onClick={() => { setRightTab(t); saveRightTab(t); }}
-                    className="rounded-t-lg px-3 py-1.5 text-xs"
-                    style={{ color: rightTab === t ? "var(--text-strong)" : "var(--text-muted)",
-                      fontWeight: rightTab === t ? 600 : 400 }}>
-                    {t === "workspace" ? "Workspace" : "Context"}
-                  </button>
-                ))}
-              </div>
+              <RightPaneTabs rightTab={rightTab} setRightTab={setRightTab} />
               <div className="min-h-0 flex-1">
                 {rightTab === "workspace"
                   ? <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />
@@ -188,17 +179,7 @@ export default function App() {
             </div>
             <div className="h-[calc(100%-2.5rem)]">
               <div className="flex h-full flex-col">
-                <div className="flex gap-1 px-2 pt-2" role="tablist" style={{ borderBottom: "1px solid var(--border)" }}>
-                  {(["workspace", "context"] as const).map((t) => (
-                    <button key={t} role="tab" aria-selected={rightTab === t}
-                      onClick={() => { setRightTab(t); saveRightTab(t); }}
-                      className="rounded-t-lg px-3 py-1.5 text-xs"
-                      style={{ color: rightTab === t ? "var(--text-strong)" : "var(--text-muted)",
-                        fontWeight: rightTab === t ? 600 : 400 }}>
-                      {t === "workspace" ? "Workspace" : "Context"}
-                    </button>
-                  ))}
-                </div>
+                <RightPaneTabs rightTab={rightTab} setRightTab={setRightTab} />
                 <div className="min-h-0 flex-1">
                   {rightTab === "workspace"
                     ? <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />

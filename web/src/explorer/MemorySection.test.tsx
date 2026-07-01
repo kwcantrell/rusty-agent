@@ -42,4 +42,12 @@ describe("MemorySection", () => {
     fireEvent.click(screen.getByRole("button", { name: /delete m1/i }));
     await waitFor(() => expect(screen.getByText(/scope-guard refusal/)).toBeInTheDocument());
   });
+
+  it("surfaces an error when the initial memory load fails", async () => {
+    const api = await import("./api");
+    (api.listMemories as unknown as { mockRejectedValueOnce: (e: Error) => void })
+      .mockRejectedValueOnce(new Error("boom"));
+    render(<MemorySection recalled={[]} lastQuery={null} />);
+    expect(await screen.findByText(/boom/)).toBeInTheDocument();
+  });
 });

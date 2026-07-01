@@ -10,13 +10,17 @@ export function MemorySection({ recalled, lastQuery }: { recalled: string[]; las
   const [scoredRows, setScoredRows] = useState<ScoredRow[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  const refresh = () => listMemories(50, 0).then(setRows).catch(() => {});
+  const refresh = () =>
+    listMemories(50, 0).then((r) => { setRows(r); setError(null); })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   useEffect(() => { refresh(); }, []);
 
   useEffect(() => {
     if (!lastQuery) { setScoredRows([]); return; }
     let active = true;
-    recallPreview(lastQuery).then((r) => { if (active) setScoredRows(r); }).catch(() => {});
+    recallPreview(lastQuery)
+      .then((r) => { if (active) setScoredRows(r); })
+      .catch((e) => { if (active) setError(e instanceof Error ? e.message : String(e)); });
     return () => { active = false; };
   }, [lastQuery]);
 
@@ -77,6 +81,8 @@ export function MemorySection({ recalled, lastQuery }: { recalled: string[]; las
                   className="flex-1 rounded px-1"
                   style={{ background: "var(--surface-base)", color: "var(--text-strong)" }} />
                 <button onClick={() => onSave(r.id)} style={{ color: "var(--accent)" }}>save</button>
+                <button onClick={() => { setEditing(null); setError(null); }}
+                  style={{ color: "var(--text-muted)" }}>cancel</button>
               </div>
             ) : (
               <div className="flex items-start justify-between gap-2">
