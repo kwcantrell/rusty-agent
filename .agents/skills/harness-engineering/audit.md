@@ -178,51 +178,25 @@ co-design harness with eval, arXiv 2503.16416).
 
 ---
 
-## Example findings (last audit: 2026-06-30, re-run)
+## Example findings (last audit: 2026-06-30; re-stamped 2026-06-30 after both HIGHs fixed)
 
 *Illustrative snapshot from a 2026-06-30 six-component fan-out run — re-stamp or replace when you run the audit; these cite live line numbers that drift.*
 
 Record one finding block per gap discovered. Multiple gaps per component → multiple blocks.
 Update this section when the audit is re-run; stamp with the new date. On re-run: remove findings whose proposed fix has been applied, retain still-open ones, and add new ones.
 
-Verification note from this re-run vs. the prior snapshot: prior Finding 1 (sandbox `Option`) was
-**refined** — production always wires `Some(build_sandbox)` (`assemble.rs:69`), so the `Option` is a
-latent footgun (F3) while the real live-severity gap is silent auto-degradation (F1). Prior Finding 2
-(Tool "when NOT to call") **confirmed**. Prior Finding 3 (observability) **refined** — `prompt_tokens`/
-`completion_tokens` ARE emitted per turn (`ServerUsage`); the true gaps are duration/reasoning/errors.
+Re-stamp note (2026-06-30): both prior HIGH findings are **fixed and merged to `main`** and have been
+removed from the list below. The sandbox silent-degradation gap now emits a first-class
+`AgentEvent::SandboxDegraded` at run start (loud CLI line + web/desktop banner fed from
+`settings_state`); the lexical-only workspace path check now canonicalizes the existing path
+components (and chases dangling symlinks), closing the symlink escape. See
+`docs/superpowers/specs/2026-06-30-sandbox-degraded-signal-design.md` and commits `344a40c` (symlink)
+plus `9cf9562`/`262e764`/`9cf68e7` (degraded signal). The five findings below — all `med`/`low` —
+remain open and are renumbered 1–5.
 
 ---
 
-**Finding 1 — Sandboxes: default mode silently degrades to unsandboxed host execution**
-
-```
-severity: high
-file:line: agent/crates/agent-sandbox/src/strategy.rs:57-65
-violated principle: "execution is isolated by default; capabilities are explicitly granted,
-  not ambient" — SKILL.md Spine A component 3 (Sandboxes & execution)
-concrete proposed fix: Default sandbox_mode="auto": when Docker is unavailable DockerSandbox calls
-  HostExecutor.launch() with only a tracing::warn! — a Docker-absent host runs FULLY unsandboxed
-  with no user-visible signal. Emit a first-class degraded AgentEvent + a startup check that surfaces
-  the degraded state loudly (the loop_.rs:353 `d.degraded` concept exists — surface it earlier).
-```
-
----
-
-**Finding 2 — Sandboxes: lexical-only workspace path check allows symlink escape**
-
-```
-severity: high
-file:line: agent/crates/agent-tools/src/fs/paths.rs:10-14
-violated principle: "capabilities explicitly granted, not ambient" — SKILL.md Spine A component 3
-concrete proposed fix: resolve_in_workspace normalizes `..` lexically but never canonicalizes.
-  A symlink inside the workspace pointing outside it passes: after `ln -s /etc escape`,
-  read_file("escape/passwd") escapes in host/off/degraded modes (Docker Enforce closes it).
-  canonicalize() existing path components before the prefix check.
-```
-
----
-
-**Finding 3 — Orchestration: parallel tool dispatch is not failure-isolated**
+**Finding 1 — Orchestration: parallel tool dispatch is not failure-isolated**
 
 ```
 severity: med (high-impact reliability)
@@ -239,7 +213,7 @@ concrete proposed fix: Three related gaps in the buffer_unordered path — (a) f
 
 ---
 
-**Finding 4 — Tools: no "when NOT to call" contract in the Tool trait**
+**Finding 2 — Tools: no "when NOT to call" contract in the Tool trait**
 
 ```
 severity: med
@@ -255,7 +229,7 @@ concrete proposed fix: [CONFIRMED from prior run] Trait exposes name/description
 
 ---
 
-**Finding 5 — Observability: tool failures, durations, and context events are invisible**
+**Finding 3 — Observability: tool failures, durations, and context events are invisible**
 
 ```
 severity: med
@@ -272,7 +246,7 @@ concrete proposed fix: [REFINED] prompt/completion tokens ARE emitted per turn (
 
 ---
 
-**Finding 6 — Guardrails: catastrophic-command denylist has structural gaps; CLI approval can hang**
+**Finding 4 — Guardrails: catastrophic-command denylist has structural gaps; CLI approval can hang**
 
 ```
 severity: med
@@ -289,7 +263,7 @@ concrete proposed fix: (a) Structural Layer-A detection covers sudo/rm/dd but NO
 
 ---
 
-**Finding 7 — Instructions: duplicated system prompt + skill files lack negative constraints**
+**Finding 5 — Instructions: duplicated system prompt + skill files lack negative constraints**
 
 ```
 severity: low
@@ -307,22 +281,24 @@ concrete proposed fix: The coding-agent system prompt is byte-identical but dupl
 
 ## Top 3 highest-leverage fixes
 
-Ranked by impact (severity × remediation cost):
+Ranked by impact (severity × remediation cost). Both prior HIGH-severity entries (silent sandbox
+degradation, symlink escape) are **done** — the remaining `med` findings re-rank as follows:
 
-1. **[Component 3 — Sandboxes] Stop silent sandbox degradation**
-   `agent/crates/agent-sandbox/src/strategy.rs:57-65` — the default `sandbox_mode="auto"` runs fully
-   unsandboxed when Docker is absent, signalled only by a log line. Emit a first-class degraded event
-   + startup warning. Highest safety-per-effort: one code path closes an invisible "we thought we were
-   sandboxed" production hole.
-
-2. **[Component 3 — Sandboxes] Close the symlink escape**
-   `agent/crates/agent-tools/src/fs/paths.rs:10-14` — lexical-only path resolution lets an in-workspace
-   symlink read/write outside the workspace in host/off/degraded modes. `canonicalize()` existing path
-   components before the prefix check. Small change, closes a real filesystem-boundary violation.
-
-3. **[Component 4 — Orchestration] Harden the parallel-tool dispatch**
-   `agent/crates/agent-core/src/loop_.rs:275-311` — one focused change closes three findings at once:
+1. **[Component 4 — Orchestration] Harden the parallel-tool dispatch** (Finding 1)
+   `agent/crates/agent-core/src/loop_.rs:275-311` — one focused change closes three gaps at once:
    catch per-tool panics (so one tool can't kill the session), wrap execute in
    `tokio::time::timeout(ctx.timeout,…)` (so a stalled fs tool can't hang all slots), and replace the
    silent `None => continue` with an explicit error result (so every tool_call_id yields one message).
    Best reliability leverage per unit effort; complements the existing parallel-tool work.
+
+2. **[Component 5 — Guardrails] Close denylist gaps + the CLI approval hang** (Finding 4)
+   `agent/crates/agent-policy/src/command.rs:59-76`; `agent/crates/agent-cli/src/approval.rs:13-28` —
+   add structural handlers (+ tests) for `mkfs` and the `:(){` forkbomb (currently substring-backstop
+   only), and give `TerminalApproval`'s stdin read a timeout defaulting to Deny so a caller holding
+   stdin open can't hang the agent. Safety-adjacent, small, well-scoped.
+
+3. **[Component 6 — Observability] Make tool failures + durations visible** (Finding 3)
+   `agent/crates/agent-core/src/loop_.rs:304-308`; `wire.rs:103`; `agent-model/src/openai.rs:205-209` —
+   emit a tool-error/status event + `duration_ms`, count streamed `reasoning_tokens`, and forward
+   `ContextEvent`s to the wire so the web UI learns the window was truncated. Highest
+   diagnose-and-eval leverage; pairs with the eval-harness work.
