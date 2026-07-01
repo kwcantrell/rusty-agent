@@ -123,15 +123,26 @@ pub trait SandboxStrategy: Send + Sync {
 /// Default strategy: run on the host exactly as the core did pre-sandbox.
 pub struct HostExecutor;
 
+/// Env vars forwarded from the parent to host-executed children. Everything
+/// else is scrubbed (`env_clear`) so secrets like AGENT_API_KEY never reach
+/// tool subprocesses; `spec.env` is applied afterwards and always wins.
+const HOST_ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"];
+
 impl SandboxStrategy for HostExecutor {
     fn launch(&self, spec: CommandSpec) -> Result<SandboxedChild, SandboxError> {
         let mut cmd = tokio::process::Command::new(&spec.program);
         cmd.args(&spec.args)
             .current_dir(&spec.cwd)
-            .envs(&spec.env)
+            .env_clear()
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for key in HOST_ENV_ALLOWLIST {
+            if let Ok(v) = std::env::var(key) {
+                cmd.env(key, v);
+            }
+        }
+        cmd.envs(&spec.env);
         // Service (mcp) needs an open stdin pipe; OneShot does not read stdin.
         match spec.kind {
             ProcKind::Service => {
@@ -170,6 +181,69 @@ mod tests {
             env: Default::default(),
             kind: ProcKind::OneShot,
         }
+    }
+
+    fn spec_with_env(program: &str, args: &[&str], env: &[(&str, &str)]) -> CommandSpec {
+        CommandSpec {
+            program: program.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            cwd: std::env::temp_dir(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            kind: ProcKind::OneShot,
+        }
+    }
+
+    async fn run_and_capture(spec: CommandSpec) -> String {
+        let mut sb = HostExecutor.launch(spec).unwrap();
+        let mut out = sb.take_stdout().unwrap();
+        let mut buf = String::new();
+        use tokio::io::AsyncReadExt;
+        out.read_to_string(&mut buf).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), sb.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn host_executor_does_not_leak_parent_env() {
+        // Plant a secret in the parent env (edition 2021: set_var is safe).
+        // Unique name so no other test can collide with it.
+        std::env::set_var("AGENT_TEST_SECRET_XYZQ", "leaked");
+        let out = run_and_capture(spec(
+            "sh",
+            &["-c", "printenv AGENT_TEST_SECRET_XYZQ || echo ABSENT"],
+        ))
+        .await;
+        assert!(
+            out.contains("ABSENT"),
+            "parent env must not leak into host children, got: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_executor_passes_allowlisted_path() {
+        let out = run_and_capture(spec("sh", &["-c", "printenv PATH"])).await;
+        assert!(!out.trim().is_empty(), "PATH must be forwarded to children");
+    }
+
+    #[tokio::test]
+    async fn host_executor_spec_env_wins() {
+        // spec.env entries survive the scrub and override allow-listed values.
+        let out = run_and_capture(spec_with_env(
+            "sh",
+            &["-c", "printenv AGENT_TEST_EXPLICIT"],
+            &[("AGENT_TEST_EXPLICIT", "explicit-value")],
+        ))
+        .await;
+        assert!(
+            out.contains("explicit-value"),
+            "spec.env must be applied, got: {out:?}"
+        );
     }
 
     fn service_spec(program: &str, args: &[&str]) -> CommandSpec {
