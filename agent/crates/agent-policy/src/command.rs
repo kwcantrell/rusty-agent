@@ -44,6 +44,12 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Remove ALL ASCII whitespace. A second backstop pass uses this so spacing variants
+/// (`: ( ) { :|:& } ; :`) cannot dodge a denylist literal like `:(){`.
+fn strip_ws(s: &str) -> String {
+    s.split_whitespace().collect::<String>()
+}
+
 fn is_recursive_flag(arg: &str) -> bool {
     arg == "--recursive"
         // bundled short flags like -rf / -fr / -R (single dash, not a long option)
@@ -72,6 +78,9 @@ fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
     {
         return Some("`dd` writing to a block device is denied".to_string());
     }
+    if name == "mkfs" || name.starts_with("mkfs.") {
+        return Some(format!("filesystem creation via `{name}` is denied"));
+    }
     None
 }
 
@@ -90,9 +99,14 @@ pub fn hard_floor_violation(cmd: &str, denylist: &[String]) -> Option<String> {
     // Layer B: always-on substring backstop (catches no-space operators, parse failures,
     // and configured denylist literals). Fail-safe.
     let norm = normalize_ws(cmd);
+    let stripped = strip_ws(cmd);
     for pat in denylist {
         let pnorm = normalize_ws(pat);
         if !pnorm.is_empty() && norm.contains(&pnorm) {
+            return Some(format!("command matches denylist: {pat}"));
+        }
+        let pstripped = strip_ws(pat);
+        if !pstripped.is_empty() && stripped.contains(&pstripped) {
             return Some(format!("command matches denylist: {pat}"));
         }
     }
@@ -199,6 +213,30 @@ mod tests {
     fn floor_denies_dd_and_fork_bomb() {
         assert!(floor("dd if=/dev/zero of=/dev/sda").is_some());
         assert!(floor(":(){ :|:& };:").is_some());
+    }
+
+    #[test]
+    fn floor_denies_mkfs_structurally() {
+        // "mkfs" is NOT in the floor() denylist, so only the structural handler catches these.
+        assert!(floor("mkfs /dev/sda").is_some());
+        assert!(floor("mkfs.ext4 /dev/sdb1").is_some());
+        assert!(floor("/sbin/mkfs.xfs /dev/sdb1").is_some());
+        assert!(floor("echo hi && mkfs /dev/sda").is_some());
+    }
+
+    #[test]
+    fn floor_denies_spaced_fork_bomb_via_stripped_backstop() {
+        // Spaced variant dodges normalize_ws (single spaces remain) but not the
+        // all-whitespace-removed pass, which collapses it to ":(){:|:&};:".
+        assert!(floor(": ( ) { :|:& } ; :").is_some());
+    }
+
+    #[test]
+    fn floor_allows_benign_despite_stricter_backstop() {
+        assert!(floor("ls -la").is_none());
+        assert!(floor("git status").is_none());
+        assert!(floor("make build").is_none());   // 'mk' prefix must not trip mkfs
+        assert!(floor("cat mkfs-notes.txt").is_none()); // 'mkfs' as an arg substring is fine (not in denylist)
     }
 
     #[test]
