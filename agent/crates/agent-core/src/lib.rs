@@ -9,6 +9,7 @@ mod curated;
 mod compactor;
 mod context_tools;
 mod snapshot;
+pub mod stats;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub use context::*;
@@ -21,3 +22,4 @@ pub use curated::*;
 pub use compactor::*;
 pub use context_tools::*;
 pub use snapshot::{ContextSegment, ContextSnapshot};
+pub use stats::SessionStats;
