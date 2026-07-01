@@ -178,71 +178,129 @@ co-design harness with eval, arXiv 2503.16416).
 
 ---
 
-## Example findings (last audit: 2026-06-30)
+## Example findings (last audit: 2026-06-30, re-run)
 
-*Illustrative snapshot from a 2026-06-30 run — re-stamp or replace when you run the audit; these cite live line numbers that drift.*
+*Illustrative snapshot from a 2026-06-30 six-component fan-out run — re-stamp or replace when you run the audit; these cite live line numbers that drift.*
 
 Record one finding block per gap discovered. Multiple gaps per component → multiple blocks.
 Update this section when the audit is re-run; stamp with the new date. On re-run: remove findings whose proposed fix has been applied, retain still-open ones, and add new ones.
 
+Verification note from this re-run vs. the prior snapshot: prior Finding 1 (sandbox `Option`) was
+**refined** — production always wires `Some(build_sandbox)` (`assemble.rs:69`), so the `Option` is a
+latent footgun (F3) while the real live-severity gap is silent auto-degradation (F1). Prior Finding 2
+(Tool "when NOT to call") **confirmed**. Prior Finding 3 (observability) **refined** — `prompt_tokens`/
+`completion_tokens` ARE emitted per turn (`ServerUsage`); the true gaps are duration/reasoning/errors.
+
 ---
 
-**Finding 1 — Sandboxes: sandbox is opt-in, not the default**
+**Finding 1 — Sandboxes: default mode silently degrades to unsandboxed host execution**
 
 ```
 severity: high
-file:line: agent/crates/agent-core/src/loop_.rs:48-51
+file:line: agent/crates/agent-sandbox/src/strategy.rs:57-65
 violated principle: "execution is isolated by default; capabilities are explicitly granted,
   not ambient" — SKILL.md Spine A component 3 (Sandboxes & execution)
-concrete proposed fix: Change `sandbox: Option<Arc<dyn SandboxStrategy>>` in LoopConfig to a
-  required field with a safe default (e.g. HostExecutor restricted to workspace root).
-  Require callers who want unrestricted execution to opt in explicitly, not opt into sandboxing.
-  A `None` sandbox currently means tools run with full ambient filesystem/network access.
+concrete proposed fix: Default sandbox_mode="auto": when Docker is unavailable DockerSandbox calls
+  HostExecutor.launch() with only a tracing::warn! — a Docker-absent host runs FULLY unsandboxed
+  with no user-visible signal. Emit a first-class degraded AgentEvent + a startup check that surfaces
+  the degraded state loudly (the loop_.rs:353 `d.degraded` concept exists — surface it earlier).
 ```
 
 ---
 
-**Finding 2 — Tools: no "when NOT to call" contract in the Tool trait**
+**Finding 2 — Sandboxes: lexical-only workspace path check allows symlink escape**
+
+```
+severity: high
+file:line: agent/crates/agent-tools/src/fs/paths.rs:10-14
+violated principle: "capabilities explicitly granted, not ambient" — SKILL.md Spine A component 3
+concrete proposed fix: resolve_in_workspace normalizes `..` lexically but never canonicalizes.
+  A symlink inside the workspace pointing outside it passes: after `ln -s /etc escape`,
+  read_file("escape/passwd") escapes in host/off/degraded modes (Docker Enforce closes it).
+  canonicalize() existing path components before the prefix check.
+```
+
+---
+
+**Finding 3 — Orchestration: parallel tool dispatch is not failure-isolated**
+
+```
+severity: med (high-impact reliability)
+file:line: agent/crates/agent-core/src/loop_.rs:275-311
+violated principle: "hand-off aggregates results explicitly; no silent discard of tool-call
+  outputs" — SKILL.md Spine A component 4 (judged from first principles + runtime conventions)
+concrete proposed fix: Three related gaps in the buffer_unordered path — (a) futures run inline with
+  no catch_unwind, so ONE tool panic aborts the whole AgentLoop; (b) no tokio::time::timeout wraps
+  tool.execute and fs/write/render ignore ctx.timeout, so one stalled tool hangs all parallel slots;
+  (c) the `None => continue` at :298 silently drops a tool result, leaving a tool_call_id with no tool
+  message (invalid conversation state). Wrap each execute in catch_unwind + timeout; replace the drop
+  with an explicit error result so every tool_call_id always yields exactly one message.
+```
+
+---
+
+**Finding 4 — Tools: no "when NOT to call" contract in the Tool trait**
 
 ```
 severity: med
-file:line: agent/crates/agent-tools/src/tool.rs:5-13
+file:line: agent/crates/agent-tools/src/tool.rs:4-13 (+ types.rs:9-14, registry.rs:13)
 violated principle: "each tool has a clear name, tight description, and explicit 'when NOT to
   call' guidance; no thin endpoint wrappers" — Anthropic: Writing Tools for Agents (tier: eng-blog)
-concrete proposed fix: Add a `when_not_to_call() -> &str` method to the Tool trait (default → ""),
-  include it in ToolSchema, and add a lint/test asserting it is non-empty for all registered tools.
-  Alternatively, enforce a prose convention in description() ("Must include a 'Do NOT use when …'
-  clause") with a test that pattern-matches the descriptions at registration time.
+concrete proposed fix: [CONFIRMED from prior run] Trait exposes name/description/schema/intent/execute
+  with no exclusion-prose slot; ToolRegistry::register is a bare HashMap insert. Add
+  `when_not_to_call() -> Option<&str>` + a registration test requiring it for name-overlapping tools
+  (e.g. recall vs context_recall). Also: 7 of ~19 tools give required params `{"type":"string"}` with
+  no description — add descriptions to every required field.
 ```
 
 ---
 
-**Finding 3 — Observability: per-turn token and latency events not verified**
+**Finding 5 — Observability: tool failures, durations, and context events are invisible**
 
 ```
 severity: med
-file:line: agent/crates/agent-server/src/runtime.rs (RuntimeState, ChannelEventSink)
+file:line: agent/crates/agent-core/src/loop_.rs:304-308; wire.rs:103; agent-model/src/openai.rs:205-209
 violated principle: "every tool call and model turn is logged with enough context to replay and
   diagnose" — SKILL.md Spine A component 6; co-design harness with eval (arXiv 2503.16416)
-concrete proposed fix: Verify ChannelEventSink emits a TurnObserved (or equivalent) event per
-  model turn carrying prompt_tokens, completion_tokens, reasoning_tokens (when preserved),
-  stop_reason, and per-tool-call duration_ms. If absent, add these fields so cost/latency can
-  be metered and drift can be detected without re-running the session.
+concrete proposed fix: [REFINED] prompt/completion tokens ARE emitted per turn (ServerUsage). Still
+  open: (a) Resolved::Err emits no event — tool denials/errors are invisible to observers/evals;
+  (b) no Instant measures tool duration_ms; (c) reasoning_tokens streamed as text but never counted
+  (undercounts spend); (d) ContextEvent (offload/compaction) dropped at wire.rs:103, so the web UI
+  never learns the window was truncated. Add a tool-error/status event + duration_ms, parse
+  reasoning_tokens, and forward ContextEvents to the wire.
 ```
 
 ---
 
-**Finding 4 — Instructions: skill files lack negative constraints**
+**Finding 6 — Guardrails: catastrophic-command denylist has structural gaps; CLI approval can hang**
+
+```
+severity: med
+file:line: agent/crates/agent-policy/src/command.rs:59-76; agent/crates/agent-cli/src/approval.rs:13-28
+violated principle: "hooks are fast, side-effect-free validators; block bad actions, not delay good
+  ones" — SKILL.md Spine A component 5
+concrete proposed fix: (a) Structural Layer-A detection covers sudo/rm/dd but NOT `mkfs` or the
+  `:(){` forkbomb (they rely solely on the substring backstop) and no test exercises mkfs through
+  hard_floor_violation — add structural handlers + tests. (b) TerminalApproval's spawn_blocking
+  stdin read has NO timeout (unlike IpcApprovalChannel) — a caller holding stdin open hangs the agent;
+  add a timeout defaulting to Deny.
+  NOTE: gate ordering (policy → approval → execute) and default-Deny-when-no-approver are both SOUND.
+```
+
+---
+
+**Finding 7 — Instructions: duplicated system prompt + skill files lack negative constraints**
 
 ```
 severity: low
-file:line: .agents/skills/harness-engineering/SKILL.md (pattern: all skill files in .agents/skills/)
+file:line: agent/crates/agent-server/src/daemon.rs:23 + agent/crates/agent-cli/src/main.rs:15;
+  .agents/skills/ (pattern)
 violated principle: "a single, versioned source of truth per agent role; no contradictory or stale
   rule files" — SKILL.md Spine A component 1
-concrete proposed fix: Add a "NOT TO DO" or "Forbidden" section to each skill file explicitly
-  stating what the agent operating under that skill is NOT permitted to do (e.g. "NEVER edits
-  code", "NEVER pushes to remote"). Currently most skill files describe capabilities only and
-  are silent on constraints, leaving the model to infer hard limits from tone and context.
+concrete proposed fix: The coding-agent system prompt is byte-identical but duplicated as two
+  constants in two crates — hoist to agent-runtime-config as one shared const. Separately, most skill
+  files describe capabilities only; add a "Forbidden"/negative-constraint section per skill (esp.
+  wayland), and disambiguate the auto-drive-tauri↔wayland description overlap.
 ```
 
 ---
@@ -251,21 +309,20 @@ concrete proposed fix: Add a "NOT TO DO" or "Forbidden" section to each skill fi
 
 Ranked by impact (severity × remediation cost):
 
-1. **[Component 3 — Sandboxes] Make sandbox non-optional in LoopConfig**
-   `agent/crates/agent-core/src/loop_.rs` lines 48–51 — Change `Option<Arc<dyn SandboxStrategy>>`
-   to a required field with a safe workspace-restricted default. Any tool call on a `None` sandbox
-   today runs with full ambient access; fixing this closes the highest-severity gap in the harness
-   with a single struct field change + callers audit.
+1. **[Component 3 — Sandboxes] Stop silent sandbox degradation**
+   `agent/crates/agent-sandbox/src/strategy.rs:57-65` — the default `sandbox_mode="auto"` runs fully
+   unsandboxed when Docker is absent, signalled only by a log line. Emit a first-class degraded event
+   + startup warning. Highest safety-per-effort: one code path closes an invisible "we thought we were
+   sandboxed" production hole.
 
-2. **[Component 2 — Tools] Add and enforce "when NOT to call" in Tool trait**
-   `agent/crates/agent-tools/src/tool.rs` lines 5–13 — Add `when_not_to_call()` to the `Tool`
-   trait (or enforce a prose convention + test). Without explicit call-boundary guidance the model
-   must infer tool scope from names and brief descriptions, the documented root cause of tool
-   over-calling (Anthropic: Writing Tools for Agents).
+2. **[Component 3 — Sandboxes] Close the symlink escape**
+   `agent/crates/agent-tools/src/fs/paths.rs:10-14` — lexical-only path resolution lets an in-workspace
+   symlink read/write outside the workspace in host/off/degraded modes. `canonicalize()` existing path
+   components before the prefix check. Small change, closes a real filesystem-boundary violation.
 
-3. **[Component 6 — Observability] Emit per-turn token + latency telemetry**
-   `agent/crates/agent-server/src/runtime.rs` (`ChannelEventSink`) — Wire a structured per-turn
-   event (prompt_tokens, completion_tokens, reasoning_tokens, stop_reason, tool_call_duration_ms)
-   so cost, latency, and reasoning overhead can be tracked externally without re-running. Without
-   this the harness is opaque between invocation and final output, making drift detection and
-   harness-vs-model attribution impossible (arXiv 2503.16416, SKILL.md Spine A component 6).
+3. **[Component 4 — Orchestration] Harden the parallel-tool dispatch**
+   `agent/crates/agent-core/src/loop_.rs:275-311` — one focused change closes three findings at once:
+   catch per-tool panics (so one tool can't kill the session), wrap execute in
+   `tokio::time::timeout(ctx.timeout,…)` (so a stalled fs tool can't hang all slots), and replace the
+   silent `None => continue` with an explicit error result (so every tool_call_id yields one message).
+   Best reliability leverage per unit effort; complements the existing parallel-tool work.
