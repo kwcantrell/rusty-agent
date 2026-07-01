@@ -206,6 +206,11 @@ fn parse_sse_line(line: &str, splitter: &mut ThinkingSplitter) -> Option<Result<
         out.push(Chunk::Usage {
             prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
             completion_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+            reasoning_tokens: u.get("completion_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens")).and_then(Value::as_u64).map(|n| n as u32),
+            cached_tokens: u.get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens")).and_then(Value::as_u64).map(|n| n as u32),
+            cost_usd: None,
         });
     }
     Some(Ok(out))
@@ -334,7 +339,41 @@ mod tests {
         let out = parse_sse_line(line, &mut s).unwrap().unwrap();
         assert!(matches!(
             out.as_slice(),
-            [Chunk::Usage { prompt_tokens: 1234, completion_tokens: 56 }]
+            [Chunk::Usage { prompt_tokens: 1234, completion_tokens: 56, .. }]
+        ));
+    }
+
+    #[test]
+    fn parses_reasoning_and_cached_token_details() {
+        let mut s = ThinkingSplitter::default();
+        let line = r#"data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":100,"completion_tokens":50,"completion_tokens_details":{"reasoning_tokens":30},"prompt_tokens_details":{"cached_tokens":80}}}"#;
+        let out = parse_sse_line(line, &mut s).unwrap().unwrap();
+        assert!(matches!(
+            out.as_slice(),
+            [Chunk::Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                reasoning_tokens: Some(30),
+                cached_tokens: Some(80),
+                cost_usd: None,
+            }]
+        ));
+    }
+
+    #[test]
+    fn usage_details_absent_yields_none() {
+        let mut s = ThinkingSplitter::default();
+        let line = r#"data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        let out = parse_sse_line(line, &mut s).unwrap().unwrap();
+        assert!(matches!(
+            out.as_slice(),
+            [Chunk::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                reasoning_tokens: None,
+                cached_tokens: None,
+                cost_usd: None,
+            }]
         ));
     }
 

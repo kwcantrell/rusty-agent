@@ -105,6 +105,7 @@ impl AgentLoop {
         let mut raw_tool_calls: Vec<RawToolCall> = Vec::new();
         let mut stop = StopReason::Stop;
         let mut usage = (0u32, 0u32);
+        let mut usage_details: (Option<u32>, Option<u32>, Option<f64>) = (None, None, None);
         loop {
             let step = tokio::select! {
                 _ = cancel.cancelled() => return Err(ModelError::Stream("cancelled".into())),
@@ -119,13 +120,17 @@ impl AgentLoop {
                     Chunk::Reasoning(r) => { self.sink.emit(AgentEvent::Reasoning(r.clone())); reasoning.push_str(&r); }
                     Chunk::ToolCallDelta(rc) => merge_tool_call(&mut raw_tool_calls, rc),
                     Chunk::Done(r) => stop = r,
-                    Chunk::Usage { prompt_tokens, completion_tokens } => {
+                    Chunk::Usage { prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, cost_usd } => {
                         usage = (prompt_tokens, completion_tokens);
+                        usage_details = (reasoning_tokens, cached_tokens, cost_usd);
                     }
                 },
             }
         }
-        Ok(AssistantTurn { text, raw_tool_calls, stop, reasoning, prompt_tokens: usage.0, completion_tokens: usage.1 })
+        Ok(AssistantTurn { text, raw_tool_calls, stop, reasoning,
+            prompt_tokens: usage.0, completion_tokens: usage.1,
+            reasoning_tokens: usage_details.0, cached_tokens: usage_details.1,
+            cost_usd: usage_details.2 })
     }
 
     /// Stream with retry/backoff on transport errors.
@@ -225,9 +230,9 @@ impl AgentLoop {
             self.sink.emit(AgentEvent::ServerUsage {
                 prompt_tokens: assistant.prompt_tokens,
                 completion_tokens: assistant.completion_tokens,
-                reasoning_tokens: None,  // wired in Task 2
-                cached_tokens: None,     // wired in Task 2
-                cost_usd: None,          // wired in Task 3
+                reasoning_tokens: assistant.reasoning_tokens,
+                cached_tokens: assistant.cached_tokens,
+                cost_usd: assistant.cost_usd,
                 turn_duration_ms: turn_started.elapsed().as_millis() as u64,
                 turn: turn + 1,
             });

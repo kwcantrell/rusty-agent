@@ -71,7 +71,8 @@ impl ModelClient for ScriptedModel {
                 Ok(Chunk::Done(StopReason::Stop))]).boxed()),
             Scripted::TextWithUsage(answer, prompt_tokens, completion_tokens) => Ok(stream::iter(vec![
                 Ok(Chunk::Text(answer)),
-                Ok(Chunk::Usage { prompt_tokens, completion_tokens }),
+                Ok(Chunk::Usage { prompt_tokens, completion_tokens,
+                    reasoning_tokens: None, cached_tokens: None, cost_usd: None }),
                 Ok(Chunk::Done(StopReason::Stop))]).boxed()),
             Scripted::Hang => Ok(stream::pending().boxed()),
             Scripted::HangOpen => {
