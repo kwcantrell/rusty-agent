@@ -84,8 +84,8 @@ async fn get_workspace(state: tauri::State<'_, AppState>) -> Result<Option<Strin
 }
 
 #[tauri::command]
-async fn pick_workspace(
-    app: tauri::AppHandle,
+async fn pick_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<String>, String> {
     let folder = app.dialog().file().blocking_pick_folder();
@@ -146,6 +146,31 @@ async fn skill_save(state: tauri::State<'_, AppState>, name: String, body: Strin
     session(&state).skill_save(name, body).await
 }
 
+/// Single source of truth for the Tauri command surface. Used by both the
+/// production builder and the `#[cfg(test)]` mock app so the two lists cannot drift.
+macro_rules! all_handlers {
+    () => {
+        tauri::generate_handler![
+            subscribe,
+            send_input,
+            approve,
+            cancel,
+            settings_get,
+            settings_update,
+            context_get,
+            get_workspace,
+            pick_workspace,
+            llama_health,
+            memory_list,
+            memory_update,
+            memory_delete,
+            memory_recall_preview,
+            skill_get,
+            skill_save
+        ]
+    };
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -173,24 +198,7 @@ pub fn run() {
             app.manage(AppState { bridge, config_path });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            subscribe,
-            send_input,
-            approve,
-            cancel,
-            settings_get,
-            settings_update,
-            context_get,
-            get_workspace,
-            pick_workspace,
-            llama_health,
-            memory_list,
-            memory_update,
-            memory_delete,
-            memory_recall_preview,
-            skill_get,
-            skill_save
-        ])
+        .invoke_handler(all_handlers!())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -216,11 +224,7 @@ mod cmd_tests {
         std::mem::forget(dir); // keep the temp dir alive for the test process
         mock_builder()
             .manage(AppState { bridge, config_path: PathBuf::from("/tmp/app.json") })
-            .invoke_handler(tauri::generate_handler![
-                subscribe, send_input, approve, cancel, settings_get, settings_update, context_get,
-                memory_list, memory_update, memory_delete, memory_recall_preview,
-                skill_get, skill_save
-            ])
+            .invoke_handler(all_handlers!())
             .build(mock_context(noop_assets()))
             .expect("failed to build mock app")
     }
