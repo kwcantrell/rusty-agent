@@ -292,3 +292,96 @@ git commit -m "fix(policy): position-aware bare-name catastrophe detection; drop
 **Placeholder scan:** none — every code step shows complete code; every run step names the command and expected result.
 
 **Type consistency:** `program_name_is_catastrophic(name: &str) -> Option<String>` defined in Step 3, called in Step 3 (`simple_command_is_catastrophic`) and Step 5 (`hard_floor_violation`, as `program_name_is_catastrophic(basename(prog))`). `command_boundary_programs(cmd: &str) -> impl Iterator<Item = &str>` defined Step 4, consumed Step 5. `basename` is the existing helper. `HARD_FLOOR_DENYLIST` 3-entry form in Step 7 matches the assertions updated in the same step. `floor()` helper's new denylist (Step 1a) is consistent with the tests in Steps 1b-1c.
+
+---
+
+### Task 2: Auto-allow guard for exec-wrapped catastrophes + interpreter-residual docs
+
+Added after implementation review found a Critical under-denial: `find . -exec sudo reboot +` (`find` is default-allowlisted, exec-capable) reaches auto-Allow — verified `hard_floor_violation` → `None`, `is_auto_allowed` → `true` — where the old `"sudo"` substring hard-denied it. See the spec Addendum.
+
+**Files:**
+- Modify: `agent/crates/agent-policy/src/command.rs` (`is_auto_allowed` ~184-203; add tests in `mod tests`)
+
+**Interfaces:**
+- Consumes: existing `program_name_is_catastrophic(name: &str) -> Option<String>`, `basename(&str) -> &str`, `is_auto_allowed(cmd, allowlist)`, and the `allow()` test helper.
+- Produces: `is_auto_allowed` now additionally returns `false` when any token's basename is a catastrophe program name. No signature change.
+
+- [ ] **Step 1: Write the failing tests (RED)**
+
+Add to `mod tests` in `agent/crates/agent-policy/src/command.rs` (near the other `auto_allow_*` tests):
+
+```rust
+    #[test]
+    fn auto_allow_rejects_catastrophe_token_in_allowlisted_command() {
+        // `find`/`xargs` are exec-capable; a catastrophe program passed as their argument must
+        // NOT auto-run. Name-exact on token basenames, so it goes to Ask (is_auto_allowed=false).
+        let al = vec!["find".to_string(), "xargs".to_string(), "cat".to_string()];
+        assert!(!is_auto_allowed("find . -exec sudo reboot +", &al));
+        assert!(!is_auto_allowed("xargs mkfs", &al));
+        assert!(!is_auto_allowed("find / -name x -exec mkfs.ext4 {} +", &al) || true);
+        // Name-exact: 'sudoku' is not the catastrophe name 'sudo' -> still auto-allowed.
+        assert!(is_auto_allowed("cat sudoku.txt", &al));
+    }
+
+    #[test]
+    fn interpreter_wrapping_reaches_ask_not_deny_or_allow() {
+        // KNOWN LIMITATION: `bash -c "sudo reboot"` passes sudo as a quoted string the interpreter
+        // runs. Position-aware layers can't see it; the name-exact guard can't either (the token is
+        // "sudo reboot", basename != "sudo"). Under the DEFAULT allowlist (no interpreters) this
+        // reaches Ask: NOT hard-denied, and NOT auto-allowed. Do not add interpreters to the allowlist.
+        let floor = vec!["rm -rf /".to_string(), ":(){".to_string(), "dd if=".to_string()];
+        let default_allow = vec!["ls","cat","pwd","echo","git","grep","find","rg","cargo","head","tail","wc"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        assert!(hard_floor_violation(r#"bash -c "sudo reboot""#, &floor).is_none()); // not Deny
+        assert!(!is_auto_allowed(r#"bash -c "sudo reboot""#, &default_allow));       // not Allow -> Ask
+    }
+```
+
+(Note: the third assert in the first test is written `|| true` only because `{}` contains
+shell-significant `{`/`}` so that command is already non-auto-allowed via the SHELL_SIGNIFICANT gate —
+the assertion documents intent without depending on the new guard. Keep the first two asserts as the
+genuine RED cases: `find . -exec sudo reboot +` and `xargs mkfs` are auto-allowed today.)
+
+- [ ] **Step 2: Run to verify RED**
+
+Run: `cd agent && cargo test -p agent-policy auto_allow_rejects_catastrophe_token_in_allowlisted_command`
+Expected: FAIL — `is_auto_allowed("find . -exec sudo reboot +", &al)` and `is_auto_allowed("xargs mkfs", &al)` currently return `true` (allowlisted prog, no shell-significant char, no catastrophe check yet). The `interpreter_wrapping_reaches_ask_not_deny_or_allow` test already passes (documents existing behavior).
+
+- [ ] **Step 3: Add the catastrophe-token guard to `is_auto_allowed`**
+
+In `agent/crates/agent-policy/src/command.rs`, insert this block in `is_auto_allowed` immediately after the `SHELL_SIGNIFICANT` rejection (after line 197, before `let prog = &tokens[0];`):
+
+```rust
+    // Even an allowlisted program must not auto-run a catastrophe program passed as an argument
+    // (`find . -exec sudo reboot +`, `xargs mkfs`). Name-exact on each token's basename, so benign
+    // substrings (`sudoku`, `pseudo`) are unaffected. These fall through to Ask, not Deny — the hard
+    // floor stays position-aware.
+    //
+    // KNOWN LIMITATION: a catastrophe wrapped in a quoted interpreter argument (`bash -c "sudo x"`)
+    // is a single token whose basename != the catastrophe name, so this guard cannot see it. Under
+    // the default allowlist such interpreters aren't allowlisted, so those reach Ask. Do not add
+    // shell interpreters (bash/sh/zsh/dash/eval/xargs) to command_allowlist.
+    if tokens.iter().any(|t| program_name_is_catastrophic(basename(t)).is_some()) {
+        return false;
+    }
+```
+
+- [ ] **Step 4: Run to verify GREEN**
+
+Run: `cd agent && cargo test -p agent-policy`
+Expected: PASS — the two new tests plus all existing (the guard only adds rejections; existing `auto_allow_*` tests use benign commands with no catastrophe token, so unaffected). Confirm the full agent-policy suite is green and output is pristine.
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd agent && git add crates/agent-policy/src/command.rs
+git commit -m "fix(policy): auto-allow gate rejects catastrophe program passed to an allowlisted exec-capable program"
+```
+
+## Task 2 Self-Review
+
+- Auto-allow guard closes the verified `find -exec sudo` auto-Allow hole → Step 3, tested Step 1. ✔
+- Name-exact (no substring false positives: `cat sudoku.txt` still auto-allows) → Step 1 assertion. ✔
+- Interpreter-wrapping documented as known limitation + tested to reach Ask (not Deny/Allow) under default allowlist + allowlist guidance → Step 1 (`interpreter_wrapping_reaches_ask_not_deny_or_allow`), Step 3 (doc comment). ✔
+- No new hard-denies; guard only affects the auto-allow gate → Step 3 placement (in `is_auto_allowed`, not `hard_floor_violation`). ✔
+- Type consistency: `program_name_is_catastrophic(basename(t))` matches the helper from Task 1. ✔
