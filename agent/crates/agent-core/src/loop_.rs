@@ -452,6 +452,7 @@ enum Resolved {
 
 /// Outcome of an isolated tool execution: the terminal result plus a tag the
 /// caller uses to decide how loudly to surface it.
+#[derive(Debug)]
 enum Executed {
     Ok(agent_tools::ToolOutput),
     /// Tool returned `Err` — a normal outcome, surfaced only to the model.
@@ -471,13 +472,20 @@ async fn execute_isolated(tool: Arc<dyn Tool>, args: serde_json::Value, name: &s
     ctx: &ToolCtx) -> Executed {
     use futures::FutureExt;
     let fut = std::panic::AssertUnwindSafe(tool.execute(args, ctx)).catch_unwind();
-    match tokio::time::timeout(ctx.timeout, fut).await {
+    // Grace margin: arm the backstop at 2x the tool budget so a tool that honors
+    // `ctx.timeout` itself resolves first (returning ToolError::Timeout, routed
+    // quietly through ToolErr). The backstop only fires for a tool that ignores
+    // its deadline entirely — the one case surfaced loudly.
+    let backstop = ctx.timeout.saturating_mul(2);
+    match tokio::time::timeout(backstop, fut).await {
         Ok(Ok(Ok(output))) => Executed::Ok(output),
+        // A tool's own ToolError::Timeout arrives here and stays quiet.
         Ok(Ok(Err(e)))     => Executed::ToolErr(format!("ERROR: {e}")),
         Ok(Err(_panic))    => Executed::Panicked(
             format!("ERROR: tool '{name}' panicked during execution")),
-        Err(_elapsed)      => Executed::TimedOut(
-            format!("ERROR: tool '{name}' timed out after {:?}", ctx.timeout)),
+        Err(_elapsed)      => Executed::TimedOut(format!(
+            "ERROR: tool '{name}' exceeded its {:?} timeout and was force-stopped \
+             by the dispatch backstop", ctx.timeout)),
     }
 }
 
@@ -1619,8 +1627,8 @@ mod tests {
             name: "slow".into(), delay_ms: 3_600_000, body: "never".into() });
         let ex = execute_isolated(tool, serde_json::json!({}), "slow",
             &test_ctx(Duration::from_millis(100))).await;
-        assert!(matches!(ex, Executed::TimedOut(ref s) if s.contains("slow") && s.contains("timed out")),
-            "a tool exceeding ctx.timeout must yield Executed::TimedOut");
+        assert!(matches!(ex, Executed::TimedOut(ref s) if s.contains("slow") && s.contains("backstop")),
+            "a tool ignoring ctx.timeout must be force-stopped by the backstop");
     }
 
     #[tokio::test]
@@ -1635,6 +1643,40 @@ mod tests {
         let ex = execute_isolated(err_tool, serde_json::json!({}), "err",
             &test_ctx(Duration::from_secs(5))).await;
         assert!(matches!(ex, Executed::ToolErr(ref s) if s.starts_with("ERROR: ")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execute_isolated_keeps_tool_honored_timeout_quiet() {
+        // The tool self-times-out at ctx.timeout (100ms), before the 200ms backstop,
+        // so it lands on the quiet ToolErr path, not the loud TimedOut path.
+        let tool: Arc<dyn Tool> = Arc::new(SelfTimeoutTool { name: "polite".into() });
+        let ex = execute_isolated(tool, serde_json::json!({}), "polite",
+            &test_ctx(Duration::from_millis(100))).await;
+        assert!(matches!(ex, Executed::ToolErr(ref s) if s.contains("timed out")),
+            "a tool honoring ctx.timeout stays on the quiet ToolErr path: {ex:?}");
+    }
+
+    /// A well-behaved tool that enforces `ctx.timeout` itself and returns
+    /// ToolError::Timeout on elapse (never runs past its own deadline).
+    struct SelfTimeoutTool { name: String }
+    #[async_trait::async_trait]
+    impl Tool for SelfTimeoutTool {
+        fn name(&self) -> &str { &self.name }
+        fn description(&self) -> &str { "self-times-out" }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema { name: self.name.clone(), description: "self-times-out".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}) }
+        }
+        fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+            Ok(ToolIntent { tool: self.name.clone(), access: Access::Read,
+                paths: vec![], command: None, summary: "self-times-out".into() })
+        }
+        async fn execute(&self, _a: serde_json::Value, ctx: &ToolCtx)
+            -> Result<ToolOutput, ToolError> {
+            tokio::time::timeout(ctx.timeout, std::future::pending::<()>()).await
+                .map_err(|_| ToolError::Timeout)?;
+            unreachable!("pending never resolves")
+        }
     }
 
     /// A tool that returns Err (not a panic) from `execute`.
@@ -1694,7 +1736,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn hanging_tool_trips_dispatch_timeout() {
+    async fn deadline_ignoring_tool_is_force_stopped_by_backstop() {
         let mut r = ToolRegistry::new();
         r.register(Arc::new(FakeTool { name: "hang".into(), delay_ms: 3_600_000, body: "never".into() }));
         r.register(Arc::new(FakeTool { name: "ok".into(), delay_ms: 0, body: "OK".into() }));
@@ -1720,12 +1762,43 @@ mod tests {
 
         let msgs = tool_messages(&ctx);
         let hang = msgs.iter().find(|(id, _)| id == "c1").expect("c1 tool message present");
-        assert!(hang.1.contains("timed out"), "hanger yields a timeout tool-result: {hang:?}");
+        assert!(hang.1.contains("backstop"), "the offender is force-stopped by the backstop: {hang:?}");
         let ok = msgs.iter().find(|(id, _)| id == "c2").expect("c2 tool message present");
         assert_eq!(ok.1, "OK", "the sibling tool still ran");
 
         let events = sink.events.lock().unwrap().clone();
-        assert!(events.iter().any(|e| e.starts_with("error:") && e.contains("timed out")),
-            "a timeout emits a loud AgentEvent::Error: {events:?}");
+        assert!(events.iter().any(|e| e.starts_with("error:") && e.contains("backstop")),
+            "the backstop emits a loud AgentEvent::Error: {events:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_honored_timeout_is_quiet_at_loop_level() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(SelfTimeoutTool { name: "polite".into() }));
+        r.register(Arc::new(FakeTool { name: "ok".into(), delay_ms: 0, body: "OK".into() }));
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                ("c1".into(), "polite".into(), "{}".into()),
+                ("c2".into(), "ok".into(), "{}".into())]),
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: std::env::temp_dir(),
+                tool_timeout: std::time::Duration::from_millis(100),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+
+        agent.run(&mut ctx, "go".into()).await.expect("run completes");
+
+        let msgs = tool_messages(&ctx);
+        let polite = msgs.iter().find(|(id, _)| id == "c1").expect("c1 tool message present");
+        assert!(polite.1.contains("timed out"), "tool's own timeout message is used: {polite:?}");
+        let events = sink.events.lock().unwrap().clone();
+        assert!(!events.iter().any(|e| e.starts_with("error:")),
+            "a tool-honored timeout must NOT emit a loud AgentEvent::Error: {events:?}");
     }
 }
