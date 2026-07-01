@@ -74,6 +74,16 @@ npm run typecheck
 
 Desktop (repo root): `npm run desktop:dev` / `npm run desktop:build`.
 
+CI gate (also runs as a pre-push hook — enable once per clone with
+`git config core.hooksPath .githooks`):
+
+```bash
+bash scripts/ci.sh   # fmt + clippy + cargo test (agent/) + web typecheck/vitest
+```
+
+Session traces land in `~/.agent/sessions/<id>.jsonl` (disable with `"trace": false`
+in the runtime config).
+
 See `agent/docs/RUNNING.md` for the full model-server setup (llama.cpp / SGLang / vLLM / Claude CLI).
 
 ## Conventions
