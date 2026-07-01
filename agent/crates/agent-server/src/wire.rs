@@ -108,14 +108,10 @@ pub struct SandboxDegraded {
 
 /// Extract the degraded posture from a sandbox descriptor, if any. Pure so the
 /// daemon's `settings_state()` stays trivial and this stays unit-testable.
-pub fn sandbox_degraded_from(
-    desc: Option<agent_tools::SandboxDescriptor>,
-) -> Option<SandboxDegraded> {
-    desc.and_then(|d| {
-        d.degraded.map(|reason| SandboxDegraded {
-            mechanism: d.mechanism.to_string(),
-            reason,
-        })
+pub fn sandbox_degraded_from(d: agent_tools::SandboxDescriptor) -> Option<SandboxDegraded> {
+    d.degraded.map(|reason| SandboxDegraded {
+        mechanism: d.mechanism.to_string(),
+        reason,
     })
 }
 
@@ -463,7 +459,7 @@ mod tests {
             degraded: Some("no daemon".into()),
         };
         assert_eq!(
-            sandbox_degraded_from(Some(degraded)),
+            sandbox_degraded_from(degraded),
             Some(SandboxDegraded {
                 mechanism: "docker".into(),
                 reason: "no daemon".into()
@@ -477,7 +473,6 @@ mod tests {
             network: true,
             degraded: None,
         };
-        assert_eq!(sandbox_degraded_from(Some(healthy)), None);
-        assert_eq!(sandbox_degraded_from(None), None);
+        assert_eq!(sandbox_degraded_from(healthy), None);
     }
 }

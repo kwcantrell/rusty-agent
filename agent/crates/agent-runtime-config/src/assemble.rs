@@ -75,7 +75,7 @@ pub fn loop_config_from(
         repeat_penalty: cfg.repeat_penalty,
         enable_thinking: cfg.enable_thinking,
         preserve_thinking: cfg.preserve_thinking,
-        sandbox: Some(build_sandbox(cfg)),
+        sandbox: build_sandbox(cfg),
         max_parallel_tools: 8,
     }
 }
@@ -354,7 +354,7 @@ mod tests {
         assert!(!lc.enable_thinking);
         assert!(lc.preserve_thinking);
         assert!((lc.temperature - 0.7).abs() < 1e-6);
-        assert!(lc.sandbox.is_some());
+        assert!(!lc.sandbox.describe().mechanism.is_empty());
     }
 
     #[test]

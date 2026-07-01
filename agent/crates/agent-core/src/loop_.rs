@@ -28,7 +28,6 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A `LoopConfig.max_parallel_tools` of 0 (the `Default`) resolves to this.
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
 
-#[derive(Default)]
 pub struct LoopConfig {
     pub model_limit: usize,
     pub max_turns: usize,
@@ -47,10 +46,38 @@ pub struct LoopConfig {
     pub repeat_penalty: Option<f32>,
     pub enable_thinking: bool,
     pub preserve_thinking: bool,
-    pub sandbox: Option<std::sync::Arc<dyn agent_tools::SandboxStrategy>>,
+    pub sandbox: std::sync::Arc<dyn agent_tools::SandboxStrategy>,
     /// Max tool calls from one assistant turn to execute concurrently.
     /// 0 (the default) means `DEFAULT_MAX_PARALLEL_TOOLS`.
     pub max_parallel_tools: usize,
+}
+
+impl Default for LoopConfig {
+    /// Test convenience only — production wiring (`assemble_loop` →
+    /// `loop_config_from`) sets every field explicitly, `sandbox` included.
+    /// The default sandbox is an explicit `HostExecutor`: the same posture
+    /// `sandbox_mode: "off"` selects, never a silent fallback at gate time.
+    fn default() -> Self {
+        Self {
+            model_limit: 0,
+            max_turns: 0,
+            max_retries: 0,
+            temperature: 0.0,
+            max_tokens: None,
+            workspace: PathBuf::new(),
+            tool_timeout: Duration::default(),
+            stream_idle_timeout: Duration::default(),
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
+            repeat_penalty: None,
+            enable_thinking: false,
+            preserve_thinking: false,
+            sandbox: std::sync::Arc::new(agent_tools::HostExecutor),
+            max_parallel_tools: 0,
+        }
+    }
 }
 
 pub struct AgentLoop {
@@ -87,10 +114,9 @@ impl AgentLoop {
         }
     }
 
-    /// The live sandbox posture (cached; never re-probes Docker). `None` when
-    /// no sandbox is wired (host executor installed directly).
-    pub fn sandbox_descriptor(&self) -> Option<agent_tools::SandboxDescriptor> {
-        self.config.sandbox.as_ref().map(|s| s.describe())
+    /// The live sandbox posture (cached; never re-probes Docker).
+    pub fn sandbox_descriptor(&self) -> agent_tools::SandboxDescriptor {
+        self.config.sandbox.describe()
     }
 
     /// Attach a memory retriever. When set, each turn auto-retrieves relevant
@@ -211,19 +237,17 @@ impl AgentLoop {
         user_input: String,
         cancel: CancellationToken,
     ) -> Result<(), AgentError> {
-        // Surface a silently-degraded sandbox loudly at run start. If the
-        // configured strategy fell back to unsandboxed host execution (e.g.
-        // Docker unavailable in `auto` mode), every tool call runs with ambient
-        // host access despite the config asking for isolation. The per-approval
-        // posture string already carries this, but a run may never hit an
-        // approval prompt — emit it unconditionally, once, here.
-        if let Some(d) = self.sandbox_descriptor() {
-            if let Some(reason) = d.degraded {
-                self.sink.emit(AgentEvent::SandboxDegraded {
-                    mechanism: d.mechanism,
-                    reason,
-                });
-            }
+        // Surface a degraded sandbox loudly at run start. While degraded,
+        // exec-capable tools (execute_command, git, MCP spawns) are REFUSED
+        // rather than run unconfined on the host. The per-approval posture
+        // string carries this too, but a run may never hit an approval
+        // prompt — emit it unconditionally, once, here.
+        let d = self.sandbox_descriptor();
+        if let Some(reason) = d.degraded {
+            self.sink.emit(AgentEvent::SandboxDegraded {
+                mechanism: d.mechanism,
+                reason,
+            });
         }
 
         if let Some(retriever) = &self.retriever {
@@ -543,20 +567,9 @@ impl AgentLoop {
                 }
             }
             Decision::Ask => {
-                let d = self
-                    .config
-                    .sandbox
-                    .as_ref()
-                    .map(|s| s.describe())
-                    .unwrap_or(agent_tools::SandboxDescriptor {
-                        mode: agent_tools::Mode::Off,
-                        mechanism: "host",
-                        image: None,
-                        network: true,
-                        degraded: None,
-                    });
+                let d = self.config.sandbox.describe();
                 let posture = if d.degraded.is_some() {
-                    format!(" (sandbox: {} unavailable->host, network on)", d.mechanism)
+                    format!(" (sandbox: {} degraded; exec refused)", d.mechanism)
                 } else {
                     format!(
                         " (sandbox: {}, network {})",
@@ -589,16 +602,11 @@ impl AgentLoop {
         }
         // The live run token: a tool that honors `ctx.cancel` (shell/git/fetch_url)
         // aborts when the caller cancels the run (Ctrl-C / SIGINT via the CLI).
-        let sandbox = self
-            .config
-            .sandbox
-            .clone()
-            .unwrap_or_else(|| std::sync::Arc::new(agent_tools::HostExecutor));
         let ctx = ToolCtx {
             workspace: self.config.workspace.clone(),
             timeout: self.config.tool_timeout,
             cancel: cancel.clone(),
-            sandbox,
+            sandbox: self.config.sandbox.clone(),
         };
         GateOutcome::Ready(ReadyCall {
             tool,
@@ -1788,7 +1796,7 @@ mod tests {
                 workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
                 stream_idle_timeout: std::time::Duration::from_secs(60),
-                sandbox: Some(sandbox),
+                sandbox,
                 ..Default::default()
             },
         );
@@ -1861,7 +1869,7 @@ mod tests {
                 workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
                 stream_idle_timeout: std::time::Duration::from_secs(60),
-                sandbox: Some(Arc::new(HostExecutor)),
+                sandbox: Arc::new(HostExecutor),
                 ..Default::default()
             },
         );
@@ -1881,7 +1889,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn degraded_posture_shows_unavailable_and_network_on() {
+    async fn degraded_posture_shows_exec_refused() {
         use agent_policy::ApprovalChannel;
         use agent_tools::{
             CommandSpec, HostExecutor, Mode, SandboxDescriptor, SandboxError, SandboxStrategy,
@@ -1960,7 +1968,7 @@ mod tests {
                 workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
                 stream_idle_timeout: std::time::Duration::from_secs(60),
-                sandbox: Some(Arc::new(DegradedFake)),
+                sandbox: Arc::new(DegradedFake),
                 ..Default::default()
             },
         );
@@ -1974,16 +1982,8 @@ mod tests {
             .clone()
             .expect("approval must have been requested");
         assert!(
-            summary.contains("unavailable"),
-            "summary should signal degraded state: {summary:?}"
-        );
-        assert!(
-            summary.contains("network on"),
-            "summary should show actual (host) network state: {summary:?}"
-        );
-        assert!(
-            !summary.contains("network off"),
-            "summary must NOT show policy network (false) when degraded: {summary:?}"
+            summary.contains("degraded; exec refused"),
+            "summary should signal degraded fail-closed state: {summary:?}"
         );
     }
 
@@ -2443,7 +2443,7 @@ mod tests {
                 workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
                 stream_idle_timeout: std::time::Duration::from_secs(60),
-                sandbox: Some(Arc::new(DegradedFake)),
+                sandbox: Arc::new(DegradedFake),
                 ..Default::default()
             },
         );
