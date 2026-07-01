@@ -81,11 +81,10 @@ pub enum AgentEvent {
     Error(String),
     Done(StopReason),
     Context(ContextEvent),
-    /// Emitted once at run start when the configured sandbox has silently
-    /// degraded to unsandboxed host execution (e.g. Docker unavailable in
-    /// `auto` mode). The run is NOT isolated despite being configured to be;
-    /// surfaces that "we thought we were sandboxed" hole loudly to every
-    /// observer instead of leaving it in a single `tracing::warn!` line.
+    /// Emitted once at run start when the configured sandbox is degraded
+    /// (e.g. Docker unavailable in `auto` mode). Exec-capable tools are
+    /// refused while degraded; `auto` recovers automatically once the
+    /// mechanism becomes available again.
     SandboxDegraded {
         mechanism: &'static str,
         reason: String,

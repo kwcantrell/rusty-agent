@@ -130,7 +130,7 @@ impl EventSink for TerminalSink {
                 let _ = writeln!(
                     out,
                     "\n\x1b[33m⚠ sandbox degraded: {mechanism} unavailable ({reason}); \
-                     tools run UNSANDBOXED on the host\x1b[0m"
+                     exec-capable tools are DISABLED until it is available\x1b[0m"
                 );
             }
             AgentEvent::Error(e) => {

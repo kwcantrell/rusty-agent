@@ -3,9 +3,9 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import { SandboxBanner } from "./SandboxBanner";
 
 describe("SandboxBanner", () => {
-  it("shows mechanism and reason and warns about host execution", () => {
+  it("shows mechanism and reason and warns that exec-capable tools are disabled", () => {
     render(<SandboxBanner info={{ mechanism: "docker", reason: "no daemon" }} onDismiss={() => {}} />);
-    expect(screen.getByRole("alert").textContent).toMatch(/unsandboxed/i);
+    expect(screen.getByRole("alert").textContent).toMatch(/exec-capable tools disabled/i);
     expect(screen.getByRole("alert").textContent).toMatch(/docker/);
     expect(screen.getByRole("alert").textContent).toMatch(/no daemon/);
   });
