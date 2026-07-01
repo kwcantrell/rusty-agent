@@ -39,9 +39,15 @@ impl StdioTransport {
             env: spec.env.clone().into_iter().collect(),
             kind: agent_tools::ProcKind::Service,
         };
-        let mut child = sandbox.launch(cspec).map_err(|e| McpError::Io(e.to_string()))?;
-        let stdin = child.take_stdin().ok_or_else(|| McpError::Io("no stdin".into()))?;
-        let stdout = child.take_stdout().ok_or_else(|| McpError::Io("no stdout".into()))?;
+        let mut child = sandbox
+            .launch(cspec)
+            .map_err(|e| McpError::Io(e.to_string()))?;
+        let stdin = child
+            .take_stdin()
+            .ok_or_else(|| McpError::Io("no stdin".into()))?;
+        let stdout = child
+            .take_stdout()
+            .ok_or_else(|| McpError::Io("no stdout".into()))?;
         let stderr_handle = child.take_stderr().map(|stderr| {
             // Drain server diagnostics to tracing so they never block the pipe.
             tokio::spawn(async move {
@@ -81,10 +87,13 @@ impl StdioTransport {
 #[async_trait]
 impl McpTransport for StdioTransport {
     async fn send(&self, msg: Value) -> Result<(), McpError> {
-        let mut line = serde_json::to_string(&msg).map_err(|e| McpError::Protocol(e.to_string()))?;
+        let mut line =
+            serde_json::to_string(&msg).map_err(|e| McpError::Protocol(e.to_string()))?;
         line.push('\n');
         let mut w = self.stdin.lock().await;
-        w.write_all(line.as_bytes()).await.map_err(|e| McpError::Io(e.to_string()))?;
+        w.write_all(line.as_bytes())
+            .await
+            .map_err(|e| McpError::Io(e.to_string()))?;
         w.flush().await.map_err(|e| McpError::Io(e.to_string()))
     }
 
@@ -99,8 +108,12 @@ impl McpTransport for StdioTransport {
             c.kill().await;
         }
         // Deterministically tear down the reader/stderr tasks (don't wait for EOF).
-        if let Some(h) = self.reader.lock().unwrap().take() { h.abort(); }
-        if let Some(h) = self.stderr.lock().unwrap().take() { h.abort(); }
+        if let Some(h) = self.reader.lock().unwrap().take() {
+            h.abort();
+        }
+        if let Some(h) = self.stderr.lock().unwrap().take() {
+            h.abort();
+        }
     }
 }
 
@@ -109,8 +122,12 @@ impl Drop for StdioTransport {
         // SandboxedChild's own Drop handles teardown — just drop it.
         let _ = self.child.lock().unwrap().take();
         // Abort the reader/stderr tasks (abort is sync — safe in Drop).
-        if let Some(h) = self.reader.lock().unwrap().take() { h.abort(); }
-        if let Some(h) = self.stderr.lock().unwrap().take() { h.abort(); }
+        if let Some(h) = self.reader.lock().unwrap().take() {
+            h.abort();
+        }
+        if let Some(h) = self.stderr.lock().unwrap().take() {
+            h.abort();
+        }
     }
 }
 
@@ -135,7 +152,11 @@ impl MockTransport {
         responder: impl Fn(&Value) -> Vec<Value> + Send + Sync + 'static,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        Self { responder: Box::new(responder), inbound: AsyncMutex::new(rx), tx }
+        Self {
+            responder: Box::new(responder),
+            inbound: AsyncMutex::new(rx),
+            tx,
+        }
     }
 }
 
@@ -178,7 +199,9 @@ mod tests {
     async fn stdio_roundtrips_newline_delimited_json_via_cat() {
         let sandbox = host_sandbox();
         let t = StdioTransport::spawn(&cat_spec(), &sandbox).expect("spawn cat");
-        t.send(json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await.unwrap();
+        t.send(json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+            .await
+            .unwrap();
         let got = t.recv().await.expect("a message");
         assert_eq!(got["id"], 1);
         assert_eq!(got["method"], "ping");
@@ -190,7 +213,9 @@ mod tests {
         let sandbox = host_sandbox();
         let t = StdioTransport::spawn(&cat_spec(), &sandbox).expect("spawn cat");
         // Sanity: the transport works before teardown.
-        t.send(json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await.unwrap();
+        t.send(json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+            .await
+            .unwrap();
         let _ = t.recv().await.expect("a message");
 
         t.close().await;
@@ -199,7 +224,10 @@ mod tests {
         let after = tokio::time::timeout(std::time::Duration::from_secs(5), t.recv())
             .await
             .expect("recv must resolve promptly after close, not hang");
-        assert!(after.is_none(), "recv after close should be None, got: {after:?}");
+        assert!(
+            after.is_none(),
+            "recv after close should be None, got: {after:?}"
+        );
     }
 
     #[tokio::test]

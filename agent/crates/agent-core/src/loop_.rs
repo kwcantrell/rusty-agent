@@ -1,6 +1,8 @@
 use crate::{built_tokens, AgentEvent, ContextManager, EventSink, Retriever, ToolStatus};
-use agent_model::{AssistantTurn, Chunk, CompletionRequest, Message, ModelClient, ModelError,
-                  RawToolCall, StopReason, ToolCallProtocol};
+use agent_model::{
+    AssistantTurn, Chunk, CompletionRequest, Message, ModelClient, ModelError, RawToolCall,
+    StopReason, ToolCallProtocol,
+};
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse, Decision, PolicyEngine};
 use agent_tools::{Tool, ToolCall, ToolCtx, ToolError, ToolRegistry};
 use futures::StreamExt;
@@ -73,7 +75,16 @@ impl AgentLoop {
         sink: Arc<dyn EventSink>,
         config: LoopConfig,
     ) -> Self {
-        Self { model, protocol, tools, policy, approval, sink, config, retriever: None }
+        Self {
+            model,
+            protocol,
+            tools,
+            policy,
+            approval,
+            sink,
+            config,
+            retriever: None,
+        }
     }
 
     /// The live sandbox posture (cached; never re-probes Docker). `None` when
@@ -90,8 +101,11 @@ impl AgentLoop {
     }
 
     /// Drive one streamed completion to an `AssistantTurn`, emitting tokens as they arrive.
-    async fn one_completion(&self, req: CompletionRequest, cancel: &CancellationToken)
-        -> Result<AssistantTurn, ModelError> {
+    async fn one_completion(
+        &self,
+        req: CompletionRequest,
+        cancel: &CancellationToken,
+    ) -> Result<AssistantTurn, ModelError> {
         let idle = self.config.stream_idle_timeout;
         let mut stream = tokio::select! {
             _ = cancel.cancelled() => return Err(ModelError::Stream("cancelled".into())),
@@ -116,26 +130,48 @@ impl AgentLoop {
                 Err(_) => return Err(ModelError::Timeout(idle)),
                 Ok(None) => break,
                 Ok(Some(item)) => match item? {
-                    Chunk::Text(t) => { self.sink.emit(AgentEvent::Token(t.clone())); text.push_str(&t); }
-                    Chunk::Reasoning(r) => { self.sink.emit(AgentEvent::Reasoning(r.clone())); reasoning.push_str(&r); }
+                    Chunk::Text(t) => {
+                        self.sink.emit(AgentEvent::Token(t.clone()));
+                        text.push_str(&t);
+                    }
+                    Chunk::Reasoning(r) => {
+                        self.sink.emit(AgentEvent::Reasoning(r.clone()));
+                        reasoning.push_str(&r);
+                    }
                     Chunk::ToolCallDelta(rc) => merge_tool_call(&mut raw_tool_calls, rc),
                     Chunk::Done(r) => stop = r,
-                    Chunk::Usage { prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, cost_usd } => {
+                    Chunk::Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        reasoning_tokens,
+                        cached_tokens,
+                        cost_usd,
+                    } => {
                         usage = (prompt_tokens, completion_tokens);
                         usage_details = (reasoning_tokens, cached_tokens, cost_usd);
                     }
                 },
             }
         }
-        Ok(AssistantTurn { text, raw_tool_calls, stop, reasoning,
-            prompt_tokens: usage.0, completion_tokens: usage.1,
-            reasoning_tokens: usage_details.0, cached_tokens: usage_details.1,
-            cost_usd: usage_details.2 })
+        Ok(AssistantTurn {
+            text,
+            raw_tool_calls,
+            stop,
+            reasoning,
+            prompt_tokens: usage.0,
+            completion_tokens: usage.1,
+            reasoning_tokens: usage_details.0,
+            cached_tokens: usage_details.1,
+            cost_usd: usage_details.2,
+        })
     }
 
     /// Stream with retry/backoff on transport errors.
-    async fn completion_with_retry(&self, base: &CompletionRequest, cancel: &CancellationToken)
-        -> Result<AssistantTurn, AgentError> {
+    async fn completion_with_retry(
+        &self,
+        base: &CompletionRequest,
+        cancel: &CancellationToken,
+    ) -> Result<AssistantTurn, AgentError> {
         let mut attempt = 0;
         loop {
             let mut req = base.clone();
@@ -143,7 +179,9 @@ impl AgentLoop {
             match self.one_completion(req, cancel).await {
                 Ok(turn) => return Ok(turn),
                 Err(e) => {
-                    if cancel.is_cancelled() { return Err(AgentError::Cancelled); }
+                    if cancel.is_cancelled() {
+                        return Err(AgentError::Cancelled);
+                    }
                     attempt += 1;
                     if attempt > self.config.max_retries {
                         self.sink.emit(AgentEvent::Error(e.to_string()));
@@ -158,13 +196,21 @@ impl AgentLoop {
 
     /// Convenience entry point with no external cancel source (server + tests).
     /// Live cancellation goes through [`Self::run_with_cancel`].
-    pub async fn run(&self, ctx: &mut dyn ContextManager, user_input: String)
-        -> Result<(), AgentError> {
-        self.run_with_cancel(ctx, user_input, CancellationToken::new()).await
+    pub async fn run(
+        &self,
+        ctx: &mut dyn ContextManager,
+        user_input: String,
+    ) -> Result<(), AgentError> {
+        self.run_with_cancel(ctx, user_input, CancellationToken::new())
+            .await
     }
 
-    pub async fn run_with_cancel(&self, ctx: &mut dyn ContextManager, user_input: String,
-                                 cancel: CancellationToken) -> Result<(), AgentError> {
+    pub async fn run_with_cancel(
+        &self,
+        ctx: &mut dyn ContextManager,
+        user_input: String,
+        cancel: CancellationToken,
+    ) -> Result<(), AgentError> {
         // Surface a silently-degraded sandbox loudly at run start. If the
         // configured strategy fell back to unsandboxed host execution (e.g.
         // Docker unavailable in `auto` mode), every tool call runs with ambient
@@ -173,7 +219,10 @@ impl AgentLoop {
         // approval prompt — emit it unconditionally, once, here.
         if let Some(d) = self.sandbox_descriptor() {
             if let Some(reason) = d.degraded {
-                self.sink.emit(AgentEvent::SandboxDegraded { mechanism: d.mechanism, reason });
+                self.sink.emit(AgentEvent::SandboxDegraded {
+                    mechanism: d.mechanism,
+                    reason,
+                });
             }
         }
 
@@ -238,7 +287,10 @@ impl AgentLoop {
             });
 
             let mut parsed = match self.protocol.parse(&assistant) {
-                Ok(p) => { protocol_repairs = 0; p }
+                Ok(p) => {
+                    protocol_repairs = 0;
+                    p
+                }
                 // The completion was cut off at `max_tokens` mid-tool-call (e.g.
                 // writing a large file), so the args are incomplete JSON. A
                 // "re-emit it correctly" repair is futile — it truncates again at
@@ -248,14 +300,17 @@ impl AgentLoop {
                     self.sink.emit(AgentEvent::Error(
                         "the model reached the max_tokens limit before it finished a \
                          tool call (e.g. writing a large file); increase max_tokens in \
-                         settings and try again".into()));
+                         settings and try again"
+                            .into(),
+                    ));
                     return Ok(());
                 }
                 Err(e) if protocol_repairs < 1 => {
                     protocol_repairs += 1;
                     ctx.append(Message::assistant(assistant.text.clone(), None));
                     ctx.append(Message::user(format!(
-                        "Your tool call could not be parsed: {e}. Re-emit it correctly.")));
+                        "Your tool call could not be parsed: {e}. Re-emit it correctly."
+                    )));
                     continue;
                 }
                 Err(e) => {
@@ -268,8 +323,14 @@ impl AgentLoop {
             // feed the assistant message and the Phase-3 tool-result drain.
             normalize_tool_call_ids(&mut parsed.tool_calls);
 
-            let mut msg = Message::assistant(parsed.text.clone(),
-                if parsed.tool_calls.is_empty() { None } else { Some(parsed.tool_calls.clone()) });
+            let mut msg = Message::assistant(
+                parsed.text.clone(),
+                if parsed.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(parsed.tool_calls.clone())
+                },
+            );
             // Preserve reasoning as data, not inline text — the model backend
             // decides how to render it (claude_cli inlines <think>; openai sends
             // reasoning_content for Qwen3.6). Gated by the effective flag above.
@@ -291,8 +352,17 @@ impl AgentLoop {
                 match self.gate_tool(call, &cancel).await {
                     GateOutcome::Rejected { id, name, content } => {
                         order.push(id.clone());
-                        results.insert(id, (name, Resolved::Err {
-                            status: ToolStatus::Denied, content, duration_ms: 0 }));
+                        results.insert(
+                            id,
+                            (
+                                name,
+                                Resolved::Err {
+                                    status: ToolStatus::Denied,
+                                    content,
+                                    duration_ms: 0,
+                                },
+                            ),
+                        );
                     }
                     GateOutcome::Ready(rc) => {
                         order.push(rc.id.clone());
@@ -305,10 +375,19 @@ impl AgentLoop {
             // panic- and timeout-isolated (execute_isolated) so one bad tool can
             // neither crash the loop nor wedge the batch.
             let cap = if self.config.max_parallel_tools == 0 {
-                DEFAULT_MAX_PARALLEL_TOOLS } else { self.config.max_parallel_tools };
+                DEFAULT_MAX_PARALLEL_TOOLS
+            } else {
+                self.config.max_parallel_tools
+            };
             let executed: Vec<(String, String, Executed, u64)> =
                 futures::stream::iter(ready.into_iter().map(|rc| {
-                    let ReadyCall { tool, args, id, name, ctx } = rc;
+                    let ReadyCall {
+                        tool,
+                        args,
+                        id,
+                        name,
+                        ctx,
+                    } = rc;
                     async move {
                         let started = std::time::Instant::now();
                         let ex = execute_isolated(tool, args, &name, &ctx).await;
@@ -322,19 +401,30 @@ impl AgentLoop {
                 let resolved = match ex {
                     Executed::Ok(o) => Resolved::Ok(o, duration_ms),
                     Executed::ToolErr(s) => Resolved::Err {
-                        status: ToolStatus::Error, content: s, duration_ms },
+                        status: ToolStatus::Error,
+                        content: s,
+                        duration_ms,
+                    },
                     Executed::Panicked(s) => {
                         tracing::error!(target: "loop", tool = %name,
                             "tool panicked during parallel dispatch");
                         self.sink.emit(AgentEvent::Error(s.clone()));
-                        Resolved::Err { status: ToolStatus::Panic, content: s, duration_ms }
+                        Resolved::Err {
+                            status: ToolStatus::Panic,
+                            content: s,
+                            duration_ms,
+                        }
                     }
                     Executed::TimedOut(s) => {
                         tracing::warn!(target: "loop", tool = %name,
                             timeout = ?self.config.tool_timeout,
                             "tool timed out during parallel dispatch");
                         self.sink.emit(AgentEvent::Error(s.clone()));
-                        Resolved::Err { status: ToolStatus::Timeout, content: s, duration_ms }
+                        Resolved::Err {
+                            status: ToolStatus::Timeout,
+                            content: s,
+                            duration_ms,
+                        }
                     }
                 };
                 results.insert(id, (name, resolved));
@@ -350,22 +440,41 @@ impl AgentLoop {
                     // change ever breaks the one-slot-per-id invariant, emit an error
                     // rather than silently drop the result and desync the transcript
                     // (an assistant tool_call with no matching tool message).
-                    None => (String::new(), Resolved::Err {
-                        status: ToolStatus::Error,
-                        content: format!("ERROR: internal: no result for tool_call_id {id}"),
-                        duration_ms: 0 }),
+                    None => (
+                        String::new(),
+                        Resolved::Err {
+                            status: ToolStatus::Error,
+                            content: format!("ERROR: internal: no result for tool_call_id {id}"),
+                            duration_ms: 0,
+                        },
+                    ),
                 };
                 let content = match resolved {
                     Resolved::Ok(output, duration_ms) => {
-                        self.sink.emit(AgentEvent::ToolResult { id: id.clone(), name: name.clone(),
-                            status: ToolStatus::Ok, output: output.clone(), duration_ms });
+                        self.sink.emit(AgentEvent::ToolResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            status: ToolStatus::Ok,
+                            output: output.clone(),
+                            duration_ms,
+                        });
                         output.content
                     }
-                    Resolved::Err { status, content, duration_ms } => {
-                        self.sink.emit(AgentEvent::ToolResult { id: id.clone(), name: name.clone(),
-                            status, output: agent_tools::ToolOutput {
-                                content: content.clone(), display: None },
-                            duration_ms });
+                    Resolved::Err {
+                        status,
+                        content,
+                        duration_ms,
+                    } => {
+                        self.sink.emit(AgentEvent::ToolResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            status,
+                            output: agent_tools::ToolOutput {
+                                content: content.clone(),
+                                display: None,
+                            },
+                            duration_ms,
+                        });
                         content
                     }
                 };
@@ -388,63 +497,116 @@ impl AgentLoop {
                 );
             }
         }
-        self.sink.emit(AgentEvent::Done(StopReason::BudgetExhausted));
+        self.sink
+            .emit(AgentEvent::Done(StopReason::BudgetExhausted));
         Ok(())
     }
 
     /// Resolve, policy-check, and (if needed) get approval for one call — but do NOT
     /// execute it. Sequential by design so approval prompts never overlap.
     async fn gate_tool(&self, call: ToolCall, cancel: &CancellationToken) -> GateOutcome {
-        self.sink.emit(AgentEvent::ToolStart { id: call.id.clone(), name: call.name.clone(),
-            args: call.args.clone() });
+        self.sink.emit(AgentEvent::ToolStart {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            args: call.args.clone(),
+        });
         let tool = match self.tools.get(&call.name) {
             Some(t) => t,
-            None => return GateOutcome::Rejected { id: call.id, name: call.name.clone(),
-                content: format!("ERROR: {}",
-                    ToolError::NotFound(format!("unknown tool {}", call.name))) },
+            None => {
+                return GateOutcome::Rejected {
+                    id: call.id,
+                    name: call.name.clone(),
+                    content: format!(
+                        "ERROR: {}",
+                        ToolError::NotFound(format!("unknown tool {}", call.name))
+                    ),
+                }
+            }
         };
         let intent = match tool.intent(&call.args) {
             Ok(i) => i,
-            Err(e) => return GateOutcome::Rejected { id: call.id, name: call.name,
-                content: format!("ERROR: {e}") },
+            Err(e) => {
+                return GateOutcome::Rejected {
+                    id: call.id,
+                    name: call.name,
+                    content: format!("ERROR: {e}"),
+                }
+            }
         };
         let allowed = match self.policy.check(&intent) {
             Decision::Allow => true,
-            Decision::Deny(reason) => return GateOutcome::Rejected { id: call.id, name: call.name,
-                content: format!("ERROR: {}", ToolError::Denied(reason)) },
+            Decision::Deny(reason) => {
+                return GateOutcome::Rejected {
+                    id: call.id,
+                    name: call.name,
+                    content: format!("ERROR: {}", ToolError::Denied(reason)),
+                }
+            }
             Decision::Ask => {
-                let d = self.config.sandbox.as_ref()
+                let d = self
+                    .config
+                    .sandbox
+                    .as_ref()
                     .map(|s| s.describe())
                     .unwrap_or(agent_tools::SandboxDescriptor {
-                        mode: agent_tools::Mode::Off, mechanism: "host", image: None,
-                        network: true, degraded: None });
+                        mode: agent_tools::Mode::Off,
+                        mechanism: "host",
+                        image: None,
+                        network: true,
+                        degraded: None,
+                    });
                 let posture = if d.degraded.is_some() {
                     format!(" (sandbox: {} unavailable->host, network on)", d.mechanism)
                 } else {
-                    format!(" (sandbox: {}, network {})",
-                        d.mechanism, if d.network { "on" } else { "off" })
+                    format!(
+                        " (sandbox: {}, network {})",
+                        d.mechanism,
+                        if d.network { "on" } else { "off" }
+                    )
                 };
                 let mut intent = intent;
-                if intent.command.is_some() { intent.summary.push_str(&posture); }
+                if intent.command.is_some() {
+                    intent.summary.push_str(&posture);
+                }
                 // diff preview is produced by execute(); the approval prompt shows the summary.
-                let req = ApprovalRequest { intent, display: None };
+                let req = ApprovalRequest {
+                    intent,
+                    display: None,
+                };
                 self.sink.emit(AgentEvent::Approval(req.clone()));
-                matches!(self.approval.request(req).await,
-                    ApprovalResponse::Approve | ApprovalResponse::ApproveAlways)
+                matches!(
+                    self.approval.request(req).await,
+                    ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
+                )
             }
         };
         if !allowed {
-            return GateOutcome::Rejected { id: call.id, name: call.name,
-                content: format!("ERROR: {}", ToolError::Denied("user declined".into())) };
+            return GateOutcome::Rejected {
+                id: call.id,
+                name: call.name,
+                content: format!("ERROR: {}", ToolError::Denied("user declined".into())),
+            };
         }
         // The live run token: a tool that honors `ctx.cancel` (shell/git/fetch_url)
         // aborts when the caller cancels the run (Ctrl-C / SIGINT via the CLI).
-        let sandbox = self.config.sandbox.clone()
+        let sandbox = self
+            .config
+            .sandbox
+            .clone()
             .unwrap_or_else(|| std::sync::Arc::new(agent_tools::HostExecutor));
-        let ctx = ToolCtx { workspace: self.config.workspace.clone(),
-            timeout: self.config.tool_timeout, cancel: cancel.clone(),
-            sandbox };
-        GateOutcome::Ready(ReadyCall { tool, args: call.args, id: call.id, name: call.name, ctx })
+        let ctx = ToolCtx {
+            workspace: self.config.workspace.clone(),
+            timeout: self.config.tool_timeout,
+            cancel: cancel.clone(),
+            sandbox,
+        };
+        GateOutcome::Ready(ReadyCall {
+            tool,
+            args: call.args,
+            id: call.id,
+            name: call.name,
+            ctx,
+        })
     }
 }
 
@@ -462,14 +624,22 @@ enum GateOutcome {
     Ready(ReadyCall),
     /// Rejected before execution (unknown tool / intent error / denied). `content`
     /// is the final `ERROR: …` text to append as this call's tool result.
-    Rejected { id: String, name: String, content: String },
+    Rejected {
+        id: String,
+        name: String,
+        content: String,
+    },
 }
 
 /// Final per-call result feeding the tool-result message + terminal event.
 enum Resolved {
     Ok(agent_tools::ToolOutput, u64),
     /// Terminal `ERROR: …` content (rejected, failed, timed out, or panicked).
-    Err { status: ToolStatus, content: String, duration_ms: u64 },
+    Err {
+        status: ToolStatus,
+        content: String,
+        duration_ms: u64,
+    },
 }
 
 /// Outcome of an isolated tool execution: the terminal result plus a tag the
@@ -490,8 +660,12 @@ enum Executed {
 /// emission. `catch_unwind` keeps a panicking tool from unwinding the loop's task;
 /// `timeout` bounds a tool that ignores `ctx.timeout` so one hang can't wedge the
 /// whole `buffer_unordered` batch.
-async fn execute_isolated(tool: Arc<dyn Tool>, args: serde_json::Value, name: &str,
-    ctx: &ToolCtx) -> Executed {
+async fn execute_isolated(
+    tool: Arc<dyn Tool>,
+    args: serde_json::Value,
+    name: &str,
+    ctx: &ToolCtx,
+) -> Executed {
     use futures::FutureExt;
     let fut = std::panic::AssertUnwindSafe(tool.execute(args, ctx)).catch_unwind();
     // Grace margin: arm the backstop at 2x the tool budget so a tool that honors
@@ -502,12 +676,15 @@ async fn execute_isolated(tool: Arc<dyn Tool>, args: serde_json::Value, name: &s
     match tokio::time::timeout(backstop, fut).await {
         Ok(Ok(Ok(output))) => Executed::Ok(output),
         // A tool's own ToolError::Timeout arrives here and stays quiet.
-        Ok(Ok(Err(e)))     => Executed::ToolErr(format!("ERROR: {e}")),
-        Ok(Err(_panic))    => Executed::Panicked(
-            format!("ERROR: tool '{name}' panicked during execution")),
-        Err(_elapsed)      => Executed::TimedOut(format!(
+        Ok(Ok(Err(e))) => Executed::ToolErr(format!("ERROR: {e}")),
+        Ok(Err(_panic)) => {
+            Executed::Panicked(format!("ERROR: tool '{name}' panicked during execution"))
+        }
+        Err(_elapsed) => Executed::TimedOut(format!(
             "ERROR: tool '{name}' exceeded its {:?} timeout and was force-stopped \
-             by the dispatch backstop", ctx.timeout)),
+             by the dispatch backstop",
+            ctx.timeout
+        )),
     }
 }
 
@@ -540,8 +717,12 @@ fn normalize_tool_call_ids(calls: &mut [ToolCall]) {
 fn merge_tool_call(acc: &mut Vec<RawToolCall>, delta: RawToolCall) {
     if let Some(idx) = delta.index {
         if let Some(existing) = acc.iter_mut().find(|c| c.index == Some(idx)) {
-            if existing.id.is_none() { existing.id = delta.id; }
-            if existing.name.is_none() { existing.name = delta.name; }
+            if existing.id.is_none() {
+                existing.id = delta.id;
+            }
+            if existing.name.is_none() {
+                existing.name = delta.name;
+            }
             existing.args_fragment.push_str(&delta.args_fragment);
         } else {
             acc.push(delta);
@@ -552,7 +733,9 @@ fn merge_tool_call(acc: &mut Vec<RawToolCall>, delta: RawToolCall) {
     if delta.id.is_some() || acc.is_empty() {
         acc.push(delta);
     } else if let Some(last) = acc.last_mut() {
-        if last.name.is_none() { last.name = delta.name; }
+        if last.name.is_none() {
+            last.name = delta.name;
+        }
         last.args_fragment.push_str(&delta.args_fragment);
     }
 }
@@ -561,7 +744,7 @@ fn merge_tool_call(acc: &mut Vec<RawToolCall>, delta: RawToolCall) {
 mod tests {
     use super::*;
     use crate::testkit::*;
-    use crate::{WindowContext};
+    use crate::WindowContext;
     use agent_model::Message;
     use agent_policy::RulePolicy;
     use agent_tools::{fs::ReadFile, ToolCall, ToolRegistry};
@@ -574,7 +757,11 @@ mod tests {
     }
 
     fn tc(id: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: "read_file".into(), args: serde_json::json!({}) }
+        ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            args: serde_json::json!({}),
+        }
     }
 
     #[test]
@@ -586,7 +773,10 @@ mod tests {
         assert!(ids.iter().all(|s| !s.is_empty()), "no empty ids: {ids:?}");
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), 4, "all ids distinct: {ids:?}");
-        assert_eq!(ids[2], "x", "an already-unique id is left intact when first seen");
+        assert_eq!(
+            ids[2], "x",
+            "an already-unique id is left intact when first seen"
+        );
     }
 
     #[test]
@@ -594,8 +784,12 @@ mod tests {
         // id-less first call AND a model literally sending "call_0" -> still distinct.
         let mut calls = vec![tc(""), tc("call_0")];
         normalize_tool_call_ids(&mut calls);
-        assert_ne!(calls[0].id, calls[1].id, "synthetic id must not collide: {:?}",
-            calls.iter().map(|c| c.id.clone()).collect::<Vec<_>>());
+        assert_ne!(
+            calls[0].id,
+            calls[1].id,
+            "synthetic id must not collide: {:?}",
+            calls.iter().map(|c| c.id.clone()).collect::<Vec<_>>()
+        );
         assert!(!calls[0].id.is_empty() && !calls[1].id.is_empty());
     }
 
@@ -603,15 +797,43 @@ mod tests {
     fn merge_tool_call_keys_on_index_for_interleaved_parallel_calls() {
         let mut acc = Vec::new();
         // Two calls open (each first fragment carries id+name+index)...
-        merge_tool_call(&mut acc, RawToolCall { index: Some(0), id: Some("a".into()),
-            name: Some("f0".into()), args_fragment: "{\"x\":".into() });
-        merge_tool_call(&mut acc, RawToolCall { index: Some(1), id: Some("b".into()),
-            name: Some("f1".into()), args_fragment: "{\"y\":".into() });
+        merge_tool_call(
+            &mut acc,
+            RawToolCall {
+                index: Some(0),
+                id: Some("a".into()),
+                name: Some("f0".into()),
+                args_fragment: "{\"x\":".into(),
+            },
+        );
+        merge_tool_call(
+            &mut acc,
+            RawToolCall {
+                index: Some(1),
+                id: Some("b".into()),
+                name: Some("f1".into()),
+                args_fragment: "{\"y\":".into(),
+            },
+        );
         // ...then INTERLEAVED arg fragments (id/name absent, only index correlates them).
-        merge_tool_call(&mut acc, RawToolCall { index: Some(0), id: None, name: None,
-            args_fragment: "1}".into() });
-        merge_tool_call(&mut acc, RawToolCall { index: Some(1), id: None, name: None,
-            args_fragment: "2}".into() });
+        merge_tool_call(
+            &mut acc,
+            RawToolCall {
+                index: Some(0),
+                id: None,
+                name: None,
+                args_fragment: "1}".into(),
+            },
+        );
+        merge_tool_call(
+            &mut acc,
+            RawToolCall {
+                index: Some(1),
+                id: None,
+                name: None,
+                args_fragment: "2}".into(),
+            },
+        );
         assert_eq!(acc.len(), 2);
         assert_eq!(acc[0].name.as_deref(), Some("f0"));
         assert_eq!(acc[0].args_fragment, "{\"x\":1}");
@@ -622,10 +844,24 @@ mod tests {
     #[test]
     fn merge_tool_call_falls_back_to_order_when_no_index() {
         let mut acc = Vec::new();
-        merge_tool_call(&mut acc, RawToolCall { index: None, id: Some("a".into()),
-            name: Some("f".into()), args_fragment: "{".into() });
-        merge_tool_call(&mut acc, RawToolCall { index: None, id: None, name: None,
-            args_fragment: "}".into() });
+        merge_tool_call(
+            &mut acc,
+            RawToolCall {
+                index: None,
+                id: Some("a".into()),
+                name: Some("f".into()),
+                args_fragment: "{".into(),
+            },
+        );
+        merge_tool_call(
+            &mut acc,
+            RawToolCall {
+                index: None,
+                id: None,
+                name: None,
+                args_fragment: "}".into(),
+            },
+        );
         assert_eq!(acc.len(), 1);
         assert_eq!(acc[0].args_fragment, "{}");
     }
@@ -634,11 +870,14 @@ mod tests {
     async fn scripted_calls_yields_multiple_native_tool_calls() {
         let model = ScriptedModel::new(vec![Scripted::Calls(vec![
             ("c1".into(), "f0".into(), "{}".into()),
-            ("c2".into(), "f1".into(), "{}".into())])]);
+            ("c2".into(), "f1".into(), "{}".into()),
+        ])]);
         let mut stream = model.stream(CompletionRequest::default()).await.unwrap();
         let mut raw = Vec::new();
         while let Some(item) = stream.next().await {
-            if let Chunk::ToolCallDelta(rc) = item.unwrap() { raw.push(rc); }
+            if let Chunk::ToolCallDelta(rc) = item.unwrap() {
+                raw.push(rc);
+            }
         }
         assert_eq!(raw.len(), 2);
         assert_eq!(raw[0].name.as_deref(), Some("f0"));
@@ -646,45 +885,86 @@ mod tests {
     }
 
     fn policy(ws: std::path::PathBuf) -> Arc<RulePolicy> {
-        Arc::new(RulePolicy { workspace: ws, command_allowlist: vec![], command_denylist: vec![] })
+        Arc::new(RulePolicy {
+            workspace: ws,
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        })
     }
 
     #[tokio::test]
     async fn server_usage_event_carries_token_totals() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().to_path_buf();
-        let model = Arc::new(ScriptedModel::new(vec![Scripted::TextWithUsage("done".into(), 900, 12)]));
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::TextWithUsage(
+            "done".into(),
+            900,
+            12,
+        )]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "hi".into()).await.unwrap();
         let events = sink.events.lock().unwrap().clone();
-        assert!(events.iter().any(|e| e == "server_usage:900:12"),
-            "expected server_usage event with real token totals; got {events:?}");
+        assert!(
+            events.iter().any(|e| e == "server_usage:900:12"),
+            "expected server_usage event with real token totals; got {events:?}"
+        );
     }
 
     #[tokio::test]
     async fn precancelled_token_stops_before_calling_model() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().to_path_buf();
-        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("should never run".into())]));
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "should never run".into(),
+        )]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         let cancel = CancellationToken::new();
         cancel.cancel(); // already cancelled before the run starts
 
-        agent.run_with_cancel(&mut ctx, "go".into(), cancel).await.unwrap();
+        agent
+            .run_with_cancel(&mut ctx, "go".into(), cancel)
+            .await
+            .unwrap();
 
         // Stopped at the turn boundary: only the terminal Done(Cancelled) event, no
         // Usage / Token events (the model was never consulted).
@@ -692,22 +972,39 @@ mod tests {
         assert_eq!(events, vec!["done".to_string()], "events were: {events:?}");
     }
 
-    struct HangsUntilCancel { started: Arc<tokio::sync::Notify> }
+    struct HangsUntilCancel {
+        started: Arc<tokio::sync::Notify>,
+    }
 
     #[async_trait::async_trait]
     impl Tool for HangsUntilCancel {
-        fn name(&self) -> &str { "hang" }
-        fn description(&self) -> &str { "hangs until cancelled" }
+        fn name(&self) -> &str {
+            "hang"
+        }
+        fn description(&self) -> &str {
+            "hangs until cancelled"
+        }
         fn schema(&self) -> agent_tools::ToolSchema {
-            agent_tools::ToolSchema { name: "hang".into(), description: "".into(),
-                parameters: serde_json::json!({"type":"object"}) }
+            agent_tools::ToolSchema {
+                name: "hang".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
         }
         fn intent(&self, _args: &serde_json::Value) -> Result<agent_tools::ToolIntent, ToolError> {
-            Ok(agent_tools::ToolIntent { tool: "hang".into(), access: agent_tools::Access::Read,
-                paths: vec![], command: None, summary: "hang".into() })
+            Ok(agent_tools::ToolIntent {
+                tool: "hang".into(),
+                access: agent_tools::Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "hang".into(),
+            })
         }
-        async fn execute(&self, _args: serde_json::Value, ctx: &ToolCtx)
-            -> Result<agent_tools::ToolOutput, ToolError> {
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            ctx: &ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, ToolError> {
             self.started.notify_one();
             ctx.cancel.cancelled().await; // blocks until the loop's token is cancelled
             Err(ToolError::Timeout)
@@ -720,7 +1017,9 @@ mod tests {
         let ws = dir.path().to_path_buf();
         let started = Arc::new(tokio::sync::Notify::new());
         let mut reg = ToolRegistry::new();
-        reg.register(Arc::new(HangsUntilCancel { started: started.clone() }));
+        reg.register(Arc::new(HangsUntilCancel {
+            started: started.clone(),
+        }));
         let registry = Arc::new(reg);
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Call("c1".into(), "hang".into(), "{}".into()),
@@ -728,21 +1027,40 @@ mod tests {
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry, policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry,
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
 
         let cancel = CancellationToken::new();
         let c2 = cancel.clone();
         // Cancel as soon as the tool reports it has started and is blocking.
-        let waiter = tokio::spawn(async move { started.notified().await; c2.cancel(); });
+        let waiter = tokio::spawn(async move {
+            started.notified().await;
+            c2.cancel();
+        });
 
         // Without cancellation this never returns (the tool blocks forever); returning
         // at all proves the hang was aborted.
-        agent.run_with_cancel(&mut ctx, "go".into(), cancel).await.unwrap();
+        agent
+            .run_with_cancel(&mut ctx, "go".into(), cancel)
+            .await
+            .unwrap();
         waiter.await.unwrap();
 
         assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
@@ -757,18 +1075,39 @@ mod tests {
         // panics the Phase-3 drain on current code.
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
-                ("c1".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()),
-                ("c1".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()),
+                (
+                    "c1".into(),
+                    "read_file".into(),
+                    r#"{"path":"a.txt"}"#.into(),
+                ),
+                (
+                    "c1".into(),
+                    "read_file".into(),
+                    r#"{"path":"a.txt"}"#.into(),
+                ),
             ]),
             Scripted::Text("done".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
 
         // Must NOT panic.
@@ -776,22 +1115,38 @@ mod tests {
 
         // Both calls produced a result — the second was not dropped by a collision.
         let events = sink.events.lock().unwrap().clone();
-        assert_eq!(events.iter().filter(|e| *e == "tool_result:read_file:ok").count(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| *e == "tool_result:read_file:ok")
+                .count(),
+            2
+        );
 
         // The transcript carries two DISTINCT tool ids.
         let built = ctx.build(100_000);
-        let tool_ids: Vec<String> = built.iter()
+        let tool_ids: Vec<String> = built
+            .iter()
             .filter(|m| matches!(m.role, agent_model::Role::Tool))
             .map(|m| m.tool_call_id.clone().unwrap_or_default())
             .collect();
-        assert_eq!(tool_ids.len(), 2, "two tool messages expected: {tool_ids:?}");
-        assert_ne!(tool_ids[0], tool_ids[1], "duplicate ids must normalize to distinct");
+        assert_eq!(
+            tool_ids.len(),
+            2,
+            "two tool messages expected: {tool_ids:?}"
+        );
+        assert_ne!(
+            tool_ids[0], tool_ids[1],
+            "duplicate ids must normalize to distinct"
+        );
     }
 
     struct FakeRetriever(Vec<String>);
     #[async_trait::async_trait]
     impl crate::Retriever for FakeRetriever {
-        async fn retrieve(&self, _q: &str) -> Vec<String> { self.0.clone() }
+        async fn retrieve(&self, _q: &str) -> Vec<String> {
+            self.0.clone()
+        }
     }
 
     #[tokio::test]
@@ -801,19 +1156,35 @@ mod tests {
         let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("ok".into())]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() })
-            .with_retriever(Arc::new(FakeRetriever(vec!["user prefers rust 2021".into()])));
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .with_retriever(Arc::new(FakeRetriever(vec![
+            "user prefers rust 2021".into()
+        ])));
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "hello".into()).await.unwrap();
 
         let built = ctx.build(100_000);
-        assert!(built.iter().any(|m|
-            m.content.contains("Relevant memories from past sessions:")
-            && m.content.contains("user prefers rust 2021")));
+        assert!(built.iter().any(
+            |m| m.content.contains("Relevant memories from past sessions:")
+                && m.content.contains("user prefers rust 2021")
+        ));
     }
 
     #[tokio::test]
@@ -823,17 +1194,32 @@ mod tests {
         let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("ok".into())]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() })
-            .with_retriever(Arc::new(FakeRetriever(vec![])));
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .with_retriever(Arc::new(FakeRetriever(vec![])));
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "hello".into()).await.unwrap();
 
         let built = ctx.build(100_000);
-        assert!(!built.iter().any(|m| m.content.contains("Relevant memories")));
+        assert!(!built
+            .iter()
+            .any(|m| m.content.contains("Relevant memories")));
         assert!(sink.events.lock().unwrap().last().unwrap() == "done");
     }
 
@@ -844,17 +1230,33 @@ mod tests {
         let ws = dir.path().to_path_buf();
 
         let model = Arc::new(ScriptedModel::new(vec![
-            Scripted::Call("c1".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()),
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
             Scripted::Text("The file says FILEBODY".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2,
-                temperature: 0.0, max_tokens: None, workspace: ws,
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
 
         let mut ctx = WindowContext::new(Message::system("you are a test agent"));
         agent.run(&mut ctx, "read a.txt".into()).await.unwrap();
@@ -877,23 +1279,44 @@ mod tests {
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
-                max_tokens: Some(2048), workspace: ws,
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: Some(2048),
+                workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
-        agent.run(&mut ctx, "write a big file".into()).await.unwrap();
+        agent
+            .run(&mut ctx, "write a big file".into())
+            .await
+            .unwrap();
 
         let events = sink.events.lock().unwrap().clone();
-        let err = events.iter().find(|e| e.starts_with("error:"))
+        let err = events
+            .iter()
+            .find(|e| e.starts_with("error:"))
             .expect("expected an error event for the truncated turn");
         let low = err.to_lowercase();
-        assert!(low.contains("max_tokens") || low.contains("truncat"),
-            "error should explain the truncation cause, got: {err}");
-        assert!(!err.contains("EOF while parsing"),
-            "must not surface the raw JSON EOF parse error: {err}");
+        assert!(
+            low.contains("max_tokens") || low.contains("truncat"),
+            "error should explain the truncation cause, got: {err}"
+        );
+        assert!(
+            !err.contains("EOF while parsing"),
+            "must not surface the raw JSON EOF parse error: {err}"
+        );
     }
 
     use agent_policy::PolicyEngine;
@@ -901,7 +1324,9 @@ mod tests {
 
     struct DenyAll;
     impl PolicyEngine for DenyAll {
-        fn check(&self, _i: &ToolIntent) -> Decision { Decision::Deny("nope".into()) }
+        fn check(&self, _i: &ToolIntent) -> Decision {
+            Decision::Deny("nope".into())
+        }
     }
 
     #[tokio::test]
@@ -910,24 +1335,43 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "X").unwrap();
         let ws = dir.path().to_path_buf();
         let model = Arc::new(ScriptedModel::new(vec![
-            Scripted::Call("c1".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()),
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
             Scripted::Text("Understood, it was denied.".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), Arc::new(DenyAll),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            Arc::new(DenyAll),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         let events = sink.events.lock().unwrap().clone();
         // No successful tool_result (it was denied) — the call terminates in a
         // Denied ToolResult instead — and the loop still reached done.
         assert!(!events.iter().any(|e| e == "tool_result:read_file:ok"));
-        assert!(events.iter().any(|e| e == "tool_result:read_file:denied"),
-            "a denied call must still emit a terminal ToolResult: {events:?}");
+        assert!(
+            events.iter().any(|e| e == "tool_result:read_file:denied"),
+            "a denied call must still emit a terminal ToolResult: {events:?}"
+        );
         assert_eq!(events.last().unwrap(), "done");
     }
 
@@ -937,17 +1381,36 @@ mod tests {
         let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("hi".into())]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), Arc::new(DenyAll),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            Arc::new(DenyAll),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         let events = sink.events.lock().unwrap().clone();
         // A usage event is emitted, and it precedes the terminal done.
-        let usage_idx = events.iter().position(|e| e.starts_with("usage:")).expect("usage event present");
-        let done_idx = events.iter().rposition(|e| e == "done").expect("done present");
+        let usage_idx = events
+            .iter()
+            .position(|e| e.starts_with("usage:"))
+            .expect("usage event present");
+        let done_idx = events
+            .iter()
+            .rposition(|e| e == "done")
+            .expect("done present");
         assert!(usage_idx < done_idx);
     }
 
@@ -960,11 +1423,24 @@ mod tests {
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 3, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 3,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
@@ -977,43 +1453,87 @@ mod tests {
         let ws = dir.path().to_path_buf();
         // Model always calls a tool, never finishes -> must hit max_turns.
         let model = Arc::new(ScriptedModel::new(vec![
-            Scripted::Call("c".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()); 100
+            Scripted::Call(
+                "c".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into()
+            );
+            100
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 3, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 3,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "loop forever".into()).await.unwrap();
         // 3 turns, each a tool call, then done (BudgetExhausted).
         let events = sink.events.lock().unwrap().clone();
-        assert_eq!(events.iter().filter(|e| *e == "tool_start:read_file").count(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| *e == "tool_start:read_file")
+                .count(),
+            3
+        );
         assert_eq!(events.last().unwrap(), "done");
     }
 
     #[tokio::test(start_paused = true)]
     async fn idle_stall_times_out_and_fails_after_retries() {
         let ws = std::env::temp_dir();
-        let model = Arc::new(ScriptedModel::new(vec![Scripted::Hang, Scripted::Hang, Scripted::Hang]));
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Hang,
+            Scripted::Hang,
+            Scripted::Hang,
+        ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: Duration::from_secs(5),
+                stream_idle_timeout: Duration::from_secs(10),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         // Guard >> the loop's 10s idle timeout so the loop terminates first.
-        let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
-            .await
-            .expect("loop must terminate on a stalled stream, not hang");
+        let result =
+            tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
+                .await
+                .expect("loop must terminate on a stalled stream, not hang");
         let err = result.unwrap_err();
         assert!(matches!(err, AgentError::Model(_)));
-        assert!(err.to_string().contains("timeout"),
-            "expected a timeout-caused failure, got: {err}");
+        assert!(
+            err.to_string().contains("timeout"),
+            "expected a timeout-caused failure, got: {err}"
+        );
         let events = sink.events.lock().unwrap().clone();
         assert!(events.iter().any(|e| e.starts_with("error:")));
     }
@@ -1021,22 +1541,41 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stream_open_stall_times_out() {
         let ws = std::env::temp_dir();
-        let model = Arc::new(ScriptedModel::new(vec![Scripted::HangOpen, Scripted::HangOpen]));
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::HangOpen,
+            Scripted::HangOpen,
+        ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: Duration::from_secs(5),
+                stream_idle_timeout: Duration::from_secs(10),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
-        let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
-            .await
-            .expect("loop must terminate when the stream never opens, not hang");
+        let result =
+            tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
+                .await
+                .expect("loop must terminate when the stream never opens, not hang");
         let err = result.unwrap_err();
         assert!(matches!(err, AgentError::Model(_)));
-        assert!(err.to_string().contains("timeout"),
-            "expected a timeout-caused failure, got: {err}");
+        assert!(
+            err.to_string().contains("timeout"),
+            "expected a timeout-caused failure, got: {err}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1048,24 +1587,43 @@ mod tests {
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 3, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 3,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: Duration::from_secs(5),
+                stream_idle_timeout: Duration::from_secs(10),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
-        let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
-            .await
-            .expect("loop must terminate, not hang");
+        let result =
+            tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
+                .await
+                .expect("loop must terminate, not hang");
         assert!(result.is_ok());
         assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
     }
 
-    struct SlowModel { gap: Duration }
+    struct SlowModel {
+        gap: Duration,
+    }
     #[async_trait::async_trait]
     impl agent_model::ModelClient for SlowModel {
-        async fn stream(&self, _req: CompletionRequest)
-            -> Result<futures::stream::BoxStream<'static, Result<Chunk, ModelError>>, ModelError> {
+        async fn stream(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<Chunk, ModelError>>, ModelError>
+        {
             let gap = self.gap;
             let chunks = vec![
                 Ok(Chunk::Text("hel".into())),
@@ -1073,28 +1631,46 @@ mod tests {
                 Ok(Chunk::Done(StopReason::Stop)),
             ];
             Ok(futures::stream::iter(chunks)
-                .then(move |c| async move { tokio::time::sleep(gap).await; c })
+                .then(move |c| async move {
+                    tokio::time::sleep(gap).await;
+                    c
+                })
                 .boxed())
         }
     }
 
-    fn empty_registry() -> Arc<ToolRegistry> { Arc::new(ToolRegistry::new()) }
+    fn empty_registry() -> Arc<ToolRegistry> {
+        Arc::new(ToolRegistry::new())
+    }
 
     async fn run_reasoning_with(preserve: bool, tools: Arc<ToolRegistry>) -> Vec<Message> {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().to_path_buf();
-        let model = Arc::new(ScriptedModel::new(vec![
-            Scripted::Reasoning("secret plan".into(), "final answer".into()),
-        ]));
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Reasoning(
+            "secret plan".into(),
+            "final answer".into(),
+        )]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), tools, policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink,
-            LoopConfig { model_limit: 100_000, max_turns: 5, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: ws,
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 5,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
                 stream_idle_timeout: std::time::Duration::from_secs(60),
-                preserve_thinking: preserve, ..Default::default() });
+                preserve_thinking: preserve,
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         ctx.build(100_000)
@@ -1111,14 +1687,20 @@ mod tests {
         // tool loop, so registered tools auto-enable preservation regardless of
         // the config flag (Qwen3.6 keeps it via reasoning_content + the kwarg).
         let msgs = run_reasoning_with(false, registry()).await;
-        let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
+        let a = msgs
+            .iter()
+            .find(|m| matches!(m.role, agent_model::Role::Assistant))
+            .unwrap();
         assert_eq!(a.reasoning.as_deref(), Some("secret plan"));
     }
 
     #[tokio::test]
     async fn preserve_thinking_keeps_reasoning_as_message_data() {
         let msgs = run_reasoning(true).await;
-        let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
+        let a = msgs
+            .iter()
+            .find(|m| matches!(m.role, agent_model::Role::Assistant))
+            .unwrap();
         // Reasoning is preserved as separate data, NOT baked into content — each
         // backend renders it per its own contract (see agent-model adapters).
         assert_eq!(a.reasoning.as_deref(), Some("secret plan"));
@@ -1129,33 +1711,52 @@ mod tests {
     #[tokio::test]
     async fn default_strips_reasoning_from_history() {
         let msgs = run_reasoning(false).await;
-        let a = msgs.iter().find(|m| matches!(m.role, agent_model::Role::Assistant)).unwrap();
+        let a = msgs
+            .iter()
+            .find(|m| matches!(m.role, agent_model::Role::Assistant))
+            .unwrap();
         assert_eq!(a.reasoning, None);
         assert_eq!(a.content, "final answer");
     }
 
     #[tokio::test]
     async fn loop_routes_execute_command_through_injected_sandbox() {
-        use agent_tools::{CommandSpec, SandboxStrategy, SandboxedChild, SandboxError,
-            SandboxDescriptor, Mode, HostExecutor};
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use agent_tools::{
+            CommandSpec, HostExecutor, Mode, SandboxDescriptor, SandboxError, SandboxStrategy,
+            SandboxedChild,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
 
-        struct CountingSandbox { inner: HostExecutor, hits: Arc<AtomicUsize> }
+        struct CountingSandbox {
+            inner: HostExecutor,
+            hits: Arc<AtomicUsize>,
+        }
         impl SandboxStrategy for CountingSandbox {
             fn launch(&self, spec: CommandSpec) -> Result<SandboxedChild, SandboxError> {
                 self.hits.fetch_add(1, Ordering::SeqCst);
                 self.inner.launch(spec)
             }
             fn describe(&self) -> SandboxDescriptor {
-                SandboxDescriptor { mode: Mode::Off, mechanism: "counting", image: None,
-                    network: true, degraded: None }
+                SandboxDescriptor {
+                    mode: Mode::Off,
+                    mechanism: "counting",
+                    image: None,
+                    network: true,
+                    degraded: None,
+                }
             }
         }
 
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().to_path_buf();
         let hits = Arc::new(AtomicUsize::new(0));
-        let sandbox = Arc::new(CountingSandbox { inner: HostExecutor, hits: hits.clone() });
+        let sandbox = Arc::new(CountingSandbox {
+            inner: HostExecutor,
+            hits: hits.clone(),
+        });
 
         // Register execute_command tool
         let mut r = ToolRegistry::new();
@@ -1163,18 +1764,34 @@ mod tests {
         let tools = Arc::new(r);
 
         let model = Arc::new(ScriptedModel::new(vec![
-            Scripted::Call("c1".into(), "execute_command".into(), r#"{"command":"echo hello"}"#.into()),
+            Scripted::Call(
+                "c1".into(),
+                "execute_command".into(),
+                r#"{"command":"echo hello"}"#.into(),
+            ),
             Scripted::Text("Done.".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), tools, policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2,
-                temperature: 0.0, max_tokens: None, workspace: ws,
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
                 stream_idle_timeout: std::time::Duration::from_secs(60),
-                sandbox: Some(sandbox), ..Default::default() });
+                sandbox: Some(sandbox),
+                ..Default::default()
+            },
+        );
 
         let mut ctx = WindowContext::new(Message::system("you are a test agent"));
         agent.run(&mut ctx, "run echo hello".into()).await.unwrap();
@@ -1184,11 +1801,13 @@ mod tests {
 
     #[tokio::test]
     async fn approval_summary_includes_sandbox_posture() {
-        use agent_tools::{HostExecutor};
         use agent_policy::ApprovalChannel;
+        use agent_tools::HostExecutor;
         use std::sync::{Arc, Mutex};
 
-        struct RecordingApproval { captured: Arc<Mutex<Option<String>>> }
+        struct RecordingApproval {
+            captured: Arc<Mutex<Option<String>>>,
+        }
         #[async_trait::async_trait]
         impl ApprovalChannel for RecordingApproval {
             async fn request(&self, req: ApprovalRequest) -> ApprovalResponse {
@@ -1206,38 +1825,68 @@ mod tests {
         let tools = Arc::new(r);
 
         // Empty allowlist -> Decision::Ask for any command
-        let pol = Arc::new(RulePolicy { workspace: ws.clone(), command_allowlist: vec![], command_denylist: vec![] });
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        });
 
         let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let approval = Arc::new(RecordingApproval { captured: captured.clone() });
+        let approval = Arc::new(RecordingApproval {
+            captured: captured.clone(),
+        });
 
         let model = Arc::new(ScriptedModel::new(vec![
-            Scripted::Call("c1".into(), "execute_command".into(), r#"{"command":"echo hello"}"#.into()),
+            Scripted::Call(
+                "c1".into(),
+                "execute_command".into(),
+                r#"{"command":"echo hello"}"#.into(),
+            ),
             Scripted::Text("Done.".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), tools, pol, approval, sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2,
-                temperature: 0.0, max_tokens: None, workspace: ws,
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            approval,
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
                 stream_idle_timeout: std::time::Duration::from_secs(60),
-                sandbox: Some(Arc::new(HostExecutor)), ..Default::default() });
+                sandbox: Some(Arc::new(HostExecutor)),
+                ..Default::default()
+            },
+        );
 
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "run echo hello".into()).await.unwrap();
 
-        let summary = captured.lock().unwrap().clone()
+        let summary = captured
+            .lock()
+            .unwrap()
+            .clone()
             .expect("approval must have been requested");
-        assert!(summary.contains("(sandbox: host, network on)"),
-            "summary does not contain posture: {summary:?}");
+        assert!(
+            summary.contains("(sandbox: host, network on)"),
+            "summary does not contain posture: {summary:?}"
+        );
     }
 
     #[tokio::test]
     async fn degraded_posture_shows_unavailable_and_network_on() {
-        use agent_tools::{CommandSpec, SandboxStrategy, SandboxedChild, SandboxError,
-            SandboxDescriptor, Mode, HostExecutor};
         use agent_policy::ApprovalChannel;
+        use agent_tools::{
+            CommandSpec, HostExecutor, Mode, SandboxDescriptor, SandboxError, SandboxStrategy,
+            SandboxedChild,
+        };
         use std::sync::{Arc, Mutex};
 
         struct DegradedFake;
@@ -1246,13 +1895,19 @@ mod tests {
                 HostExecutor.launch(spec) // degraded == runs on host
             }
             fn describe(&self) -> SandboxDescriptor {
-                SandboxDescriptor { mode: Mode::Auto, mechanism: "docker",
-                    image: Some("debian:stable-slim".into()), network: false,
-                    degraded: Some("no daemon".into()) }
+                SandboxDescriptor {
+                    mode: Mode::Auto,
+                    mechanism: "docker",
+                    image: Some("debian:stable-slim".into()),
+                    network: false,
+                    degraded: Some("no daemon".into()),
+                }
             }
         }
 
-        struct RecordingApproval { captured: Arc<Mutex<Option<String>>> }
+        struct RecordingApproval {
+            captured: Arc<Mutex<Option<String>>>,
+        }
         #[async_trait::async_trait]
         impl ApprovalChannel for RecordingApproval {
             async fn request(&self, req: ApprovalRequest) -> ApprovalResponse {
@@ -1269,53 +1924,101 @@ mod tests {
         let tools = Arc::new(r);
 
         // Empty allowlist -> Decision::Ask for any command
-        let pol = Arc::new(RulePolicy { workspace: ws.clone(), command_allowlist: vec![], command_denylist: vec![] });
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        });
 
         let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let approval = Arc::new(RecordingApproval { captured: captured.clone() });
+        let approval = Arc::new(RecordingApproval {
+            captured: captured.clone(),
+        });
 
         let model = Arc::new(ScriptedModel::new(vec![
-            Scripted::Call("c1".into(), "execute_command".into(), r#"{"command":"echo hello"}"#.into()),
+            Scripted::Call(
+                "c1".into(),
+                "execute_command".into(),
+                r#"{"command":"echo hello"}"#.into(),
+            ),
             Scripted::Text("Done.".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), tools, pol, approval, sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 2,
-                temperature: 0.0, max_tokens: None, workspace: ws,
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            approval,
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
                 stream_idle_timeout: std::time::Duration::from_secs(60),
-                sandbox: Some(Arc::new(DegradedFake)), ..Default::default() });
+                sandbox: Some(Arc::new(DegradedFake)),
+                ..Default::default()
+            },
+        );
 
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "run echo hello".into()).await.unwrap();
 
-        let summary = captured.lock().unwrap().clone()
+        let summary = captured
+            .lock()
+            .unwrap()
+            .clone()
             .expect("approval must have been requested");
-        assert!(summary.contains("unavailable"),
-            "summary should signal degraded state: {summary:?}");
-        assert!(summary.contains("network on"),
-            "summary should show actual (host) network state: {summary:?}");
-        assert!(!summary.contains("network off"),
-            "summary must NOT show policy network (false) when degraded: {summary:?}");
+        assert!(
+            summary.contains("unavailable"),
+            "summary should signal degraded state: {summary:?}"
+        );
+        assert!(
+            summary.contains("network on"),
+            "summary should show actual (host) network state: {summary:?}"
+        );
+        assert!(
+            !summary.contains("network off"),
+            "summary must NOT show policy network (false) when degraded: {summary:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn slow_but_progressing_stream_does_not_trip() {
         let ws = std::env::temp_dir();
         // gap (5s) < idle timeout (10s): healthy progress must NOT trip the timeout.
-        let model = Arc::new(SlowModel { gap: Duration::from_secs(5) });
+        let model = Arc::new(SlowModel {
+            gap: Duration::from_secs(5),
+        });
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: Duration::from_secs(5),
-                stream_idle_timeout: Duration::from_secs(10), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: Duration::from_secs(5),
+                stream_idle_timeout: Duration::from_secs(10),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
-        let result = tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
-            .await
-            .expect("loop must terminate, not hang");
+        let result =
+            tokio::time::timeout(Duration::from_secs(600), agent.run(&mut ctx, "go".into()))
+                .await
+                .expect("loop must terminate, not hang");
         assert!(result.is_ok());
         let events = sink.events.lock().unwrap().clone();
         assert!(!events.iter().any(|e| e.starts_with("error:")));
@@ -1323,33 +2026,56 @@ mod tests {
     }
 
     // ---- Parallel tool-call execution -------------------------------------
-    use agent_tools::{Tool, Access, ToolOutput, ToolSchema};
     use agent_model::Role;
+    use agent_tools::{Access, Tool, ToolOutput, ToolSchema};
 
     struct AllowAll;
     impl PolicyEngine for AllowAll {
-        fn check(&self, _i: &ToolIntent) -> Decision { Decision::Allow }
+        fn check(&self, _i: &ToolIntent) -> Decision {
+            Decision::Allow
+        }
     }
 
     /// Tool that blocks on a shared 2-party barrier — only completes if a sibling
     /// call runs concurrently. Sequential execution deadlocks it.
-    struct BarrierTool { name: String, barrier: Arc<tokio::sync::Barrier> }
+    struct BarrierTool {
+        name: String,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
     #[async_trait::async_trait]
     impl Tool for BarrierTool {
-        fn name(&self) -> &str { &self.name }
-        fn description(&self) -> &str { "waits on a shared barrier" }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "waits on a shared barrier"
+        }
         fn schema(&self) -> ToolSchema {
-            ToolSchema { name: self.name.clone(), description: "barrier".into(),
-                parameters: serde_json::json!({"type":"object","properties":{}}) }
+            ToolSchema {
+                name: self.name.clone(),
+                description: "barrier".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            }
         }
         fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
-            Ok(ToolIntent { tool: self.name.clone(), access: Access::Read,
-                paths: vec![], command: None, summary: "barrier".into() })
+            Ok(ToolIntent {
+                tool: self.name.clone(),
+                access: Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "barrier".into(),
+            })
         }
-        async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx)
-            -> Result<ToolOutput, ToolError> {
+        async fn execute(
+            &self,
+            _a: serde_json::Value,
+            _c: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
             self.barrier.wait().await;
-            Ok(ToolOutput { content: format!("{} done", self.name), display: None })
+            Ok(ToolOutput {
+                content: format!("{} done", self.name),
+                display: None,
+            })
         }
     }
 
@@ -1357,55 +2083,109 @@ mod tests {
     async fn parallel_tool_calls_execute_concurrently() {
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(BarrierTool { name: "wait_a".into(), barrier: barrier.clone() }));
-        r.register(Arc::new(BarrierTool { name: "wait_b".into(), barrier: barrier.clone() }));
+        r.register(Arc::new(BarrierTool {
+            name: "wait_a".into(),
+            barrier: barrier.clone(),
+        }));
+        r.register(Arc::new(BarrierTool {
+            name: "wait_b".into(),
+            barrier: barrier.clone(),
+        }));
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
                 ("c1".into(), "wait_a".into(), "{}".into()),
-                ("c2".into(), "wait_b".into(), "{}".into())]),
+                ("c2".into(), "wait_b".into(), "{}".into()),
+            ]),
             Scripted::Text("both done".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: std::env::temp_dir(),
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(r),
+            Arc::new(AllowAll),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: std::env::temp_dir(),
                 tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         // Sequential execution would block wait_a forever (wait_b never starts) -> timeout.
-        let res = tokio::time::timeout(std::time::Duration::from_secs(5),
-            agent.run(&mut ctx, "go".into())).await;
-        assert!(res.is_ok(), "parallel calls did not run concurrently (barrier deadlock)");
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.run(&mut ctx, "go".into()),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "parallel calls did not run concurrently (barrier deadlock)"
+        );
         res.unwrap().unwrap();
         let events = sink.events.lock().unwrap().clone();
-        assert_eq!(events.iter().filter(|e| e.starts_with("tool_result:")).count(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.starts_with("tool_result:"))
+                .count(),
+            2
+        );
     }
 
     /// Deterministic tool: sleeps `delay_ms`, then returns `body` as its content.
-    struct FakeTool { name: String, delay_ms: u64, body: String }
+    struct FakeTool {
+        name: String,
+        delay_ms: u64,
+        body: String,
+    }
     #[async_trait::async_trait]
     impl Tool for FakeTool {
-        fn name(&self) -> &str { &self.name }
-        fn description(&self) -> &str { "fake" }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "fake"
+        }
         fn schema(&self) -> ToolSchema {
-            ToolSchema { name: self.name.clone(), description: "fake".into(),
-                parameters: serde_json::json!({"type":"object","properties":{}}) }
+            ToolSchema {
+                name: self.name.clone(),
+                description: "fake".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            }
         }
         fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
-            Ok(ToolIntent { tool: self.name.clone(), access: Access::Read,
-                paths: vec![], command: None, summary: "fake".into() })
+            Ok(ToolIntent {
+                tool: self.name.clone(),
+                access: Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "fake".into(),
+            })
         }
-        async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx)
-            -> Result<ToolOutput, ToolError> {
+        async fn execute(
+            &self,
+            _a: serde_json::Value,
+            _c: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
             tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
-            Ok(ToolOutput { content: self.body.clone(), display: None })
+            Ok(ToolOutput {
+                content: self.body.clone(),
+                display: None,
+            })
         }
     }
 
     fn tool_messages(ctx: &WindowContext) -> Vec<(String, String)> {
-        ctx.build(usize::MAX).into_iter()
+        ctx.build(usize::MAX)
+            .into_iter()
             .filter(|m| m.role == Role::Tool)
             .map(|m| (m.tool_call_id.unwrap_or_default(), m.content))
             .collect()
@@ -1414,82 +2194,160 @@ mod tests {
     #[tokio::test]
     async fn tool_results_keep_model_call_order_despite_completion_order() {
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(FakeTool { name: "slow".into(), delay_ms: 150, body: "SLOW".into() }));
-        r.register(Arc::new(FakeTool { name: "fast".into(), delay_ms: 5, body: "FAST".into() }));
+        r.register(Arc::new(FakeTool {
+            name: "slow".into(),
+            delay_ms: 150,
+            body: "SLOW".into(),
+        }));
+        r.register(Arc::new(FakeTool {
+            name: "fast".into(),
+            delay_ms: 5,
+            body: "FAST".into(),
+        }));
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
-                ("c1".into(), "slow".into(), "{}".into()),   // finishes LAST
-                ("c2".into(), "fast".into(), "{}".into())]), // finishes FIRST
+                ("c1".into(), "slow".into(), "{}".into()), // finishes LAST
+                ("c2".into(), "fast".into(), "{}".into()),
+            ]), // finishes FIRST
             Scripted::Text("done".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
-            Arc::new(AlwaysApprove), sink,
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: std::env::temp_dir(),
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(r),
+            Arc::new(AllowAll),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: std::env::temp_dir(),
                 tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         let msgs = tool_messages(&ctx);
-        assert_eq!(msgs, vec![
-            ("c1".into(), "SLOW".into()),
-            ("c2".into(), "FAST".into())]);
+        assert_eq!(
+            msgs,
+            vec![("c1".into(), "SLOW".into()), ("c2".into(), "FAST".into())]
+        );
     }
 
     #[tokio::test]
     async fn multiple_tool_calls_produce_matched_results_in_order() {
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(FakeTool { name: "ta".into(), delay_ms: 0, body: "AAA".into() }));
-        r.register(Arc::new(FakeTool { name: "tb".into(), delay_ms: 0, body: "BBB".into() }));
-        r.register(Arc::new(FakeTool { name: "tc".into(), delay_ms: 0, body: "CCC".into() }));
+        r.register(Arc::new(FakeTool {
+            name: "ta".into(),
+            delay_ms: 0,
+            body: "AAA".into(),
+        }));
+        r.register(Arc::new(FakeTool {
+            name: "tb".into(),
+            delay_ms: 0,
+            body: "BBB".into(),
+        }));
+        r.register(Arc::new(FakeTool {
+            name: "tc".into(),
+            delay_ms: 0,
+            body: "CCC".into(),
+        }));
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
                 ("c1".into(), "ta".into(), "{}".into()),
                 ("c2".into(), "tb".into(), "{}".into()),
-                ("c3".into(), "tc".into(), "{}".into())]),
+                ("c3".into(), "tc".into(), "{}".into()),
+            ]),
             Scripted::Text("done".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: std::env::temp_dir(),
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(r),
+            Arc::new(AllowAll),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: std::env::temp_dir(),
                 tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
-        assert_eq!(tool_messages(&ctx), vec![
-            ("c1".into(), "AAA".into()),
-            ("c2".into(), "BBB".into()),
-            ("c3".into(), "CCC".into())]);
+        assert_eq!(
+            tool_messages(&ctx),
+            vec![
+                ("c1".into(), "AAA".into()),
+                ("c2".into(), "BBB".into()),
+                ("c3".into(), "CCC".into())
+            ]
+        );
         let events = sink.events.lock().unwrap().clone();
-        assert_eq!(events.iter().filter(|e| e.starts_with("tool_result:")).count(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.starts_with("tool_result:"))
+                .count(),
+            3
+        );
     }
 
     #[tokio::test]
     async fn one_failing_call_does_not_abort_the_others() {
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(FakeTool { name: "ta".into(), delay_ms: 0, body: "AAA".into() }));
-        r.register(Arc::new(FakeTool { name: "tc".into(), delay_ms: 0, body: "CCC".into() }));
+        r.register(Arc::new(FakeTool {
+            name: "ta".into(),
+            delay_ms: 0,
+            body: "AAA".into(),
+        }));
+        r.register(Arc::new(FakeTool {
+            name: "tc".into(),
+            delay_ms: 0,
+            body: "CCC".into(),
+        }));
         // "tb" is intentionally NOT registered -> unknown-tool rejection for c2.
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
                 ("c1".into(), "ta".into(), "{}".into()),
                 ("c2".into(), "tb".into(), "{}".into()),
-                ("c3".into(), "tc".into(), "{}".into())]),
+                ("c3".into(), "tc".into(), "{}".into()),
+            ]),
             Scripted::Text("done".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: std::env::temp_dir(),
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(r),
+            Arc::new(AllowAll),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: std::env::temp_dir(),
                 tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         let msgs = tool_messages(&ctx);
@@ -1501,9 +2359,18 @@ mod tests {
         // Every call terminates in a ToolResult — two ok, one denied (unknown
         // tool is gate-rejected) — and the loop still completes.
         let events = sink.events.lock().unwrap().clone();
-        assert_eq!(events.iter().filter(|e| e.starts_with("tool_result:")).count(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.starts_with("tool_result:"))
+                .count(),
+            3
+        );
         assert_eq!(events.iter().filter(|e| e.ends_with(":ok")).count(), 2);
-        assert!(events.iter().any(|e| e == "tool_result:tb:denied"), "events: {events:?}");
+        assert!(
+            events.iter().any(|e| e == "tool_result:tb:denied"),
+            "events: {events:?}"
+        );
         assert_eq!(events.last().unwrap(), "done");
     }
 
@@ -1511,11 +2378,16 @@ mod tests {
 
     struct AskAll;
     impl PolicyEngine for AskAll {
-        fn check(&self, _i: &ToolIntent) -> Decision { Decision::Ask }
+        fn check(&self, _i: &ToolIntent) -> Decision {
+            Decision::Ask
+        }
     }
 
     /// Approval channel that records the peak number of concurrent in-flight requests.
-    struct CountingApproval { inflight: AtomicUsize, peak: AtomicUsize }
+    struct CountingApproval {
+        inflight: AtomicUsize,
+        peak: AtomicUsize,
+    }
     #[async_trait::async_trait]
     impl ApprovalChannel for CountingApproval {
         async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
@@ -1529,8 +2401,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_emits_sandbox_degraded_even_without_tool_calls() {
-        use agent_tools::{CommandSpec, SandboxStrategy, SandboxedChild, SandboxError,
-            SandboxDescriptor, Mode, HostExecutor};
+        use agent_tools::{
+            CommandSpec, HostExecutor, Mode, SandboxDescriptor, SandboxError, SandboxStrategy,
+            SandboxedChild,
+        };
         use std::sync::Arc;
 
         struct DegradedFake;
@@ -1539,9 +2413,13 @@ mod tests {
                 HostExecutor.launch(spec)
             }
             fn describe(&self) -> SandboxDescriptor {
-                SandboxDescriptor { mode: Mode::Auto, mechanism: "docker",
-                    image: Some("debian:stable-slim".into()), network: false,
-                    degraded: Some("no daemon".into()) }
+                SandboxDescriptor {
+                    mode: Mode::Auto,
+                    mechanism: "docker",
+                    image: Some("debian:stable-slim".into()),
+                    network: false,
+                    degraded: Some("no daemon".into()),
+                }
             }
         }
 
@@ -1550,46 +2428,86 @@ mod tests {
         let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("hi".into())]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1,
-                temperature: 0.0, max_tokens: None, workspace: ws,
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
                 tool_timeout: std::time::Duration::from_secs(5),
                 stream_idle_timeout: std::time::Duration::from_secs(60),
-                sandbox: Some(Arc::new(DegradedFake)), ..Default::default() });
+                sandbox: Some(Arc::new(DegradedFake)),
+                ..Default::default()
+            },
+        );
 
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "hello".into()).await.unwrap();
 
         let events = sink.events.lock().unwrap();
-        assert!(events.iter().any(|e| e == "sandbox_degraded:docker"),
-            "degraded sandbox must be surfaced even with no tool calls: {events:?}");
+        assert!(
+            events.iter().any(|e| e == "sandbox_degraded:docker"),
+            "degraded sandbox must be surfaced even with no tool calls: {events:?}"
+        );
     }
 
     #[tokio::test]
     async fn approvals_are_serialized_across_parallel_calls() {
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(FakeTool { name: "ta".into(), delay_ms: 0, body: "AAA".into() }));
-        r.register(Arc::new(FakeTool { name: "tb".into(), delay_ms: 0, body: "BBB".into() }));
+        r.register(Arc::new(FakeTool {
+            name: "ta".into(),
+            delay_ms: 0,
+            body: "AAA".into(),
+        }));
+        r.register(Arc::new(FakeTool {
+            name: "tb".into(),
+            delay_ms: 0,
+            body: "BBB".into(),
+        }));
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
                 ("c1".into(), "ta".into(), "{}".into()),
-                ("c2".into(), "tb".into(), "{}".into())]),
+                ("c2".into(), "tb".into(), "{}".into()),
+            ]),
             Scripted::Text("done".into()),
         ]));
         let approval = Arc::new(CountingApproval {
-            inflight: AtomicUsize::new(0), peak: AtomicUsize::new(0) });
+            inflight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AskAll),
-            approval.clone(), Arc::new(CollectingSink::default()),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: std::env::temp_dir(),
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(r),
+            Arc::new(AskAll),
+            approval.clone(),
+            Arc::new(CollectingSink::default()),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: std::env::temp_dir(),
                 tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
-        assert_eq!(approval.peak.load(Ordering::SeqCst), 1,
-            "approval prompts must never overlap");
+        assert_eq!(
+            approval.peak.load(Ordering::SeqCst),
+            1,
+            "approval prompts must never overlap"
+        );
     }
 
     // ---- Panic + timeout isolation (execute_isolated) ---------------------
@@ -1604,47 +2522,81 @@ mod tests {
         INSTALL.call_once(|| {
             let default = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
-                let is_sentinel = info.payload().downcast_ref::<&str>()
-                    .map(|s| *s == "SENTINEL_TEST_PANIC").unwrap_or(false);
-                if !is_sentinel { default(info); }
+                let is_sentinel = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| *s == "SENTINEL_TEST_PANIC")
+                    .unwrap_or(false);
+                if !is_sentinel {
+                    default(info);
+                }
             }));
         });
     }
 
     /// A tool that panics inside `execute` (with the sentinel payload).
-    struct PanicTool { name: String }
+    struct PanicTool {
+        name: String,
+    }
     #[async_trait::async_trait]
     impl Tool for PanicTool {
-        fn name(&self) -> &str { &self.name }
-        fn description(&self) -> &str { "panics" }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "panics"
+        }
         fn schema(&self) -> ToolSchema {
-            ToolSchema { name: self.name.clone(), description: "panics".into(),
-                parameters: serde_json::json!({"type":"object","properties":{}}) }
+            ToolSchema {
+                name: self.name.clone(),
+                description: "panics".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            }
         }
         fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
-            Ok(ToolIntent { tool: self.name.clone(), access: Access::Read,
-                paths: vec![], command: None, summary: "panics".into() })
+            Ok(ToolIntent {
+                tool: self.name.clone(),
+                access: Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "panics".into(),
+            })
         }
-        async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx)
-            -> Result<ToolOutput, ToolError> {
+        async fn execute(
+            &self,
+            _a: serde_json::Value,
+            _c: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
             panic!("SENTINEL_TEST_PANIC");
         }
     }
 
     fn test_ctx(timeout: Duration) -> ToolCtx {
-        ToolCtx { workspace: std::env::temp_dir(), timeout,
+        ToolCtx {
+            workspace: std::env::temp_dir(),
+            timeout,
             cancel: CancellationToken::new(),
-            sandbox: Arc::new(agent_tools::HostExecutor) }
+            sandbox: Arc::new(agent_tools::HostExecutor),
+        }
     }
 
     #[tokio::test]
     async fn execute_isolated_catches_panic() {
         silence_sentinel_panics();
-        let tool: Arc<dyn Tool> = Arc::new(PanicTool { name: "boom".into() });
-        let ex = execute_isolated(tool, serde_json::json!({}), "boom",
-            &test_ctx(Duration::from_secs(5))).await;
-        assert!(matches!(ex, Executed::Panicked(ref s) if s.contains("boom") && s.contains("panicked")),
-            "panic must be caught as Executed::Panicked");
+        let tool: Arc<dyn Tool> = Arc::new(PanicTool {
+            name: "boom".into(),
+        });
+        let ex = execute_isolated(
+            tool,
+            serde_json::json!({}),
+            "boom",
+            &test_ctx(Duration::from_secs(5)),
+        )
+        .await;
+        assert!(
+            matches!(ex, Executed::Panicked(ref s) if s.contains("boom") && s.contains("panicked")),
+            "panic must be caught as Executed::Panicked"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1652,24 +2604,47 @@ mod tests {
         // Huge tool sleep vs a 100ms budget: under paused time the timeout timer
         // fires first, so this is deterministic with no real wall-clock wait.
         let tool: Arc<dyn Tool> = Arc::new(FakeTool {
-            name: "slow".into(), delay_ms: 3_600_000, body: "never".into() });
-        let ex = execute_isolated(tool, serde_json::json!({}), "slow",
-            &test_ctx(Duration::from_millis(100))).await;
-        assert!(matches!(ex, Executed::TimedOut(ref s) if s.contains("slow") && s.contains("backstop")),
-            "a tool ignoring ctx.timeout must be force-stopped by the backstop");
+            name: "slow".into(),
+            delay_ms: 3_600_000,
+            body: "never".into(),
+        });
+        let ex = execute_isolated(
+            tool,
+            serde_json::json!({}),
+            "slow",
+            &test_ctx(Duration::from_millis(100)),
+        )
+        .await;
+        assert!(
+            matches!(ex, Executed::TimedOut(ref s) if s.contains("slow") && s.contains("backstop")),
+            "a tool ignoring ctx.timeout must be force-stopped by the backstop"
+        );
     }
 
     #[tokio::test]
     async fn execute_isolated_passes_through_ok_and_err() {
         let ok_tool: Arc<dyn Tool> = Arc::new(FakeTool {
-            name: "ok".into(), delay_ms: 0, body: "hi".into() });
-        let ex = execute_isolated(ok_tool, serde_json::json!({}), "ok",
-            &test_ctx(Duration::from_secs(5))).await;
+            name: "ok".into(),
+            delay_ms: 0,
+            body: "hi".into(),
+        });
+        let ex = execute_isolated(
+            ok_tool,
+            serde_json::json!({}),
+            "ok",
+            &test_ctx(Duration::from_secs(5)),
+        )
+        .await;
         assert!(matches!(ex, Executed::Ok(ref o) if o.content == "hi"));
 
         let err_tool: Arc<dyn Tool> = Arc::new(ErrTool { name: "err".into() });
-        let ex = execute_isolated(err_tool, serde_json::json!({}), "err",
-            &test_ctx(Duration::from_secs(5))).await;
+        let ex = execute_isolated(
+            err_tool,
+            serde_json::json!({}),
+            "err",
+            &test_ctx(Duration::from_secs(5)),
+        )
+        .await;
         assert!(matches!(ex, Executed::ToolErr(ref s) if s.starts_with("ERROR: ")));
     }
 
@@ -1677,53 +2652,100 @@ mod tests {
     async fn execute_isolated_keeps_tool_honored_timeout_quiet() {
         // The tool self-times-out at ctx.timeout (100ms), before the 200ms backstop,
         // so it lands on the quiet ToolErr path, not the loud TimedOut path.
-        let tool: Arc<dyn Tool> = Arc::new(SelfTimeoutTool { name: "polite".into() });
-        let ex = execute_isolated(tool, serde_json::json!({}), "polite",
-            &test_ctx(Duration::from_millis(100))).await;
-        assert!(matches!(ex, Executed::ToolErr(ref s) if s.contains("timed out")),
-            "a tool honoring ctx.timeout stays on the quiet ToolErr path: {ex:?}");
+        let tool: Arc<dyn Tool> = Arc::new(SelfTimeoutTool {
+            name: "polite".into(),
+        });
+        let ex = execute_isolated(
+            tool,
+            serde_json::json!({}),
+            "polite",
+            &test_ctx(Duration::from_millis(100)),
+        )
+        .await;
+        assert!(
+            matches!(ex, Executed::ToolErr(ref s) if s.contains("timed out")),
+            "a tool honoring ctx.timeout stays on the quiet ToolErr path: {ex:?}"
+        );
     }
 
     /// A well-behaved tool that enforces `ctx.timeout` itself and returns
     /// ToolError::Timeout on elapse (never runs past its own deadline).
-    struct SelfTimeoutTool { name: String }
+    struct SelfTimeoutTool {
+        name: String,
+    }
     #[async_trait::async_trait]
     impl Tool for SelfTimeoutTool {
-        fn name(&self) -> &str { &self.name }
-        fn description(&self) -> &str { "self-times-out" }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "self-times-out"
+        }
         fn schema(&self) -> ToolSchema {
-            ToolSchema { name: self.name.clone(), description: "self-times-out".into(),
-                parameters: serde_json::json!({"type":"object","properties":{}}) }
+            ToolSchema {
+                name: self.name.clone(),
+                description: "self-times-out".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            }
         }
         fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
-            Ok(ToolIntent { tool: self.name.clone(), access: Access::Read,
-                paths: vec![], command: None, summary: "self-times-out".into() })
+            Ok(ToolIntent {
+                tool: self.name.clone(),
+                access: Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "self-times-out".into(),
+            })
         }
-        async fn execute(&self, _a: serde_json::Value, ctx: &ToolCtx)
-            -> Result<ToolOutput, ToolError> {
-            tokio::time::timeout(ctx.timeout, std::future::pending::<()>()).await
+        async fn execute(
+            &self,
+            _a: serde_json::Value,
+            ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            tokio::time::timeout(ctx.timeout, std::future::pending::<()>())
+                .await
                 .map_err(|_| ToolError::Timeout)?;
             unreachable!("pending never resolves")
         }
     }
 
     /// A tool that returns Err (not a panic) from `execute`.
-    struct ErrTool { name: String }
+    struct ErrTool {
+        name: String,
+    }
     #[async_trait::async_trait]
     impl Tool for ErrTool {
-        fn name(&self) -> &str { &self.name }
-        fn description(&self) -> &str { "errs" }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "errs"
+        }
         fn schema(&self) -> ToolSchema {
-            ToolSchema { name: self.name.clone(), description: "errs".into(),
-                parameters: serde_json::json!({"type":"object","properties":{}}) }
+            ToolSchema {
+                name: self.name.clone(),
+                description: "errs".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            }
         }
         fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
-            Ok(ToolIntent { tool: self.name.clone(), access: Access::Read,
-                paths: vec![], command: None, summary: "errs".into() })
+            Ok(ToolIntent {
+                tool: self.name.clone(),
+                access: Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "errs".into(),
+            })
         }
-        async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx)
-            -> Result<ToolOutput, ToolError> {
-            Err(ToolError::Failed { message: "nope".into(), stderr: None })
+        async fn execute(
+            &self,
+            _a: serde_json::Value,
+            _c: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            Err(ToolError::Failed {
+                message: "nope".into(),
+                stderr: None,
+            })
         }
     }
 
@@ -1731,107 +2753,213 @@ mod tests {
     async fn panicking_tool_is_isolated_from_the_batch() {
         silence_sentinel_panics();
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(PanicTool { name: "boom".into() }));
-        r.register(Arc::new(FakeTool { name: "ok".into(), delay_ms: 0, body: "OK".into() }));
+        r.register(Arc::new(PanicTool {
+            name: "boom".into(),
+        }));
+        r.register(Arc::new(FakeTool {
+            name: "ok".into(),
+            delay_ms: 0,
+            body: "OK".into(),
+        }));
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
                 ("c1".into(), "boom".into(), "{}".into()),
-                ("c2".into(), "ok".into(), "{}".into())]),
+                ("c2".into(), "ok".into(), "{}".into()),
+            ]),
             Scripted::Text("recovered".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: std::env::temp_dir(),
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(r),
+            Arc::new(AllowAll),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: std::env::temp_dir(),
                 tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
 
         // The panic must NOT abort the run.
-        agent.run(&mut ctx, "go".into()).await.expect("panic must be isolated, run completes");
+        agent
+            .run(&mut ctx, "go".into())
+            .await
+            .expect("panic must be isolated, run completes");
 
         let msgs = tool_messages(&ctx);
-        let boom = msgs.iter().find(|(id, _)| id == "c1").expect("c1 tool message present");
-        assert!(boom.1.contains("panicked"), "panicker yields an error tool-result: {boom:?}");
-        let ok = msgs.iter().find(|(id, _)| id == "c2").expect("c2 tool message present");
+        let boom = msgs
+            .iter()
+            .find(|(id, _)| id == "c1")
+            .expect("c1 tool message present");
+        assert!(
+            boom.1.contains("panicked"),
+            "panicker yields an error tool-result: {boom:?}"
+        );
+        let ok = msgs
+            .iter()
+            .find(|(id, _)| id == "c2")
+            .expect("c2 tool message present");
         assert_eq!(ok.1, "OK", "the sibling tool still ran");
 
         let events = sink.events.lock().unwrap().clone();
-        assert!(events.iter().any(|e| e.starts_with("error:") && e.contains("panicked")),
-            "a panic emits a loud AgentEvent::Error: {events:?}");
-        assert!(events.iter().any(|e| e == "tool_result:boom:panic"),
-            "the panicking call emits a terminal ToolResult with Panic status: {events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("error:") && e.contains("panicked")),
+            "a panic emits a loud AgentEvent::Error: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e == "tool_result:boom:panic"),
+            "the panicking call emits a terminal ToolResult with Panic status: {events:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn deadline_ignoring_tool_is_force_stopped_by_backstop() {
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(FakeTool { name: "hang".into(), delay_ms: 3_600_000, body: "never".into() }));
-        r.register(Arc::new(FakeTool { name: "ok".into(), delay_ms: 0, body: "OK".into() }));
+        r.register(Arc::new(FakeTool {
+            name: "hang".into(),
+            delay_ms: 3_600_000,
+            body: "never".into(),
+        }));
+        r.register(Arc::new(FakeTool {
+            name: "ok".into(),
+            delay_ms: 0,
+            body: "OK".into(),
+        }));
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
                 ("c1".into(), "hang".into(), "{}".into()),
-                ("c2".into(), "ok".into(), "{}".into())]),
+                ("c2".into(), "ok".into(), "{}".into()),
+            ]),
             Scripted::Text("recovered".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: std::env::temp_dir(),
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(r),
+            Arc::new(AllowAll),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: std::env::temp_dir(),
                 tool_timeout: std::time::Duration::from_millis(100),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
 
         // Under paused time, the 100ms dispatch timeout fires before the 3600s sleep,
         // so the turn completes instead of hanging.
-        agent.run(&mut ctx, "go".into()).await.expect("hang must be bounded, run completes");
+        agent
+            .run(&mut ctx, "go".into())
+            .await
+            .expect("hang must be bounded, run completes");
 
         let msgs = tool_messages(&ctx);
-        let hang = msgs.iter().find(|(id, _)| id == "c1").expect("c1 tool message present");
-        assert!(hang.1.contains("backstop"), "the offender is force-stopped by the backstop: {hang:?}");
-        let ok = msgs.iter().find(|(id, _)| id == "c2").expect("c2 tool message present");
+        let hang = msgs
+            .iter()
+            .find(|(id, _)| id == "c1")
+            .expect("c1 tool message present");
+        assert!(
+            hang.1.contains("backstop"),
+            "the offender is force-stopped by the backstop: {hang:?}"
+        );
+        let ok = msgs
+            .iter()
+            .find(|(id, _)| id == "c2")
+            .expect("c2 tool message present");
         assert_eq!(ok.1, "OK", "the sibling tool still ran");
 
         let events = sink.events.lock().unwrap().clone();
-        assert!(events.iter().any(|e| e.starts_with("error:") && e.contains("backstop")),
-            "the backstop emits a loud AgentEvent::Error: {events:?}");
-        assert!(events.iter().any(|e| e == "tool_result:hang:timeout"),
-            "the force-stopped call emits a terminal ToolResult with Timeout status: {events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("error:") && e.contains("backstop")),
+            "the backstop emits a loud AgentEvent::Error: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e == "tool_result:hang:timeout"),
+            "the force-stopped call emits a terminal ToolResult with Timeout status: {events:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn tool_honored_timeout_is_quiet_at_loop_level() {
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(SelfTimeoutTool { name: "polite".into() }));
-        r.register(Arc::new(FakeTool { name: "ok".into(), delay_ms: 0, body: "OK".into() }));
+        r.register(Arc::new(SelfTimeoutTool {
+            name: "polite".into(),
+        }));
+        r.register(Arc::new(FakeTool {
+            name: "ok".into(),
+            delay_ms: 0,
+            body: "OK".into(),
+        }));
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
                 ("c1".into(), "polite".into(), "{}".into()),
-                ("c2".into(), "ok".into(), "{}".into())]),
+                ("c2".into(), "ok".into(), "{}".into()),
+            ]),
             Scripted::Text("recovered".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), Arc::new(r), Arc::new(AllowAll),
-            Arc::new(AlwaysApprove), sink.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: std::env::temp_dir(),
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(r),
+            Arc::new(AllowAll),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: std::env::temp_dir(),
                 tool_timeout: std::time::Duration::from_millis(100),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
 
-        agent.run(&mut ctx, "go".into()).await.expect("run completes");
+        agent
+            .run(&mut ctx, "go".into())
+            .await
+            .expect("run completes");
 
         let msgs = tool_messages(&ctx);
-        let polite = msgs.iter().find(|(id, _)| id == "c1").expect("c1 tool message present");
-        assert!(polite.1.contains("timed out"), "tool's own timeout message is used: {polite:?}");
+        let polite = msgs
+            .iter()
+            .find(|(id, _)| id == "c1")
+            .expect("c1 tool message present");
+        assert!(
+            polite.1.contains("timed out"),
+            "tool's own timeout message is used: {polite:?}"
+        );
         let events = sink.events.lock().unwrap().clone();
-        assert!(!events.iter().any(|e| e.starts_with("error:")),
-            "a tool-honored timeout must NOT emit a loud AgentEvent::Error: {events:?}");
+        assert!(
+            !events.iter().any(|e| e.starts_with("error:")),
+            "a tool-honored timeout must NOT emit a loud AgentEvent::Error: {events:?}"
+        );
     }
 
     // ---- Per-call terminal ToolResult events (id, status, duration_ms) -----
@@ -1849,22 +2977,46 @@ mod tests {
         fn emit(&self, event: AgentEvent) {
             match event {
                 AgentEvent::ToolStart { id, .. } => self.starts.lock().unwrap().push(id),
-                AgentEvent::ToolResult { id, name, status, duration_ms, .. } =>
-                    self.results.lock().unwrap().push((id, name, status, duration_ms)),
+                AgentEvent::ToolResult {
+                    id,
+                    name,
+                    status,
+                    duration_ms,
+                    ..
+                } => self
+                    .results
+                    .lock()
+                    .unwrap()
+                    .push((id, name, status, duration_ms)),
                 _ => {}
             }
         }
     }
 
-    fn loop_with_capture(model: Arc<ScriptedModel>, tools: ToolRegistry,
-        capture: Arc<ToolEventCapture>) -> AgentLoop {
+    fn loop_with_capture(
+        model: Arc<ScriptedModel>,
+        tools: ToolRegistry,
+        capture: Arc<ToolEventCapture>,
+    ) -> AgentLoop {
         AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), Arc::new(tools), Arc::new(AllowAll),
-            Arc::new(AlwaysApprove), capture,
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: std::env::temp_dir(),
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(tools),
+            Arc::new(AllowAll),
+            Arc::new(AlwaysApprove),
+            capture,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: std::env::temp_dir(),
                 tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() })
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
     }
 
     #[tokio::test]
@@ -1873,14 +3025,19 @@ mod tests {
         // Denied), one erroring tool (-> Error). Every call must terminate in
         // exactly one ToolResult event.
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(FakeTool { name: "echo".into(), delay_ms: 0, body: "OK".into() }));
+        r.register(Arc::new(FakeTool {
+            name: "echo".into(),
+            delay_ms: 0,
+            body: "OK".into(),
+        }));
         r.register(Arc::new(ErrTool { name: "err".into() }));
         // "ghost" is intentionally NOT registered -> unknown-tool rejection.
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
                 ("c1".into(), "echo".into(), "{}".into()),
                 ("c2".into(), "ghost".into(), "{}".into()),
-                ("c3".into(), "err".into(), "{}".into())]),
+                ("c3".into(), "err".into(), "{}".into()),
+            ]),
             Scripted::Text("done".into()),
         ]));
         let capture = Arc::new(ToolEventCapture::default());
@@ -1889,7 +3046,11 @@ mod tests {
         agent.run(&mut ctx, "go".into()).await.unwrap();
 
         let results = capture.results.lock().unwrap();
-        assert_eq!(results.len(), 3, "one terminal event per call, got {results:?}");
+        assert_eq!(
+            results.len(),
+            3,
+            "one terminal event per call, got {results:?}"
+        );
         let statuses: std::collections::HashSet<_> = results.iter().map(|r| r.2).collect();
         assert!(statuses.contains(&ToolStatus::Ok));
         assert!(statuses.contains(&ToolStatus::Denied));
@@ -1900,12 +3061,21 @@ mod tests {
     async fn tool_result_ids_match_tool_start() {
         // Two parallel ok calls: every ToolResult id must match a ToolStart id.
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(FakeTool { name: "ta".into(), delay_ms: 0, body: "A".into() }));
-        r.register(Arc::new(FakeTool { name: "tb".into(), delay_ms: 0, body: "B".into() }));
+        r.register(Arc::new(FakeTool {
+            name: "ta".into(),
+            delay_ms: 0,
+            body: "A".into(),
+        }));
+        r.register(Arc::new(FakeTool {
+            name: "tb".into(),
+            delay_ms: 0,
+            body: "B".into(),
+        }));
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
                 ("c1".into(), "ta".into(), "{}".into()),
-                ("c2".into(), "tb".into(), "{}".into())]),
+                ("c2".into(), "tb".into(), "{}".into()),
+            ]),
             Scripted::Text("done".into()),
         ]));
         let capture = Arc::new(ToolEventCapture::default());
@@ -1915,8 +3085,13 @@ mod tests {
 
         let starts: std::collections::HashSet<_> =
             capture.starts.lock().unwrap().iter().cloned().collect();
-        let result_ids: std::collections::HashSet<_> =
-            capture.results.lock().unwrap().iter().map(|r| r.0.clone()).collect();
+        let result_ids: std::collections::HashSet<_> = capture
+            .results
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.0.clone())
+            .collect();
         assert_eq!(starts.len(), 2);
         assert_eq!(starts, result_ids);
     }
@@ -1925,11 +3100,16 @@ mod tests {
     async fn executed_calls_report_nonzero_duration_and_denied_zero() {
         // One ok call whose tool sleeps ~10ms, one unknown tool (never executed).
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(FakeTool { name: "sleepy".into(), delay_ms: 10, body: "Z".into() }));
+        r.register(Arc::new(FakeTool {
+            name: "sleepy".into(),
+            delay_ms: 10,
+            body: "Z".into(),
+        }));
         let model = Arc::new(ScriptedModel::new(vec![
             Scripted::Calls(vec![
                 ("c1".into(), "sleepy".into(), "{}".into()),
-                ("c2".into(), "ghost".into(), "{}".into())]),
+                ("c2".into(), "ghost".into(), "{}".into()),
+            ]),
             Scripted::Text("done".into()),
         ]));
         let capture = Arc::new(ToolEventCapture::default());
@@ -1940,32 +3120,58 @@ mod tests {
         let results = capture.results.lock().unwrap();
         let ok = results.iter().find(|r| r.2 == ToolStatus::Ok).unwrap();
         let denied = results.iter().find(|r| r.2 == ToolStatus::Denied).unwrap();
-        assert!(ok.3 >= 5, "executed duration_ms should reflect the ~10ms sleep, got {}", ok.3);
+        assert!(
+            ok.3 >= 5,
+            "executed duration_ms should reflect the ~10ms sleep, got {}",
+            ok.3
+        );
         assert_eq!(denied.3, 0, "gate-rejected calls never executed");
     }
 
     #[tokio::test]
     async fn server_usage_carries_turn_duration() {
-        struct UsageCapture { turn_duration_ms: Mutex<Option<u64>> }
+        struct UsageCapture {
+            turn_duration_ms: Mutex<Option<u64>>,
+        }
         impl EventSink for UsageCapture {
             fn emit(&self, event: AgentEvent) {
-                if let AgentEvent::ServerUsage { turn_duration_ms, .. } = event {
+                if let AgentEvent::ServerUsage {
+                    turn_duration_ms, ..
+                } = event
+                {
                     *self.turn_duration_ms.lock().unwrap() = Some(turn_duration_ms);
                 }
             }
         }
         let ws = std::env::temp_dir();
         let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("hi".into())]));
-        let capture = Arc::new(UsageCapture { turn_duration_ms: Mutex::new(None) });
+        let capture = Arc::new(UsageCapture {
+            turn_duration_ms: Mutex::new(None),
+        });
         let agent = AgentLoop::new(
-            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
-            Arc::new(AlwaysApprove), capture.clone(),
-            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
-                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            capture.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
-        assert!(capture.turn_duration_ms.lock().unwrap().is_some(),
-            "ServerUsage must carry a measured turn_duration_ms");
+        assert!(
+            capture.turn_duration_ms.lock().unwrap().is_some(),
+            "ServerUsage must carry a measured turn_duration_ms"
+        );
     }
 }

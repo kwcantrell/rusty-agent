@@ -25,7 +25,10 @@ pub struct SkillDto {
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
-pub enum SendOutcome { Started, Busy }
+pub enum SendOutcome {
+    Started,
+    Busy,
+}
 
 pub struct Session {
     runtime: Arc<RuntimeState>,
@@ -49,20 +52,36 @@ impl Session {
         let approval = Arc::new(IpcApprovalChannel::new(slot.clone(), APPROVAL_TIMEOUT));
         let config = RuntimeConfig::load_over(params.config.clone(), &params.config_path);
         let runtime = Arc::new(RuntimeState::new(
-            config, sink, approval.clone(), params.workspace.clone(), params.api_key.clone(),
-            params.claude_binary.clone(), params.config_path.clone(),
-            params.mcp_tools.clone(), params.memory_tools.clone(),
-            params.memory_retriever.clone(), params.system_prompt.clone()));
+            config,
+            sink,
+            approval.clone(),
+            params.workspace.clone(),
+            params.api_key.clone(),
+            params.claude_binary.clone(),
+            params.config_path.clone(),
+            params.mcp_tools.clone(),
+            params.memory_tools.clone(),
+            params.memory_retriever.clone(),
+            params.system_prompt.clone(),
+        ));
         let ctx = Arc::new(AsyncMutex::new(
             CuratedContext::new(
                 Message::system(params.system_prompt.clone()),
                 runtime.offload_store(),
                 runtime.compact_flag(),
             )
-            .with_recall_budget(params.recall_token_budget)));
-        Arc::new(Self { runtime, ctx, slot, approval,
-            active: Arc::new(Mutex::new(None)), recall_budget: params.recall_token_budget,
-            workspace: Mutex::new(params.workspace), memory_parts: params.memory_parts })
+            .with_recall_budget(params.recall_token_budget),
+        ));
+        Arc::new(Self {
+            runtime,
+            ctx,
+            slot,
+            approval,
+            active: Arc::new(Mutex::new(None)),
+            recall_budget: params.recall_token_budget,
+            workspace: Mutex::new(params.workspace),
+            memory_parts: params.memory_parts,
+        })
     }
 
     /// Register/replace the outbound channel (the `subscribe` command body).
@@ -73,7 +92,9 @@ impl Session {
     /// Start a run unless one is active (A1 guard).
     pub fn send_input(self: &Arc<Self>, text: String) -> SendOutcome {
         let mut active = self.active.lock().unwrap();
-        if active.is_some() { return SendOutcome::Busy; }
+        if active.is_some() {
+            return SendOutcome::Busy;
+        }
         let cancel = CancellationToken::new();
         *active = Some(cancel.clone());
         drop(active);
@@ -93,7 +114,11 @@ impl Session {
                 }
             }
             // Push a final stats snapshot so an attached client needs no poll.
-            let snapshot = runtime.stats().read().map(|s| s.clone()).unwrap_or_default();
+            let snapshot = runtime
+                .stats()
+                .read()
+                .map(|s| s.clone())
+                .unwrap_or_default();
             if let Some(out) = slot.lock().unwrap().clone() {
                 out.send(crate::wire::ServerEvent::SessionStats { stats: snapshot });
             }
@@ -104,7 +129,9 @@ impl Session {
 
     /// Trip the active run's token (the B3 interactive cancel). No-op when idle.
     pub fn cancel(&self) {
-        if let Some(tok) = self.active.lock().unwrap().as_ref() { tok.cancel(); }
+        if let Some(tok) = self.active.lock().unwrap().as_ref() {
+            tok.cancel();
+        }
     }
 
     pub fn approve(&self, id: &str, decision: Decision) {
@@ -117,7 +144,11 @@ impl Session {
 
     /// Snapshot of the cumulative per-session counters (the `session_stats` query).
     pub fn session_stats(&self) -> agent_core::SessionStats {
-        self.runtime.stats().read().map(|s| s.clone()).unwrap_or_default()
+        self.runtime
+            .stats()
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_default()
     }
 
     pub async fn context_get(&self) -> agent_core::ContextSnapshot {
@@ -133,28 +164,47 @@ impl Session {
 
     fn memory_admin(&self) -> Option<agent_memory::MemoryAdmin> {
         let parts = self.memory_parts.as_ref()?;
+        // Legacy lint, unrelated to this branch: explicit reborrow off the MutexGuard.
+        #[allow(clippy::explicit_auto_deref)]
         let scope = agent_memory::project_scope(&*self.workspace.lock().unwrap());
         Some(agent_memory::MemoryAdmin::new(
-            parts.embedder.clone(), parts.store.clone(), parts.cfg.clone(), scope))
+            parts.embedder.clone(),
+            parts.store.clone(),
+            parts.cfg.clone(),
+            scope,
+        ))
     }
 
-    pub async fn memory_list(&self, limit: usize, offset: usize)
-        -> Result<Vec<agent_memory::MemoryRow>, String> {
+    pub async fn memory_list(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<agent_memory::MemoryRow>, String> {
         match self.memory_admin() {
             Some(a) => a.list(limit, offset).await.map_err(|e| e.to_string()),
             None => Ok(vec![]),
         }
     }
 
-    pub async fn memory_update(&self, id: String, text: Option<String>, tags: Option<Vec<String>>)
-        -> Result<agent_memory::MemoryRow, String> {
-        self.memory_admin().ok_or_else(|| "memory disabled".to_string())?
-            .update(&id, text, tags).await.map_err(|e| e.to_string())
+    pub async fn memory_update(
+        &self,
+        id: String,
+        text: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> Result<agent_memory::MemoryRow, String> {
+        self.memory_admin()
+            .ok_or_else(|| "memory disabled".to_string())?
+            .update(&id, text, tags)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub async fn memory_delete(&self, id: String) -> Result<bool, String> {
-        self.memory_admin().ok_or_else(|| "memory disabled".to_string())?
-            .delete(&id).await.map_err(|e| e.to_string())
+        self.memory_admin()
+            .ok_or_else(|| "memory disabled".to_string())?
+            .delete(&id)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub async fn memory_recall_preview(&self, query: String) -> Vec<agent_memory::ScoredRow> {
@@ -177,14 +227,20 @@ impl Session {
         // Normalize to a slug for lookup (ignore errors), then fall through to the raw
         // name so non-slug callers still resolve.
         let slug = agent_skills::sanitize_slug(&name).ok();
-        let s = slug.as_deref().and_then(|sl| reg.find(sl))
+        let s = slug
+            .as_deref()
+            .and_then(|sl| reg.find(sl))
             .or_else(|| reg.find(&name))
             .ok_or_else(|| format!("skill not found: {name}"))?;
         Ok(SkillDto {
             name: s.name,
             description: s.description,
             body: s.body,
-            files: s.files.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+            files: s
+                .files
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
         })
     }
 
@@ -195,7 +251,8 @@ impl Session {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         // Preserve an existing description: try the original name first (consistent
         // with skill_get), then the slug, then fall back to a generated default.
-        let desc = reg.find(&name)
+        let desc = reg
+            .find(&name)
             .or_else(|| reg.find(&slug))
             .map(|s| s.description)
             .unwrap_or_else(|| format!("{slug} skill"));
@@ -233,14 +290,20 @@ mod tests {
     #[derive(Default)]
     struct Captured(Mutex<Vec<ServerEvent>>);
     impl EventOut for Captured {
-        fn send(&self, ev: ServerEvent) { self.0.lock().unwrap().push(ev); }
+        fn send(&self, ev: ServerEvent) {
+            self.0.lock().unwrap().push(ev);
+        }
     }
 
     fn session_with_scripted() -> (Arc<Session>, Arc<Captured>) {
         let dir = tempfile::tempdir().unwrap();
         let params = crate::setup::local_params(
-            dir.path().to_path_buf(), dir.path().join("rt.json"),
-            "http://localhost:8080".into(), "m".into(), None);
+            dir.path().to_path_buf(),
+            dir.path().join("rt.json"),
+            "http://localhost:8080".into(),
+            "m".into(),
+            None,
+        );
         let sess = Session::from_params(params);
         let cap = Arc::new(Captured::default());
         sess.set_event_out(cap.clone());
@@ -250,24 +313,38 @@ mod tests {
 
     #[tokio::test]
     async fn memory_list_returns_seeded_rows() {
-        use agent_memory::{MemoryConfig, MemoryParts, MemoryRecord, MemoryScope, MemoryStore,
-            InMemoryStore, StubEmbedder, now_secs};
+        use agent_memory::{
+            now_secs, InMemoryStore, MemoryConfig, MemoryParts, MemoryRecord, MemoryScope,
+            MemoryStore, StubEmbedder,
+        };
         use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
         let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
-        store.upsert(MemoryRecord {
-            id: "seed".into(), text: "hello world".into(), scope: MemoryScope::Global,
-            tags: vec![], vector: vec![0.1, 0.2], created_at: now_secs(), updated_at: now_secs(),
-            source: "test".into(),
-        }).await.unwrap();
+        store
+            .upsert(MemoryRecord {
+                id: "seed".into(),
+                text: "hello world".into(),
+                scope: MemoryScope::Global,
+                tags: vec![],
+                vector: vec![0.1, 0.2],
+                created_at: now_secs(),
+                updated_at: now_secs(),
+                source: "test".into(),
+            })
+            .await
+            .unwrap();
         let parts = MemoryParts {
             embedder: Arc::new(StubEmbedder::new(384)),
             store: store.clone(),
             cfg: Arc::new(MemoryConfig::default()),
         };
         let params = crate::setup::local_params(
-            dir.path().to_path_buf(), dir.path().join("rt.json"),
-            "http://localhost:8080".into(), "m".into(), Some(&parts));
+            dir.path().to_path_buf(),
+            dir.path().join("rt.json"),
+            "http://localhost:8080".into(),
+            "m".into(),
+            Some(&parts),
+        );
         let sess = Session::from_params(params);
         std::mem::forget(dir); // keep temp dir alive for the test process
         let rows = sess.memory_list(20, 0).await.unwrap();
@@ -326,7 +403,9 @@ mod tests {
     #[tokio::test]
     async fn skill_save_then_get_roundtrips() {
         let (sess, _cap) = session_with_scripted();
-        sess.skill_save("greeter".into(), "Say hello to the user.".into()).await.unwrap();
+        sess.skill_save("greeter".into(), "Say hello to the user.".into())
+            .await
+            .unwrap();
         let got = sess.skill_get("greeter".into()).await.unwrap();
         assert_eq!(got.name, "greeter");
         assert!(got.body.contains("hello"));
@@ -352,14 +431,17 @@ mod tests {
         .unwrap();
 
         // Simulate a body edit via skill_save using the same name "Greeter".
-        sess.skill_save("Greeter".into(), "Say hi to everyone.".into()).await.unwrap();
+        sess.skill_save("Greeter".into(), "Say hi to everyone.".into())
+            .await
+            .unwrap();
 
         // The written file goes to writable_root/greeter (the slug).
         // The description must be preserved from "Greeter", not defaulted to "greeter skill".
         let got = sess.skill_get("greeter".into()).await.unwrap();
         assert_eq!(
             got.description, "Greets the user warmly",
-            "description was lost on edit; got: {:?}", got.description
+            "description was lost on edit; got: {:?}",
+            got.description
         );
     }
 }

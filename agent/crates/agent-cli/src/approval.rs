@@ -21,7 +21,9 @@ impl TerminalApproval {
 
 impl Default for TerminalApproval {
     fn default() -> Self {
-        Self { timeout: DEFAULT_TERMINAL_APPROVAL_TIMEOUT }
+        Self {
+            timeout: DEFAULT_TERMINAL_APPROVAL_TIMEOUT,
+        }
     }
 }
 

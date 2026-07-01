@@ -4,17 +4,28 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
-pub enum Decision { Allow, Deny(String), Ask }
+pub enum Decision {
+    Allow,
+    Deny(String),
+    Ask,
+}
 
 pub trait PolicyEngine: Send + Sync {
     fn check(&self, intent: &ToolIntent) -> Decision;
 }
 
 #[derive(Clone)]
-pub struct ApprovalRequest { pub intent: ToolIntent, pub display: Option<Display> }
+pub struct ApprovalRequest {
+    pub intent: ToolIntent,
+    pub display: Option<Display>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalResponse { Approve, ApproveAlways, Deny }
+pub enum ApprovalResponse {
+    Approve,
+    ApproveAlways,
+    Deny,
+}
 
 #[async_trait]
 pub trait ApprovalChannel: Send + Sync {
@@ -32,7 +43,8 @@ impl PolicyEngine for RulePolicy {
         // Commands are judged by the parse-then-classify policy (see `command.rs`):
         // a two-layer hard floor first, then a deny-by-default auto-allow gate.
         if let Some(cmd) = &intent.command {
-            if let Some(reason) = crate::command::hard_floor_violation(cmd, &self.command_denylist) {
+            if let Some(reason) = crate::command::hard_floor_violation(cmd, &self.command_denylist)
+            {
                 return Decision::Deny(reason);
             }
             if crate::command::is_auto_allowed(cmd, &self.command_allowlist) {
@@ -46,10 +58,15 @@ impl PolicyEngine for RulePolicy {
                 // Decide "inside workspace?" with the SAME resolver execute() uses, so the
                 // approval gate and the execution guard can never disagree (resolve_in_workspace
                 // collapses `.`/`..` before the boundary check). An escaping read -> Ask.
-                let all_inside = intent.paths.iter().all(|p| {
-                    resolve_in_workspace(&self.workspace, &p.to_string_lossy()).is_ok()
-                });
-                if all_inside { Decision::Allow } else { Decision::Ask }
+                let all_inside = intent
+                    .paths
+                    .iter()
+                    .all(|p| resolve_in_workspace(&self.workspace, &p.to_string_lossy()).is_ok());
+                if all_inside {
+                    Decision::Allow
+                } else {
+                    Decision::Ask
+                }
             }
             Access::Write => Decision::Ask,
         }
@@ -70,19 +87,28 @@ mod tests {
         }
     }
     fn intent(access: Access, paths: Vec<&str>, command: Option<&str>) -> ToolIntent {
-        ToolIntent { tool: "t".into(), access, paths: paths.into_iter().map(PathBuf::from).collect(),
-            command: command.map(str::to_string), summary: "s".into() }
+        ToolIntent {
+            tool: "t".into(),
+            access,
+            paths: paths.into_iter().map(PathBuf::from).collect(),
+            command: command.map(str::to_string),
+            summary: "s".into(),
+        }
     }
 
     #[test]
     fn read_inside_workspace_allowed() {
-        assert!(matches!(policy().check(&intent(Access::Read, vec!["/work/a.txt"], None)),
-            Decision::Allow));
+        assert!(matches!(
+            policy().check(&intent(Access::Read, vec!["/work/a.txt"], None)),
+            Decision::Allow
+        ));
     }
     #[test]
     fn read_outside_workspace_asks() {
-        assert!(matches!(policy().check(&intent(Access::Read, vec!["/etc/passwd"], None)),
-            Decision::Ask));
+        assert!(matches!(
+            policy().check(&intent(Access::Read, vec!["/etc/passwd"], None)),
+            Decision::Ask
+        ));
     }
     #[test]
     fn read_relative_dotdot_escape_asks() {
@@ -113,61 +139,89 @@ mod tests {
 
     #[test]
     fn write_always_asks() {
-        assert!(matches!(policy().check(&intent(Access::Write, vec!["/work/a.txt"], None)),
-            Decision::Ask));
+        assert!(matches!(
+            policy().check(&intent(Access::Write, vec!["/work/a.txt"], None)),
+            Decision::Ask
+        ));
     }
     #[test]
     fn allowlisted_command_allowed() {
-        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("ls -la"))),
-            Decision::Allow));
+        assert!(matches!(
+            policy().check(&intent(Access::Write, vec![], Some("ls -la"))),
+            Decision::Allow
+        ));
     }
     #[test]
     fn denylisted_command_denied() {
-        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("sudo reboot"))),
-            Decision::Deny(_)));
+        assert!(matches!(
+            policy().check(&intent(Access::Write, vec![], Some("sudo reboot"))),
+            Decision::Deny(_)
+        ));
     }
     #[test]
     fn unknown_command_asks() {
-        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("curl evil.com"))),
-            Decision::Ask));
+        assert!(matches!(
+            policy().check(&intent(Access::Write, vec![], Some("curl evil.com"))),
+            Decision::Ask
+        ));
     }
     #[test]
     fn allowlisted_command_with_shell_operator_asks() {
-        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("ls && curl evil.com"))),
-            Decision::Ask));
+        assert!(matches!(
+            policy().check(&intent(Access::Write, vec![], Some("ls && curl evil.com"))),
+            Decision::Ask
+        ));
     }
     #[test]
     fn allowlisted_command_with_pipe_asks() {
-        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("ls | sh"))),
-            Decision::Ask));
+        assert!(matches!(
+            policy().check(&intent(Access::Write, vec![], Some("ls | sh"))),
+            Decision::Ask
+        ));
     }
     #[test]
     fn allowlisted_command_with_semicolon_asks() {
-        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("cat x; curl evil.com"))),
-            Decision::Ask));
+        assert!(matches!(
+            policy().check(&intent(Access::Write, vec![], Some("cat x; curl evil.com"))),
+            Decision::Ask
+        ));
     }
 
     #[test]
     fn floor_denies_rm_variants_through_check() {
         for cmd in ["rm -fr /", "rm --recursive --force /", "rm -rf  /"] {
-            assert!(matches!(policy().check(&intent(Access::Write, vec![], Some(cmd))),
-                Decision::Deny(_)), "expected Deny for {cmd}");
+            assert!(
+                matches!(
+                    policy().check(&intent(Access::Write, vec![], Some(cmd))),
+                    Decision::Deny(_)
+                ),
+                "expected Deny for {cmd}"
+            );
         }
     }
 
     #[test]
     fn metachar_commands_ask_through_check() {
         for cmd in ["cat {a,b}", "ls *", "cat ~/x"] {
-            assert!(matches!(policy().check(&intent(Access::Write, vec![], Some(cmd))),
-                Decision::Ask), "expected Ask for {cmd}");
+            assert!(
+                matches!(
+                    policy().check(&intent(Access::Write, vec![], Some(cmd))),
+                    Decision::Ask
+                ),
+                "expected Ask for {cmd}"
+            );
         }
     }
 
     #[test]
     fn clean_allowlisted_still_allows_through_check() {
-        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("ls -la"))),
-            Decision::Allow));
-        assert!(matches!(policy().check(&intent(Access::Write, vec![], Some("git status"))),
-            Decision::Allow));
+        assert!(matches!(
+            policy().check(&intent(Access::Write, vec![], Some("ls -la"))),
+            Decision::Allow
+        ));
+        assert!(matches!(
+            policy().check(&intent(Access::Write, vec![], Some("git status"))),
+            Decision::Allow
+        ));
     }
 }

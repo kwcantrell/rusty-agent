@@ -203,13 +203,15 @@ mod tests {
     fn build_keeps_system_and_drops_oldest_when_over_limit() {
         let mut ctx = WindowContext::new(Message::system("SYS"));
         for i in 0..50 {
-            ctx.append(Message::user(format!("message number {i} with some padding text")));
+            ctx.append(Message::user(format!(
+                "message number {i} with some padding text"
+            )));
         }
         // Tiny limit forces eviction.
         let built = ctx.build(40);
         assert!(matches!(built[0].role, Role::System)); // system always first
-        assert!(built.len() < 51);                       // some history evicted
-        // The most recent user message survives.
+        assert!(built.len() < 51); // some history evicted
+                                   // The most recent user message survives.
         let last = built.last().unwrap();
         assert!(last.content.contains("49"));
     }
@@ -229,9 +231,11 @@ mod tests {
         ctx.set_recall(vec!["user likes rust".into(), "project uses tokio".into()]);
         let built = ctx.build(100_000);
         assert!(matches!(built[0].role, Role::System)); // system first
-        assert_eq!(built[1].content,
-            "Relevant memories from past sessions:\n- user likes rust\n- project uses tokio");
-        assert!(matches!(built[1].role, Role::System));  // recall block is system-role
+        assert_eq!(
+            built[1].content,
+            "Relevant memories from past sessions:\n- user likes rust\n- project uses tokio"
+        );
+        assert!(matches!(built[1].role, Role::System)); // recall block is system-role
         assert_eq!(built.last().unwrap().content, "hello"); // history after recall
     }
 
@@ -274,13 +278,15 @@ mod tests {
     fn history_is_evicted_before_recall_and_system() {
         let mut ctx = WindowContext::new(Message::system("SYS"));
         for i in 0..50 {
-            ctx.append(Message::user(format!("message number {i} with some padding text")));
+            ctx.append(Message::user(format!(
+                "message number {i} with some padding text"
+            )));
         }
         ctx.set_recall(vec!["pinned memory".into()]);
         let built = ctx.build(40); // tiny limit forces history eviction
         assert!(matches!(built[0].role, Role::System));
         assert!(built[1].content.contains("pinned memory")); // recall survives
-        assert!(built.len() < 51);                            // history evicted
+        assert!(built.len() < 51); // history evicted
     }
 
     #[test]
@@ -290,7 +296,7 @@ mod tests {
         ctx.set_system(Message::system("NEW"));
         let built = ctx.build(100_000);
         assert!(matches!(built[0].role, Role::System)); // system still first
-        assert_eq!(built[0].content, "NEW");            // and replaced
+        assert_eq!(built[0].content, "NEW"); // and replaced
         assert!(built.iter().any(|m| m.content == "u1")); // history intact
     }
 }

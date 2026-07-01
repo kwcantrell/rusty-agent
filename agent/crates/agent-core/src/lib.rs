@@ -1,25 +1,25 @@
 //! Agent loop, context manager, and event model.
-mod event;
+mod compactor;
 mod context;
+mod context_tools;
+mod curated;
+mod event;
 mod loop_;
-mod recall;
 mod offload;
 mod offload_policy;
-mod curated;
-mod compactor;
-mod context_tools;
+mod recall;
 mod snapshot;
 pub mod stats;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
+pub use compactor::*;
 pub use context::*;
+pub use context_tools::*;
+pub use curated::*;
 pub use event::*;
 pub use loop_::*;
-pub use recall::*;
 pub use offload::*;
 pub use offload_policy::*;
-pub use curated::*;
-pub use compactor::*;
-pub use context_tools::*;
+pub use recall::*;
 pub use snapshot::{ContextSegment, ContextSnapshot};
 pub use stats::SessionStats;

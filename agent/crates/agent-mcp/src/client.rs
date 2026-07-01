@@ -45,7 +45,7 @@ impl McpClient {
         tokio::spawn(async move {
             while let Some(msg) = transport.recv().await {
                 let Some(id) = msg.get("id").and_then(Value::as_u64) else {
-                    continue
+                    continue;
                 }; // notifications ignored
                 if let Some(tx) = pending.lock().unwrap().remove(&id) {
                     let routed = if let Some(err) = msg.get("error") {
@@ -117,16 +117,26 @@ impl McpClient {
     /// `tools/list` → parse the tool descriptors.
     pub async fn list_tools(&self, timeout: Duration) -> Result<Vec<RawTool>, McpError> {
         let res = self.request("tools/list", json!({}), timeout).await?;
-        let arr = res.get("tools").and_then(Value::as_array)
+        let arr = res
+            .get("tools")
+            .and_then(Value::as_array)
             .ok_or_else(|| McpError::Protocol("tools/list: missing 'tools' array".into()))?;
         let mut out = Vec::with_capacity(arr.len());
         for t in arr {
-            let name = t.get("name").and_then(Value::as_str)
+            let name = t
+                .get("name")
+                .and_then(Value::as_str)
                 .ok_or_else(|| McpError::Protocol("tool missing 'name'".into()))?;
             out.push(RawTool {
                 name: name.to_string(),
-                description: t.get("description").and_then(Value::as_str).unwrap_or("").to_string(),
-                input_schema: t.get("inputSchema").cloned()
+                description: t
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                input_schema: t
+                    .get("inputSchema")
+                    .cloned()
                     .unwrap_or_else(|| json!({"type":"object"})),
             });
         }
@@ -201,6 +211,9 @@ mod tests {
         let tools = client.list_tools(Duration::from_secs(2)).await.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "read_file");
-        assert_eq!(tools[0].input_schema["properties"]["path"]["type"], "string");
+        assert_eq!(
+            tools[0].input_schema["properties"]["path"]["type"],
+            "string"
+        );
     }
 }

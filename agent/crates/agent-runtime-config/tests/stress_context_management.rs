@@ -22,7 +22,9 @@ use agent_core::{
 };
 use agent_model::{Message, ModelClient, NativeProtocol, OpenAiCompatClient, Role};
 use agent_policy::RulePolicy;
-use agent_tools::{Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema};
+use agent_tools::{
+    Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema,
+};
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -66,7 +68,10 @@ impl Tool for BlobTool {
     }
     async fn execute(&self, a: serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let n = a.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
-        Ok(ToolOutput { content: blob_body(n), display: None })
+        Ok(ToolOutput {
+            content: blob_body(n),
+            display: None,
+        })
     }
 }
 
@@ -87,14 +92,17 @@ impl EventSink for StressSink {
                 let mut m = self.max_prompt_tokens.lock().unwrap();
                 *m = (*m).max(prompt_tokens);
             }
-            AgentEvent::ToolResult { name, output, status: agent_core::ToolStatus::Ok, .. }
-                if name == "context_recall" => {
-                self.recalls.lock().unwrap().push(output.content)
-            }
-            AgentEvent::ToolResult { name, status: agent_core::ToolStatus::Ok, .. }
-                if name == "blob" => {
-                *self.blob_results.lock().unwrap() += 1
-            }
+            AgentEvent::ToolResult {
+                name,
+                output,
+                status: agent_core::ToolStatus::Ok,
+                ..
+            } if name == "context_recall" => self.recalls.lock().unwrap().push(output.content),
+            AgentEvent::ToolResult {
+                name,
+                status: agent_core::ToolStatus::Ok,
+                ..
+            } if name == "blob" => *self.blob_results.lock().unwrap() += 1,
             AgentEvent::Error(m) => self.errors.lock().unwrap().push(m),
             AgentEvent::Done(_) => *self.done.lock().unwrap() = true,
             _ => {}
@@ -139,14 +147,21 @@ async fn loop_stays_bounded_under_many_large_outputs_and_recalls() {
     // the end ids 1..=BLOBS-1 are in the store. high_water_pct 2.0 disables
     // compaction so this test isolates the offload+window path.
     let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag)
-        .with_offload_config(OffloadConfig { keep_recent: 1, ..Default::default() })
+        .with_offload_config(OffloadConfig {
+            keep_recent: 1,
+            ..Default::default()
+        })
         .with_high_water_pct(2.0);
 
     let agent = AgentLoop::new(
         Arc::new(ScriptedModel::new(script)),
         Arc::new(NativeProtocol),
         Arc::new(reg),
-        Arc::new(RulePolicy { workspace: ws.clone(), command_allowlist: vec![], command_denylist: vec![] }),
+        Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        }),
         Arc::new(AlwaysApprove),
         sink.clone(),
         LoopConfig {
@@ -161,7 +176,10 @@ async fn loop_stays_bounded_under_many_large_outputs_and_recalls() {
             ..Default::default()
         },
     );
-    agent.run(&mut ctx, "stress the context window".into()).await.unwrap();
+    agent
+        .run(&mut ctx, "stress the context window".into())
+        .await
+        .unwrap();
 
     // INVARIANT 1: the window never blew the budget, despite 60 x ~1.4KB outputs.
     let peak = *sink.max_prompt_tokens.lock().unwrap();
@@ -172,11 +190,19 @@ async fn loop_stays_bounded_under_many_large_outputs_and_recalls() {
     );
 
     // INVARIANT 2: lots actually got offloaded (not a trivially-passing test).
-    assert!(store.len() >= (BLOBS as usize) - 2, "most blobs should have offloaded; got {}", store.len());
+    assert!(
+        store.len() >= (BLOBS as usize) - 2,
+        "most blobs should have offloaded; got {}",
+        store.len()
+    );
 
     // INVARIANT 3: each interleaved recall returned the exact bytes for that id.
     let recalls = sink.recalls.lock().unwrap().clone();
-    assert_eq!(recalls.len(), recall_ids.len(), "every recall produced a result");
+    assert_eq!(
+        recalls.len(),
+        recall_ids.len(),
+        "every recall produced a result"
+    );
     for (slot, id) in recall_ids.iter().enumerate() {
         let marker = format!("<<n={id}>>");
         assert!(
@@ -192,7 +218,12 @@ fn maint<'a>(
     cancel: &'a tokio_util::sync::CancellationToken,
     limit: usize,
 ) -> MaintCtx<'a> {
-    MaintCtx { model_limit: limit, model, sink, cancel }
+    MaintCtx {
+        model_limit: limit,
+        model,
+        sink,
+        cancel,
+    }
 }
 
 struct NullSink;
@@ -211,7 +242,11 @@ async fn offload_table_recovers_every_entry_over_hundreds_of_cycles() {
     let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
     let flag = Arc::new(AtomicBool::new(false));
     let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag)
-        .with_offload_config(OffloadConfig { keep_recent: 0, error_min_bytes: 20, ..Default::default() })
+        .with_offload_config(OffloadConfig {
+            keep_recent: 0,
+            error_min_bytes: 20,
+            ..Default::default()
+        })
         .with_high_water_pct(2.0); // never compact — isolate the offload path
 
     // No compaction => the model is never called.
@@ -232,9 +267,15 @@ async fn offload_table_recovers_every_entry_over_hundreds_of_cycles() {
                 args: serde_json::json!({ "n": i }),
             }]),
         ));
-        ctx.append(Message::tool(id, "blob", format!("ERROR: {}", blob_body(i))));
+        ctx.append(Message::tool(
+            id,
+            "blob",
+            format!("ERROR: {}", blob_body(i)),
+        ));
 
-        let report: MaintReport = ctx.maintain(&maint(&model, &sink, &cancel, MODEL_LIMIT)).await;
+        let report: MaintReport = ctx
+            .maintain(&maint(&model, &sink, &cancel, MODEL_LIMIT))
+            .await;
         total_offloaded += report.offloaded;
 
         // INVARIANT: build() never exceeds the budget, on every single turn.
@@ -247,13 +288,26 @@ async fn offload_table_recovers_every_entry_over_hundreds_of_cycles() {
     }
 
     // INVARIANT: every blob was offloaded exactly once and the store holds them all.
-    assert_eq!(total_offloaded, TURNS as usize, "each turn must offload its one large result");
-    assert_eq!(store.len(), TURNS as usize, "store must hold every offloaded entry");
+    assert_eq!(
+        total_offloaded, TURNS as usize,
+        "each turn must offload its one large result"
+    );
+    assert_eq!(
+        store.len(),
+        TURNS as usize,
+        "store must hold every offloaded entry"
+    );
 
     // INVARIANT: every entry recovers to its exact bytes (spot-check the full range).
     for i in 1..=TURNS {
-        let entry = store.get(i).unwrap_or_else(|| panic!("entry #{i} vanished"));
-        assert_eq!(entry.content, format!("ERROR: {}", blob_body(i)), "entry #{i} corrupted");
+        let entry = store
+            .get(i)
+            .unwrap_or_else(|| panic!("entry #{i} vanished"));
+        assert_eq!(
+            entry.content,
+            format!("ERROR: {}", blob_body(i)),
+            "entry #{i} corrupted"
+        );
     }
 
     // INVARIANT: linkage intact — every tool message kept its id+name; for each one
@@ -266,9 +320,15 @@ async fn offload_table_recovers_every_entry_over_hundreds_of_cycles() {
         .map(|c| c.id.clone())
         .collect();
     for m in all.iter().filter(|m| matches!(m.role, Role::Tool)) {
-        let tcid = m.tool_call_id.as_ref().expect("tool message kept its tool_call_id");
+        let tcid = m
+            .tool_call_id
+            .as_ref()
+            .expect("tool message kept its tool_call_id");
         assert!(m.name.is_some(), "tool message kept its name");
-        assert!(assistant_ids.contains(tcid), "tool result {tcid} still paired to an assistant call");
+        assert!(
+            assistant_ids.contains(tcid),
+            "tool result {tcid} still paired to an assistant call"
+        );
     }
 }
 
@@ -284,13 +344,18 @@ async fn repeated_compaction_keeps_history_bounded_and_coherent() {
     let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
     let flag = Arc::new(AtomicBool::new(false));
     let mut ctx = CuratedContext::new(Message::system("SYS"), store, flag)
-        .with_offload_config(OffloadConfig { keep_recent: KEEP, ..Default::default() })
+        .with_offload_config(OffloadConfig {
+            keep_recent: KEEP,
+            ..Default::default()
+        })
         .with_high_water_pct(0.0); // over high-water every turn => always try to compact
 
     // A scripted model that hands back a short, non-empty summary every time it is
     // called — over-provisioned so the deque never drains across the run.
     let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![
-        Scripted::Text("compact summary of prior turns".into());
+        Scripted::Text(
+            "compact summary of prior turns".into()
+        );
         TURNS + 20
     ]));
     let sink: Arc<dyn EventSink> = Arc::new(NullSink);
@@ -300,37 +365,58 @@ async fn repeated_compaction_keeps_history_bounded_and_coherent() {
     for i in 0..TURNS {
         // A reasonably large user+assistant turn so the compaction is a net win.
         ctx.append(Message::user(format!("turn {i}: {}", "detail ".repeat(40))));
-        ctx.append(Message::assistant(format!("ack {i}: {}", "reasoning ".repeat(40)), None));
-        let report = ctx.maintain(&maint(&model, &sink, &cancel, MODEL_LIMIT)).await;
+        ctx.append(Message::assistant(
+            format!("ack {i}: {}", "reasoning ".repeat(40)),
+            None,
+        ));
+        let report = ctx
+            .maintain(&maint(&model, &sink, &cancel, MODEL_LIMIT))
+            .await;
         if report.compacted_turns > 0 {
             compactions += 1;
         }
 
         // INVARIANT: build() never exceeds the budget.
         let built = ctx.build(MODEL_LIMIT);
-        assert!(built_tokens(&built) <= MODEL_LIMIT, "turn {i} exceeded budget");
+        assert!(
+            built_tokens(&built) <= MODEL_LIMIT,
+            "turn {i} exceeded budget"
+        );
     }
 
     // Compaction actually happened repeatedly (not a no-op test).
-    assert!(compactions >= 50, "compaction should fire most turns; got {compactions}");
+    assert!(
+        compactions >= 50,
+        "compaction should fire most turns; got {compactions}"
+    );
 
     let built = ctx.build(MODEL_LIMIT);
     // INVARIANT: a summary block is pinned in.
     assert!(
-        built.iter().any(|m| m.content.contains("compact summary of prior turns")),
+        built
+            .iter()
+            .any(|m| m.content.contains("compact summary of prior turns")),
         "a compaction summary must be present"
     );
     // INVARIANT: the very last turn survived verbatim (within keep_recent).
     assert!(
-        built.iter().any(|m| m.content.starts_with(&format!("ack {}", TURNS - 1))),
+        built
+            .iter()
+            .any(|m| m.content.starts_with(&format!("ack {}", TURNS - 1))),
         "the newest assistant turn must be kept verbatim"
     );
     // INVARIANT: the live context never exceeds the token budget — this, not message
     // count, is the real "bounded" guarantee (build() truncates newest-first).
-    assert!(built_tokens(&built) <= MODEL_LIMIT, "built context must fit the budget");
+    assert!(
+        built_tokens(&built) <= MODEL_LIMIT,
+        "built context must fit the budget"
+    );
     // INVARIANT: assistant/tool CHATTER is collapsed into the summary rather than
     // accumulating — only the keep_recent newest non-user turns survive verbatim.
-    let assistant_kept = built.iter().filter(|m| matches!(m.role, Role::Assistant)).count();
+    let assistant_kept = built
+        .iter()
+        .filter(|m| matches!(m.role, Role::Assistant))
+        .count();
     assert!(
         assistant_kept <= KEEP + 2,
         "assistant chatter must be summarized away, not accumulate; kept {assistant_kept}"
@@ -342,7 +428,9 @@ async fn repeated_compaction_keeps_history_bounded_and_coherent() {
         "the earliest user instruction must survive compaction verbatim"
     );
     assert!(
-        built.iter().any(|m| m.content.starts_with(&format!("turn {}:", TURNS - 1))),
+        built
+            .iter()
+            .any(|m| m.content.starts_with(&format!("turn {}:", TURNS - 1))),
         "the latest user instruction must survive compaction verbatim"
     );
 }
@@ -385,11 +473,19 @@ async fn store_is_safe_and_lossless_under_concurrent_writers() {
     let total = (WRITERS * PER_WRITER) as usize;
     // INVARIANT: no id collisions across threads.
     let ids: HashSet<u64> = all.iter().map(|(id, _)| *id).collect();
-    assert_eq!(ids.len(), total, "every put must get a unique id (no races)");
+    assert_eq!(
+        ids.len(),
+        total,
+        "every put must get a unique id (no races)"
+    );
     assert_eq!(store.len(), total, "store must hold every concurrent write");
     // INVARIANT: every write reads back with the exact content the writer stored.
     for (id, content) in &all {
-        assert_eq!(store.get(*id).unwrap().content, *content, "entry #{id} corrupted under contention");
+        assert_eq!(
+            store.get(*id).unwrap().content,
+            *content,
+            "entry #{id} corrupted under contention"
+        );
     }
 }
 
@@ -424,18 +520,33 @@ async fn live_window_stays_bounded_under_model_driven_volume() {
     let sink = Arc::new(StressSink::default());
     // keep_recent 2; compaction disabled so the live model only drives blob/recall
     // and the offload+window path is what's under stress.
-    let mut ctx = CuratedContext::new(Message::system(
-        "You are a tool-using agent. The `blob` tool returns a large block of text \
+    let mut ctx = CuratedContext::new(
+        Message::system(
+            "You are a tool-using agent. The `blob` tool returns a large block of text \
          for a given integer `n`. When you call a tool, wait for its result.",
-    ), store.clone(), flag)
-        .with_offload_config(OffloadConfig { keep_recent: 2, ..Default::default() })
-        .with_high_water_pct(2.0);
+        ),
+        store.clone(),
+        flag,
+    )
+    .with_offload_config(OffloadConfig {
+        keep_recent: 2,
+        ..Default::default()
+    })
+    .with_high_water_pct(2.0);
 
     let agent = AgentLoop::new(
-        Arc::new(OpenAiCompatClient::new(url, model_name, std::env::var("AGENT_API_KEY").ok())),
+        Arc::new(OpenAiCompatClient::new(
+            url,
+            model_name,
+            std::env::var("AGENT_API_KEY").ok(),
+        )),
         Arc::new(NativeProtocol),
         Arc::new(reg),
-        Arc::new(RulePolicy { workspace: ws.clone(), command_allowlist: vec![], command_denylist: vec![] }),
+        Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        }),
         Arc::new(AlwaysApprove),
         sink.clone(),
         LoopConfig {

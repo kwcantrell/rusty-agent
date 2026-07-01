@@ -12,16 +12,22 @@ pub use trace::{build_trace, ObservedSink, TraceWriter};
 
 pub mod eval;
 
-use agent_mcp::McpServersConfig;
-use agent_model::{ClaudeCliClient, ModelClient, NativeProtocol, OpenAiCompatClient,
-                  PromptedJsonProtocol, ToolCallProtocol};
 use agent_http::{FetchUrl, NetworkPolicy};
-use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
-use agent_tools::{git::{GitCommit, GitDiff, GitStatus}, shell::ExecuteCommand, ToolRegistry};
-use agent_tools::{HostExecutor, Limits, Mode, RenderArtifact, SandboxStrategy, Tool};
+use agent_mcp::McpServersConfig;
+use agent_memory::{build_tools, build_tools_and_retriever, MemoryConfig};
+use agent_model::{
+    ClaudeCliClient, ModelClient, NativeProtocol, OpenAiCompatClient, PromptedJsonProtocol,
+    ToolCallProtocol,
+};
 use agent_sandbox::{validate_mount, DockerSandbox, SandboxPolicy};
 use agent_skills::{CreateSkill, ListSkills, ReadSkillFile, SkillRegistry, UseSkill};
-use agent_memory::{build_tools, build_tools_and_retriever, MemoryConfig};
+use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
+use agent_tools::{
+    git::{GitCommit, GitDiff, GitStatus},
+    shell::ExecuteCommand,
+    ToolRegistry,
+};
+use agent_tools::{HostExecutor, Limits, Mode, RenderArtifact, SandboxStrategy, Tool};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,10 +37,7 @@ pub use agent_mcp::{McpManager, ServerStatus};
 /// Load `mcp.json` at `path` and connect its servers. A missing file yields an
 /// empty manager (MCP disabled); a malformed file warns and yields empty. The
 /// returned `McpManager` owns the server processes — keep it alive for the session.
-pub async fn connect_mcp(
-    path: &Path,
-    sandbox: Arc<dyn SandboxStrategy>,
-) -> McpManager {
+pub async fn connect_mcp(path: &Path, sandbox: Arc<dyn SandboxStrategy>) -> McpManager {
     let (cfg, warning) = McpServersConfig::load_or_empty(path);
     if let Some(w) = warning {
         eprintln!("warning: {} ({}); MCP disabled", w, path.display());
@@ -68,7 +71,11 @@ pub fn build_model(
 ) -> Arc<dyn ModelClient> {
     match backend {
         "claude-cli" => Arc::new(ClaudeCliClient::new(claude_binary, model)),
-        _ => Arc::new(OpenAiCompatClient::new(base_url.to_string(), model.to_string(), api_key)),
+        _ => Arc::new(OpenAiCompatClient::new(
+            base_url.to_string(),
+            model.to_string(),
+            api_key,
+        )),
     }
 }
 
@@ -83,7 +90,9 @@ pub fn build_registry(http_allow_hosts: &[String]) -> ToolRegistry {
     r.register(Arc::new(GitDiff));
     r.register(Arc::new(GitCommit));
     r.register(Arc::new(RenderArtifact));
-    r.register(Arc::new(FetchUrl::new(NetworkPolicy::new(http_allow_hosts))));
+    r.register(Arc::new(FetchUrl::new(NetworkPolicy::new(
+        http_allow_hosts,
+    ))));
     r
 }
 
@@ -155,7 +164,11 @@ pub fn build_memory_full(
     let auto_recall = cfg.auto_recall;
 
     if !enabled {
-        return MemoryBuild { tools: Vec::new(), retriever: None, recall_token_budget };
+        return MemoryBuild {
+            tools: Vec::new(),
+            retriever: None,
+            recall_token_budget,
+        };
     }
     match build_tools_and_retriever(cfg, workspace) {
         Ok((tools, retriever)) => MemoryBuild {
@@ -165,20 +178,31 @@ pub fn build_memory_full(
         },
         Err(e) => {
             tracing::warn!(target: "memory", "disabled: {e}");
-            MemoryBuild { tools: Vec::new(), retriever: None, recall_token_budget }
+            MemoryBuild {
+                tools: Vec::new(),
+                retriever: None,
+                recall_token_budget,
+            }
         }
     }
 }
 
 pub fn default_allowlist() -> Vec<String> {
-    ["ls","cat","pwd","echo","git","grep","find","rg","cargo","head","tail","wc"]
-        .into_iter().map(String::from).collect()
+    [
+        "ls", "cat", "pwd", "echo", "git", "grep", "find", "rg", "cargo", "head", "tail", "wc",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 pub fn default_denylist() -> Vec<String> {
     // Bare program-name catastrophes (sudo/mkfs) are handled position-aware in agent-policy;
     // keeping them here as substrings would re-introduce the `man mkfs` false positive on the CLI.
     // Mirrors HARD_FLOOR_DENYLIST.
-    ["rm -rf /",":(){","dd if="].into_iter().map(String::from).collect()
+    ["rm -rf /", ":(){", "dd if="]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 /// Map a `RuntimeConfig` to a `SandboxStrategy`:
@@ -261,7 +285,11 @@ mod tests {
 
     fn base_cfg() -> RuntimeConfig {
         RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192,
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m1".into(),
+            "native".into(),
+            8192,
         )
     }
 
@@ -302,8 +330,17 @@ mod tests {
     #[test]
     fn registry_has_all_core_tools() {
         let r = build_registry(&[]);
-        for name in ["read_file","write_file","edit_file","list_directory",
-                     "execute_command","git_status","git_diff","git_commit","fetch_url"] {
+        for name in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_directory",
+            "execute_command",
+            "git_status",
+            "git_diff",
+            "git_commit",
+            "fetch_url",
+        ] {
             assert!(r.get(name).is_some(), "missing {name}");
         }
     }
@@ -311,7 +348,12 @@ mod tests {
     fn build_skills_returns_four_tools() {
         let (_reg, tools) = build_skills(&[], std::path::Path::new("/tmp/ws"));
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        for expected in ["list_skills", "use_skill", "read_skill_file", "create_skill"] {
+        for expected in [
+            "list_skills",
+            "use_skill",
+            "read_skill_file",
+            "create_skill",
+        ] {
             assert!(names.contains(&expected), "missing {expected}");
         }
     }

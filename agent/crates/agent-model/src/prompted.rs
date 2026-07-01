@@ -1,4 +1,6 @@
-use crate::{AssistantTurn, CompletionRequest, Message, ParsedTurn, ProtocolError, Role, ToolCallProtocol};
+use crate::{
+    AssistantTurn, CompletionRequest, Message, ParsedTurn, ProtocolError, Role, ToolCallProtocol,
+};
 use agent_tools::ToolCall;
 
 const FENCE: &str = "```tool_call";
@@ -10,12 +12,20 @@ impl PromptedJsonProtocol {
         let mut s = String::from(
             "You can call tools. To call one, emit a fenced block exactly like:\n\
              ```tool_call\n{\"name\":\"<tool>\",\"arguments\":{...}}\n```\n\
-             Emit at most one tool_call block per reply. Available tools:\n");
+             Emit at most one tool_call block per reply. Available tools:\n",
+        );
         for t in &req.tools {
             // Collapse internal whitespace so a multi-line description (e.g. one with
             // a folded `When NOT to call:` paragraph) stays on this one-line bullet.
-            let desc = t.description.split_whitespace().collect::<Vec<_>>().join(" ");
-            s.push_str(&format!("- {}: {} | schema: {}\n", t.name, desc, t.parameters));
+            let desc = t
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            s.push_str(&format!(
+                "- {}: {} | schema: {}\n",
+                t.name, desc, t.parameters
+            ));
         }
         s
     }
@@ -39,7 +49,10 @@ impl ToolCallProtocol for PromptedJsonProtocol {
     fn parse(&self, raw: &AssistantTurn) -> Result<ParsedTurn, ProtocolError> {
         let text = &raw.text;
         let Some(start) = text.find(FENCE) else {
-            return Ok(ParsedTurn { text: text.clone(), tool_calls: vec![] });
+            return Ok(ParsedTurn {
+                text: text.clone(),
+                tool_calls: vec![],
+            });
         };
         let after = &text[start + FENCE.len()..];
         let Some(end_rel) = after.find("```") else {
@@ -48,13 +61,24 @@ impl ToolCallProtocol for PromptedJsonProtocol {
         let body = after[..end_rel].trim();
         let v: serde_json::Value = serde_json::from_str(body)
             .map_err(|e| ProtocolError(format!("bad tool_call JSON: {e}")))?;
-        let name = v.get("name").and_then(|n| n.as_str())
+        let name = v
+            .get("name")
+            .and_then(|n| n.as_str())
             .ok_or_else(|| ProtocolError("tool_call missing `name`".into()))?;
-        let args = v.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
-        let visible = format!("{}{}", &text[..start], &after[end_rel + 3..]).trim().to_string();
+        let args = v
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let visible = format!("{}{}", &text[..start], &after[end_rel + 3..])
+            .trim()
+            .to_string();
         Ok(ParsedTurn {
             text: visible,
-            tool_calls: vec![ToolCall { id: "call_0".into(), name: name.into(), args }],
+            tool_calls: vec![ToolCall {
+                id: "call_0".into(),
+                name: name.into(),
+                args,
+            }],
         })
     }
 }
@@ -70,29 +94,47 @@ mod tests {
         // (`desc\n\nWhen NOT to call: ...`); the one-line bullet must not break.
         let req = CompletionRequest {
             messages: vec![Message::user("hi")],
-            tools: vec![agent_tools::ToolSchema { name: "read_file".into(),
-                description: "Read a file.\n\nWhen NOT to call: use read_skill_file instead.".into(),
-                parameters: serde_json::json!({"type":"object"}) }],
-            ..Default::default() };
+            tools: vec![agent_tools::ToolSchema {
+                name: "read_file".into(),
+                description: "Read a file.\n\nWhen NOT to call: use read_skill_file instead."
+                    .into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }],
+            ..Default::default()
+        };
         let preamble = PromptedJsonProtocol::system_preamble(&req);
-        let bullet = preamble.lines().find(|l| l.starts_with("- read_file:"))
+        let bullet = preamble
+            .lines()
+            .find(|l| l.starts_with("- read_file:"))
             .expect("read_file bullet present");
-        assert!(bullet.contains("When NOT to call: use read_skill_file instead."),
-            "exclusion prose stays on the bullet line: {bullet:?}");
-        assert!(bullet.contains("| schema:"),
-            "schema tail stays on the same line: {bullet:?}");
+        assert!(
+            bullet.contains("When NOT to call: use read_skill_file instead."),
+            "exclusion prose stays on the bullet line: {bullet:?}"
+        );
+        assert!(
+            bullet.contains("| schema:"),
+            "schema tail stays on the same line: {bullet:?}"
+        );
     }
 
     #[test]
     fn prepare_moves_schemas_into_system_prompt_and_clears_tools() {
         let mut req = CompletionRequest {
             messages: vec![Message::user("hi")],
-            tools: vec![agent_tools::ToolSchema { name: "read_file".into(),
-                description: "read".into(), parameters: serde_json::json!({"type":"object"}) }],
-            ..Default::default() };
+            tools: vec![agent_tools::ToolSchema {
+                name: "read_file".into(),
+                description: "read".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }],
+            ..Default::default()
+        };
         PromptedJsonProtocol.prepare(&mut req);
         assert!(req.tools.is_empty());
-        let sys = req.messages.iter().find(|m| matches!(m.role, Role::System)).unwrap();
+        let sys = req
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, Role::System))
+            .unwrap();
         assert!(sys.content.contains("read_file"));
     }
 
@@ -100,8 +142,13 @@ mod tests {
     fn parse_extracts_fenced_tool_call_block() {
         let text = "Let me read it.\n```tool_call\n{\"name\":\"read_file\",\
                     \"arguments\":{\"path\":\"a.txt\"}}\n```";
-        let turn = AssistantTurn { text: text.into(), raw_tool_calls: vec![],
-            stop: StopReason::Stop, reasoning: String::new(), ..Default::default() };
+        let turn = AssistantTurn {
+            text: text.into(),
+            raw_tool_calls: vec![],
+            stop: StopReason::Stop,
+            reasoning: String::new(),
+            ..Default::default()
+        };
         let parsed = PromptedJsonProtocol.parse(&turn).unwrap();
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "read_file");
@@ -112,8 +159,13 @@ mod tests {
 
     #[test]
     fn parse_returns_plain_text_when_no_block() {
-        let turn = AssistantTurn { text: "all done".into(), raw_tool_calls: vec![],
-            stop: StopReason::Stop, reasoning: String::new(), ..Default::default() };
+        let turn = AssistantTurn {
+            text: "all done".into(),
+            raw_tool_calls: vec![],
+            stop: StopReason::Stop,
+            reasoning: String::new(),
+            ..Default::default()
+        };
         let parsed = PromptedJsonProtocol.parse(&turn).unwrap();
         assert!(parsed.tool_calls.is_empty());
         assert_eq!(parsed.text, "all done");
@@ -121,8 +173,13 @@ mod tests {
 
     #[test]
     fn parse_errors_on_malformed_block() {
-        let turn = AssistantTurn { text: "```tool_call\n{bad}\n```".into(),
-            raw_tool_calls: vec![], stop: StopReason::Stop, reasoning: String::new(), ..Default::default() };
+        let turn = AssistantTurn {
+            text: "```tool_call\n{bad}\n```".into(),
+            raw_tool_calls: vec![],
+            stop: StopReason::Stop,
+            reasoning: String::new(),
+            ..Default::default()
+        };
         assert!(PromptedJsonProtocol.parse(&turn).is_err());
     }
 }

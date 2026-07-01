@@ -30,7 +30,12 @@ impl BatchResult {
     /// Median token count over passing runs only — failed runs are not comparable
     /// (a run that gave up early is "cheap" but worthless).
     pub fn median_tokens_passing(&self) -> Option<u64> {
-        let mut v: Vec<u64> = self.runs.iter().filter(|r| r.passed).map(|r| r.tokens).collect();
+        let mut v: Vec<u64> = self
+            .runs
+            .iter()
+            .filter(|r| r.passed)
+            .map(|r| r.tokens)
+            .collect();
         if v.is_empty() {
             return None;
         }
@@ -43,18 +48,26 @@ impl BatchResult {
 mod tests {
     use super::*;
     fn rr(passed: bool, tokens: u64) -> RunResult {
-        RunResult { passed, tokens, turns: 1 }
+        RunResult {
+            passed,
+            tokens,
+            turns: 1,
+        }
     }
     #[test]
     fn median_uses_only_passing_runs() {
-        let b = BatchResult { runs: vec![rr(true, 100), rr(false, 1), rr(true, 300), rr(true, 200)] };
+        let b = BatchResult {
+            runs: vec![rr(true, 100), rr(false, 1), rr(true, 300), rr(true, 200)],
+        };
         assert_eq!(b.passes(), 3);
         assert!((b.pass_rate() - 0.75).abs() < 1e-9);
         assert_eq!(b.median_tokens_passing(), Some(200)); // median of {100,200,300}
     }
     #[test]
     fn no_passing_runs_has_no_median() {
-        let b = BatchResult { runs: vec![rr(false, 5), rr(false, 9)] };
+        let b = BatchResult {
+            runs: vec![rr(false, 5), rr(false, 9)],
+        };
         assert_eq!(b.median_tokens_passing(), None);
         assert_eq!(b.pass_rate(), 0.0);
     }

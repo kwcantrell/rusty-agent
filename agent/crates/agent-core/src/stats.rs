@@ -28,8 +28,15 @@ impl SessionStats {
     /// server usage (total billed volume); `turns` tracks the highest turn seen.
     pub fn fold(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::ServerUsage { prompt_tokens, completion_tokens, reasoning_tokens,
-                cached_tokens, cost_usd, turn_duration_ms, turn } => {
+            AgentEvent::ServerUsage {
+                prompt_tokens,
+                completion_tokens,
+                reasoning_tokens,
+                cached_tokens,
+                cost_usd,
+                turn_duration_ms,
+                turn,
+            } => {
                 self.turns = self.turns.max(*turn);
                 self.prompt_tokens += *prompt_tokens as u64;
                 self.completion_tokens += *completion_tokens as u64;
@@ -39,7 +46,11 @@ impl SessionStats {
                 self.turn_time_ms += turn_duration_ms;
             }
             AgentEvent::ToolStart { .. } => self.tool_calls += 1,
-            AgentEvent::ToolResult { status, duration_ms, .. } => {
+            AgentEvent::ToolResult {
+                status,
+                duration_ms,
+                ..
+            } => {
                 self.tool_time_ms += duration_ms;
                 match status {
                     crate::ToolStatus::Ok => self.tools_ok += 1,
@@ -65,21 +76,52 @@ mod tests {
     #[test]
     fn fold_accumulates_usage_tools_and_context() {
         let mut s = SessionStats::default();
-        s.fold(&AgentEvent::ServerUsage { prompt_tokens: 100, completion_tokens: 40,
-            reasoning_tokens: Some(10), cached_tokens: Some(60), cost_usd: Some(0.02),
-            turn_duration_ms: 500, turn: 1 });
-        s.fold(&AgentEvent::ServerUsage { prompt_tokens: 200, completion_tokens: 50,
-            reasoning_tokens: None, cached_tokens: None, cost_usd: Some(0.03),
-            turn_duration_ms: 700, turn: 2 });
-        s.fold(&AgentEvent::ToolStart { id: "a".into(), name: "t".into(),
-            args: serde_json::json!({}) });
-        s.fold(&AgentEvent::ToolResult { id: "a".into(), name: "t".into(),
+        s.fold(&AgentEvent::ServerUsage {
+            prompt_tokens: 100,
+            completion_tokens: 40,
+            reasoning_tokens: Some(10),
+            cached_tokens: Some(60),
+            cost_usd: Some(0.02),
+            turn_duration_ms: 500,
+            turn: 1,
+        });
+        s.fold(&AgentEvent::ServerUsage {
+            prompt_tokens: 200,
+            completion_tokens: 50,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            cost_usd: Some(0.03),
+            turn_duration_ms: 700,
+            turn: 2,
+        });
+        s.fold(&AgentEvent::ToolStart {
+            id: "a".into(),
+            name: "t".into(),
+            args: serde_json::json!({}),
+        });
+        s.fold(&AgentEvent::ToolResult {
+            id: "a".into(),
+            name: "t".into(),
             status: ToolStatus::Ok,
-            output: ToolOutput { content: "x".into(), display: None }, duration_ms: 30 });
-        s.fold(&AgentEvent::ToolResult { id: "b".into(), name: "t".into(),
+            output: ToolOutput {
+                content: "x".into(),
+                display: None,
+            },
+            duration_ms: 30,
+        });
+        s.fold(&AgentEvent::ToolResult {
+            id: "b".into(),
+            name: "t".into(),
             status: ToolStatus::Timeout,
-            output: ToolOutput { content: "e".into(), display: None }, duration_ms: 60000 });
-        s.fold(&AgentEvent::Context(ContextEvent::CompactionFailed { reason: "r".into() }));
+            output: ToolOutput {
+                content: "e".into(),
+                display: None,
+            },
+            duration_ms: 60000,
+        });
+        s.fold(&AgentEvent::Context(ContextEvent::CompactionFailed {
+            reason: "r".into(),
+        }));
         s.fold(&AgentEvent::Error("boom".into()));
 
         assert_eq!(s.turns, 2);
@@ -89,7 +131,7 @@ mod tests {
         assert_eq!(s.cached_tokens, 60);
         assert!((s.cost_usd - 0.05).abs() < 1e-9);
         assert_eq!(s.turn_time_ms, 1200);
-        assert_eq!(s.tool_calls, 1);           // counted on ToolStart
+        assert_eq!(s.tool_calls, 1); // counted on ToolStart
         assert_eq!(s.tools_ok, 1);
         assert_eq!(s.tools_timeout, 1);
         assert_eq!(s.tool_time_ms, 60030);

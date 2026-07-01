@@ -5,7 +5,9 @@ use std::path::{Component, Path, PathBuf};
 /// workspace guard in `agent-tools`).
 pub fn resolve_in_dir(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     if Path::new(rel).is_absolute() {
-        return Err(format!("path must be relative to the skill directory: {rel}"));
+        return Err(format!(
+            "path must be relative to the skill directory: {rel}"
+        ));
     }
     let candidate = base_dir.join(rel);
     let normalized = normalize(&candidate);

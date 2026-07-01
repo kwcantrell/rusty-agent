@@ -27,19 +27,20 @@ pub fn render(
         .trim()
         .to_ascii_lowercase();
 
-    let (kind, raw): (&'static str, String) = if mime == "text/html" || mime == "application/xhtml+xml" {
-        ("markdown", html_to_text(body, base))
-    } else if mime == "application/json" || mime.ends_with("+json") {
-        ("json", String::from_utf8_lossy(body).into_owned())
-    } else if mime.starts_with("text/") {
-        ("text", String::from_utf8_lossy(body).into_owned())
-    } else {
-        let shown = if mime.is_empty() { "unknown" } else { &mime };
-        return Err(ToolError::Failed {
-            message: format!("non-text content ({} bytes, {shown})", body.len()),
-            stderr: None,
-        });
-    };
+    let (kind, raw): (&'static str, String) =
+        if mime == "text/html" || mime == "application/xhtml+xml" {
+            ("markdown", html_to_text(body, base))
+        } else if mime == "application/json" || mime.ends_with("+json") {
+            ("json", String::from_utf8_lossy(body).into_owned())
+        } else if mime.starts_with("text/") {
+            ("text", String::from_utf8_lossy(body).into_owned())
+        } else {
+            let shown = if mime.is_empty() { "unknown" } else { &mime };
+            return Err(ToolError::Failed {
+                message: format!("non-text content ({} bytes, {shown})", body.len()),
+                stderr: None,
+            });
+        };
 
     Ok(truncate(kind, raw, body.len(), download_truncated))
 }
@@ -59,7 +60,12 @@ fn html_to_text(body: &[u8], base: &Url) -> String {
 
 /// Bound the rendered text to `MAX_RETURN` bytes (on a char boundary) and append a
 /// marker if anything was dropped (either here or by the 2 MiB download cap).
-fn truncate(kind: &'static str, mut text: String, downloaded: usize, download_truncated: bool) -> Rendered {
+fn truncate(
+    kind: &'static str,
+    mut text: String,
+    downloaded: usize,
+    download_truncated: bool,
+) -> Rendered {
     let mut note = download_truncated;
     if text.len() > MAX_RETURN {
         let mut cut = MAX_RETURN;
@@ -70,9 +76,7 @@ fn truncate(kind: &'static str, mut text: String, downloaded: usize, download_tr
         note = true;
     }
     if note {
-        text.push_str(&format!(
-            "\n\n[truncated: {downloaded} bytes downloaded]"
-        ));
+        text.push_str(&format!("\n\n[truncated: {downloaded} bytes downloaded]"));
     }
     Rendered { kind, text }
 }
@@ -82,7 +86,9 @@ mod tests {
     use super::*;
     use url::Url;
 
-    fn base() -> Url { Url::parse("https://example.com/").unwrap() }
+    fn base() -> Url {
+        Url::parse("https://example.com/").unwrap()
+    }
 
     #[test]
     fn html_is_reduced_to_readable_text() {
@@ -110,9 +116,17 @@ mod tests {
 
     #[test]
     fn binary_is_refused() {
-        let err = render("application/octet-stream", &[0u8, 159, 146, 150], &base(), false).unwrap_err();
+        let err = render(
+            "application/octet-stream",
+            &[0u8, 159, 146, 150],
+            &base(),
+            false,
+        )
+        .unwrap_err();
         match err {
-            agent_tools::ToolError::Failed { message, .. } => assert!(message.contains("non-text content")),
+            agent_tools::ToolError::Failed { message, .. } => {
+                assert!(message.contains("non-text content"))
+            }
             _ => panic!("expected Failed"),
         }
     }

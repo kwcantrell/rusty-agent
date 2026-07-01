@@ -50,7 +50,10 @@ mod tests {
     fn exact_host_is_allowed_case_insensitively() {
         let p = NetworkPolicy::new(&["Docs.RS".to_string()]);
         assert!(matches!(p.decide("docs.rs"), HostDecision::Allow));
-        assert!(matches!(p.decide("evil.docs.rs.attacker.com"), HostDecision::Ask));
+        assert!(matches!(
+            p.decide("evil.docs.rs.attacker.com"),
+            HostDecision::Ask
+        ));
     }
 
     #[test]

@@ -2,7 +2,12 @@ use agent_tools::{ToolCall, ToolSchema};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Role { System, User, Assistant, Tool }
+pub enum Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
 
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -19,19 +24,41 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn system(c: impl Into<String>) -> Self { Self::plain(Role::System, c) }
-    pub fn user(c: impl Into<String>) -> Self { Self::plain(Role::User, c) }
+    pub fn system(c: impl Into<String>) -> Self {
+        Self::plain(Role::System, c)
+    }
+    pub fn user(c: impl Into<String>) -> Self {
+        Self::plain(Role::User, c)
+    }
     pub fn assistant(c: impl Into<String>, calls: Option<Vec<ToolCall>>) -> Self {
-        Self { role: Role::Assistant, content: c.into(), tool_calls: calls,
-               tool_call_id: None, name: None, reasoning: None }
+        Self {
+            role: Role::Assistant,
+            content: c.into(),
+            tool_calls: calls,
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+        }
     }
     pub fn tool(call_id: impl Into<String>, name: impl Into<String>, c: impl Into<String>) -> Self {
-        Self { role: Role::Tool, content: c.into(), tool_calls: None,
-               tool_call_id: Some(call_id.into()), name: Some(name.into()), reasoning: None }
+        Self {
+            role: Role::Tool,
+            content: c.into(),
+            tool_calls: None,
+            tool_call_id: Some(call_id.into()),
+            name: Some(name.into()),
+            reasoning: None,
+        }
     }
     fn plain(role: Role, c: impl Into<String>) -> Self {
-        Self { role, content: c.into(), tool_calls: None, tool_call_id: None, name: None,
-               reasoning: None }
+        Self {
+            role,
+            content: c.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+        }
     }
     /// Attach preserved reasoning, returning the message for chaining.
     pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
@@ -59,7 +86,14 @@ pub struct CompletionRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StopReason { #[default] Stop, ToolCalls, Length, BudgetExhausted, Cancelled }
+pub enum StopReason {
+    #[default]
+    Stop,
+    ToolCalls,
+    Length,
+    BudgetExhausted,
+    Cancelled,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct RawToolCall {
@@ -100,7 +134,10 @@ pub struct AssistantTurn {
 }
 
 #[derive(Debug, Clone)]
-pub struct ParsedTurn { pub text: String, pub tool_calls: Vec<ToolCall> }
+pub struct ParsedTurn {
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
+}
 
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("protocol error: {0}")]

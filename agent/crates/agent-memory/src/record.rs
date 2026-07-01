@@ -8,10 +8,16 @@ pub enum MemoryScope {
 
 impl MemoryScope {
     pub fn kind(&self) -> &'static str {
-        match self { MemoryScope::Project(_) => "project", MemoryScope::Global => "global" }
+        match self {
+            MemoryScope::Project(_) => "project",
+            MemoryScope::Global => "global",
+        }
     }
     pub fn key(&self) -> &str {
-        match self { MemoryScope::Project(k) => k, MemoryScope::Global => "" }
+        match self {
+            MemoryScope::Project(k) => k,
+            MemoryScope::Global => "",
+        }
     }
 }
 
@@ -56,7 +62,10 @@ pub struct Scored {
 
 pub fn now_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -65,7 +74,9 @@ mod tests {
 
     #[test]
     fn project_and_global_filter_admits_global_and_matching_project_only() {
-        let f = ScopeFilter::ProjectAndGlobal { project_key: "abc".into() };
+        let f = ScopeFilter::ProjectAndGlobal {
+            project_key: "abc".into(),
+        };
         assert!(f.matches(&MemoryScope::Global));
         assert!(f.matches(&MemoryScope::Project("abc".into())));
         assert!(!f.matches(&MemoryScope::Project("other".into())));

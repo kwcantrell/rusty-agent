@@ -125,9 +125,13 @@ mod tests {
 
     #[tokio::test]
     async fn run_compaction_returns_summary_message() {
-        let span = vec![Message::user("a".repeat(50)), Message::assistant("b".repeat(50), None)];
-        let model: Arc<dyn ModelClient> =
-            Arc::new(ScriptedModel::new(vec![Scripted::Text("decided X; bug Y open".into())]));
+        let span = vec![
+            Message::user("a".repeat(50)),
+            Message::assistant("b".repeat(50), None),
+        ];
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "decided X; bug Y open".into(),
+        )]));
         let cancel = CancellationToken::new();
         let msg = run_compaction(&span, None, &model, &cancel).await.unwrap();
         assert!(matches!(msg.role, Role::System));
@@ -139,7 +143,10 @@ mod tests {
         let span = vec![Message::user("tiny")];
         let empty = Message::system("Summary of earlier conversation:\n   ");
         assert!(!compaction_is_worthwhile(&empty, &span));
-        let huge = Message::system(format!("Summary of earlier conversation:\n{}", "x".repeat(9999)));
+        let huge = Message::system(format!(
+            "Summary of earlier conversation:\n{}",
+            "x".repeat(9999)
+        ));
         assert!(!compaction_is_worthwhile(&huge, &span));
     }
 }

@@ -1,9 +1,9 @@
+use crate::SandboxStrategy;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use crate::SandboxStrategy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSchema {
@@ -21,7 +21,10 @@ pub struct ToolCall {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Access { Read, Write }
+pub enum Access {
+    Read,
+    Write,
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolIntent {
@@ -35,41 +38,63 @@ pub struct ToolIntent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Display {
     Text(String),
-    Diff { path: String, before: String, after: String },
-    Terminal { command: String, stdout: String, stderr: String, exit_code: i32 },
+    Diff {
+        path: String,
+        before: String,
+        after: String,
+    },
+    Terminal {
+        command: String,
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    },
     Markdown {
         text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     Code {
         lang: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")] filename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
         text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     Html {
         html: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     Mermaid {
         source: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     Table {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     Image {
         mime: String,
         data: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")] title: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
 }
 
@@ -90,7 +115,10 @@ pub enum ToolError {
     #[error("not found: {0}")]
     NotFound(String),
     #[error("failed: {message}")]
-    Failed { message: String, stderr: Option<String> },
+    Failed {
+        message: String,
+        stderr: Option<String>,
+    },
     #[error("invalid arguments: {0}")]
     InvalidArgs(String),
 }
@@ -122,7 +150,10 @@ mod tests {
 
     #[test]
     fn tool_error_carries_context() {
-        let e = ToolError::Failed { message: "boom".into(), stderr: Some("trace".into()) };
+        let e = ToolError::Failed {
+            message: "boom".into(),
+            stderr: Some("trace".into()),
+        };
         match e {
             ToolError::Failed { message, stderr } => {
                 assert_eq!(message, "boom");
@@ -134,7 +165,11 @@ mod tests {
 
     #[test]
     fn display_markdown_round_trips_externally_tagged() {
-        let d = Display::Markdown { text: "# Hi".into(), title: Some("Notes".into()), id: None };
+        let d = Display::Markdown {
+            text: "# Hi".into(),
+            title: Some("Notes".into()),
+            id: None,
+        };
         let j = serde_json::to_string(&d).unwrap();
         assert!(j.starts_with("{\"Markdown\":"), "got {j}");
         assert!(j.contains("\"text\":\"# Hi\""));
@@ -144,12 +179,19 @@ mod tests {
 
     #[test]
     fn display_code_carries_lang_and_optional_filename() {
-        let d = Display::Code { lang: "rust".into(), filename: Some("a.rs".into()),
-            text: "fn x(){}".into(), title: None, id: Some("art-1".into()) };
+        let d = Display::Code {
+            lang: "rust".into(),
+            filename: Some("a.rs".into()),
+            text: "fn x(){}".into(),
+            title: None,
+            id: Some("art-1".into()),
+        };
         let j = serde_json::to_string(&d).unwrap();
         let back: Display = serde_json::from_str(&j).unwrap();
         match back {
-            Display::Code { lang, filename, id, .. } => {
+            Display::Code {
+                lang, filename, id, ..
+            } => {
                 assert_eq!(lang, "rust");
                 assert_eq!(filename.as_deref(), Some("a.rs"));
                 assert_eq!(id.as_deref(), Some("art-1"));
@@ -160,8 +202,12 @@ mod tests {
 
     #[test]
     fn display_table_round_trips() {
-        let d = Display::Table { columns: vec!["a".into(), "b".into()],
-            rows: vec![vec!["1".into(), "2".into()]], title: None, id: None };
+        let d = Display::Table {
+            columns: vec!["a".into(), "b".into()],
+            rows: vec![vec!["1".into(), "2".into()]],
+            title: None,
+            id: None,
+        };
         let j = serde_json::to_string(&d).unwrap();
         let back: Display = serde_json::from_str(&j).unwrap();
         assert!(matches!(back, Display::Table { .. }));
@@ -169,7 +215,11 @@ mod tests {
 
     #[test]
     fn existing_diff_variant_json_is_unchanged() {
-        let d = Display::Diff { path: "a".into(), before: "x".into(), after: "y".into() };
+        let d = Display::Diff {
+            path: "a".into(),
+            before: "x".into(),
+            after: "y".into(),
+        };
         let j = serde_json::to_string(&d).unwrap();
         assert_eq!(j, r#"{"Diff":{"path":"a","before":"x","after":"y"}}"#);
     }

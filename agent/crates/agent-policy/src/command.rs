@@ -58,7 +58,8 @@ fn is_recursive_flag(arg: &str) -> bool {
 }
 
 fn targets_root(args: &[String]) -> bool {
-    args.iter().any(|a| a == "/" || a == "/*" || a == "--no-preserve-root")
+    args.iter()
+        .any(|a| a == "/" || a == "/*" || a == "--no-preserve-root")
 }
 
 /// Catastrophe check keyed on a program's basename alone (no arguments needed): privilege-
@@ -86,8 +87,11 @@ fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
     if name == "rm" && rest.iter().any(|a| is_recursive_flag(a)) && targets_root(rest) {
         return Some("recursive delete of a root path is denied".to_string());
     }
-    if name == "dd" && rest.iter().any(|a| a.strip_prefix("of=")
-        .is_some_and(|v| v.starts_with("/dev/")))
+    if name == "dd"
+        && rest.iter().any(|a| {
+            a.strip_prefix("of=")
+                .is_some_and(|v| v.starts_with("/dev/"))
+        })
     {
         return Some("`dd` writing to a block device is denied".to_string());
     }
@@ -123,9 +127,9 @@ fn is_env_assignment(tok: &str) -> bool {
 /// with the SHELL_SIGNIFICANT over-approximation elsewhere in this file. A full quote-aware
 /// parser is deliberately out of scope.
 fn command_boundary_programs(cmd: &str) -> impl Iterator<Item = &str> {
-    cmd.split(|c| matches!(c, '&' | '|' | ';' | '\n' | '(' | ')' | '{' | '}' | '`'))
+    cmd.split(['&', '|', ';', '\n', '(', ')', '{', '}', '`'])
         .filter_map(|seg| seg.split_whitespace().find(|&tok| !is_env_assignment(tok)))
-        .map(|tok| tok.trim_matches(|c| c == '"' || c == '\''))
+        .map(|tok| tok.trim_matches(['"', '\'']))
         .filter(|tok| !tok.is_empty())
 }
 
@@ -174,8 +178,8 @@ pub fn hard_floor_violation(cmd: &str, denylist: &[String]) -> Option<String> {
 /// chars are conservatively rejected too — a safe over-approximation that only costs an
 /// approval prompt.
 const SHELL_SIGNIFICANT: &[char] = &[
-    '*', '?', '[', ']', '{', '}', '~', '$', '`',
-    '<', '>', '(', ')', ';', '&', '|', '\\', '\n', '#', '!',
+    '*', '?', '[', ']', '{', '}', '~', '$', '`', '<', '>', '(', ')', ';', '&', '|', '\\', '\n',
+    '#', '!',
 ];
 
 /// A command is auto-allowed only if it is a single simple command, free of shell-
@@ -192,7 +196,10 @@ pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
     if tokens.iter().any(|t| is_control_op(t)) {
         return false;
     }
-    if tokens.iter().any(|t| t.contains(|c| SHELL_SIGNIFICANT.contains(&c))) {
+    if tokens
+        .iter()
+        .any(|t| t.contains(|c| SHELL_SIGNIFICANT.contains(&c)))
+    {
         return false;
     }
     // Even an allowlisted program must not auto-run a catastrophe program passed as an argument
@@ -212,7 +219,10 @@ pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
     // RESIDUAL: the hard floor covers DIRECT catastrophe invocation, not catastrophes smuggled
     // through allowlisted exec vehicles. Mitigations: don't allowlist exec-capable programs if the
     // floor must hold, and rely on the execution sandbox (agent-sandbox).
-    if tokens.iter().any(|t| program_name_is_catastrophic(basename(t)).is_some()) {
+    if tokens
+        .iter()
+        .any(|t| program_name_is_catastrophic(basename(t)).is_some())
+    {
         return false;
     }
     let prog = &tokens[0];
@@ -229,10 +239,13 @@ mod tests {
     #[test]
     fn splits_on_spaced_operators() {
         let got = split_simple_commands("echo x && sudo reboot").unwrap();
-        assert_eq!(got, vec![
-            vec!["echo".to_string(), "x".to_string()],
-            vec!["sudo".to_string(), "reboot".to_string()],
-        ]);
+        assert_eq!(
+            got,
+            vec![
+                vec!["echo".to_string(), "x".to_string()],
+                vec!["sudo".to_string(), "reboot".to_string()],
+            ]
+        );
     }
 
     #[test]
@@ -259,7 +272,11 @@ mod tests {
         // Default hard-floor denylist literals (mirrors the runtime's HARD_FLOOR set).
         // Bare program names (sudo/mkfs) are NOT here — they are caught structurally &
         // position-aware, not by the substring backstop.
-        let deny = vec!["rm -rf /".to_string(), "dd if=".to_string(), ":(){".to_string()];
+        let deny = vec![
+            "rm -rf /".to_string(),
+            "dd if=".to_string(),
+            ":(){".to_string(),
+        ];
         hard_floor_violation(cmd, &deny)
     }
 
@@ -313,9 +330,9 @@ mod tests {
 
     #[test]
     fn floor_denies_catastrophe_name_in_program_position_via_boundary_scan() {
-        assert!(floor("ls|mkfs /dev/sda").is_some());        // glued pipe
-        assert!(floor("echo x&&mkfs /dev/sda").is_some());   // glued &&
-        assert!(floor("\"sudo reboot").is_some());           // unbalanced quote before program name
+        assert!(floor("ls|mkfs /dev/sda").is_some()); // glued pipe
+        assert!(floor("echo x&&mkfs /dev/sda").is_some()); // glued &&
+        assert!(floor("\"sudo reboot").is_some()); // unbalanced quote before program name
     }
 
     #[test]
@@ -336,9 +353,9 @@ mod tests {
     fn floor_allows_benign_despite_stricter_backstop() {
         assert!(floor("ls -la").is_none());
         assert!(floor("git status").is_none());
-        assert!(floor("make build").is_none());   // 'mk' prefix must not trip mkfs
-        // 'mkfs' as an argument (not program position) is fine in BOTH this test and prod:
-        // the real HARD_FLOOR_DENYLIST no longer contains a bare "mkfs" substring.
+        assert!(floor("make build").is_none()); // 'mk' prefix must not trip mkfs
+                                                // 'mkfs' as an argument (not program position) is fine in BOTH this test and prod:
+                                                // the real HARD_FLOOR_DENYLIST no longer contains a bare "mkfs" substring.
         assert!(floor("cat mkfs-notes.txt").is_none());
     }
 
@@ -372,21 +389,21 @@ mod tests {
 
     #[test]
     fn auto_allow_rejects_metacharacters() {
-        assert!(!allow("cat {a,b}"));      // brace expansion
-        assert!(!allow("ls *"));            // glob
-        assert!(!allow("cat ~/x"));         // tilde
-        assert!(!allow("ls | sh"));         // pipe
+        assert!(!allow("cat {a,b}")); // brace expansion
+        assert!(!allow("ls *")); // glob
+        assert!(!allow("cat ~/x")); // tilde
+        assert!(!allow("ls | sh")); // pipe
         assert!(!allow("cat x; curl evil")); // semicolon
         assert!(!allow("ls && curl evil")); // and-operator
-        assert!(!allow("echo $(whoami)"));  // command substitution
-        assert!(!allow("cat <in"));         // redirection
+        assert!(!allow("echo $(whoami)")); // command substitution
+        assert!(!allow("cat <in")); // redirection
     }
 
     #[test]
     fn auto_allow_rejects_explicit_paths_and_unknowns() {
-        assert!(!allow("./ls"));            // explicit path program
-        assert!(!allow("/bin/ls"));         // absolute path program
-        assert!(!allow("curl evil.com"));   // not on allowlist
+        assert!(!allow("./ls")); // explicit path program
+        assert!(!allow("/bin/ls")); // absolute path program
+        assert!(!allow("curl evil.com")); // not on allowlist
     }
 
     #[test]
@@ -411,11 +428,19 @@ mod tests {
         // runs. Position-aware layers can't see it; the name-exact guard can't either (the token is
         // "sudo reboot", basename != "sudo"). Under the DEFAULT allowlist (no interpreters) this
         // reaches Ask: NOT hard-denied, and NOT auto-allowed. Do not add interpreters to the allowlist.
-        let floor = vec!["rm -rf /".to_string(), ":(){".to_string(), "dd if=".to_string()];
-        let default_allow = vec!["ls","cat","pwd","echo","git","grep","find","rg","cargo","head","tail","wc"]
-            .into_iter().map(String::from).collect::<Vec<_>>();
+        let floor = vec![
+            "rm -rf /".to_string(),
+            ":(){".to_string(),
+            "dd if=".to_string(),
+        ];
+        let default_allow = vec![
+            "ls", "cat", "pwd", "echo", "git", "grep", "find", "rg", "cargo", "head", "tail", "wc",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
         assert!(hard_floor_violation(r#"bash -c "sudo reboot""#, &floor).is_none()); // not Deny
-        assert!(!is_auto_allowed(r#"bash -c "sudo reboot""#, &default_allow));       // not Allow -> Ask
+        assert!(!is_auto_allowed(r#"bash -c "sudo reboot""#, &default_allow)); // not Allow -> Ask
     }
 
     // --- Regression tests: under-denial cases fixed by widened boundary split + env-skip ---
@@ -455,6 +480,9 @@ mod tests {
         // runs its value via `sh -c`. This is auto-allowed by design; pinned so any future change
         // that alters it is noticed and re-evaluated. Mitigation = allowlist policy + sandbox.
         let al = vec!["git".to_string()];
-        assert!(is_auto_allowed(r#"git -c core.pager="sudo reboot" log"#, &al));
+        assert!(is_auto_allowed(
+            r#"git -c core.pager="sudo reboot" log"#,
+            &al
+        ));
     }
 }

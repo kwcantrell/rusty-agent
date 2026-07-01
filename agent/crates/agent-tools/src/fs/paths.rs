@@ -93,7 +93,9 @@ fn normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
         match comp {
-            Component::ParentDir => { out.pop(); }
+            Component::ParentDir => {
+                out.pop();
+            }
             Component::CurDir => {}
             other => out.push(other.as_os_str()),
         }
@@ -148,8 +150,10 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), ws.join("escape")).unwrap();
 
         let err = resolve_in_workspace(ws, "escape/secret.txt").unwrap_err();
-        assert!(matches!(err, ToolError::Denied(_)),
-            "symlink to an outside dir must be rejected");
+        assert!(
+            matches!(err, ToolError::Denied(_)),
+            "symlink to an outside dir must be rejected"
+        );
     }
 
     #[cfg(unix)]
@@ -164,8 +168,10 @@ mod tests {
         std::os::unix::fs::symlink(&target, ws.join("escape")).unwrap();
 
         let err = resolve_in_workspace(ws, "escape").unwrap_err();
-        assert!(matches!(err, ToolError::Denied(_)),
-            "dangling symlink to an outside target must be rejected");
+        assert!(
+            matches!(err, ToolError::Denied(_)),
+            "dangling symlink to an outside target must be rejected"
+        );
     }
 
     #[cfg(unix)]

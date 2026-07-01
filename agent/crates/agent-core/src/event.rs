@@ -5,22 +5,41 @@ use agent_tools::ToolOutput;
 /// Telemetry for context-window curation (offload / compaction).
 #[derive(Debug, Clone)]
 pub enum ContextEvent {
-    Offloaded { id: u64, bytes: usize, tool: String },
-    Compacted { turns_replaced: usize, tokens_before: usize, tokens_after: usize },
-    CompactionFailed { reason: String },
+    Offloaded {
+        id: u64,
+        bytes: usize,
+        tool: String,
+    },
+    Compacted {
+        turns_replaced: usize,
+        tokens_before: usize,
+        tokens_after: usize,
+    },
+    CompactionFailed {
+        reason: String,
+    },
 }
 
 /// Terminal status of one tool call — carried on every ToolResult so
 /// observers/evals can compute error and denial rates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolStatus { Ok, Denied, Error, Timeout, Panic }
+pub enum ToolStatus {
+    Ok,
+    Denied,
+    Error,
+    Timeout,
+    Panic,
+}
 
 impl ToolStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Ok => "ok", Self::Denied => "denied", Self::Error => "error",
-            Self::Timeout => "timeout", Self::Panic => "panic",
+            Self::Ok => "ok",
+            Self::Denied => "denied",
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+            Self::Panic => "panic",
         }
     }
 }
@@ -28,7 +47,12 @@ impl ToolStatus {
 pub enum AgentEvent {
     Token(String),
     Reasoning(String),
-    Usage { prompt_tokens: usize, context_limit: usize, turn: usize, max_turns: usize },
+    Usage {
+        prompt_tokens: usize,
+        context_limit: usize,
+        turn: usize,
+        max_turns: usize,
+    },
     /// Server-reported token usage for a completed turn (the faithful metric;
     /// `Usage.prompt_tokens` above is the pre-request local estimate).
     ServerUsage {
@@ -40,9 +64,19 @@ pub enum AgentEvent {
         turn_duration_ms: u64,
         turn: usize,
     },
-    ToolStart { id: String, name: String, args: serde_json::Value },
+    ToolStart {
+        id: String,
+        name: String,
+        args: serde_json::Value,
+    },
     /// duration_ms is 0 for gate-rejected calls that never executed.
-    ToolResult { id: String, name: String, status: ToolStatus, output: ToolOutput, duration_ms: u64 },
+    ToolResult {
+        id: String,
+        name: String,
+        status: ToolStatus,
+        output: ToolOutput,
+        duration_ms: u64,
+    },
     Approval(ApprovalRequest),
     Error(String),
     Done(StopReason),
@@ -52,7 +86,10 @@ pub enum AgentEvent {
     /// `auto` mode). The run is NOT isolated despite being configured to be;
     /// surfaces that "we thought we were sandboxed" hole loudly to every
     /// observer instead of leaving it in a single `tracing::warn!` line.
-    SandboxDegraded { mechanism: &'static str, reason: String },
+    SandboxDegraded {
+        mechanism: &'static str,
+        reason: String,
+    },
 }
 
 pub trait EventSink: Send + Sync {

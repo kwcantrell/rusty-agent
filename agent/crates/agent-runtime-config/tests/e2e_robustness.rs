@@ -30,17 +30,20 @@ impl EventSink for Capture {
     fn emit(&self, e: AgentEvent) {
         match e {
             AgentEvent::Token(t) => self.text.lock().unwrap().push_str(&t),
-            AgentEvent::ToolStart { name, .. } => {
-                self.events.lock().unwrap().push(format!("tool_start:{name}"))
-            }
-            AgentEvent::ToolResult { name, status, .. } => {
-                self.events.lock().unwrap().push(format!("tool_result:{name}:{}", status.as_str()))
-            }
-            AgentEvent::Approval(req) => self
+            AgentEvent::ToolStart { name, .. } => self
                 .events
                 .lock()
                 .unwrap()
-                .push(format!("approval:{}:{:?}", req.intent.tool, req.intent.paths)),
+                .push(format!("tool_start:{name}")),
+            AgentEvent::ToolResult { name, status, .. } => self
+                .events
+                .lock()
+                .unwrap()
+                .push(format!("tool_result:{name}:{}", status.as_str())),
+            AgentEvent::Approval(req) => self.events.lock().unwrap().push(format!(
+                "approval:{}:{:?}",
+                req.intent.tool, req.intent.paths
+            )),
             AgentEvent::Error(m) => self.events.lock().unwrap().push(format!("error:{m}")),
             AgentEvent::Done(r) => self.events.lock().unwrap().push(format!("done:{r:?}")),
             _ => {}
@@ -96,19 +99,34 @@ async fn b1_duplicate_tool_call_ids_through_assembled_loop() {
     std::fs::write(ws.join("a.txt"), "BODY").unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         Scripted::Calls(vec![
-            ("c1".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()),
-            ("c1".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()),
+            (
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
+            (
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
         ]),
         Scripted::Text("done".into()),
     ]));
     let (built, sink) = assemble_test(ws, model, Arc::new(AlwaysApprove));
     let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()));
 
-    built.loop_.run(&mut ctx, "read twice".into()).await.unwrap(); // must not panic
+    built
+        .loop_
+        .run(&mut ctx, "read twice".into())
+        .await
+        .unwrap(); // must not panic
 
     let events = sink.events.lock().unwrap().clone();
     assert_eq!(
-        events.iter().filter(|e| *e == "tool_result:read_file:ok").count(),
+        events
+            .iter()
+            .filter(|e| *e == "tool_result:read_file:ok")
+            .count(),
         2,
         "both reads should produce a result; events: {events:?}"
     );
@@ -118,8 +136,15 @@ async fn b1_duplicate_tool_call_ids_through_assembled_loop() {
         .filter(|m| matches!(m.role, Role::Tool))
         .map(|m| m.tool_call_id.clone().unwrap_or_default())
         .collect();
-    assert_eq!(tool_ids.len(), 2, "two tool messages expected: {tool_ids:?}");
-    assert_ne!(tool_ids[0], tool_ids[1], "duplicate ids must normalize to distinct");
+    assert_eq!(
+        tool_ids.len(),
+        2,
+        "two tool messages expected: {tool_ids:?}"
+    );
+    assert_ne!(
+        tool_ids[0], tool_ids[1],
+        "duplicate ids must normalize to distinct"
+    );
 }
 
 // T2 — B3: a pre-cancelled token stops the assembled loop cleanly, before the
@@ -128,19 +153,32 @@ async fn b1_duplicate_tool_call_ids_through_assembled_loop() {
 async fn b3_precancelled_token_stops_assembled_loop() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().to_path_buf();
-    let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("should not run".into())]));
+    let model = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+        "should not run".into(),
+    )]));
     let (built, sink) = assemble_test(ws, model, Arc::new(AlwaysApprove));
     let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()));
 
     let cancel = tokio_util::sync::CancellationToken::new();
     cancel.cancel(); // cancelled before the run starts
 
-    built.loop_.run_with_cancel(&mut ctx, "go".into(), cancel).await.unwrap();
+    built
+        .loop_
+        .run_with_cancel(&mut ctx, "go".into(), cancel)
+        .await
+        .unwrap();
 
     // Only the terminal Done(Cancelled); no Usage/Token (model never consulted).
     let events = sink.events.lock().unwrap().clone();
-    assert_eq!(events, vec!["done:Cancelled".to_string()], "events: {events:?}");
-    assert!(sink.text.lock().unwrap().is_empty(), "no model text should stream");
+    assert_eq!(
+        events,
+        vec!["done:Cancelled".to_string()],
+        "events: {events:?}"
+    );
+    assert!(
+        sink.text.lock().unwrap().is_empty(),
+        "no model text should stream"
+    );
 }
 
 struct DenyAll;
@@ -160,13 +198,21 @@ async fn c_escaping_read_requests_approval_through_assembled_loop() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().to_path_buf();
     let model = Arc::new(ScriptedModel::new(vec![
-        Scripted::Call("c1".into(), "read_file".into(), r#"{"path":"../../escape.txt"}"#.into()),
+        Scripted::Call(
+            "c1".into(),
+            "read_file".into(),
+            r#"{"path":"../../escape.txt"}"#.into(),
+        ),
         Scripted::Text("ok".into()),
     ]));
     let (built, sink) = assemble_test(ws, model, Arc::new(DenyAll));
     let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()));
 
-    built.loop_.run(&mut ctx, "read escaping".into()).await.unwrap();
+    built
+        .loop_
+        .run(&mut ctx, "read escaping".into())
+        .await
+        .unwrap();
 
     let events = sink.events.lock().unwrap().clone();
     assert!(
@@ -174,8 +220,12 @@ async fn c_escaping_read_requests_approval_through_assembled_loop() {
         "escaping read must request approval (normalized gate); events: {events:?}"
     );
     // Cluster-2 pinning: a denied call must surface a terminal tool_result with its status.
-    assert!(events.iter().any(|e| e.starts_with("tool_result:") && e.ends_with(":denied")),
-        "denied call must emit a terminal ToolResult event, got: {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.starts_with("tool_result:") && e.ends_with(":denied")),
+        "denied call must emit a terminal ToolResult event, got: {events:?}"
+    );
 }
 
 // T4 — B2: a truncated model stream (no finish_reason / [DONE]) is detected,
@@ -198,14 +248,21 @@ async fn b2_truncated_stream_surfaces_error_through_assembled_loop() {
 
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().to_path_buf();
-    let model = Arc::new(OpenAiCompatClient::new(server.uri(), "test-model".into(), None));
+    let model = Arc::new(OpenAiCompatClient::new(
+        server.uri(),
+        "test-model".into(),
+        None,
+    ));
     let (built, sink) = assemble_test(ws, model, Arc::new(AlwaysApprove));
     let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()));
 
     // max_retries is 3 (hardcoded in loop_config_from): 4 attempts, all truncated,
     // then the loop gives up and propagates the model error.
     let err = built.loop_.run(&mut ctx, "go".into()).await.unwrap_err();
-    assert!(matches!(err, AgentError::Model(_)), "expected Model error, got {err:?}");
+    assert!(
+        matches!(err, AgentError::Model(_)),
+        "expected Model error, got {err:?}"
+    );
     let events = sink.events.lock().unwrap().clone();
     assert!(
         events.iter().any(|e| e.starts_with("error:")),

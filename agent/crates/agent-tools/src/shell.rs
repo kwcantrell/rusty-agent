@@ -5,27 +5,44 @@ use serde_json::json;
 pub struct ExecuteCommand;
 
 fn cmd_arg(args: &serde_json::Value) -> Result<String, ToolError> {
-    args.get("command").and_then(|v| v.as_str()).map(str::to_string)
+    args.get("command")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
         .ok_or_else(|| ToolError::InvalidArgs("missing string field `command`".into()))
 }
 
 #[async_trait]
 impl Tool for ExecuteCommand {
-    fn name(&self) -> &str { "execute_command" }
-    fn description(&self) -> &str { "Run a shell command in the workspace directory." }
+    fn name(&self) -> &str {
+        "execute_command"
+    }
+    fn description(&self) -> &str {
+        "Run a shell command in the workspace directory."
+    }
     fn schema(&self) -> ToolSchema {
-        ToolSchema { name: self.name().into(), description: self.description().into(),
+        ToolSchema {
+            name: self.name().into(),
+            description: self.description().into(),
             parameters: json!({"type":"object","properties":{
                 "command":{"type":"string","description":"The shell command line to execute."}},
-                "required":["command"]}) }
+                "required":["command"]}),
+        }
     }
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
         let command = cmd_arg(args)?;
-        Ok(ToolIntent { tool: "execute_command".into(), access: Access::Write, paths: vec![],
-            command: Some(command.clone()), summary: format!("run `{command}`") })
+        Ok(ToolIntent {
+            tool: "execute_command".into(),
+            access: Access::Write,
+            paths: vec![],
+            command: Some(command.clone()),
+            summary: format!("run `{command}`"),
+        })
     }
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx)
-        -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         use tokio::io::AsyncReadExt;
         let command = cmd_arg(&args)?;
         let spec = crate::CommandSpec {
@@ -37,19 +54,26 @@ impl Tool for ExecuteCommand {
         };
         let mut child = ctx.sandbox.launch(spec).map_err(|e| match e {
             crate::SandboxError::Unavailable(m) => ToolError::Denied(m),
-            other => ToolError::Failed { message: other.to_string(), stderr: None },
+            other => ToolError::Failed {
+                message: other.to_string(),
+                stderr: None,
+            },
         })?;
 
         let mut out_pipe = child.take_stdout();
         let mut err_pipe = child.take_stderr();
         let read_out = async {
             let mut s = String::new();
-            if let Some(p) = out_pipe.as_mut() { let _ = p.read_to_string(&mut s).await; }
+            if let Some(p) = out_pipe.as_mut() {
+                let _ = p.read_to_string(&mut s).await;
+            }
             s
         };
         let read_err = async {
             let mut s = String::new();
-            if let Some(p) = err_pipe.as_mut() { let _ = p.read_to_string(&mut s).await; }
+            if let Some(p) = err_pipe.as_mut() {
+                let _ = p.read_to_string(&mut s).await;
+            }
             s
         };
 
@@ -71,9 +95,17 @@ impl Tool for ExecuteCommand {
             }
         };
         let exit_code = status.code().unwrap_or(-1);
-        let content = format!("exit={exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
-        Ok(ToolOutput { content, display: Some(Display::Terminal {
-            command, stdout, stderr, exit_code }) })
+        let content =
+            format!("exit={exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+        Ok(ToolOutput {
+            content,
+            display: Some(Display::Terminal {
+                command,
+                stdout,
+                stderr,
+                exit_code,
+            }),
+        })
     }
 }
 
@@ -87,16 +119,28 @@ mod tests {
 
     fn ctx(timeout: Duration) -> ToolCtx {
         use std::sync::Arc;
-        ToolCtx { workspace: std::env::temp_dir(), timeout, cancel: CancellationToken::new(),
-            sandbox: Arc::new(crate::HostExecutor) }
+        ToolCtx {
+            workspace: std::env::temp_dir(),
+            timeout,
+            cancel: CancellationToken::new(),
+            sandbox: Arc::new(crate::HostExecutor),
+        }
     }
 
     #[tokio::test]
     async fn runs_command_and_captures_stdout() {
-        let out = ExecuteCommand.execute(json!({"command":"echo hello"}),
-            &ctx(Duration::from_secs(5))).await.unwrap();
+        let out = ExecuteCommand
+            .execute(
+                json!({"command":"echo hello"}),
+                &ctx(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
         assert!(out.content.contains("hello"));
-        assert!(matches!(out.display, Some(Display::Terminal { exit_code: 0, .. })));
+        assert!(matches!(
+            out.display,
+            Some(Display::Terminal { exit_code: 0, .. })
+        ));
     }
 
     #[test]
@@ -108,8 +152,13 @@ mod tests {
 
     #[tokio::test]
     async fn times_out_long_command() {
-        let err = ExecuteCommand.execute(json!({"command":"sleep 5"}),
-            &ctx(Duration::from_millis(200))).await.unwrap_err();
+        let err = ExecuteCommand
+            .execute(
+                json!({"command":"sleep 5"}),
+                &ctx(Duration::from_millis(200)),
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Timeout));
     }
 
@@ -117,10 +166,17 @@ mod tests {
     async fn captures_large_output_without_deadlock() {
         // ~200 KiB of stdout — well past the OS pipe buffer; would hang under the
         // wait-before-drain bug.
-        let out = ExecuteCommand.execute(
-            json!({"command": "for i in $(seq 1 20000); do echo 0123456789; done"}),
-            &ctx(Duration::from_secs(20))).await.unwrap();
+        let out = ExecuteCommand
+            .execute(
+                json!({"command": "for i in $(seq 1 20000); do echo 0123456789; done"}),
+                &ctx(Duration::from_secs(20)),
+            )
+            .await
+            .unwrap();
         assert!(out.content.len() > 100_000);
-        assert!(matches!(out.display, Some(Display::Terminal { exit_code: 0, .. })));
+        assert!(matches!(
+            out.display,
+            Some(Display::Terminal { exit_code: 0, .. })
+        ));
     }
 }

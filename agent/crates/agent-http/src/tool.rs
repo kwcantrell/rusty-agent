@@ -22,7 +22,10 @@ pub struct FetchUrl {
 
 impl FetchUrl {
     pub fn new(policy: NetworkPolicy) -> Self {
-        Self { policy, guard: SsrfGuard::strict() }
+        Self {
+            policy,
+            guard: SsrfGuard::strict(),
+        }
     }
 
     #[cfg(test)]
@@ -64,7 +67,11 @@ impl Resolve for FixedResolver {
 }
 
 /// Resolve `host:port` to socket addresses, honoring cancellation.
-async fn resolve(host: &str, port: u16, cancel: &CancellationToken) -> Result<Vec<SocketAddr>, ToolError> {
+async fn resolve(
+    host: &str,
+    port: u16,
+    cancel: &CancellationToken,
+) -> Result<Vec<SocketAddr>, ToolError> {
     let lookup = tokio::net::lookup_host((host, port));
     let addrs = tokio::select! {
         _ = cancel.cancelled() => return Err(ToolError::Timeout),
@@ -93,14 +100,23 @@ async fn read_capped(
                     return Ok((buf, true));
                 }
             }
-            Some(Err(e)) => return Err(ToolError::Failed { message: format!("body read: {e}"), stderr: None }),
+            Some(Err(e)) => {
+                return Err(ToolError::Failed {
+                    message: format!("body read: {e}"),
+                    stderr: None,
+                })
+            }
             None => return Ok((buf, false)),
         }
     }
 }
 
 fn human(bytes: usize) -> String {
-    if bytes >= 1024 { format!("{:.1} KB", bytes as f64 / 1024.0) } else { format!("{bytes} B") }
+    if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 #[async_trait]
@@ -180,11 +196,17 @@ impl Tool for FetchUrl {
             // Pin reqwest to the validated address; disable auto-redirects so we re-validate each hop.
             let client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .dns_resolver(Arc::new(FixedResolver { ip: addrs[0].ip(), port }))
+                .dns_resolver(Arc::new(FixedResolver {
+                    ip: addrs[0].ip(),
+                    port,
+                }))
                 .timeout(ctx.timeout)
                 .user_agent(USER_AGENT)
                 .build()
-                .map_err(|e| ToolError::Failed { message: format!("http client: {e}"), stderr: None })?;
+                .map_err(|e| ToolError::Failed {
+                    message: format!("http client: {e}"),
+                    stderr: None,
+                })?;
 
             let send = client.get(url.clone()).send();
             let resp = tokio::select! {
@@ -202,13 +224,20 @@ impl Tool for FetchUrl {
                 {
                     hops += 1;
                     if hops > MAX_REDIRECTS {
-                        return Err(ToolError::Failed { message: "too many redirects".into(), stderr: None });
+                        return Err(ToolError::Failed {
+                            message: "too many redirects".into(),
+                            stderr: None,
+                        });
                     }
-                    url = url
-                        .join(loc)
-                        .map_err(|e| ToolError::Failed { message: format!("bad redirect '{loc}': {e}"), stderr: None })?;
+                    url = url.join(loc).map_err(|e| ToolError::Failed {
+                        message: format!("bad redirect '{loc}': {e}"),
+                        stderr: None,
+                    })?;
                     if !matches!(url.scheme(), "http" | "https") {
-                        return Err(ToolError::Denied(format!("redirect to non-http scheme '{}'", url.scheme())));
+                        return Err(ToolError::Denied(format!(
+                            "redirect to non-http scheme '{}'",
+                            url.scheme()
+                        )));
                     }
                     // Re-run the host policy for the new target (decide-at-execution).
                     let new_host = url
@@ -238,14 +267,21 @@ impl Tool for FetchUrl {
             let rendered = crate::content::render(&ctype, &body, &url, hit_cap)?;
 
             let final_url = url.to_string();
-            let content = format!("GET {final_url} -> {}\n\n{}", status.as_u16(), rendered.text);
+            let content = format!(
+                "GET {final_url} -> {}\n\n{}",
+                status.as_u16(),
+                rendered.text
+            );
             let display = Display::Text(format!(
                 "GET {final_url} -> {} ({} {})",
                 status.as_u16(),
                 human(body.len()),
                 rendered.kind
             ));
-            return Ok(ToolOutput { content, display: Some(display) });
+            return Ok(ToolOutput {
+                content,
+                display: Some(display),
+            });
         }
     }
 }
@@ -276,7 +312,9 @@ mod tests {
     #[test]
     fn allowlisted_host_maps_to_read_and_rule_policy_allows() {
         let t = FetchUrl::new(NetworkPolicy::new(&["example.com".to_string()]));
-        let intent = t.intent(&json!({"url": "https://example.com/page"})).unwrap();
+        let intent = t
+            .intent(&json!({"url": "https://example.com/page"}))
+            .unwrap();
         assert!(matches!(intent.access, Access::Read));
         assert!(intent.paths.is_empty());
         assert!(matches!(rule_policy().check(&intent), Decision::Allow));
@@ -300,7 +338,10 @@ mod tests {
     #[test]
     fn missing_url_is_invalid_args() {
         let t = FetchUrl::new(NetworkPolicy::new(&[]));
-        assert!(matches!(t.intent(&json!({})).unwrap_err(), agent_tools::ToolError::InvalidArgs(_)));
+        assert!(matches!(
+            t.intent(&json!({})).unwrap_err(),
+            agent_tools::ToolError::InvalidArgs(_)
+        ));
     }
 
     use crate::ssrf::SsrfGuard;
@@ -328,14 +369,23 @@ mod tests {
     #[tokio::test]
     async fn fetches_html_and_returns_readable_text() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/doc"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/html")
-                .set_body_string("<html><body><h1>Hi</h1><p>Readable body here.</p></body></html>"))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string(
+                        "<html><body><h1>Hi</h1><p>Readable body here.</p></body></html>",
+                    ),
+            )
+            .mount(&server)
+            .await;
 
         let url = format!("{}/doc", server.uri());
-        let out = permissive().execute(json!({ "url": url }), &ctx()).await.unwrap();
+        let out = permissive()
+            .execute(json!({ "url": url }), &ctx())
+            .await
+            .unwrap();
         assert!(out.content.contains("Readable body here"));
         assert!(out.content.starts_with("GET "));
     }
@@ -343,18 +393,31 @@ mod tests {
     #[tokio::test]
     async fn follows_redirect_then_fetches() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/from"))
+        Mock::given(method("GET"))
+            .and(path("/from"))
             .respond_with(ResponseTemplate::new(302).insert_header("location", "/to"))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(path("/to"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/plain").set_body_string("landed"))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/to"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string("landed"),
+            )
+            .mount(&server)
+            .await;
 
         let url = format!("{}/from", server.uri());
-        let out = permissive().execute(json!({ "url": url }), &ctx()).await.unwrap();
+        let out = permissive()
+            .execute(json!({ "url": url }), &ctx())
+            .await
+            .unwrap();
         assert!(out.content.contains("landed"));
-        assert!(out.content.contains("/to"), "final_url should reflect the redirect target");
+        assert!(
+            out.content.contains("/to"),
+            "final_url should reflect the redirect target"
+        );
     }
 
     #[tokio::test]
@@ -362,14 +425,20 @@ mod tests {
         // Origin 127.0.0.1 (server) redirects to a different host not in the allowlist.
         // The host check fires BEFORE the next hop's DNS resolution, so no network needed.
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/from"))
-            .respond_with(ResponseTemplate::new(302)
-                .insert_header("location", "http://blocked.invalid/to"))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/from"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "http://blocked.invalid/to"),
+            )
+            .mount(&server)
+            .await;
 
         let url = format!("{}/from", server.uri());
         // permissive() has an EMPTY allowlist -> every host is Ask.
-        let err = permissive().execute(json!({ "url": url }), &ctx()).await.unwrap_err();
+        let err = permissive()
+            .execute(json!({ "url": url }), &ctx())
+            .await
+            .unwrap_err();
         match &err {
             ToolError::Denied(msg) => assert!(
                 msg.contains("un-approved host") && msg.contains("blocked.invalid"),
@@ -386,10 +455,13 @@ mod tests {
         // so the hop proceeds past the gate and fails at DNS with NotFound — NOT a
         // policy Denied. That distinguishes "gate passed" from "gate blocked".
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/from"))
-            .respond_with(ResponseTemplate::new(302)
-                .insert_header("location", "http://allowed.invalid/to"))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/from"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "http://allowed.invalid/to"),
+            )
+            .mount(&server)
+            .await;
 
         let t = FetchUrl::with_guard(
             NetworkPolicy::new(&["allowed.invalid".to_string()]),
@@ -406,14 +478,21 @@ mod tests {
     #[tokio::test]
     async fn binary_content_is_refused() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/blob"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "application/octet-stream")
-                .set_body_bytes(vec![0u8, 1, 2, 3]))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/blob"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(vec![0u8, 1, 2, 3]),
+            )
+            .mount(&server)
+            .await;
 
         let url = format!("{}/blob", server.uri());
-        let err = permissive().execute(json!({ "url": url }), &ctx()).await.unwrap_err();
+        let err = permissive()
+            .execute(json!({ "url": url }), &ctx())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Failed { .. }));
     }
 
@@ -421,20 +500,32 @@ mod tests {
     async fn strict_guard_blocks_loopback_target() {
         // Strict guard (production default) must refuse a loopback URL with Denied.
         let t = FetchUrl::new(NetworkPolicy::new(&[]));
-        let err = t.execute(json!({ "url": "http://127.0.0.1:9/" }), &ctx()).await.unwrap_err();
-        assert!(matches!(err, ToolError::Denied(_)), "expected SSRF Denied, got {err:?}");
+        let err = t
+            .execute(json!({ "url": "http://127.0.0.1:9/" }), &ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Denied(_)),
+            "expected SSRF Denied, got {err:?}"
+        );
     }
 
     #[tokio::test]
     async fn redirect_to_non_http_scheme_is_denied() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/evil"))
-            .respond_with(ResponseTemplate::new(302)
-                .insert_header("location", "file:///etc/passwd"))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/evil"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "file:///etc/passwd"),
+            )
+            .mount(&server)
+            .await;
 
         let url = format!("{}/evil", server.uri());
-        let err = permissive().execute(json!({ "url": url }), &ctx()).await.unwrap_err();
+        let err = permissive()
+            .execute(json!({ "url": url }), &ctx())
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ToolError::Denied(_)),
             "expected Denied for non-http redirect scheme, got {err:?}"
@@ -447,17 +538,26 @@ mod tests {
         // Set up a chain of 7 redirects: /r/1 -> /r/2 -> ... -> /r/7 -> /r/8
         // MAX_REDIRECTS is 5, so the 6th hop (hops > 5) trips the cap.
         for i in 1..=7usize {
-            Mock::given(method("GET")).and(path(format!("/r/{i}")))
-                .respond_with(ResponseTemplate::new(302)
-                    .insert_header("location", format!("/r/{}", i + 1)))
-                .mount(&server).await;
+            Mock::given(method("GET"))
+                .and(path(format!("/r/{i}")))
+                .respond_with(
+                    ResponseTemplate::new(302).insert_header("location", format!("/r/{}", i + 1)),
+                )
+                .mount(&server)
+                .await;
         }
 
         let url = format!("{}/r/1", server.uri());
-        let err = permissive().execute(json!({ "url": url }), &ctx()).await.unwrap_err();
+        let err = permissive()
+            .execute(json!({ "url": url }), &ctx())
+            .await
+            .unwrap_err();
         match &err {
             ToolError::Failed { message, .. } => {
-                assert!(message.contains("too many redirects"), "expected 'too many redirects', got: {message}");
+                assert!(
+                    message.contains("too many redirects"),
+                    "expected 'too many redirects', got: {message}"
+                );
             }
             other => panic!("expected Failed(too many redirects), got {other:?}"),
         }

@@ -12,7 +12,13 @@ use uuid::Uuid;
 /// path-less, command-less intent → `RulePolicy` auto-allows them. Approval-gating
 /// memory writes is deferred per spec §1; `summary` stays truthful for the audit log.
 fn read_intent(tool: &str, summary: String) -> ToolIntent {
-    ToolIntent { tool: tool.into(), access: Access::Read, paths: vec![], command: None, summary }
+    ToolIntent {
+        tool: tool.into(),
+        access: Access::Read,
+        paths: vec![],
+        command: None,
+        summary,
+    }
 }
 
 pub(crate) fn parse_scope(args: &Value, project_key: &str) -> MemoryScope {
@@ -23,23 +29,36 @@ pub(crate) fn parse_scope(args: &Value, project_key: &str) -> MemoryScope {
 }
 
 pub(crate) fn parse_tags(args: &Value, cfg: &MemoryConfig) -> Vec<String> {
-    args.get("tags").and_then(Value::as_array).map(|a| {
-        a.iter().filter_map(Value::as_str)
-            .map(|s| s.chars().take(cfg.max_tag_len).collect::<String>())
-            .take(cfg.max_tags).collect()
-    }).unwrap_or_default()
+    args.get("tags")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(|s| s.chars().take(cfg.max_tag_len).collect::<String>())
+                .take(cfg.max_tags)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn embed_failed(e: impl std::fmt::Display) -> ToolError {
-    ToolError::Failed { message: format!("embedding failed: {e}"), stderr: None }
+    ToolError::Failed {
+        message: format!("embedding failed: {e}"),
+        stderr: None,
+    }
 }
 fn store_failed(e: impl std::fmt::Display) -> ToolError {
-    ToolError::Failed { message: format!("memory store error: {e}"), stderr: None }
+    ToolError::Failed {
+        message: format!("memory store error: {e}"),
+        stderr: None,
+    }
 }
 /// Take the single embedding for a one-element embed() call, or a ToolError if the
 /// embedder returned nothing (contract violation) — memory ops never panic.
 fn first_embedding(vectors: Vec<Vec<f32>>) -> Result<Vec<f32>, ToolError> {
-    vectors.into_iter().next()
+    vectors
+        .into_iter()
+        .next()
         .ok_or_else(|| embed_failed("embedder returned no vectors"))
 }
 
@@ -53,9 +72,19 @@ pub(crate) async fn query_memories(
     query: &str,
     k: usize,
 ) -> Result<Vec<crate::record::Scored>, ToolError> {
-    let qv = first_embedding(embedder.embed(&[query.to_string()]).await.map_err(embed_failed)?)?;
-    let filter = ScopeFilter::ProjectAndGlobal { project_key: project_key.to_string() };
-    let mut hits = store.query(&qv, cfg.max_k, &filter).await.map_err(store_failed)?;
+    let qv = first_embedding(
+        embedder
+            .embed(&[query.to_string()])
+            .await
+            .map_err(embed_failed)?,
+    )?;
+    let filter = ScopeFilter::ProjectAndGlobal {
+        project_key: project_key.to_string(),
+    };
+    let mut hits = store
+        .query(&qv, cfg.max_k, &filter)
+        .await
+        .map_err(store_failed)?;
     hits.retain(|h| h.score >= cfg.relevance_threshold);
     hits.truncate(k);
     Ok(hits)
@@ -70,7 +99,9 @@ pub struct Remember {
 
 #[async_trait]
 impl Tool for Remember {
-    fn name(&self) -> &str { "remember" }
+    fn name(&self) -> &str {
+        "remember"
+    }
     fn description(&self) -> &str {
         "Store a fact in long-term memory for recall in future sessions. \
          Args: text (required), tags (optional string array), scope ('project'|'global', default project)."
@@ -91,23 +122,40 @@ impl Tool for Remember {
         }
     }
     fn intent(&self, _args: &Value) -> Result<ToolIntent, ToolError> {
-        Ok(read_intent("remember", "write to long-term memory store".into()))
+        Ok(read_intent(
+            "remember",
+            "write to long-term memory store".into(),
+        ))
     }
     async fn execute(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let text = args.get("text").and_then(Value::as_str)
-            .map(str::trim).filter(|s| !s.is_empty())
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| ToolError::InvalidArgs("missing non-empty 'text'".into()))?;
         if text.len() > self.cfg.max_text_len {
             return Err(ToolError::InvalidArgs(format!(
-                "text too long ({} bytes; max {})", text.len(), self.cfg.max_text_len)));
+                "text too long ({} bytes; max {})",
+                text.len(),
+                self.cfg.max_text_len
+            )));
         }
         let scope = parse_scope(&args, &self.project_key);
         let tags = parse_tags(&args, &self.cfg);
-        let vector = first_embedding(self.embedder.embed(&[text.to_string()]).await.map_err(embed_failed)?)?;
+        let vector = first_embedding(
+            self.embedder
+                .embed(&[text.to_string()])
+                .await
+                .map_err(embed_failed)?,
+        )?;
 
         // Dedup: supersede a near-identical memory in the same scope instead of duplicating.
-        let near = self.store.query(&vector, 1, &ScopeFilter::Exact(scope.clone()))
-            .await.map_err(store_failed)?;
+        let near = self
+            .store
+            .query(&vector, 1, &ScopeFilter::Exact(scope.clone()))
+            .await
+            .map_err(store_failed)?;
         if let Some(top) = near.first() {
             if top.score >= self.cfg.dedup_threshold {
                 let mut rec = top.record.clone();
@@ -118,34 +166,65 @@ impl Tool for Remember {
                 let id = rec.id.clone();
                 self.store.upsert(rec).await.map_err(store_failed)?;
                 tracing::info!(target: "memory", %id, scope = scope.kind(), "remember: superseded");
-                return Ok(ToolOutput { content: format!("Updated existing memory {id}."), display: None });
+                return Ok(ToolOutput {
+                    content: format!("Updated existing memory {id}."),
+                    display: None,
+                });
             }
         }
 
         // Cap: evict least-recently-updated while at the per-scope ceiling.
-        while self.store.count(&ScopeFilter::Exact(scope.clone())).await.map_err(store_failed)?
-            >= self.cfg.max_memories_per_scope {
-            if let Some(ev) = self.store.evict_oldest(&scope).await.map_err(store_failed)? {
+        while self
+            .store
+            .count(&ScopeFilter::Exact(scope.clone()))
+            .await
+            .map_err(store_failed)?
+            >= self.cfg.max_memories_per_scope
+        {
+            if let Some(ev) = self
+                .store
+                .evict_oldest(&scope)
+                .await
+                .map_err(store_failed)?
+            {
                 tracing::warn!(target: "memory", evicted = %ev, "remember: scope cap reached, evicted oldest");
-            } else { break; }
+            } else {
+                break;
+            }
         }
 
         let now = now_secs();
         let id = Uuid::new_v4().to_string();
-        let rec = MemoryRecord { id: id.clone(), text: text.to_string(), scope: scope.clone(),
-            tags, vector, created_at: now, updated_at: now, source: "remember".into() };
+        let rec = MemoryRecord {
+            id: id.clone(),
+            text: text.to_string(),
+            scope: scope.clone(),
+            tags,
+            vector,
+            created_at: now,
+            updated_at: now,
+            source: "remember".into(),
+        };
         self.store.upsert(rec).await.map_err(store_failed)?;
         tracing::info!(target: "memory", %id, scope = scope.kind(), "remember: stored new");
-        Ok(ToolOutput { content: format!("Stored memory {id}."), display: None })
+        Ok(ToolOutput {
+            content: format!("Stored memory {id}."),
+            display: None,
+        })
     }
 }
 
 fn render_age(updated_at: i64) -> String {
     let secs = (now_secs() - updated_at).max(0);
-    if secs < 60 { "just now".into() }
-    else if secs < 3600 { format!("{}m ago", secs / 60) }
-    else if secs < 86400 { format!("{}h ago", secs / 3600) }
-    else { format!("{}d ago", secs / 86400) }
+    if secs < 60 {
+        "just now".into()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
 pub struct Recall {
@@ -157,14 +236,18 @@ pub struct Recall {
 
 #[async_trait]
 impl Tool for Recall {
-    fn name(&self) -> &str { "recall" }
+    fn name(&self) -> &str {
+        "recall"
+    }
     fn description(&self) -> &str {
         "Search long-term memory for facts relevant to a query. Returns the most similar \
          stored memories from this project and the global tier. Args: query (required), k (optional)."
     }
     fn when_not_to_call(&self) -> Option<&str> {
-        Some("Not for rehydrating offloaded conversation context — use context_recall. \
-              Use recall only for semantic search over saved long-term memories.")
+        Some(
+            "Not for rehydrating offloaded conversation context — use context_recall. \
+              Use recall only for semantic search over saved long-term memories.",
+        )
     }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -184,22 +267,41 @@ impl Tool for Recall {
         Ok(read_intent("recall", "search long-term memory".into()))
     }
     async fn execute(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let query = args.get("query").and_then(Value::as_str)
-            .map(str::trim).filter(|s| !s.is_empty())
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| ToolError::InvalidArgs("missing non-empty 'query'".into()))?;
-        let k = args.get("k").and_then(Value::as_u64).map(|n| n as usize)
-            .unwrap_or(self.cfg.default_k).clamp(1, self.cfg.max_k);
+        let k = args
+            .get("k")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(self.cfg.default_k)
+            .clamp(1, self.cfg.max_k);
         let hits = query_memories(
-            self.embedder.as_ref(), self.store.as_ref(), &self.cfg, &self.project_key, query, k,
-        ).await?;
+            self.embedder.as_ref(),
+            self.store.as_ref(),
+            &self.cfg,
+            &self.project_key,
+            query,
+            k,
+        )
+        .await?;
         tracing::info!(target: "memory", returned = hits.len(),
             top = hits.first().map(|h| h.score).unwrap_or(0.0), "recall");
 
         if hits.is_empty() {
-            return Ok(ToolOutput { content: "No relevant memories found.".into(), display: None });
+            return Ok(ToolOutput {
+                content: "No relevant memories found.".into(),
+                display: None,
+            });
         }
         let body = render_hits(&hits, self.cfg.max_recall_chars);
-        Ok(ToolOutput { content: body, display: None })
+        Ok(ToolOutput {
+            content: body,
+            display: None,
+        })
     }
 }
 
@@ -212,7 +314,9 @@ pub struct Forget {
 
 #[async_trait]
 impl Tool for Forget {
-    fn name(&self) -> &str { "forget" }
+    fn name(&self) -> &str {
+        "forget"
+    }
     fn description(&self) -> &str {
         "Remove a memory. Args: either id (exact) or query (deletes the single best match \
          only if confidently similar). Never mass-deletes."
@@ -235,33 +339,57 @@ impl Tool for Forget {
     }
     async fn execute(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         if let Some(id) = args.get("id").and_then(Value::as_str) {
-            let visible = ScopeFilter::ProjectAndGlobal { project_key: self.project_key.clone() };
+            let visible = ScopeFilter::ProjectAndGlobal {
+                project_key: self.project_key.clone(),
+            };
             match self.store.get(id).await.map_err(store_failed)? {
                 Some(rec) if visible.matches(&rec.scope) => {
                     self.store.delete(id).await.map_err(store_failed)?;
-                    return Ok(ToolOutput { content: format!("Removed memory {id}."), display: None });
+                    return Ok(ToolOutput {
+                        content: format!("Removed memory {id}."),
+                        display: None,
+                    });
                 }
                 // Not found, OR found but outside this scope — report identically so a caller
                 // cannot probe for the existence of another project's memory ids.
                 _ => return Err(ToolError::NotFound(format!("no memory with id {id}"))),
             }
         }
-        let query = args.get("query").and_then(Value::as_str)
-            .map(str::trim).filter(|s| !s.is_empty())
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| ToolError::InvalidArgs("provide 'id' or non-empty 'query'".into()))?;
-        let qv = first_embedding(self.embedder.embed(&[query.to_string()]).await.map_err(embed_failed)?)?;
-        let filter = ScopeFilter::ProjectAndGlobal { project_key: self.project_key.clone() };
-        let hits = self.store.query(&qv, 1, &filter).await.map_err(store_failed)?;
+        let qv = first_embedding(
+            self.embedder
+                .embed(&[query.to_string()])
+                .await
+                .map_err(embed_failed)?,
+        )?;
+        let filter = ScopeFilter::ProjectAndGlobal {
+            project_key: self.project_key.clone(),
+        };
+        let hits = self
+            .store
+            .query(&qv, 1, &filter)
+            .await
+            .map_err(store_failed)?;
         match hits.first() {
             Some(top) if top.score >= self.cfg.forget_threshold => {
                 let id = top.record.id.clone();
                 self.store.delete(&id).await.map_err(store_failed)?;
                 tracing::info!(target: "memory", %id, "forget: removed by query");
-                Ok(ToolOutput { content: format!("Removed memory {id}: {}", top.record.text), display: None })
+                Ok(ToolOutput {
+                    content: format!("Removed memory {id}: {}", top.record.text),
+                    display: None,
+                })
             }
             _ => Ok(ToolOutput {
-                content: "No confident match; nothing removed. Use a more specific query or an id.".into(),
-                display: None }),
+                content: "No confident match; nothing removed. Use a more specific query or an id."
+                    .into(),
+                display: None,
+            }),
         }
     }
 }
@@ -269,10 +397,18 @@ impl Tool for Forget {
 fn render_hits(hits: &[crate::record::Scored], max_chars: usize) -> String {
     let mut out = String::new();
     for h in hits {
-        let tags = if h.record.tags.is_empty() { String::new() }
-                   else { format!("; tags: {}", h.record.tags.join(",")) };
-        let line = format!("[{:.2}] {} ({}{})\n",
-            h.score, h.record.text, render_age(h.record.updated_at), tags);
+        let tags = if h.record.tags.is_empty() {
+            String::new()
+        } else {
+            format!("; tags: {}", h.record.tags.join(","))
+        };
+        let line = format!(
+            "[{:.2}] {} ({}{})\n",
+            h.score,
+            h.record.text,
+            render_age(h.record.updated_at),
+            tags
+        );
         if out.len() + line.len() > max_chars {
             out.push_str("[truncated: more memories matched]\n");
             break;
@@ -294,11 +430,27 @@ mod recall_tests {
         let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
         let cfg = Arc::new(MemoryConfig::default());
-        let rem = Remember { embedder: embedder.clone(), store: store.clone(), cfg: cfg.clone(),
-            project_key: "A".into() };
-        rem.execute(json!({"text": "deploys run on fridays"}), &ctx()).await.unwrap();
-        rem.execute(json!({"text": "user prefers tabs", "scope": "global"}), &ctx()).await.unwrap();
-        let rec = Recall { embedder, store: store.clone(), cfg, project_key: "A".into() };
+        let rem = Remember {
+            embedder: embedder.clone(),
+            store: store.clone(),
+            cfg: cfg.clone(),
+            project_key: "A".into(),
+        };
+        rem.execute(json!({"text": "deploys run on fridays"}), &ctx())
+            .await
+            .unwrap();
+        rem.execute(
+            json!({"text": "user prefers tabs", "scope": "global"}),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        let rec = Recall {
+            embedder,
+            store: store.clone(),
+            cfg,
+            project_key: "A".into(),
+        };
         (rec, store)
     }
 
@@ -306,10 +458,16 @@ mod recall_tests {
     async fn exact_query_returns_match_unrelated_returns_none() {
         let (rec, _s) = seed().await;
         // Exact stored text → cosine 1.0 ≥ relevance_threshold.
-        let hit = rec.execute(json!({"query": "deploys run on fridays"}), &ctx()).await.unwrap();
+        let hit = rec
+            .execute(json!({"query": "deploys run on fridays"}), &ctx())
+            .await
+            .unwrap();
         assert!(hit.content.contains("deploys run on fridays"));
         // Unrelated query → below threshold → "no relevant memories".
-        let miss = rec.execute(json!({"query": "zxcv qwerty nonsense token"}), &ctx()).await.unwrap();
+        let miss = rec
+            .execute(json!({"query": "zxcv qwerty nonsense token"}), &ctx())
+            .await
+            .unwrap();
         assert!(miss.content.contains("No relevant memories"));
     }
 
@@ -318,26 +476,59 @@ mod recall_tests {
         let (rec, store) = seed().await;
         // Add a project-B memory directly; project-A recall must not see it.
         let embedder = StubEmbedder::d384();
-        let v = embedder.embed(&["secret from project b".to_string()]).await.unwrap().pop().unwrap();
-        store.upsert(MemoryRecord { id: "b1".into(), text: "secret from project b".into(),
-            scope: MemoryScope::Project("B".into()), tags: vec![], vector: v,
-            created_at: 1, updated_at: 1, source: "test".into() }).await.unwrap();
-        let out = rec.execute(json!({"query": "secret from project b"}), &ctx()).await.unwrap();
-        assert!(!out.content.contains("secret from project b"), "cross-project leak");
+        let v = embedder
+            .embed(&["secret from project b".to_string()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .upsert(MemoryRecord {
+                id: "b1".into(),
+                text: "secret from project b".into(),
+                scope: MemoryScope::Project("B".into()),
+                tags: vec![],
+                vector: v,
+                created_at: 1,
+                updated_at: 1,
+                source: "test".into(),
+            })
+            .await
+            .unwrap();
+        let out = rec
+            .execute(json!({"query": "secret from project b"}), &ctx())
+            .await
+            .unwrap();
+        assert!(
+            !out.content.contains("secret from project b"),
+            "cross-project leak"
+        );
         // But the global memory is reachable.
-        let g = rec.execute(json!({"query": "user prefers tabs"}), &ctx()).await.unwrap();
+        let g = rec
+            .execute(json!({"query": "user prefers tabs"}), &ctx())
+            .await
+            .unwrap();
         assert!(g.content.contains("user prefers tabs"));
     }
 
     #[tokio::test]
     async fn render_budget_truncates() {
         use crate::record::Scored;
-        let hits: Vec<Scored> = (0..100).map(|i| Scored {
-            record: MemoryRecord { id: i.to_string(), text: "x".repeat(100),
-                scope: MemoryScope::Global, tags: vec![], vector: vec![1.0],
-                created_at: 0, updated_at: 0, source: "t".into() },
-            score: 0.9,
-        }).collect();
+        let hits: Vec<Scored> = (0..100)
+            .map(|i| Scored {
+                record: MemoryRecord {
+                    id: i.to_string(),
+                    text: "x".repeat(100),
+                    scope: MemoryScope::Global,
+                    tags: vec![],
+                    vector: vec![1.0],
+                    created_at: 0,
+                    updated_at: 0,
+                    source: "t".into(),
+                },
+                score: 0.9,
+            })
+            .collect();
         let body = render_hits(&hits, 512);
         assert!(body.len() <= 512 + 64);
         assert!(body.contains("[truncated"));
@@ -350,18 +541,34 @@ mod forget_tests {
     use super::*;
     use crate::config::MemoryConfig;
     use crate::embedder::StubEmbedder;
-    use crate::store::InMemoryStore;
     use crate::record::ScopeFilter;
+    use crate::store::InMemoryStore;
 
     async fn seeded() -> (Forget, Arc<dyn MemoryStore>, String) {
         let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
         let cfg = Arc::new(MemoryConfig::default());
-        let rem = Remember { embedder: embedder.clone(), store: store.clone(), cfg: cfg.clone(),
-            project_key: "A".into() };
-        let out = rem.execute(json!({"text": "delete me please"}), &ctx()).await.unwrap();
-        let id = out.content.trim_start_matches("Stored memory ").trim_end_matches('.').to_string();
-        let f = Forget { embedder, store: store.clone(), cfg, project_key: "A".into() };
+        let rem = Remember {
+            embedder: embedder.clone(),
+            store: store.clone(),
+            cfg: cfg.clone(),
+            project_key: "A".into(),
+        };
+        let out = rem
+            .execute(json!({"text": "delete me please"}), &ctx())
+            .await
+            .unwrap();
+        let id = out
+            .content
+            .trim_start_matches("Stored memory ")
+            .trim_end_matches('.')
+            .to_string();
+        let f = Forget {
+            embedder,
+            store: store.clone(),
+            cfg,
+            project_key: "A".into(),
+        };
         (f, store, id)
     }
 
@@ -369,22 +576,51 @@ mod forget_tests {
     async fn forget_by_id() {
         let (f, store, id) = seeded().await;
         f.execute(json!({"id": id}), &ctx()).await.unwrap();
-        assert_eq!(store.count(&ScopeFilter::ProjectAndGlobal { project_key: "A".into() }).await.unwrap(), 0);
+        assert_eq!(
+            store
+                .count(&ScopeFilter::ProjectAndGlobal {
+                    project_key: "A".into()
+                })
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn forget_by_query_above_threshold_deletes_one() {
         let (f, store, _id) = seeded().await;
-        f.execute(json!({"query": "delete me please"}), &ctx()).await.unwrap(); // exact → 1.0
-        assert_eq!(store.count(&ScopeFilter::ProjectAndGlobal { project_key: "A".into() }).await.unwrap(), 0);
+        f.execute(json!({"query": "delete me please"}), &ctx())
+            .await
+            .unwrap(); // exact → 1.0
+        assert_eq!(
+            store
+                .count(&ScopeFilter::ProjectAndGlobal {
+                    project_key: "A".into()
+                })
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn forget_by_weak_query_deletes_nothing() {
         let (f, store, _id) = seeded().await;
-        let out = f.execute(json!({"query": "qwerty unrelated zxcv"}), &ctx()).await.unwrap();
+        let out = f
+            .execute(json!({"query": "qwerty unrelated zxcv"}), &ctx())
+            .await
+            .unwrap();
         assert!(out.content.contains("nothing removed"));
-        assert_eq!(store.count(&ScopeFilter::ProjectAndGlobal { project_key: "A".into() }).await.unwrap(), 1);
+        assert_eq!(
+            store
+                .count(&ScopeFilter::ProjectAndGlobal {
+                    project_key: "A".into()
+                })
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -400,23 +636,46 @@ mod forget_tests {
         let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
         let cfg = Arc::new(MemoryConfig::default());
-        let f = Forget { embedder: embedder.clone(), store: store.clone(), cfg, project_key: "A".into() };
+        let f = Forget {
+            embedder: embedder.clone(),
+            store: store.clone(),
+            cfg,
+            project_key: "A".into(),
+        };
 
         // Insert a record belonging to project "B" directly into the store.
-        let v = StubEmbedder::d384().embed(&["foreign secret".to_string()]).await.unwrap().pop().unwrap();
-        store.upsert(MemoryRecord {
-            id: "bX".into(), text: "foreign secret".into(),
-            scope: MemoryScope::Project("B".into()),
-            tags: vec![], vector: v,
-            created_at: 1, updated_at: 1, source: "test".into(),
-        }).await.unwrap();
+        let v = StubEmbedder::d384()
+            .embed(&["foreign secret".to_string()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .upsert(MemoryRecord {
+                id: "bX".into(),
+                text: "foreign secret".into(),
+                scope: MemoryScope::Project("B".into()),
+                tags: vec![],
+                vector: v,
+                created_at: 1,
+                updated_at: 1,
+                source: "test".into(),
+            })
+            .await
+            .unwrap();
 
         // Forget-by-id from project "A" must be refused.
         let err = f.execute(json!({"id": "bX"}), &ctx()).await.unwrap_err();
-        assert!(matches!(err, ToolError::NotFound(_)), "expected NotFound, got {err:?}");
+        assert!(
+            matches!(err, ToolError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
 
         // The record must still be present in the store.
-        assert!(store.get("bX").await.unwrap().is_some(), "foreign record was silently deleted");
+        assert!(
+            store.get("bX").await.unwrap().is_some(),
+            "foreign record was silently deleted"
+        );
     }
 }
 
@@ -426,12 +685,23 @@ pub(crate) mod test_support {
     use crate::embedder::StubEmbedder;
     use crate::store::InMemoryStore;
 
-    pub fn remember(project_key: &str) -> (Remember, Arc<dyn MemoryStore>, Arc<dyn Embedder>, Arc<MemoryConfig>) {
+    pub fn remember(
+        project_key: &str,
+    ) -> (
+        Remember,
+        Arc<dyn MemoryStore>,
+        Arc<dyn Embedder>,
+        Arc<MemoryConfig>,
+    ) {
         let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
         let cfg = Arc::new(MemoryConfig::default());
-        let r = Remember { embedder: embedder.clone(), store: store.clone(), cfg: cfg.clone(),
-            project_key: project_key.into() };
+        let r = Remember {
+            embedder: embedder.clone(),
+            store: store.clone(),
+            cfg: cfg.clone(),
+            project_key: project_key.into(),
+        };
         (r, store, embedder, cfg)
     }
 
@@ -462,11 +732,18 @@ mod recall_contract_tests {
         };
         // Confusable contract present in the curated list AND on the tool.
         assert!(agent_tools::CONFUSABLE_TOOLS.contains(&"recall"));
-        let wntc = rec.when_not_to_call().expect("recall must disambiguate vs context_recall");
-        assert!(wntc.contains("context_recall"), "prose names the sibling: {wntc}");
+        let wntc = rec
+            .when_not_to_call()
+            .expect("recall must disambiguate vs context_recall");
+        assert!(
+            wntc.contains("context_recall"),
+            "prose names the sibling: {wntc}"
+        );
         // Required param `query` is described.
-        assert!(agent_tools::required_params_missing_description(&rec.schema()).is_empty(),
-            "recall.query must have a description");
+        assert!(
+            agent_tools::required_params_missing_description(&rec.schema()).is_empty(),
+            "recall.query must have a description"
+        );
     }
 }
 
@@ -479,18 +756,30 @@ mod tests {
     #[tokio::test]
     async fn stores_new_then_supersedes_identical() {
         let (r, store, _e, _c) = remember("A");
-        r.execute(json!({"text": "the build uses cargo"}), &ctx()).await.unwrap();
+        r.execute(json!({"text": "the build uses cargo"}), &ctx())
+            .await
+            .unwrap();
         // Identical text → cosine 1.0 ≥ dedup_threshold → supersede, not duplicate.
-        r.execute(json!({"text": "the build uses cargo"}), &ctx()).await.unwrap();
+        r.execute(json!({"text": "the build uses cargo"}), &ctx())
+            .await
+            .unwrap();
         let scope = MemoryScope::Project("A".into());
-        assert_eq!(store.count(&ScopeFilter::Exact(scope)).await.unwrap(), 1, "deduped");
+        assert_eq!(
+            store.count(&ScopeFilter::Exact(scope)).await.unwrap(),
+            1,
+            "deduped"
+        );
     }
 
     #[tokio::test]
     async fn distinct_text_inserts_separately() {
         let (r, store, _e, _c) = remember("A");
-        r.execute(json!({"text": "fact one about networking"}), &ctx()).await.unwrap();
-        r.execute(json!({"text": "an unrelated fact about cooking"}), &ctx()).await.unwrap();
+        r.execute(json!({"text": "fact one about networking"}), &ctx())
+            .await
+            .unwrap();
+        r.execute(json!({"text": "an unrelated fact about cooking"}), &ctx())
+            .await
+            .unwrap();
         let scope = MemoryScope::Project("A".into());
         assert_eq!(store.count(&ScopeFilter::Exact(scope)).await.unwrap(), 2);
     }

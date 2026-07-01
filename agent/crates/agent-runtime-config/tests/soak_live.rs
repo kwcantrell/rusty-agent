@@ -46,8 +46,19 @@ impl ApprovalChannel for SafeApproval {
                     let base = first.rsplit('/').next().unwrap_or(first);
                     matches!(
                         base,
-                        "ls" | "cat" | "wc" | "head" | "tail" | "echo" | "grep" | "find"
-                            | "pwd" | "sort" | "uniq" | "true" | "date" | "nl"
+                        "ls" | "cat"
+                            | "wc"
+                            | "head"
+                            | "tail"
+                            | "echo"
+                            | "grep"
+                            | "find"
+                            | "pwd"
+                            | "sort"
+                            | "uniq"
+                            | "true"
+                            | "date"
+                            | "nl"
                     )
                 })
                 .unwrap_or(false),
@@ -105,7 +116,10 @@ impl EventSink for SoakMonitor {
             }
             AgentEvent::Context(ContextEvent::CompactionFailed { reason }) => {
                 self.compaction_fails.fetch_add(1, Ordering::Relaxed);
-                self.errors.lock().unwrap().push(format!("compaction_failed: {reason}"));
+                self.errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("compaction_failed: {reason}"));
             }
             _ => {}
         }
@@ -120,6 +134,8 @@ fn lcg(state: &mut u64) -> u64 {
 }
 
 /// A varied, tool-exercising task. `store_len` lets recall pick a real id.
+// Legacy lint, unrelated to this branch.
+#[allow(clippy::manual_is_multiple_of)]
 fn make_task(rng: &mut u64, i: usize, store_len: usize) -> String {
     // Guarantee recall coverage: every 5th step (once something is offloaded),
     // ask the model to pull an offloaded entry back. Otherwise pick at random.
@@ -164,7 +180,10 @@ async fn soak_all_components_live() {
     let url = std::env::var("AGENT_E2E_URL").expect("set AGENT_E2E_URL");
     let model_name = std::env::var("AGENT_E2E_MODEL").expect("set AGENT_E2E_MODEL");
     let budget = Duration::from_secs(
-        std::env::var("SOAK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300),
+        std::env::var("SOAK_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300),
     );
     const CONTEXT_LIMIT: usize = 4000; // small enough that offload + compaction both fire
 
@@ -175,7 +194,11 @@ async fn soak_all_components_live() {
         let body: String = (1..=80)
             .map(|l| format!("big{n} line {l}: the quick brown fox jumps over the lazy dog\n"))
             .collect();
-        std::fs::write(ws.join(format!("big{n}.txt")), format!("{body}LAST-LINE-big{n}\n")).unwrap();
+        std::fs::write(
+            ws.join(format!("big{n}.txt")),
+            format!("{body}LAST-LINE-big{n}\n"),
+        )
+        .unwrap();
     }
     std::fs::write(
         ws.join("data.csv"),
@@ -184,7 +207,11 @@ async fn soak_all_components_live() {
     .unwrap();
 
     let mut cfg = RuntimeConfig::from_launch(
-        "openai".into(), url.clone(), model_name.clone(), "native".into(), CONTEXT_LIMIT,
+        "openai".into(),
+        url.clone(),
+        model_name.clone(),
+        "native".into(),
+        CONTEXT_LIMIT,
     );
     cfg.memory = false;
     cfg.sandbox_mode = "off".into(); // host executor — no docker needed
@@ -193,12 +220,18 @@ async fn soak_all_components_live() {
     let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let monitor = Arc::new(SoakMonitor::default());
-    let approval = Arc::new(SafeApproval { denied: Mutex::new(Vec::new()) });
+    let approval = Arc::new(SafeApproval {
+        denied: Mutex::new(Vec::new()),
+    });
 
     let built = assemble_loop(
         &cfg,
         LoopParts {
-            model: Arc::new(OpenAiCompatClient::new(url, model_name, std::env::var("AGENT_API_KEY").ok())),
+            model: Arc::new(OpenAiCompatClient::new(
+                url,
+                model_name,
+                std::env::var("AGENT_API_KEY").ok(),
+            )),
             sink: monitor.clone(),
             approval: approval.clone(),
             workspace: ws.clone(),
@@ -206,11 +239,12 @@ async fn soak_all_components_live() {
             memory_tools: vec![],
             memory_retriever: None,
             stream_idle_timeout: Duration::from_secs(120),
-            base_system_prompt: "You are a coding agent operating in a sandboxed workspace. Use the \
+            base_system_prompt:
+                "You are a coding agent operating in a sandboxed workspace. Use the \
                 provided tools (read_file, list_directory, write_file, execute_command, \
                 context_recall, context_compact) to complete each task, then give a short final \
                 reply. Keep replies concise."
-                .into(),
+                    .into(),
             offload_store: store.clone(),
             compact_flag: flag.clone(),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
@@ -223,12 +257,19 @@ async fn soak_all_components_live() {
     let mut ctx = CuratedContext::new(Message::system(built.system_prompt), store.clone(), flag)
         .with_recall_budget(256);
 
-    let mut rng = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64 | 1;
+    let mut rng = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos() as u64
+        | 1;
     let start = Instant::now();
     let mut tasks = 0usize;
     let mut task_timeouts = 0usize;
 
-    eprintln!("[soak] starting; budget={}s context_limit={CONTEXT_LIMIT}", budget.as_secs());
+    eprintln!(
+        "[soak] starting; budget={}s context_limit={CONTEXT_LIMIT}",
+        budget.as_secs()
+    );
     while start.elapsed() < budget {
         tasks += 1;
         let task = make_task(&mut rng, tasks, store.len());
@@ -287,13 +328,25 @@ async fn soak_all_components_live() {
     eprintln!("compactions      : {compactions}  (failed={compaction_fails})");
     eprintln!("context_recalls  : {recalls}");
     eprintln!("tool results     : {tool_results:?}");
-    eprintln!("policy-denied    : {} {:?}", denied.len(), &denied[..denied.len().min(5)]);
-    eprintln!("errors           : {} {:?}", errors.len(), &errors[..errors.len().min(5)]);
+    eprintln!(
+        "policy-denied    : {} {:?}",
+        denied.len(),
+        &denied[..denied.len().min(5)]
+    );
+    eprintln!(
+        "errors           : {} {:?}",
+        errors.len(),
+        &errors[..errors.len().min(5)]
+    );
 
     // Recoverability spot-check: a sample of offloaded entries still read back intact.
     let mut recovered = 0;
     for id in 1..=store.len().min(8) as u64 {
-        if store.get(id).map(|e| !e.content.is_empty()).unwrap_or(false) {
+        if store
+            .get(id)
+            .map(|e| !e.content.is_empty())
+            .unwrap_or(false)
+        {
             recovered += 1;
         }
     }
@@ -303,7 +356,10 @@ async fn soak_all_components_live() {
     // ---- Invariants ----
     // HARD: the window never blew the budget across the whole soak.
     assert!(peak > 0, "expected model turns to have happened");
-    assert!(peak <= CONTEXT_LIMIT, "peak prompt {peak} exceeded context_limit {CONTEXT_LIMIT}");
+    assert!(
+        peak <= CONTEXT_LIMIT,
+        "peak prompt {peak} exceeded context_limit {CONTEXT_LIMIT}"
+    );
     // The soak actually did sustained work.
     assert!(turns >= 20, "expected a sustained run; only {turns} turns");
     assert!(tasks >= 5, "expected several tasks; only {tasks}");
@@ -312,7 +368,10 @@ async fn soak_all_components_live() {
         tool_results.values().sum::<usize>() >= 5,
         "expected real tool activity; got {tool_results:?}"
     );
-    assert!(offloads >= 1, "expected the offload path to engage over a long run");
+    assert!(
+        offloads >= 1,
+        "expected the offload path to engage over a long run"
+    );
     // Everything offloaded is still recoverable.
     assert_eq!(
         recovered,
@@ -320,10 +379,15 @@ async fn soak_all_components_live() {
         "every sampled offloaded entry must still read back"
     );
     // No compaction should have hard-failed.
-    assert_eq!(compaction_fails, 0, "compaction failures: {compaction_fails}");
+    assert_eq!(
+        compaction_fails, 0,
+        "compaction failures: {compaction_fails}"
+    );
     // The safety gate held: nothing outside the allow-set executed.
     assert!(
-        !tool_results.keys().any(|k| k == "git_commit" || k == "fetch_url"),
+        !tool_results
+            .keys()
+            .any(|k| k == "git_commit" || k == "fetch_url"),
         "a disallowed tool produced a result: {tool_results:?}"
     );
 }

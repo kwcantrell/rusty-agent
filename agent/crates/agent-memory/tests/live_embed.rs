@@ -19,17 +19,33 @@ async fn paraphrase_recall_across_reopen() {
         let tools = build_tools(cfg.clone(), tmp.path()).unwrap();
         let remember = tools.iter().find(|t| t.name() == "remember").unwrap();
         let ctx = test_ctx();
-        remember.execute(serde_json::json!({
-            "text": "The deployment pipeline runs every Friday afternoon."
-        }), &ctx).await.unwrap();
+        remember
+            .execute(
+                serde_json::json!({
+                    "text": "The deployment pipeline runs every Friday afternoon."
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
     }
     // Session 2: fresh build over the same DB; recall by a paraphrase (no lexical overlap).
     let tools = build_tools(cfg, tmp.path()).unwrap();
     let recall = tools.iter().find(|t| t.name() == "recall").unwrap();
-    let out = recall.execute(serde_json::json!({
-        "query": "When do we ship releases?"
-    }), &test_ctx()).await.unwrap();
-    assert!(out.content.contains("Friday"), "paraphrase failed to retrieve: {}", out.content);
+    let out = recall
+        .execute(
+            serde_json::json!({
+                "query": "When do we ship releases?"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.content.contains("Friday"),
+        "paraphrase failed to retrieve: {}",
+        out.content
+    );
 }
 
 fn test_ctx() -> agent_tools::ToolCtx {

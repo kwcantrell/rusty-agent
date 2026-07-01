@@ -12,13 +12,17 @@ pub struct SkillRegistry {
 
 impl SkillRegistry {
     pub fn new(roots: Vec<PathBuf>, writable_root: PathBuf) -> Self {
-        Self { roots, writable_root }
+        Self {
+            roots,
+            writable_root,
+        }
     }
 
     /// Explicit `--skills-dir` roots if any (writable = first); otherwise the
     /// defaults: `<workspace>/.agent/skills` (writable) + `~/.agent/skills`.
     pub fn from_config(skills_dirs: &[String], workspace: &Path) -> Self {
-        let filtered: Vec<String> = skills_dirs.iter()
+        let filtered: Vec<String> = skills_dirs
+            .iter()
             .filter(|s| !s.trim().is_empty())
             .cloned()
             .collect();
@@ -50,7 +54,11 @@ impl SkillRegistry {
                 Ok(r) => r,
                 Err(_) => continue, // missing/unreadable root → no skills here
             };
-            let mut dirs: Vec<PathBuf> = read.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+            let mut dirs: Vec<PathBuf> = read
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
             dirs.sort();
             for dir in dirs {
                 if !dir.join("SKILL.md").is_file() {
@@ -82,11 +90,14 @@ impl SkillRegistry {
 }
 
 fn load_skill(dir: &Path, dir_name: &str) -> Result<Skill, String> {
-    let text = std::fs::read_to_string(dir.join("SKILL.md")).map_err(|e| format!("read SKILL.md: {e}"))?;
+    let text =
+        std::fs::read_to_string(dir.join("SKILL.md")).map_err(|e| format!("read SKILL.md: {e}"))?;
     let parsed = parse_skill_md(&text)?;
     if let Some(fm_name) = &parsed.name {
         if fm_name != dir_name {
-            return Err(format!("frontmatter name '{fm_name}' != directory '{dir_name}'"));
+            return Err(format!(
+                "frontmatter name '{fm_name}' != directory '{dir_name}'"
+            ));
         }
     }
     Ok(Skill {
@@ -124,7 +135,9 @@ pub fn sanitize_slug(name: &str) -> Result<String, String> {
         return Err("skill name too long (max 64 chars)".into());
     }
     if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
-        return Err(format!("invalid skill name (no path separators): {trimmed}"));
+        return Err(format!(
+            "invalid skill name (no path separators): {trimmed}"
+        ));
     }
     let mut slug = String::new();
     let mut prev_dash = false;
@@ -153,8 +166,11 @@ mod tests {
     fn write_skill(root: &Path, name: &str, desc: &str, body: &str) {
         let dir = root.join(name);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("SKILL.md"),
-            format!("---\nname: {name}\ndescription: {desc}\n---\n{body}\n")).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\n{body}\n"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -164,7 +180,10 @@ mod tests {
         write_skill(dir.path(), "alpha", "A skill", "a body");
         let reg = SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf());
         let found = reg.scan();
-        assert_eq!(found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
+        assert_eq!(
+            found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
         assert_eq!(found[0].description, "A skill");
     }
 
@@ -176,7 +195,8 @@ mod tests {
         write_skill(user.path(), "dup", "from user", "u");
         let reg = SkillRegistry::new(
             vec![proj.path().to_path_buf(), user.path().to_path_buf()],
-            proj.path().to_path_buf());
+            proj.path().to_path_buf(),
+        );
         let found = reg.scan();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].description, "from project");
@@ -191,7 +211,10 @@ mod tests {
         fs::write(bad.join("SKILL.md"), "no front matter").unwrap();
         let reg = SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf());
         let found = reg.scan();
-        assert_eq!(found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["good"]);
+        assert_eq!(
+            found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["good"]
+        );
     }
 
     #[test]
@@ -199,7 +222,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let d = dir.path().join("realdir");
         fs::create_dir_all(&d).unwrap();
-        fs::write(d.join("SKILL.md"), "---\nname: other\ndescription: x\n---\nbody").unwrap();
+        fs::write(
+            d.join("SKILL.md"),
+            "---\nname: other\ndescription: x\n---\nbody",
+        )
+        .unwrap();
         let reg = SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf());
         assert!(reg.scan().is_empty());
     }
@@ -217,7 +244,10 @@ mod tests {
 
     #[test]
     fn missing_root_is_empty_not_error() {
-        let reg = SkillRegistry::new(vec![PathBuf::from("/nonexistent/xyz")], PathBuf::from("/tmp"));
+        let reg = SkillRegistry::new(
+            vec![PathBuf::from("/nonexistent/xyz")],
+            PathBuf::from("/tmp"),
+        );
         assert!(reg.scan().is_empty());
     }
 

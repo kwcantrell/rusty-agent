@@ -13,14 +13,22 @@ pub enum StoreError {
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
     async fn upsert(&self, rec: MemoryRecord) -> Result<(), StoreError>;
-    async fn query(&self, vector: &[f32], k: usize, filter: &ScopeFilter)
-        -> Result<Vec<Scored>, StoreError>;
+    async fn query(
+        &self,
+        vector: &[f32],
+        k: usize,
+        filter: &ScopeFilter,
+    ) -> Result<Vec<Scored>, StoreError>;
     async fn get(&self, id: &str) -> Result<Option<MemoryRecord>, StoreError>;
     async fn delete(&self, id: &str) -> Result<bool, StoreError>;
     async fn count(&self, filter: &ScopeFilter) -> Result<usize, StoreError>;
     async fn evict_oldest(&self, scope: &MemoryScope) -> Result<Option<String>, StoreError>;
-    async fn list(&self, filter: &ScopeFilter, limit: usize, offset: usize)
-        -> Result<Vec<MemoryRecord>, StoreError>;
+    async fn list(
+        &self,
+        filter: &ScopeFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<MemoryRecord>, StoreError>;
 }
 
 /// Score a candidate set against a query vector, skipping dimension-mismatched rows
@@ -38,7 +46,11 @@ pub(crate) fn rank(rows: Vec<MemoryRecord>, vector: &[f32], k: usize) -> Vec<Sco
             }
         })
         .collect();
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored.truncate(k);
     scored
 }
@@ -60,10 +72,20 @@ impl MemoryStore for InMemoryStore {
         self.rows.lock().unwrap().insert(rec.id.clone(), rec);
         Ok(())
     }
-    async fn query(&self, vector: &[f32], k: usize, filter: &ScopeFilter)
-        -> Result<Vec<Scored>, StoreError> {
-        let rows: Vec<MemoryRecord> = self.rows.lock().unwrap().values()
-            .filter(|r| filter.matches(&r.scope)).cloned().collect();
+    async fn query(
+        &self,
+        vector: &[f32],
+        k: usize,
+        filter: &ScopeFilter,
+    ) -> Result<Vec<Scored>, StoreError> {
+        let rows: Vec<MemoryRecord> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| filter.matches(&r.scope))
+            .cloned()
+            .collect();
         Ok(rank(rows, vector, k))
     }
     async fn get(&self, id: &str) -> Result<Option<MemoryRecord>, StoreError> {
@@ -73,21 +95,42 @@ impl MemoryStore for InMemoryStore {
         Ok(self.rows.lock().unwrap().remove(id).is_some())
     }
     async fn count(&self, filter: &ScopeFilter) -> Result<usize, StoreError> {
-        Ok(self.rows.lock().unwrap().values().filter(|r| filter.matches(&r.scope)).count())
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| filter.matches(&r.scope))
+            .count())
     }
     async fn evict_oldest(&self, scope: &MemoryScope) -> Result<Option<String>, StoreError> {
         let mut g = self.rows.lock().unwrap();
-        let oldest = g.values().filter(|r| &r.scope == scope)
-            .min_by_key(|r| r.updated_at).map(|r| r.id.clone());
+        let oldest = g
+            .values()
+            .filter(|r| &r.scope == scope)
+            .min_by_key(|r| r.updated_at)
+            .map(|r| r.id.clone());
         if let Some(id) = &oldest {
             g.remove(id);
         }
         Ok(oldest)
     }
-    async fn list(&self, filter: &ScopeFilter, limit: usize, offset: usize)
-        -> Result<Vec<MemoryRecord>, StoreError> {
-        let mut rows: Vec<MemoryRecord> = self.rows.lock().unwrap().values()
-            .filter(|r| filter.matches(&r.scope)).cloned().collect();
+    async fn list(
+        &self,
+        filter: &ScopeFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<MemoryRecord>, StoreError> {
+        let mut rows: Vec<MemoryRecord> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| filter.matches(&r.scope))
+            .cloned()
+            .collect();
+        // Legacy lint, unrelated to this branch: reverse cmp is clearer than sort_by_key + Reverse.
+        #[allow(clippy::unnecessary_sort_by)]
         rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(rows.into_iter().skip(offset).take(limit).collect())
     }
@@ -106,7 +149,9 @@ fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     out
 }
 fn blob_to_vec(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 pub struct SqliteStore {
@@ -119,8 +164,10 @@ impl SqliteStore {
             std::fs::create_dir_all(parent).map_err(|e| StoreError::Io(e.to_string()))?;
         }
         let conn = Connection::open(path).map_err(|e| StoreError::Io(e.to_string()))?;
-        conn.busy_timeout(Duration::from_secs(5)).map_err(|e| StoreError::Io(e.to_string()))?;
-        conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| StoreError::Io(e.to_string()))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| StoreError::Io(e.to_string()))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
@@ -135,19 +182,26 @@ impl SqliteStore {
                 source TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_scope ON memories(scope_kind, scope_key);",
-        ).map_err(|e| StoreError::Io(e.to_string()))?;
+        )
+        .map_err(|e| StoreError::Io(e.to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<MemoryRecord> {
         let kind: String = row.get("scope_kind")?;
         let key: String = row.get("scope_key")?;
-        let scope = if kind == "global" { MemoryScope::Global } else { MemoryScope::Project(key) };
+        let scope = if kind == "global" {
+            MemoryScope::Global
+        } else {
+            MemoryScope::Project(key)
+        };
         let tags_json: String = row.get("tags")?;
         let blob: Vec<u8> = row.get("vector")?;
         Ok(MemoryRecord {
@@ -196,14 +250,22 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
-    async fn query(&self, vector: &[f32], k: usize, filter: &ScopeFilter)
-        -> Result<Vec<Scored>, StoreError> {
+    async fn query(
+        &self,
+        vector: &[f32],
+        k: usize,
+        filter: &ScopeFilter,
+    ) -> Result<Vec<Scored>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let (clause, params) = scope_where(filter);
         let sql = format!("SELECT * FROM memories WHERE {clause}");
-        let mut stmt = conn.prepare(&sql).map_err(|e| StoreError::Io(e.to_string()))?;
-        let pref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let rows = stmt.query_map(pref.as_slice(), Self::row_to_record)
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let pref: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(pref.as_slice(), Self::row_to_record)
             .map_err(|e| StoreError::Io(e.to_string()))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| StoreError::Io(e.to_string()))?;
@@ -212,9 +274,11 @@ impl MemoryStore for SqliteStore {
 
     async fn get(&self, id: &str) -> Result<Option<MemoryRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")
+        let mut stmt = conn
+            .prepare("SELECT * FROM memories WHERE id = ?1")
             .map_err(|e| StoreError::Io(e.to_string()))?;
-        let mut rows = stmt.query_map([id], Self::row_to_record)
+        let mut rows = stmt
+            .query_map([id], Self::row_to_record)
             .map_err(|e| StoreError::Io(e.to_string()))?;
         match rows.next() {
             Some(r) => Ok(Some(r.map_err(|e| StoreError::Io(e.to_string()))?)),
@@ -224,7 +288,8 @@ impl MemoryStore for SqliteStore {
 
     async fn delete(&self, id: &str) -> Result<bool, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let n = conn.execute("DELETE FROM memories WHERE id = ?1", [id])
+        let n = conn
+            .execute("DELETE FROM memories WHERE id = ?1", [id])
             .map_err(|e| StoreError::Io(e.to_string()))?;
         Ok(n > 0)
     }
@@ -233,8 +298,10 @@ impl MemoryStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let (clause, params) = scope_where(filter);
         let sql = format!("SELECT COUNT(*) FROM memories WHERE {clause}");
-        let pref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let n: i64 = conn.query_row(&sql, pref.as_slice(), |r| r.get(0))
+        let pref: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let n: i64 = conn
+            .query_row(&sql, pref.as_slice(), |r| r.get(0))
             .map_err(|e| StoreError::Io(e.to_string()))?;
         Ok(n as usize)
     }
@@ -253,20 +320,28 @@ impl MemoryStore for SqliteStore {
         Ok(id)
     }
 
-    async fn list(&self, filter: &ScopeFilter, limit: usize, offset: usize)
-        -> Result<Vec<MemoryRecord>, StoreError> {
+    async fn list(
+        &self,
+        filter: &ScopeFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<MemoryRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let (where_sql, params) = scope_where(filter);
         let sql = format!(
             "SELECT * FROM memories WHERE {where_sql} ORDER BY updated_at DESC LIMIT ?{n1} OFFSET ?{n2}",
             n1 = params.len() + 1, n2 = params.len() + 2);
-        let mut stmt = conn.prepare(&sql).map_err(|e| StoreError::Io(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
         let limit_i = limit as i64;
         let offset_i = offset as i64;
-        let mut pref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut pref: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         pref.push(&limit_i);
         pref.push(&offset_i);
-        let rows = stmt.query_map(pref.as_slice(), Self::row_to_record)
+        let rows = stmt
+            .query_map(pref.as_slice(), Self::row_to_record)
             .map_err(|e| StoreError::Io(e.to_string()))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| StoreError::Io(e.to_string()))?;
@@ -280,8 +355,16 @@ mod sqlite_tests {
     use crate::record::now_secs;
 
     fn rec(id: &str, scope: MemoryScope, vector: Vec<f32>) -> MemoryRecord {
-        MemoryRecord { id: id.into(), text: format!("text-{id}"), scope, tags: vec!["t".into()],
-                       vector, created_at: now_secs(), updated_at: now_secs(), source: "test".into() }
+        MemoryRecord {
+            id: id.into(),
+            text: format!("text-{id}"),
+            scope,
+            tags: vec!["t".into()],
+            vector,
+            created_at: now_secs(),
+            updated_at: now_secs(),
+            source: "test".into(),
+        }
     }
 
     #[tokio::test]
@@ -290,7 +373,9 @@ mod sqlite_tests {
         let path = tmp.path().join("memory.db");
         {
             let s = SqliteStore::open(&path).unwrap();
-            s.upsert(rec("a", MemoryScope::Global, vec![1.0, 0.0, 0.0])).await.unwrap();
+            s.upsert(rec("a", MemoryScope::Global, vec![1.0, 0.0, 0.0]))
+                .await
+                .unwrap();
         }
         // Fresh process simulation: reopen the same file.
         let s2 = SqliteStore::open(&path).unwrap();
@@ -304,13 +389,27 @@ mod sqlite_tests {
     async fn query_scopes_and_dimension_mismatch_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
         let s = SqliteStore::open(&tmp.path().join("m.db")).unwrap();
-        s.upsert(rec("p", MemoryScope::Project("A".into()), vec![1.0, 0.0])).await.unwrap();
-        s.upsert(rec("g", MemoryScope::Global, vec![1.0, 0.0])).await.unwrap();
+        s.upsert(rec("p", MemoryScope::Project("A".into()), vec![1.0, 0.0]))
+            .await
+            .unwrap();
+        s.upsert(rec("g", MemoryScope::Global, vec![1.0, 0.0]))
+            .await
+            .unwrap();
         // A stale 3-dim row from an old model: must be skipped, not panic.
-        s.upsert(rec("stale", MemoryScope::Global, vec![1.0, 0.0, 0.0])).await.unwrap();
+        s.upsert(rec("stale", MemoryScope::Global, vec![1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
 
-        let hits = s.query(&[1.0, 0.0], 10,
-            &ScopeFilter::ProjectAndGlobal { project_key: "A".into() }).await.unwrap();
+        let hits = s
+            .query(
+                &[1.0, 0.0],
+                10,
+                &ScopeFilter::ProjectAndGlobal {
+                    project_key: "A".into(),
+                },
+            )
+            .await
+            .unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h.record.id.as_str()).collect();
         assert!(ids.contains(&"p") && ids.contains(&"g"));
         assert!(!ids.contains(&"stale"), "mismatched-dim row skipped");
@@ -342,9 +441,12 @@ mod sqlite_tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = SqliteStore::open(&tmp.path().join("m.db")).unwrap();
         let sc = MemoryScope::Project("A".into());
-        let mut old = rec("old", sc.clone(), vec![1.0, 0.0]); old.updated_at = 1;
+        let mut old = rec("old", sc.clone(), vec![1.0, 0.0]);
+        old.updated_at = 1;
         s.upsert(old).await.unwrap();
-        s.upsert(rec("new", sc.clone(), vec![1.0, 0.0])).await.unwrap();
+        s.upsert(rec("new", sc.clone(), vec![1.0, 0.0]))
+            .await
+            .unwrap();
         assert_eq!(s.count(&ScopeFilter::Exact(sc.clone())).await.unwrap(), 2);
         assert_eq!(s.evict_oldest(&sc).await.unwrap().as_deref(), Some("old"));
         assert!(s.delete("new").await.unwrap());
@@ -358,16 +460,30 @@ mod tests {
     use crate::record::now_secs;
 
     fn rec(id: &str, scope: MemoryScope, vector: Vec<f32>, updated: i64) -> MemoryRecord {
-        MemoryRecord { id: id.into(), text: id.into(), scope, tags: vec![], vector,
-                       created_at: updated, updated_at: updated, source: "test".into() }
+        MemoryRecord {
+            id: id.into(),
+            text: id.into(),
+            scope,
+            tags: vec![],
+            vector,
+            created_at: updated,
+            updated_at: updated,
+            source: "test".into(),
+        }
     }
 
     #[tokio::test]
     async fn list_returns_scope_filtered_newest_first() {
         let s = InMemoryStore::new();
         let mk = |id: &str, t: i64| MemoryRecord {
-            id: id.into(), text: format!("m{id}"), scope: MemoryScope::Project("K".into()),
-            tags: vec![], vector: vec![0.1, 0.2], created_at: t, updated_at: t, source: "x".into(),
+            id: id.into(),
+            text: format!("m{id}"),
+            scope: MemoryScope::Project("K".into()),
+            tags: vec![],
+            vector: vec![0.1, 0.2],
+            created_at: t,
+            updated_at: t,
+            source: "x".into(),
         };
         s.upsert(mk("a", 100)).await.unwrap();
         s.upsert(mk("b", 200)).await.unwrap();
@@ -380,14 +496,41 @@ mod tests {
     #[tokio::test]
     async fn query_respects_scope_and_orders_by_similarity() {
         let s = InMemoryStore::new();
-        s.upsert(rec("p1", MemoryScope::Project("A".into()), vec![1.0, 0.0], 1)).await.unwrap();
-        s.upsert(rec("g1", MemoryScope::Global, vec![0.0, 1.0], 2)).await.unwrap();
-        s.upsert(rec("p2", MemoryScope::Project("B".into()), vec![1.0, 0.0], 3)).await.unwrap();
+        s.upsert(rec(
+            "p1",
+            MemoryScope::Project("A".into()),
+            vec![1.0, 0.0],
+            1,
+        ))
+        .await
+        .unwrap();
+        s.upsert(rec("g1", MemoryScope::Global, vec![0.0, 1.0], 2))
+            .await
+            .unwrap();
+        s.upsert(rec(
+            "p2",
+            MemoryScope::Project("B".into()),
+            vec![1.0, 0.0],
+            3,
+        ))
+        .await
+        .unwrap();
 
-        let hits = s.query(&[1.0, 0.0], 10,
-            &ScopeFilter::ProjectAndGlobal { project_key: "A".into() }).await.unwrap();
+        let hits = s
+            .query(
+                &[1.0, 0.0],
+                10,
+                &ScopeFilter::ProjectAndGlobal {
+                    project_key: "A".into(),
+                },
+            )
+            .await
+            .unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h.record.id.as_str()).collect();
-        assert!(ids.contains(&"p1") && ids.contains(&"g1"), "project A + global visible");
+        assert!(
+            ids.contains(&"p1") && ids.contains(&"g1"),
+            "project A + global visible"
+        );
         assert!(!ids.contains(&"p2"), "project B hidden");
         assert_eq!(hits[0].record.id, "p1", "best match first");
     }
@@ -396,8 +539,12 @@ mod tests {
     async fn evict_oldest_removes_least_recently_updated_in_scope() {
         let s = InMemoryStore::new();
         let sc = MemoryScope::Project("A".into());
-        s.upsert(rec("old", sc.clone(), vec![1.0, 0.0], 1)).await.unwrap();
-        s.upsert(rec("new", sc.clone(), vec![1.0, 0.0], now_secs())).await.unwrap();
+        s.upsert(rec("old", sc.clone(), vec![1.0, 0.0], 1))
+            .await
+            .unwrap();
+        s.upsert(rec("new", sc.clone(), vec![1.0, 0.0], now_secs()))
+            .await
+            .unwrap();
         assert_eq!(s.evict_oldest(&sc).await.unwrap().as_deref(), Some("old"));
         assert!(s.get("old").await.unwrap().is_none());
         assert!(s.get("new").await.unwrap().is_some());

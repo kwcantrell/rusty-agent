@@ -57,7 +57,10 @@ impl Tool for ListSkills {
         for s in &skills {
             content.push_str(&format!("- {}: {}\n", s.name, s.description));
         }
-        Ok(ToolOutput { content, display: None })
+        Ok(ToolOutput {
+            content,
+            display: None,
+        })
     }
 }
 
@@ -112,7 +115,10 @@ impl Tool for UseSkill {
         let name = name_arg(&args, "name")?;
         let skill = self.registry.find(&name).ok_or_else(|| {
             let avail: Vec<String> = self.registry.scan().into_iter().map(|s| s.name).collect();
-            ToolError::NotFound(format!("skill '{name}' not found. Available: {}", avail.join(", ")))
+            ToolError::NotFound(format!(
+                "skill '{name}' not found. Available: {}",
+                avail.join(", ")
+            ))
         })?;
         let mut content = format!("# Skill: {}\n\n{}\n", skill.name, skill.body);
         if skill.files.is_empty() {
@@ -126,7 +132,10 @@ impl Tool for UseSkill {
                 "\nRead a bundled file with read_skill_file; run a bundled script with execute_command.\n",
             );
         }
-        Ok(ToolOutput { content, display: None })
+        Ok(ToolOutput {
+            content,
+            display: None,
+        })
     }
 }
 
@@ -194,7 +203,9 @@ impl Tool for CreateSkill {
         let body = name_arg(&args, "body")?;
         let slug = sanitize_slug(&name).map_err(ToolError::InvalidArgs)?;
         if body.len() > MAX_BODY_BYTES {
-            return Err(ToolError::InvalidArgs(format!("body exceeds {MAX_BODY_BYTES} bytes")));
+            return Err(ToolError::InvalidArgs(format!(
+                "body exceeds {MAX_BODY_BYTES} bytes"
+            )));
         }
         let target = self.registry.writable_root().join(&slug);
         if target.exists() {
@@ -208,16 +219,24 @@ impl Tool for CreateSkill {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(arr)) => {
                 if arr.len() > MAX_FILES {
-                    return Err(ToolError::InvalidArgs(format!("too many files (max {MAX_FILES})")));
+                    return Err(ToolError::InvalidArgs(format!(
+                        "too many files (max {MAX_FILES})"
+                    )));
                 }
                 let mut out = Vec::new();
                 for f in arr {
-                    let path = f.get("path").and_then(Value::as_str)
+                    let path = f
+                        .get("path")
+                        .and_then(Value::as_str)
                         .ok_or_else(|| ToolError::InvalidArgs("file missing 'path'".into()))?;
-                    let content = f.get("content").and_then(Value::as_str)
+                    let content = f
+                        .get("content")
+                        .and_then(Value::as_str)
                         .ok_or_else(|| ToolError::InvalidArgs("file missing 'content'".into()))?;
                     if content.len() > MAX_FILE_BYTES {
-                        return Err(ToolError::InvalidArgs(format!("file '{path}' exceeds {MAX_FILE_BYTES} bytes")));
+                        return Err(ToolError::InvalidArgs(format!(
+                            "file '{path}' exceeds {MAX_FILE_BYTES} bytes"
+                        )));
                     }
                     let full = resolve_in_dir(&target, path).map_err(ToolError::Denied)?;
                     out.push((full, content.to_string()));
@@ -227,21 +246,32 @@ impl Tool for CreateSkill {
             Some(_) => return Err(ToolError::InvalidArgs("'files' must be an array".into())),
         };
 
-        std::fs::create_dir_all(&target)
-            .map_err(|e| ToolError::Failed { message: format!("mkdir {}: {e}", target.display()), stderr: None })?;
+        std::fs::create_dir_all(&target).map_err(|e| ToolError::Failed {
+            message: format!("mkdir {}: {e}", target.display()),
+            stderr: None,
+        })?;
         let md = format!("---\nname: {slug}\ndescription: {description}\n---\n\n{body}\n");
-        std::fs::write(target.join("SKILL.md"), md)
-            .map_err(|e| ToolError::Failed { message: format!("write SKILL.md: {e}"), stderr: None })?;
+        std::fs::write(target.join("SKILL.md"), md).map_err(|e| ToolError::Failed {
+            message: format!("write SKILL.md: {e}"),
+            stderr: None,
+        })?;
         for (full, content) in &files {
             if let Some(parent) = full.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| ToolError::Failed { message: format!("mkdir {}: {e}", parent.display()), stderr: None })?;
+                std::fs::create_dir_all(parent).map_err(|e| ToolError::Failed {
+                    message: format!("mkdir {}: {e}", parent.display()),
+                    stderr: None,
+                })?;
             }
-            std::fs::write(full, content)
-                .map_err(|e| ToolError::Failed { message: format!("write {}: {e}", full.display()), stderr: None })?;
+            std::fs::write(full, content).map_err(|e| ToolError::Failed {
+                message: format!("write {}: {e}", full.display()),
+                stderr: None,
+            })?;
         }
         Ok(ToolOutput {
-            content: format!("Created skill '{slug}' at {}. Load it with use_skill.", target.display()),
+            content: format!(
+                "Created skill '{slug}' at {}. Load it with use_skill.",
+                target.display()
+            ),
             display: None,
         })
     }
@@ -267,8 +297,10 @@ impl Tool for ReadSkillFile {
         "Read a bundled file belonging to a skill (e.g. a script or reference), so you can inspect it before acting."
     }
     fn when_not_to_call(&self) -> Option<&str> {
-        Some("Not for arbitrary workspace files — use read_file. Use read_skill_file \
-              only for files bundled inside a loaded skill's directory.")
+        Some(
+            "Not for arbitrary workspace files — use read_file. Use read_skill_file \
+              only for files bundled inside a loaded skill's directory.",
+        )
     }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -305,7 +337,10 @@ impl Tool for ReadSkillFile {
         let full = resolve_in_dir(&skill.dir, &rel).map_err(ToolError::Denied)?;
         let content = std::fs::read_to_string(&full)
             .map_err(|e| ToolError::NotFound(format!("{}: {e}", full.display())))?;
-        Ok(ToolOutput { content, display: None })
+        Ok(ToolOutput {
+            content,
+            display: None,
+        })
     }
 }
 
@@ -328,37 +363,60 @@ mod tests {
         }
     }
 
-    fn reg_with_skill(name: &str, body: &str, files: &[(&str, &str)]) -> (Arc<SkillRegistry>, TempDir) {
+    fn reg_with_skill(
+        name: &str,
+        body: &str,
+        files: &[(&str, &str)],
+    ) -> (Arc<SkillRegistry>, TempDir) {
         let dir = tempdir().unwrap();
         let sdir = dir.path().join(name);
         fs::create_dir_all(&sdir).unwrap();
-        fs::write(sdir.join("SKILL.md"), format!("---\nname: {name}\ndescription: d\n---\n{body}")).unwrap();
+        fs::write(
+            sdir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d\n---\n{body}"),
+        )
+        .unwrap();
         for (fname, content) in files {
             fs::write(sdir.join(fname), content).unwrap();
         }
-        let reg = Arc::new(SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf()));
+        let reg = Arc::new(SkillRegistry::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().to_path_buf(),
+        ));
         (reg, dir)
     }
 
     #[tokio::test]
     async fn list_skills_reports_catalog() {
         let (reg, _d) = reg_with_skill("alpha", "body", &[]);
-        let out = ListSkills::new(reg).execute(json!({}), &ctx()).await.unwrap();
+        let out = ListSkills::new(reg)
+            .execute(json!({}), &ctx())
+            .await
+            .unwrap();
         assert!(out.content.contains("alpha: d"));
     }
 
     #[tokio::test]
     async fn list_skills_empty_is_clean() {
         let dir = tempdir().unwrap();
-        let reg = Arc::new(SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf()));
-        let out = ListSkills::new(reg).execute(json!({}), &ctx()).await.unwrap();
+        let reg = Arc::new(SkillRegistry::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().to_path_buf(),
+        ));
+        let out = ListSkills::new(reg)
+            .execute(json!({}), &ctx())
+            .await
+            .unwrap();
         assert!(out.content.contains("No skills"));
     }
 
     #[tokio::test]
     async fn use_skill_returns_body_and_files() {
         let (reg, _d) = reg_with_skill("alpha", "Step one.", &[("run.sh", "echo hi")]);
-        let out = UseSkill::new(reg).execute(json!({"name": "alpha"}), &ctx()).await.unwrap();
+        let out = UseSkill::new(reg)
+            .execute(json!({"name": "alpha"}), &ctx())
+            .await
+            .unwrap();
         assert!(out.content.contains("Step one."));
         assert!(out.content.contains("run.sh"));
         assert!(out.content.contains("execute_command"));
@@ -367,7 +425,10 @@ mod tests {
     #[tokio::test]
     async fn use_skill_unknown_is_not_found() {
         let (reg, _d) = reg_with_skill("alpha", "body", &[]);
-        let err = UseSkill::new(reg).execute(json!({"name": "missing"}), &ctx()).await.unwrap_err();
+        let err = UseSkill::new(reg)
+            .execute(json!({"name": "missing"}), &ctx())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
     }
 
@@ -385,7 +446,10 @@ mod tests {
     async fn read_skill_file_rejects_escape() {
         let (reg, _d) = reg_with_skill("alpha", "body", &[]);
         let err = ReadSkillFile::new(reg)
-            .execute(json!({"skill": "alpha", "path": "../../etc/passwd"}), &ctx())
+            .execute(
+                json!({"skill": "alpha", "path": "../../etc/passwd"}),
+                &ctx(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)));
@@ -457,8 +521,19 @@ mod tests {
     async fn create_skill_refuses_overwrite() {
         let (reg, _d) = writable_reg();
         let t = CreateSkill::new(reg.clone());
-        t.execute(json!({"name": "dup", "description": "d", "body": "b"}), &ctx()).await.unwrap();
-        let err = t.execute(json!({"name": "dup", "description": "d2", "body": "b2"}), &ctx()).await.unwrap_err();
+        t.execute(
+            json!({"name": "dup", "description": "d", "body": "b"}),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        let err = t
+            .execute(
+                json!({"name": "dup", "description": "d2", "body": "b2"}),
+                &ctx(),
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Failed { .. }));
     }
 
@@ -466,7 +541,10 @@ mod tests {
     async fn create_skill_rejects_bad_name() {
         let (reg, _d) = writable_reg();
         let err = CreateSkill::new(reg)
-            .execute(json!({"name": "../evil", "description": "d", "body": "b"}), &ctx())
+            .execute(
+                json!({"name": "../evil", "description": "d", "body": "b"}),
+                &ctx(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));

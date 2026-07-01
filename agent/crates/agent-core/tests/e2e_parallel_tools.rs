@@ -23,7 +23,9 @@ impl EventSink for Capture {
 struct AutoApprove;
 #[async_trait::async_trait]
 impl ApprovalChannel for AutoApprove {
-    async fn request(&self, _r: ApprovalRequest) -> ApprovalResponse { ApprovalResponse::Approve }
+    async fn request(&self, _r: ApprovalRequest) -> ApprovalResponse {
+        ApprovalResponse::Approve
+    }
 }
 
 #[tokio::test]
@@ -41,29 +43,59 @@ async fn parallel_reads_against_real_server() {
     reg.register(Arc::new(ReadFile));
     let sink = Arc::new(Capture(Mutex::new(vec![])));
     let agent = AgentLoop::new(
-        Arc::new(OpenAiCompatClient::new(url, model_name, std::env::var("AGENT_API_KEY").ok())),
-        Arc::new(NativeProtocol), Arc::new(reg),
-        Arc::new(RulePolicy { workspace: ws.clone(), command_allowlist: vec![],
-            command_denylist: vec![] }),
-        Arc::new(AutoApprove), sink.clone(),
+        Arc::new(OpenAiCompatClient::new(
+            url,
+            model_name,
+            std::env::var("AGENT_API_KEY").ok(),
+        )),
+        Arc::new(NativeProtocol),
+        Arc::new(reg),
+        Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        }),
+        Arc::new(AutoApprove),
+        sink.clone(),
         // temperature 0.0 to make parallel emission as deterministic as the model allows.
-        LoopConfig { model_limit: 8192, max_turns: 4, max_retries: 2, temperature: 0.0,
-            max_tokens: Some(512), workspace: ws, tool_timeout: Duration::from_secs(60),
-            stream_idle_timeout: Duration::from_secs(120), ..Default::default() });
+        LoopConfig {
+            model_limit: 8192,
+            max_turns: 4,
+            max_retries: 2,
+            temperature: 0.0,
+            max_tokens: Some(512),
+            workspace: ws,
+            tool_timeout: Duration::from_secs(60),
+            stream_idle_timeout: Duration::from_secs(120),
+            ..Default::default()
+        },
+    );
 
     let mut ctx = WindowContext::new(Message::system(
         "You are a coding agent. When asked about multiple files, call read_file \
-         once per file IN THE SAME turn (parallel tool calls)."));
-    agent.run(&mut ctx,
-        "Read BOTH alpha.txt and beta.txt and report each file's contents. \
-         Call read_file for each file in the same turn.".into()).await.unwrap();
+         once per file IN THE SAME turn (parallel tool calls).",
+    ));
+    agent
+        .run(
+            &mut ctx,
+            "Read BOTH alpha.txt and beta.txt and report each file's contents. \
+         Call read_file for each file in the same turn."
+                .into(),
+        )
+        .await
+        .unwrap();
 
     let reads = sink.0.lock().unwrap().clone();
     // Distinguish a loop bug from model behavior: <2 calls means the model did not
     // emit parallel calls this run — inconclusive, not a loop failure.
-    assert!(reads.len() >= 2,
+    assert!(
+        reads.len() >= 2,
         "INCONCLUSIVE: model did not emit parallel tool calls (got {} read_file result(s)); \
-         re-run or adjust the prompt. This is model behavior, not a loop bug.", reads.len());
-    assert!(reads.iter().all(|n| n == "read_file"),
-        "every result should be a read_file; got {reads:?}");
+         re-run or adjust the prompt. This is model behavior, not a loop bug.",
+        reads.len()
+    );
+    assert!(
+        reads.iter().all(|n| n == "read_file"),
+        "every result should be a read_file; got {reads:?}"
+    );
 }

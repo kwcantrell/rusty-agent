@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use serde_json::json;
 
 fn arg_path(args: &serde_json::Value) -> Result<String, ToolError> {
-    args.get("path").and_then(|v| v.as_str()).map(str::to_string)
+    args.get("path")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
         .ok_or_else(|| ToolError::InvalidArgs("missing string field `path`".into()))
 }
 
@@ -12,30 +14,51 @@ pub struct ReadFile;
 
 #[async_trait]
 impl Tool for ReadFile {
-    fn name(&self) -> &str { "read_file" }
-    fn description(&self) -> &str { "Read the contents of a file within the workspace." }
+    fn name(&self) -> &str {
+        "read_file"
+    }
+    fn description(&self) -> &str {
+        "Read the contents of a file within the workspace."
+    }
     fn when_not_to_call(&self) -> Option<&str> {
-        Some("Not for files bundled inside a loaded skill's directory — use \
-              read_skill_file for those. Use read_file for workspace paths.")
+        Some(
+            "Not for files bundled inside a loaded skill's directory — use \
+              read_skill_file for those. Use read_file for workspace paths.",
+        )
     }
     fn schema(&self) -> ToolSchema {
-        ToolSchema { name: self.name().into(), description: self.description().into(),
+        ToolSchema {
+            name: self.name().into(),
+            description: self.description().into(),
             parameters: json!({"type":"object","properties":{
                 "path":{"type":"string","description":"Workspace-relative path of the file to read."}},
-                "required":["path"]}) }
+                "required":["path"]}),
+        }
     }
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
         let path = arg_path(args)?;
-        Ok(ToolIntent { tool: "read_file".into(), access: Access::Read,
-            paths: vec![path.clone().into()], command: None, summary: format!("read {path}") })
+        Ok(ToolIntent {
+            tool: "read_file".into(),
+            access: Access::Read,
+            paths: vec![path.clone().into()],
+            command: None,
+            summary: format!("read {path}"),
+        })
     }
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx)
-        -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         let path = arg_path(&args)?;
         let full = resolve_in_workspace(&ctx.workspace, &path)?;
-        let content = tokio::fs::read_to_string(&full).await
+        let content = tokio::fs::read_to_string(&full)
+            .await
             .map_err(|e| ToolError::NotFound(format!("{path}: {e}")))?;
-        Ok(ToolOutput { content, display: None })
+        Ok(ToolOutput {
+            content,
+            display: None,
+        })
     }
 }
 
@@ -43,32 +66,53 @@ pub struct ListDirectory;
 
 #[async_trait]
 impl Tool for ListDirectory {
-    fn name(&self) -> &str { "list_directory" }
-    fn description(&self) -> &str { "List entries of a directory within the workspace." }
+    fn name(&self) -> &str {
+        "list_directory"
+    }
+    fn description(&self) -> &str {
+        "List entries of a directory within the workspace."
+    }
     fn schema(&self) -> ToolSchema {
-        ToolSchema { name: self.name().into(), description: self.description().into(),
+        ToolSchema {
+            name: self.name().into(),
+            description: self.description().into(),
             parameters: json!({"type":"object","properties":{
                 "path":{"type":"string","description":"Workspace-relative path of the directory to list."}},
-                "required":["path"]}) }
+                "required":["path"]}),
+        }
     }
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
         let path = arg_path(args)?;
-        Ok(ToolIntent { tool: "list_directory".into(), access: Access::Read,
-            paths: vec![path.clone().into()], command: None, summary: format!("list {path}") })
+        Ok(ToolIntent {
+            tool: "list_directory".into(),
+            access: Access::Read,
+            paths: vec![path.clone().into()],
+            command: None,
+            summary: format!("list {path}"),
+        })
     }
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx)
-        -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         let path = arg_path(&args)?;
         let full = resolve_in_workspace(&ctx.workspace, &path)?;
-        let mut entries = tokio::fs::read_dir(&full).await
+        let mut entries = tokio::fs::read_dir(&full)
+            .await
             .map_err(|e| ToolError::NotFound(format!("{path}: {e}")))?;
         let mut names = Vec::new();
-        while let Some(e) = entries.next_entry().await
-            .map_err(|e| ToolError::Failed { message: e.to_string(), stderr: None })? {
+        while let Some(e) = entries.next_entry().await.map_err(|e| ToolError::Failed {
+            message: e.to_string(),
+            stderr: None,
+        })? {
             names.push(e.file_name().to_string_lossy().into_owned());
         }
         names.sort();
-        Ok(ToolOutput { content: names.join("\n"), display: None })
+        Ok(ToolOutput {
+            content: names.join("\n"),
+            display: None,
+        })
     }
 }
 
@@ -83,15 +127,22 @@ mod tests {
 
     fn ctx(ws: std::path::PathBuf) -> ToolCtx {
         use std::sync::Arc;
-        ToolCtx { workspace: ws, timeout: Duration::from_secs(5), cancel: CancellationToken::new(),
-            sandbox: Arc::new(crate::HostExecutor) }
+        ToolCtx {
+            workspace: ws,
+            timeout: Duration::from_secs(5),
+            cancel: CancellationToken::new(),
+            sandbox: Arc::new(crate::HostExecutor),
+        }
     }
 
     #[tokio::test]
     async fn read_file_returns_contents() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
-        let out = ReadFile.execute(json!({"path":"a.txt"}), &ctx(dir.path().into())).await.unwrap();
+        let out = ReadFile
+            .execute(json!({"path":"a.txt"}), &ctx(dir.path().into()))
+            .await
+            .unwrap();
         assert_eq!(out.content, "hello");
     }
 
@@ -106,7 +157,10 @@ mod tests {
     async fn list_directory_lists_entries() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("x.txt"), "").unwrap();
-        let out = ListDirectory.execute(json!({"path":"."}), &ctx(dir.path().into())).await.unwrap();
+        let out = ListDirectory
+            .execute(json!({"path":"."}), &ctx(dir.path().into()))
+            .await
+            .unwrap();
         assert!(out.content.contains("x.txt"));
     }
 }

@@ -67,7 +67,9 @@ mod tests {
     #[test]
     fn two_sessions_is_cross_session() {
         let mut t = TaskSpec::from_json(JSON).unwrap();
-        t.sessions.push(SessionSpec { prompts: vec!["recall it".into()] });
+        t.sessions.push(SessionSpec {
+            prompts: vec!["recall it".into()],
+        });
         assert!(t.is_cross_session());
     }
 }

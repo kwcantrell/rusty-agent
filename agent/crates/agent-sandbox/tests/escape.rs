@@ -41,10 +41,7 @@ async fn run(network: bool, ws: std::path::PathBuf, c: &str) -> (i32, String) {
 
 /// Helper to get the current user's uid by shelling out to `id -u`
 fn id_of(flag: &str) -> u32 {
-    let out = std::process::Command::new("id")
-        .arg(flag)
-        .output()
-        .unwrap();
+    let out = std::process::Command::new("id").arg(flag).output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
 }
 
@@ -67,8 +64,14 @@ async fn host_filesystem_is_not_visible() {
     out.read_to_string(&mut s).await.unwrap();
     let code = child.wait().await.unwrap().code().unwrap_or(-1);
 
-    assert_ne!(code, 0, "host secret must be unreachable inside the sandbox");
-    assert!(!s.contains("TOPSECRET"), "host secret content must not leak");
+    assert_ne!(
+        code, 0,
+        "host secret must be unreachable inside the sandbox"
+    );
+    assert!(
+        !s.contains("TOPSECRET"),
+        "host secret content must not leak"
+    );
 }
 
 #[tokio::test]
@@ -98,10 +101,7 @@ async fn workspace_is_writable() {
     let gid = id_of("-g");
     let uid_gid = format!("{}:{}", uid, gid);
     let mut child = DockerSandbox::new(policy(false), uid_gid, Availability::Available)
-        .launch(cmd(
-            "touch /workspace/made_in_container",
-            ws.path().into(),
-        ))
+        .launch(cmd("touch /workspace/made_in_container", ws.path().into()))
         .unwrap();
     assert!(child.wait().await.unwrap().success());
     assert!(ws.path().join("made_in_container").exists());
@@ -116,10 +116,7 @@ async fn workspace_is_host_owned() {
     let uid_gid = format!("{}:{}", uid, gid);
     let sb = DockerSandbox::new(policy(false), uid_gid, Availability::Available);
     let mut child = sb
-        .launch(cmd(
-            "touch /workspace/made_in_container",
-            ws.path().into(),
-        ))
+        .launch(cmd("touch /workspace/made_in_container", ws.path().into()))
         .unwrap();
     assert!(child.wait().await.unwrap().success());
     let meta = std::fs::metadata(ws.path().join("made_in_container")).unwrap();

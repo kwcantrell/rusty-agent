@@ -3,8 +3,10 @@ mod render;
 
 use agent_core::CuratedContext;
 use agent_model::Message;
-use agent_runtime_config::{assemble_loop, backend_name_is_valid, build_memory_full, build_model,
-    build_sandbox, default_allowlist, default_denylist, LoopParts, RuntimeConfig};
+use agent_runtime_config::{
+    assemble_loop, backend_name_is_valid, build_memory_full, build_model, build_sandbox,
+    default_allowlist, default_denylist, LoopParts, RuntimeConfig,
+};
 use approval::TerminalApproval;
 use clap::Parser;
 use render::TerminalSink;
@@ -20,8 +22,12 @@ summary and no tool call.";
 /// way as the server (via `agent_runtime_config::assemble_loop`).
 fn runtime_config_from_cli(cli: &Cli, protocol_name: &str) -> RuntimeConfig {
     let mut c = RuntimeConfig::from_launch(
-        cli.backend.clone(), cli.base_url.clone(), cli.model.clone(),
-        protocol_name.to_string(), cli.context_limit);
+        cli.backend.clone(),
+        cli.base_url.clone(),
+        cli.model.clone(),
+        protocol_name.to_string(),
+        cli.context_limit,
+    );
     // Sandbox
     c.sandbox_mode = cli.sandbox_mode.clone();
     c.sandbox_image = cli.sandbox_image.clone();
@@ -165,18 +171,28 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().with_env_filter(
-        tracing_subscriber::EnvFilter::from_default_env()).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     let cli = Cli::parse();
     let workspace = std::fs::canonicalize(&cli.workspace)
         .unwrap_or_else(|_| std::path::PathBuf::from(&cli.workspace));
 
     if !backend_name_is_valid(&cli.backend) {
-        eprintln!("unknown --backend '{}': use openai | claude-cli", cli.backend);
+        eprintln!(
+            "unknown --backend '{}': use openai | claude-cli",
+            cli.backend
+        );
         std::process::exit(2);
     }
     let api_key = std::env::var("AGENT_API_KEY").ok();
-    let model = build_model(&cli.backend, &cli.base_url, &cli.model, &cli.claude_binary, api_key);
+    let model = build_model(
+        &cli.backend,
+        &cli.base_url,
+        &cli.model,
+        &cli.claude_binary,
+        api_key,
+    );
     // claude-cli is a pure text generator; tool calls must come via the prompted protocol.
     let protocol_name = if cli.backend == "claude-cli" {
         if cli.protocol != "prompted" {
@@ -204,8 +220,12 @@ async fn main() {
     };
 
     // Long-term memory: construct once (loads the embedding model); pass tools + retriever in.
-    let memory = build_memory_full(cli.memory, cli.memory_db.clone(),
-        cli.memory_model_dir.clone(), &workspace);
+    let memory = build_memory_full(
+        cli.memory,
+        cli.memory_db.clone(),
+        cli.memory_model_dir.clone(),
+        &workspace,
+    );
 
     let offload_store: Arc<dyn agent_core::OffloadStore> =
         Arc::new(agent_core::InMemoryOffloadStore::new());
@@ -218,23 +238,29 @@ async fn main() {
         let dir = rt.trace_dir.as_deref().unwrap_or("~/.agent/sessions");
         eprintln!("\x1b[2mtrace: {}/{}.jsonl\x1b[0m", dir, t.session_id());
     }
-    let built = assemble_loop(&rt, LoopParts {
-        model,
-        sink: Arc::new(TerminalSink::default()),
-        approval: Arc::new(TerminalApproval::default()),
-        workspace: workspace.clone(),
-        mcp_tools,
-        memory_tools: memory.tools.clone(),
-        memory_retriever: memory.retriever.clone(),
-        stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
-        base_system_prompt: BASE_SYSTEM_PROMPT.to_string(),
-        offload_store: offload_store.clone(),
-        compact_flag: compact_flag.clone(),
-        stats: stats.clone(),
-        trace,
-    });
+    let built = assemble_loop(
+        &rt,
+        LoopParts {
+            model,
+            sink: Arc::new(TerminalSink::default()),
+            approval: Arc::new(TerminalApproval::default()),
+            workspace: workspace.clone(),
+            mcp_tools,
+            memory_tools: memory.tools.clone(),
+            memory_retriever: memory.retriever.clone(),
+            stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
+            base_system_prompt: BASE_SYSTEM_PROMPT.to_string(),
+            offload_store: offload_store.clone(),
+            compact_flag: compact_flag.clone(),
+            stats: stats.clone(),
+            trace,
+        },
+    );
     if !built.unknown_presets.is_empty() {
-        eprintln!("skills: unknown active skill(s): {}", built.unknown_presets.join(", "));
+        eprintln!(
+            "skills: unknown active skill(s): {}",
+            built.unknown_presets.join(", ")
+        );
         std::process::exit(2);
     }
     let agent = built.loop_;
@@ -252,10 +278,16 @@ async fn main() {
         print!("\n\x1b[1m›\x1b[0m ");
         let _ = std::io::stdout().flush();
         let mut line = String::new();
-        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 { break; }
+        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
         let input = line.trim();
-        if input.is_empty() { continue; }
-        if input == "exit" || input == "quit" { break; }
+        if input.is_empty() {
+            continue;
+        }
+        if input == "exit" || input == "quit" {
+            break;
+        }
         let cancel = tokio_util::sync::CancellationToken::new();
         let run = agent.run_with_cancel(&mut ctx, input.to_string(), cancel.clone());
         tokio::pin!(run);
@@ -312,9 +344,12 @@ mod tests {
     fn sandbox_repeatable_flags_parsed() {
         let cli = Cli::parse_from([
             "agent-cli",
-            "--sandbox-extra-rw", "/data",
-            "--sandbox-extra-rw", "/mnt",
-            "--sandbox-extra-ro", "/etc/config",
+            "--sandbox-extra-rw",
+            "/data",
+            "--sandbox-extra-rw",
+            "/mnt",
+            "--sandbox-extra-ro",
+            "/etc/config",
         ]);
         assert_eq!(cli.sandbox_extra_rw, vec!["/data", "/mnt"]);
         assert_eq!(cli.sandbox_extra_ro, vec!["/etc/config"]);
@@ -323,9 +358,20 @@ mod tests {
     #[test]
     fn runtime_config_from_cli_carries_loop_fields() {
         let cli = Cli::parse_from([
-            "agent", "--model", "m", "--base-url", "http://x",
-            "--top-p", "0.9", "--allow-host", "example.com",
-            "--skills-dir", "/sk", "--skill", "greeter", "--memory",
+            "agent",
+            "--model",
+            "m",
+            "--base-url",
+            "http://x",
+            "--top-p",
+            "0.9",
+            "--allow-host",
+            "example.com",
+            "--skills-dir",
+            "/sk",
+            "--skill",
+            "greeter",
+            "--memory",
         ]);
         let rc = runtime_config_from_cli(&cli, "native");
         assert_eq!(rc.model, "m");

@@ -13,13 +13,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
-    Token { text: String },
-    Reasoning { text: String },
-    Usage { prompt_tokens: usize, context_limit: usize, turn: usize, max_turns: usize },
+    Token {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+    },
+    Usage {
+        prompt_tokens: usize,
+        context_limit: usize,
+        turn: usize,
+        max_turns: usize,
+    },
     /// Faithful server-reported token totals for the completed turn; the web
     /// Context Explorer uses this as ground truth for the prompt-token chart.
     ServerUsage {
-        prompt_tokens: u32, completion_tokens: u32, turn: usize,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        turn: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_tokens: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -29,7 +40,11 @@ pub enum ServerEvent {
         #[serde(default)]
         turn_duration_ms: u64,
     },
-    ToolStart { id: String, name: String, args: serde_json::Value },
+    ToolStart {
+        id: String,
+        name: String,
+        args: serde_json::Value,
+    },
     ToolResult {
         id: String,
         name: String,
@@ -39,8 +54,12 @@ pub enum ServerEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<Display>,
     },
-    Error { message: String },
-    Done { reason: String },
+    Error {
+        message: String,
+    },
+    Done {
+        reason: String,
+    },
     ApprovalRequest {
         id: String,
         summary: String,
@@ -49,13 +68,21 @@ pub enum ServerEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<Display>,
     },
-    SandboxDegraded { mechanism: String, reason: String },
+    SandboxDegraded {
+        mechanism: String,
+        reason: String,
+    },
     /// Context-curation telemetry (offload/compaction), forwarded from
     /// `AgentEvent::Context`. `kind` discriminates the payload in `detail`.
-    Context { kind: String, detail: serde_json::Value },
+    Context {
+        kind: String,
+        detail: serde_json::Value,
+    },
     /// Cumulative per-session counters, pushed once per completed run so an
     /// attached client needs no poll.
-    SessionStats { stats: agent_core::SessionStats },
+    SessionStats {
+        stats: agent_core::SessionStats,
+    },
 }
 
 /// Settings snapshot returned by the `settings_get` command (was `WireBody::SettingsState`).
@@ -74,13 +101,22 @@ pub struct SettingsState {
 /// streamed `ServerEvent` (run-start). Present only when isolation was requested
 /// but not delivered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SandboxDegraded { pub mechanism: String, pub reason: String }
+pub struct SandboxDegraded {
+    pub mechanism: String,
+    pub reason: String,
+}
 
 /// Extract the degraded posture from a sandbox descriptor, if any. Pure so the
 /// daemon's `settings_state()` stays trivial and this stays unit-testable.
-pub fn sandbox_degraded_from(desc: Option<agent_tools::SandboxDescriptor>) -> Option<SandboxDegraded> {
-    desc.and_then(|d| d.degraded.map(|reason| SandboxDegraded {
-        mechanism: d.mechanism.to_string(), reason }))
+pub fn sandbox_degraded_from(
+    desc: Option<agent_tools::SandboxDescriptor>,
+) -> Option<SandboxDegraded> {
+    desc.and_then(|d| {
+        d.degraded.map(|reason| SandboxDegraded {
+            mechanism: d.mechanism.to_string(),
+            reason,
+        })
+    })
 }
 
 /// Read-only skill info surfaced in `settings_state` for the Settings UI's
@@ -93,7 +129,11 @@ pub struct DiscoveredSkill {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Decision { Approve, ApproveAlways, Deny }
+pub enum Decision {
+    Approve,
+    ApproveAlways,
+    Deny,
+}
 
 impl From<Decision> for ApprovalResponse {
     fn from(d: Decision) -> Self {
@@ -127,34 +167,83 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
     Some(match event {
         AgentEvent::Token(t) => ServerEvent::Token { text: t },
         AgentEvent::Reasoning(t) => ServerEvent::Reasoning { text: t },
-        AgentEvent::Usage { prompt_tokens, context_limit, turn, max_turns } =>
-            ServerEvent::Usage { prompt_tokens, context_limit, turn, max_turns },
+        AgentEvent::Usage {
+            prompt_tokens,
+            context_limit,
+            turn,
+            max_turns,
+        } => ServerEvent::Usage {
+            prompt_tokens,
+            context_limit,
+            turn,
+            max_turns,
+        },
         AgentEvent::ToolStart { id, name, args } => ServerEvent::ToolStart { id, name, args },
-        AgentEvent::ToolResult { id, name, status, output, duration_ms } => ServerEvent::ToolResult {
-            id, name, status: status.as_str().into(), duration_ms,
-            content: output.content, display: output.display },
+        AgentEvent::ToolResult {
+            id,
+            name,
+            status,
+            output,
+            duration_ms,
+        } => ServerEvent::ToolResult {
+            id,
+            name,
+            status: status.as_str().into(),
+            duration_ms,
+            content: output.content,
+            display: output.display,
+        },
         AgentEvent::Error(m) => ServerEvent::Error { message: m },
-        AgentEvent::Done(r) => ServerEvent::Done { reason: stop_reason_str(&r).into() },
+        AgentEvent::Done(r) => ServerEvent::Done {
+            reason: stop_reason_str(&r).into(),
+        },
         AgentEvent::Approval(_) => return None,
         AgentEvent::Context(c) => {
             use agent_core::ContextEvent as CE;
             let (kind, detail) = match c {
-                CE::Offloaded { id, bytes, tool } =>
-                    ("offloaded", serde_json::json!({"id": id, "bytes": bytes, "tool": tool})),
-                CE::Compacted { turns_replaced, tokens_before, tokens_after } =>
-                    ("compacted", serde_json::json!({"turns_replaced": turns_replaced,
-                        "tokens_before": tokens_before, "tokens_after": tokens_after})),
-                CE::CompactionFailed { reason } =>
-                    ("compaction_failed", serde_json::json!({"reason": reason})),
+                CE::Offloaded { id, bytes, tool } => (
+                    "offloaded",
+                    serde_json::json!({"id": id, "bytes": bytes, "tool": tool}),
+                ),
+                CE::Compacted {
+                    turns_replaced,
+                    tokens_before,
+                    tokens_after,
+                } => (
+                    "compacted",
+                    serde_json::json!({"turns_replaced": turns_replaced,
+                        "tokens_before": tokens_before, "tokens_after": tokens_after}),
+                ),
+                CE::CompactionFailed { reason } => {
+                    ("compaction_failed", serde_json::json!({"reason": reason}))
+                }
             };
-            ServerEvent::Context { kind: kind.into(), detail }
+            ServerEvent::Context {
+                kind: kind.into(),
+                detail,
+            }
         }
-        AgentEvent::ServerUsage { prompt_tokens, completion_tokens, reasoning_tokens,
-            cached_tokens, cost_usd, turn_duration_ms, turn } =>
-            ServerEvent::ServerUsage { prompt_tokens, completion_tokens, turn,
-                reasoning_tokens, cached_tokens, cost_usd, turn_duration_ms },
-        AgentEvent::SandboxDegraded { mechanism, reason } =>
-            ServerEvent::SandboxDegraded { mechanism: mechanism.to_string(), reason },
+        AgentEvent::ServerUsage {
+            prompt_tokens,
+            completion_tokens,
+            reasoning_tokens,
+            cached_tokens,
+            cost_usd,
+            turn_duration_ms,
+            turn,
+        } => ServerEvent::ServerUsage {
+            prompt_tokens,
+            completion_tokens,
+            turn,
+            reasoning_tokens,
+            cached_tokens,
+            cost_usd,
+            turn_duration_ms,
+        },
+        AgentEvent::SandboxDegraded { mechanism, reason } => ServerEvent::SandboxDegraded {
+            mechanism: mechanism.to_string(),
+            reason,
+        },
     })
 }
 
@@ -175,13 +264,22 @@ mod tests {
         use agent_policy::ApprovalRequest;
         use agent_tools::{Access, ToolIntent};
         let req = ApprovalRequest {
-            intent: ToolIntent { tool: "x".into(), access: Access::Write, paths: vec![],
-                command: None, summary: "s".into() },
+            intent: ToolIntent {
+                tool: "x".into(),
+                access: Access::Write,
+                paths: vec![],
+                command: None,
+                summary: "s".into(),
+            },
             display: None,
         };
         assert!(server_event_from(AgentEvent::Approval(req)).is_none());
-        let ar = ServerEvent::ApprovalRequest { id: "c0".into(), summary: "s".into(),
-            command: None, display: None };
+        let ar = ServerEvent::ApprovalRequest {
+            id: "c0".into(),
+            summary: "s".into(),
+            command: None,
+            display: None,
+        };
         let j = serde_json::to_string(&ar).unwrap();
         assert!(j.contains(r#""type":"approval_request""#));
         assert!(j.contains(r#""id":"c0""#));
@@ -197,17 +295,39 @@ mod tests {
             cost_usd: None,
             turn_duration_ms: 1234,
             turn: 3,
-        }).unwrap();
+        })
+        .unwrap();
         let j = serde_json::to_string(&ev).unwrap();
-        assert!(j.contains(r#""type":"server_usage""#), "missing type tag: {j}");
-        assert!(j.contains(r#""prompt_tokens":42"#), "missing prompt_tokens: {j}");
-        assert!(j.contains(r#""completion_tokens":7"#), "missing completion_tokens: {j}");
+        assert!(
+            j.contains(r#""type":"server_usage""#),
+            "missing type tag: {j}"
+        );
+        assert!(
+            j.contains(r#""prompt_tokens":42"#),
+            "missing prompt_tokens: {j}"
+        );
+        assert!(
+            j.contains(r#""completion_tokens":7"#),
+            "missing completion_tokens: {j}"
+        );
         assert!(j.contains(r#""turn":3"#), "missing turn: {j}");
-        assert!(j.contains(r#""turn_duration_ms":1234"#), "missing turn_duration_ms: {j}");
+        assert!(
+            j.contains(r#""turn_duration_ms":1234"#),
+            "missing turn_duration_ms: {j}"
+        );
         // None-valued optionals are omitted from the wire form entirely.
-        assert!(!j.contains("reasoning_tokens"), "None optionals must be skipped: {j}");
-        assert!(!j.contains("cached_tokens"), "None optionals must be skipped: {j}");
-        assert!(!j.contains("cost_usd"), "None optionals must be skipped: {j}");
+        assert!(
+            !j.contains("reasoning_tokens"),
+            "None optionals must be skipped: {j}"
+        );
+        assert!(
+            !j.contains("cached_tokens"),
+            "None optionals must be skipped: {j}"
+        );
+        assert!(
+            !j.contains("cost_usd"),
+            "None optionals must be skipped: {j}"
+        );
     }
 
     #[test]
@@ -218,24 +338,56 @@ mod tests {
             id: "c9".into(),
             name: "read_file".into(),
             status: ToolStatus::Denied,
-            output: ToolOutput { content: "ERROR: nope".into(), display: None },
+            output: ToolOutput {
+                content: "ERROR: nope".into(),
+                display: None,
+            },
             duration_ms: 0,
-        }).unwrap();
+        })
+        .unwrap();
         let j = serde_json::to_string(&ev).unwrap();
-        assert!(j.contains(r#""type":"tool_result""#), "missing type tag: {j}");
+        assert!(
+            j.contains(r#""type":"tool_result""#),
+            "missing type tag: {j}"
+        );
         assert!(j.contains(r#""id":"c9""#), "missing id: {j}");
-        assert!(j.contains(r#""status":"denied""#), "missing snake_case status: {j}");
+        assert!(
+            j.contains(r#""status":"denied""#),
+            "missing snake_case status: {j}"
+        );
         assert!(j.contains(r#""duration_ms":0"#), "missing duration_ms: {j}");
-        assert!(j.contains(r#""content":"ERROR: nope""#), "missing content: {j}");
+        assert!(
+            j.contains(r#""content":"ERROR: nope""#),
+            "missing content: {j}"
+        );
     }
 
     #[test]
     fn context_events_are_forwarded() {
         use agent_core::ContextEvent;
         for (ev, kind) in [
-            (ContextEvent::Offloaded { id: 4, bytes: 2048, tool: "read_file".into() }, "offloaded"),
-            (ContextEvent::Compacted { turns_replaced: 3, tokens_before: 900, tokens_after: 200 }, "compacted"),
-            (ContextEvent::CompactionFailed { reason: "model err".into() }, "compaction_failed"),
+            (
+                ContextEvent::Offloaded {
+                    id: 4,
+                    bytes: 2048,
+                    tool: "read_file".into(),
+                },
+                "offloaded",
+            ),
+            (
+                ContextEvent::Compacted {
+                    turns_replaced: 3,
+                    tokens_before: 900,
+                    tokens_after: 200,
+                },
+                "compacted",
+            ),
+            (
+                ContextEvent::CompactionFailed {
+                    reason: "model err".into(),
+                },
+                "compaction_failed",
+            ),
         ] {
             let out = server_event_from(AgentEvent::Context(ev)).expect("must forward");
             let j = serde_json::to_value(&out).unwrap();
@@ -247,9 +399,16 @@ mod tests {
     #[test]
     fn tool_result_wire_carries_status_and_duration() {
         let out = server_event_from(AgentEvent::ToolResult {
-            id: "c1".into(), name: "t".into(), status: agent_core::ToolStatus::Timeout,
-            output: agent_tools::ToolOutput { content: "e".into(), display: None },
-            duration_ms: 60000 }).unwrap();
+            id: "c1".into(),
+            name: "t".into(),
+            status: agent_core::ToolStatus::Timeout,
+            output: agent_tools::ToolOutput {
+                content: "e".into(),
+                display: None,
+            },
+            duration_ms: 60000,
+        })
+        .unwrap();
         let j = serde_json::to_value(&out).unwrap();
         assert_eq!(j["type"], "tool_result");
         assert_eq!(j["id"], "c1");
@@ -260,34 +419,64 @@ mod tests {
     #[test]
     fn done_uses_stop_reason_string() {
         let ev = server_event_from(AgentEvent::Done(StopReason::Cancelled)).unwrap();
-        assert_eq!(serde_json::to_string(&ev).unwrap(), r#"{"type":"done","reason":"cancelled"}"#);
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"type":"done","reason":"cancelled"}"#
+        );
     }
 
     #[test]
     fn decision_into_response() {
-        assert_eq!(ApprovalResponse::from(Decision::ApproveAlways), ApprovalResponse::ApproveAlways);
+        assert_eq!(
+            ApprovalResponse::from(Decision::ApproveAlways),
+            ApprovalResponse::ApproveAlways
+        );
     }
 
     #[test]
     fn sandbox_degraded_event_serializes_with_type_tag() {
         let ev = server_event_from(AgentEvent::SandboxDegraded {
-            mechanism: "docker", reason: "no daemon".into() }).unwrap();
+            mechanism: "docker",
+            reason: "no daemon".into(),
+        })
+        .unwrap();
         let j = serde_json::to_string(&ev).unwrap();
-        assert!(j.contains(r#""type":"sandbox_degraded""#), "missing type tag: {j}");
-        assert!(j.contains(r#""mechanism":"docker""#), "missing mechanism: {j}");
+        assert!(
+            j.contains(r#""type":"sandbox_degraded""#),
+            "missing type tag: {j}"
+        );
+        assert!(
+            j.contains(r#""mechanism":"docker""#),
+            "missing mechanism: {j}"
+        );
         assert!(j.contains(r#""reason":"no daemon""#), "missing reason: {j}");
     }
 
     #[test]
     fn sandbox_degraded_from_maps_only_when_degraded() {
-        use agent_tools::{SandboxDescriptor, Mode};
-        let degraded = SandboxDescriptor { mode: Mode::Auto, mechanism: "docker",
-            image: None, network: false, degraded: Some("no daemon".into()) };
-        assert_eq!(sandbox_degraded_from(Some(degraded)),
-            Some(SandboxDegraded { mechanism: "docker".into(), reason: "no daemon".into() }));
+        use agent_tools::{Mode, SandboxDescriptor};
+        let degraded = SandboxDescriptor {
+            mode: Mode::Auto,
+            mechanism: "docker",
+            image: None,
+            network: false,
+            degraded: Some("no daemon".into()),
+        };
+        assert_eq!(
+            sandbox_degraded_from(Some(degraded)),
+            Some(SandboxDegraded {
+                mechanism: "docker".into(),
+                reason: "no daemon".into()
+            })
+        );
 
-        let healthy = SandboxDescriptor { mode: Mode::Off, mechanism: "host",
-            image: None, network: true, degraded: None };
+        let healthy = SandboxDescriptor {
+            mode: Mode::Off,
+            mechanism: "host",
+            image: None,
+            network: true,
+            degraded: None,
+        };
         assert_eq!(sandbox_degraded_from(Some(healthy)), None);
         assert_eq!(sandbox_degraded_from(None), None);
     }

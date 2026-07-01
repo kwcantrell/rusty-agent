@@ -20,7 +20,12 @@ pub struct IpcApprovalChannel {
 
 impl IpcApprovalChannel {
     pub fn new(slot: EventSlot, timeout: Duration) -> Self {
-        Self { slot, pending: Mutex::new(HashMap::new()), counter: AtomicU64::new(0), timeout }
+        Self {
+            slot,
+            pending: Mutex::new(HashMap::new()),
+            counter: AtomicU64::new(0),
+            timeout,
+        }
     }
 
     /// Complete a pending approval, called by the `approve` command.
@@ -70,22 +75,33 @@ mod tests {
     #[derive(Default)]
     struct Captured(Mutex<Vec<ServerEvent>>);
     impl EventOut for Captured {
-        fn send(&self, ev: ServerEvent) { self.0.lock().unwrap().push(ev); }
+        fn send(&self, ev: ServerEvent) {
+            self.0.lock().unwrap().push(ev);
+        }
     }
     fn slot_with(out: Arc<Captured>) -> crate::sink::EventSlot {
         Arc::new(Mutex::new(Some(out as Arc<dyn EventOut>)))
     }
     fn req() -> ApprovalRequest {
         ApprovalRequest {
-            intent: ToolIntent { tool: "execute_command".into(), access: Access::Write,
-                paths: vec![], command: Some("touch x".into()), summary: "run touch x".into() },
-            display: None }
+            intent: ToolIntent {
+                tool: "execute_command".into(),
+                access: Access::Write,
+                paths: vec![],
+                command: Some("touch x".into()),
+                summary: "run touch x".into(),
+            },
+            display: None,
+        }
     }
 
     #[tokio::test]
     async fn emits_request_and_resolves() {
         let cap = Arc::new(Captured::default());
-        let ch = Arc::new(IpcApprovalChannel::new(slot_with(cap.clone()), Duration::from_secs(5)));
+        let ch = Arc::new(IpcApprovalChannel::new(
+            slot_with(cap.clone()),
+            Duration::from_secs(5),
+        ));
         let ch2 = ch.clone();
         let h = tokio::spawn(async move { ch2.request(req()).await });
         // Spin until the request frame appears, then pull its id.

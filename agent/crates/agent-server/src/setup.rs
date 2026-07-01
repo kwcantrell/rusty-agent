@@ -15,15 +15,19 @@ pub fn local_params(
     model: String,
     memory_parts: Option<&MemoryParts>,
 ) -> DaemonParams {
-    let mut config = RuntimeConfig::from_launch(
-        "openai".into(), base_url, model, "native".into(), 262_144);
+    let mut config =
+        RuntimeConfig::from_launch("openai".into(), base_url, model, "native".into(), 262_144);
     config.preserve_thinking = true;
     config.enable_thinking = true;
 
     let (memory_tools, memory_retriever, recall_token_budget) = match memory_parts {
         Some(parts) => {
             let (tools, retriever) = assemble_memory(parts, &workspace);
-            (Arc::from(tools), Some(retriever), parts.cfg.recall_token_budget)
+            (
+                Arc::from(tools),
+                Some(retriever),
+                parts.cfg.recall_token_budget,
+            )
         }
         None => (
             Arc::from(Vec::<Arc<dyn agent_tools::Tool>>::new()),
@@ -81,8 +85,12 @@ mod tests {
             cfg: Arc::new(MemoryConfig::default()),
         };
         let p = local_params(
-            PathBuf::from("/tmp/ws"), PathBuf::from("/tmp/rt.json"),
-            "http://localhost:8080".into(), "m".into(), Some(&parts));
+            PathBuf::from("/tmp/ws"),
+            PathBuf::from("/tmp/rt.json"),
+            "http://localhost:8080".into(),
+            "m".into(),
+            Some(&parts),
+        );
         assert_eq!(p.memory_tools.len(), 3);
         assert!(p.memory_retriever.is_some());
         assert_eq!(p.recall_token_budget, 512);

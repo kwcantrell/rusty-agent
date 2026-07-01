@@ -19,12 +19,17 @@ pub fn gate(champion: &BatchResult, candidate: &BatchResult) -> Verdict {
             ),
         };
     }
-    match (candidate.median_tokens_passing(), champion.median_tokens_passing()) {
+    match (
+        candidate.median_tokens_passing(),
+        champion.median_tokens_passing(),
+    ) {
         (Some(cand), Some(champ)) if cand < champ => Verdict::Promote,
         (Some(cand), Some(champ)) => Verdict::Reject {
             reason: format!("tokens not improved: {cand} >= {champ}"),
         },
-        _ => Verdict::Reject { reason: "no passing runs to compare tokens".into() },
+        _ => Verdict::Reject {
+            reason: "no passing runs to compare tokens".into(),
+        },
     }
 }
 
@@ -33,7 +38,10 @@ pub fn gate(champion: &BatchResult, candidate: &BatchResult) -> Verdict {
 /// checked here. `champion`/`candidate` are aligned per-task (same order).
 pub fn heldout_ok(champion: &[BatchResult], candidate: &[BatchResult]) -> bool {
     champion.len() == candidate.len()
-        && champion.iter().zip(candidate).all(|(c, n)| n.pass_rate() >= c.pass_rate())
+        && champion
+            .iter()
+            .zip(candidate)
+            .all(|(c, n)| n.pass_rate() >= c.pass_rate())
 }
 
 #[cfg(test)]
@@ -42,7 +50,14 @@ mod tests {
     use crate::eval::result::{BatchResult, RunResult};
     fn batch(spec: &[(bool, u64)]) -> BatchResult {
         BatchResult {
-            runs: spec.iter().map(|&(passed, tokens)| RunResult { passed, tokens, turns: 1 }).collect(),
+            runs: spec
+                .iter()
+                .map(|&(passed, tokens)| RunResult {
+                    passed,
+                    tokens,
+                    turns: 1,
+                })
+                .collect(),
         }
     }
     #[test]
@@ -65,9 +80,18 @@ mod tests {
     }
     #[test]
     fn heldout_blocks_any_pass_rate_regression() {
-        let champ = vec![batch(&[(true, 9), (true, 9)]), batch(&[(true, 9), (true, 9)])];
-        let cand_ok = vec![batch(&[(true, 9), (true, 9)]), batch(&[(true, 9), (true, 9)])];
-        let cand_bad = vec![batch(&[(true, 9), (true, 9)]), batch(&[(true, 9), (false, 9)])];
+        let champ = vec![
+            batch(&[(true, 9), (true, 9)]),
+            batch(&[(true, 9), (true, 9)]),
+        ];
+        let cand_ok = vec![
+            batch(&[(true, 9), (true, 9)]),
+            batch(&[(true, 9), (true, 9)]),
+        ];
+        let cand_bad = vec![
+            batch(&[(true, 9), (true, 9)]),
+            batch(&[(true, 9), (false, 9)]),
+        ];
         assert!(heldout_ok(&champ, &cand_ok));
         assert!(!heldout_ok(&champ, &cand_bad));
     }

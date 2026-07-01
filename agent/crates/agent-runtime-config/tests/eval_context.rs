@@ -5,7 +5,9 @@
 //!   AGENT_E2E_URL=http://localhost:8080 AGENT_E2E_MODEL=qwen3.6-35b-a3b \
 //!   TASK_JSON=task.json CONFIG_JSON=cfg.json HIDDEN_TESTS_DIR=hidden_tests \
 //!   cargo test -p agent-runtime-config --test eval_context -- --ignored --nocapture
-use agent_core::{AgentEvent, CuratedContext, EventSink, InMemoryOffloadStore, OffloadStore, Retriever};
+use agent_core::{
+    AgentEvent, CuratedContext, EventSink, InMemoryOffloadStore, OffloadStore, Retriever,
+};
 use agent_memory::{
     build_tools_with, project_scope, Embedder, FastEmbedEmbedder, MemoryConfig, MemoryRetriever,
     MemoryScope, MemoryStore, SqliteStore, StubEmbedder,
@@ -27,8 +29,9 @@ struct SafeApproval {
 impl ApprovalChannel for SafeApproval {
     async fn request(&self, r: ApprovalRequest) -> ApprovalResponse {
         let allow = match r.intent.tool.as_str() {
-            "read_file" | "list_directory" | "write_file" | "edit_file" | "render" | "git_status"
-            | "git_diff" | "context_recall" | "context_compact" | "remember" | "recall" | "forget" => true,
+            "read_file" | "list_directory" | "write_file" | "edit_file" | "render"
+            | "git_status" | "git_diff" | "context_recall" | "context_compact" | "remember"
+            | "recall" | "forget" => true,
             "execute_command" => r
                 .intent
                 .command
@@ -52,7 +55,10 @@ impl ApprovalChannel for SafeApproval {
         if allow {
             ApprovalResponse::Approve
         } else {
-            self.denied.lock().unwrap().push(format!("{}:{:?}", r.intent.tool, r.intent.command));
+            self.denied
+                .lock()
+                .unwrap()
+                .push(format!("{}:{:?}", r.intent.tool, r.intent.command));
             ApprovalResponse::Deny
         }
     }
@@ -66,13 +72,23 @@ struct TokenMeter {
 }
 impl EventSink for TokenMeter {
     fn emit(&self, e: AgentEvent) {
-        if let AgentEvent::ServerUsage { prompt_tokens, completion_tokens, .. } = e {
-            self.total.fetch_add(prompt_tokens as u64 + completion_tokens as u64, Ordering::Relaxed);
+        if let AgentEvent::ServerUsage {
+            prompt_tokens,
+            completion_tokens,
+            ..
+        } = e
+        {
+            self.total.fetch_add(
+                prompt_tokens as u64 + completion_tokens as u64,
+                Ordering::Relaxed,
+            );
             self.turns.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
+// Legacy lint, unrelated to this branch: field-by-field config build reads clearly here.
+#[allow(clippy::field_reassign_with_default)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live eval: requires AGENT_E2E_URL/MODEL, TASK_JSON, CONFIG_JSON, HIDDEN_TESTS_DIR"]
 async fn eval_context_run() {
@@ -125,7 +141,9 @@ async fn eval_context_run() {
             let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open(&mem_db).unwrap());
             let embedder: Arc<dyn Embedder> = if std::env::var("EVAL_REAL_EMBEDDINGS").is_ok() {
                 let mut ecfg = MemoryConfig::default();
-                ecfg.model_cache_dir = std::env::var("FASTEMBED_CACHE").ok().map(std::path::PathBuf::from);
+                ecfg.model_cache_dir = std::env::var("FASTEMBED_CACHE")
+                    .ok()
+                    .map(std::path::PathBuf::from);
                 Arc::new(FastEmbedEmbedder::new(&ecfg).expect("load BGE-Small embedder"))
             } else {
                 Arc::new(StubEmbedder::d384())
@@ -140,13 +158,18 @@ async fn eval_context_run() {
             mcfg.auto_recall = cc.auto_recall;
             let mcfg = Arc::new(mcfg);
             let scope = project_scope(&ws);
-            let tools = build_tools_with(embedder.clone(), store.clone(), mcfg.clone(), scope.clone());
+            let tools =
+                build_tools_with(embedder.clone(), store.clone(), mcfg.clone(), scope.clone());
             let key = match &scope {
                 MemoryScope::Project(k) => k.clone(),
                 MemoryScope::Global => String::new(),
             };
-            let r: Arc<dyn Retriever> =
-                Arc::new(MemoryRetriever { embedder, store, cfg: mcfg, project_key: key });
+            let r: Arc<dyn Retriever> = Arc::new(MemoryRetriever {
+                embedder,
+                store,
+                cfg: mcfg,
+                project_key: key,
+            });
             (tools, Some(r))
         } else {
             (vec![], None)
@@ -163,15 +186,18 @@ async fn eval_context_run() {
                     std::env::var("AGENT_API_KEY").ok(),
                 )),
                 sink: meter.clone(),
-                approval: Arc::new(SafeApproval { denied: Mutex::new(Vec::new()) }),
+                approval: Arc::new(SafeApproval {
+                    denied: Mutex::new(Vec::new()),
+                }),
                 workspace: ws.clone(),
                 mcp_tools: vec![],
                 memory_tools: mem_tools,
                 memory_retriever: retriever,
                 stream_idle_timeout: Duration::from_secs(120),
-                base_system_prompt: "You are a coding agent operating in a sandboxed workspace. Use \
+                base_system_prompt:
+                    "You are a coding agent operating in a sandboxed workspace. Use \
                     the provided tools to complete each task, then give a short final reply."
-                    .into(),
+                        .into(),
                 offload_store: offload.clone(),
                 compact_flag: flag.clone(),
                 stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
@@ -179,10 +205,11 @@ async fn eval_context_run() {
             },
         );
         let agent = built.loop_;
-        let mut ctx = CuratedContext::new(Message::system(built.system_prompt), offload.clone(), flag)
-            .with_recall_budget(cc.recall_budget)
-            .with_offload_config(cc.offload_config())
-            .with_high_water_pct(cc.high_water_pct);
+        let mut ctx =
+            CuratedContext::new(Message::system(built.system_prompt), offload.clone(), flag)
+                .with_recall_budget(cc.recall_budget)
+                .with_offload_config(cc.offload_config())
+                .with_high_water_pct(cc.high_water_pct);
 
         for prompt in &session.prompts {
             let cancel = tokio_util::sync::CancellationToken::new();

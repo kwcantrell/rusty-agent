@@ -1,4 +1,4 @@
-use crate::{default_allowlist, backend_name_is_valid, protocol_name_is_valid};
+use crate::{backend_name_is_valid, default_allowlist, protocol_name_is_valid};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -13,10 +13,10 @@ pub const HARD_FLOOR_DENYLIST: &[&str] = &["rm -rf /", ":(){", "dd if="];
 /// The editable runtime surface, persisted to disk and mirrored on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    pub backend: String,        // "openai" | "claude-cli"
+    pub backend: String, // "openai" | "claude-cli"
     pub base_url: String,
     pub model: String,
-    pub protocol: String,       // "native" | "prompted"
+    pub protocol: String, // "native" | "prompted"
     pub command_allowlist: Vec<String>,
     pub command_denylist: Vec<String>, // user-editable portion ONLY (floor added separately)
     pub http_allow_hosts: Vec<String>, // hosts fetch_url may contact without approval
@@ -45,7 +45,7 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub active_skills: Vec<String>,
     #[serde(default = "default_sandbox_mode")]
-    pub sandbox_mode: String,        // "off" | "auto" | "enforce"
+    pub sandbox_mode: String, // "off" | "auto" | "enforce"
     #[serde(default = "default_sandbox_image")]
     pub sandbox_image: String,
     #[serde(default)]
@@ -111,22 +111,45 @@ struct PartialRuntimeConfig {
     trace_max_mb: Option<u64>,
 }
 
-fn default_true() -> bool { true }
-fn default_sandbox_mode() -> String { "auto".into() }
-fn default_sandbox_image() -> String { "debian:stable-slim".into() }
-fn default_sandbox_memory() -> String { "2g".into() }
-fn default_sandbox_cpus() -> String { "2".into() }
-fn default_sandbox_pids() -> u32 { 512 }
-fn default_sandbox_tmp_size() -> String { "256m".into() }
-fn default_trace_max_mb() -> u64 { 64 }
+fn default_true() -> bool {
+    true
+}
+fn default_sandbox_mode() -> String {
+    "auto".into()
+}
+fn default_sandbox_image() -> String {
+    "debian:stable-slim".into()
+}
+fn default_sandbox_memory() -> String {
+    "2g".into()
+}
+fn default_sandbox_cpus() -> String {
+    "2".into()
+}
+fn default_sandbox_pids() -> u32 {
+    512
+}
+fn default_sandbox_tmp_size() -> String {
+    "256m".into()
+}
+fn default_trace_max_mb() -> u64 {
+    64
+}
 
 impl RuntimeConfig {
     /// Seed a config from launch flags + sensible defaults for the rest.
     pub fn from_launch(
-        backend: String, base_url: String, model: String, protocol: String, context_limit: usize,
+        backend: String,
+        base_url: String,
+        model: String,
+        protocol: String,
+        context_limit: usize,
     ) -> Self {
         Self {
-            backend, base_url, model, protocol,
+            backend,
+            base_url,
+            model,
+            protocol,
             command_allowlist: default_allowlist(),
             command_denylist: Vec::new(),
             http_allow_hosts: Vec::new(),
@@ -175,14 +198,23 @@ impl RuntimeConfig {
     /// claude-cli protocol correction is not flagged as an error.
     pub fn validate(&self) -> Result<(), String> {
         if !backend_name_is_valid(&self.backend) {
-            return Err(format!("unknown backend '{}': use openai | claude-cli", self.backend));
+            return Err(format!(
+                "unknown backend '{}': use openai | claude-cli",
+                self.backend
+            ));
         }
         if !protocol_name_is_valid(&self.protocol) {
-            return Err(format!("unknown protocol '{}': use native | prompted", self.protocol));
+            return Err(format!(
+                "unknown protocol '{}': use native | prompted",
+                self.protocol
+            ));
         }
         if self.backend == "claude-cli" && self.protocol != "prompted" {
-            return Err("claude-cli backend is prompted-only: protocol must be 'prompted' \
-                        (normalized() applies this automatically)".into());
+            return Err(
+                "claude-cli backend is prompted-only: protocol must be 'prompted' \
+                        (normalized() applies this automatically)"
+                    .into(),
+            );
         }
         if self.backend == "openai" && self.base_url.trim().is_empty() {
             return Err("base_url is required for the openai backend".into());
@@ -199,17 +231,30 @@ impl RuntimeConfig {
         if self.context_limit < 1024 {
             return Err("context_limit must be >= 1024".into());
         }
-        if let Some(v) = self.top_p { if !(0.0..=1.0).contains(&v) {
-            return Err("top_p must be between 0.0 and 1.0".into()); } }
-        if let Some(v) = self.min_p { if !(0.0..=1.0).contains(&v) {
-            return Err("min_p must be between 0.0 and 1.0".into()); } }
-        if let Some(v) = self.presence_penalty { if !(-2.0..=2.0).contains(&v) {
-            return Err("presence_penalty must be between -2.0 and 2.0".into()); } }
-        if let Some(v) = self.repeat_penalty { if v <= 0.0 {
-            return Err("repeat_penalty must be > 0.0".into()); } }
+        if let Some(v) = self.top_p {
+            if !(0.0..=1.0).contains(&v) {
+                return Err("top_p must be between 0.0 and 1.0".into());
+            }
+        }
+        if let Some(v) = self.min_p {
+            if !(0.0..=1.0).contains(&v) {
+                return Err("min_p must be between 0.0 and 1.0".into());
+            }
+        }
+        if let Some(v) = self.presence_penalty {
+            if !(-2.0..=2.0).contains(&v) {
+                return Err("presence_penalty must be between -2.0 and 2.0".into());
+            }
+        }
+        if let Some(v) = self.repeat_penalty {
+            if v <= 0.0 {
+                return Err("repeat_penalty must be > 0.0".into());
+            }
+        }
         if !matches!(self.sandbox_mode.as_str(), "off" | "auto" | "enforce") {
             return Err(format!(
-                "unknown sandbox_mode '{}': use off | auto | enforce", self.sandbox_mode
+                "unknown sandbox_mode '{}': use off | auto | enforce",
+                self.sandbox_mode
             ));
         }
         Ok(())
@@ -228,39 +273,105 @@ impl RuntimeConfig {
     }
 
     fn merge(mut self, p: PartialRuntimeConfig) -> Self {
-        if let Some(v) = p.backend { self.backend = v; }
-        if let Some(v) = p.base_url { self.base_url = v; }
-        if let Some(v) = p.model { self.model = v; }
-        if let Some(v) = p.protocol { self.protocol = v; }
-        if let Some(v) = p.command_allowlist { self.command_allowlist = v; }
-        if let Some(v) = p.command_denylist { self.command_denylist = v; }
-        if let Some(v) = p.http_allow_hosts { self.http_allow_hosts = v; }
-        if let Some(v) = p.temperature { self.temperature = v; }
-        if let Some(v) = p.max_tokens { self.max_tokens = v; }
-        if let Some(v) = p.max_turns { self.max_turns = v; }
-        if let Some(v) = p.context_limit { self.context_limit = v; }
-        if let Some(v) = p.top_p { self.top_p = Some(v); }
-        if let Some(v) = p.top_k { self.top_k = Some(v); }
-        if let Some(v) = p.min_p { self.min_p = Some(v); }
-        if let Some(v) = p.presence_penalty { self.presence_penalty = Some(v); }
-        if let Some(v) = p.repeat_penalty { self.repeat_penalty = Some(v); }
-        if let Some(v) = p.enable_thinking { self.enable_thinking = v; }
-        if let Some(v) = p.preserve_thinking { self.preserve_thinking = v; }
-        if let Some(v) = p.skills_dirs { self.skills_dirs = v; }
-        if let Some(v) = p.active_skills { self.active_skills = v; }
-        if let Some(v) = p.sandbox_mode { self.sandbox_mode = v; }
-        if let Some(v) = p.sandbox_image { self.sandbox_image = v; }
-        if let Some(v) = p.sandbox_network { self.sandbox_network = v; }
-        if let Some(v) = p.sandbox_memory { self.sandbox_memory = v; }
-        if let Some(v) = p.sandbox_cpus { self.sandbox_cpus = v; }
-        if let Some(v) = p.sandbox_pids { self.sandbox_pids = v; }
-        if let Some(v) = p.sandbox_fsize { self.sandbox_fsize = Some(v); }
-        if let Some(v) = p.sandbox_tmp_size { self.sandbox_tmp_size = v; }
-        if let Some(v) = p.sandbox_extra_rw { self.sandbox_extra_rw = v; }
-        if let Some(v) = p.sandbox_extra_ro { self.sandbox_extra_ro = v; }
-        if let Some(v) = p.trace { self.trace = v; }
-        if let Some(v) = p.trace_dir { self.trace_dir = Some(v); }
-        if let Some(v) = p.trace_max_mb { self.trace_max_mb = v; }
+        if let Some(v) = p.backend {
+            self.backend = v;
+        }
+        if let Some(v) = p.base_url {
+            self.base_url = v;
+        }
+        if let Some(v) = p.model {
+            self.model = v;
+        }
+        if let Some(v) = p.protocol {
+            self.protocol = v;
+        }
+        if let Some(v) = p.command_allowlist {
+            self.command_allowlist = v;
+        }
+        if let Some(v) = p.command_denylist {
+            self.command_denylist = v;
+        }
+        if let Some(v) = p.http_allow_hosts {
+            self.http_allow_hosts = v;
+        }
+        if let Some(v) = p.temperature {
+            self.temperature = v;
+        }
+        if let Some(v) = p.max_tokens {
+            self.max_tokens = v;
+        }
+        if let Some(v) = p.max_turns {
+            self.max_turns = v;
+        }
+        if let Some(v) = p.context_limit {
+            self.context_limit = v;
+        }
+        if let Some(v) = p.top_p {
+            self.top_p = Some(v);
+        }
+        if let Some(v) = p.top_k {
+            self.top_k = Some(v);
+        }
+        if let Some(v) = p.min_p {
+            self.min_p = Some(v);
+        }
+        if let Some(v) = p.presence_penalty {
+            self.presence_penalty = Some(v);
+        }
+        if let Some(v) = p.repeat_penalty {
+            self.repeat_penalty = Some(v);
+        }
+        if let Some(v) = p.enable_thinking {
+            self.enable_thinking = v;
+        }
+        if let Some(v) = p.preserve_thinking {
+            self.preserve_thinking = v;
+        }
+        if let Some(v) = p.skills_dirs {
+            self.skills_dirs = v;
+        }
+        if let Some(v) = p.active_skills {
+            self.active_skills = v;
+        }
+        if let Some(v) = p.sandbox_mode {
+            self.sandbox_mode = v;
+        }
+        if let Some(v) = p.sandbox_image {
+            self.sandbox_image = v;
+        }
+        if let Some(v) = p.sandbox_network {
+            self.sandbox_network = v;
+        }
+        if let Some(v) = p.sandbox_memory {
+            self.sandbox_memory = v;
+        }
+        if let Some(v) = p.sandbox_cpus {
+            self.sandbox_cpus = v;
+        }
+        if let Some(v) = p.sandbox_pids {
+            self.sandbox_pids = v;
+        }
+        if let Some(v) = p.sandbox_fsize {
+            self.sandbox_fsize = Some(v);
+        }
+        if let Some(v) = p.sandbox_tmp_size {
+            self.sandbox_tmp_size = v;
+        }
+        if let Some(v) = p.sandbox_extra_rw {
+            self.sandbox_extra_rw = v;
+        }
+        if let Some(v) = p.sandbox_extra_ro {
+            self.sandbox_extra_ro = v;
+        }
+        if let Some(v) = p.trace {
+            self.trace = v;
+        }
+        if let Some(v) = p.trace_dir {
+            self.trace_dir = Some(v);
+        }
+        if let Some(v) = p.trace_max_mb {
+            self.trace_max_mb = v;
+        }
         self
     }
 
@@ -277,7 +388,10 @@ impl RuntimeConfig {
     pub fn load_over(base: RuntimeConfig, path: &Path) -> RuntimeConfig {
         let (cfg, warning) = resolve_load(base, std::fs::read_to_string(path));
         if let Some(w) = warning {
-            eprintln!("warning: runtime config at {} {w}; using launch defaults", path.display());
+            eprintln!(
+                "warning: runtime config at {} {w}; using launch defaults",
+                path.display()
+            );
         }
         cfg
     }
@@ -288,7 +402,8 @@ impl RuntimeConfig {
 /// file (`NotFound`) is normal and yields no warning; any other read error or a
 /// malformed file falls back to `base` *with* a warning.
 fn resolve_load(
-    base: RuntimeConfig, read: std::io::Result<String>,
+    base: RuntimeConfig,
+    read: std::io::Result<String>,
 ) -> (RuntimeConfig, Option<String>) {
     match read {
         Ok(text) => match serde_json::from_str::<PartialRuntimeConfig>(&text) {
@@ -306,7 +421,12 @@ mod tests {
 
     fn base() -> RuntimeConfig {
         RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192)
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m1".into(),
+            "native".into(),
+            8192,
+        )
     }
 
     #[test]
@@ -322,7 +442,12 @@ mod tests {
     #[test]
     fn memory_defaults_on() {
         let c = RuntimeConfig::from_launch(
-            "openai".into(), "http://x".into(), "m".into(), "native".into(), 8192);
+            "openai".into(),
+            "http://x".into(),
+            "m".into(),
+            "native".into(),
+            8192,
+        );
         assert!(c.memory, "memory should default on");
     }
 
@@ -382,7 +507,10 @@ mod tests {
         c.backend = "claude-cli".into();
         c.protocol = "native".into();
         let err = c.validate().unwrap_err();
-        assert!(err.contains("claude-cli"), "expected claude-cli protocol error, got: {err}");
+        assert!(
+            err.contains("claude-cli"),
+            "expected claude-cli protocol error, got: {err}"
+        );
     }
 
     #[test]
@@ -425,7 +553,12 @@ mod tests {
 
         // A different base proves the file wins.
         let other = RuntimeConfig::from_launch(
-            "openai".into(), "http://x".into(), "flag-model".into(), "native".into(), 4096);
+            "openai".into(),
+            "http://x".into(),
+            "flag-model".into(),
+            "native".into(),
+            4096,
+        );
         let loaded = RuntimeConfig::load_over(other, &path);
         assert_eq!(loaded.model, "saved-model");
         assert_eq!(loaded.temperature, 0.7);
@@ -449,7 +582,7 @@ mod tests {
         let b = base();
         let loaded = RuntimeConfig::load_over(b.clone(), &path);
         assert_eq!(loaded.model, "only-model"); // file wins
-        assert_eq!(loaded.backend, b.backend);   // absent field falls back to base
+        assert_eq!(loaded.backend, b.backend); // absent field falls back to base
         assert_eq!(loaded.max_tokens, b.max_tokens);
     }
 
@@ -475,7 +608,10 @@ mod tests {
         let denied = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         let (cfg, warn) = resolve_load(base(), denied);
         assert_eq!(cfg, base(), "still falls back to the launch base");
-        assert!(warn.unwrap().contains("read"), "operator should be warned the file was unreadable");
+        assert!(
+            warn.unwrap().contains("read"),
+            "operator should be warned the file was unreadable"
+        );
     }
 
     #[test]
@@ -543,7 +679,7 @@ mod tests {
         std::fs::write(&path, r#"{"model":"only-model"}"#).unwrap();
         let loaded = RuntimeConfig::load_over(base(), &path);
         assert_eq!(loaded.model, "only-model");
-        assert!(loaded.skills_dirs.is_empty());   // absent field falls back to base
+        assert!(loaded.skills_dirs.is_empty()); // absent field falls back to base
         assert!(loaded.active_skills.is_empty());
     }
 

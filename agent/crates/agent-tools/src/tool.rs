@@ -10,9 +10,14 @@ pub trait Tool: Send + Sync {
     /// prefer). `None` for tools whose name/purpose already disambiguate. The
     /// registry folds this into the model-facing schema description; it is not a
     /// separate wire field.
-    fn when_not_to_call(&self) -> Option<&str> { None }
+    fn when_not_to_call(&self) -> Option<&str> {
+        None
+    }
     /// Declare what this call will do, for the policy engine to judge before execution.
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError>;
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx)
-        -> Result<ToolOutput, ToolError>;
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError>;
 }

@@ -159,8 +159,11 @@ impl ContextManager for CuratedContext {
             self.history[idx].content = placeholder_for(id, &tool, &kind, bytes);
             report.offloaded += 1;
             report.offloaded_bytes += bytes;
-            deps.sink
-                .emit(AgentEvent::Context(ContextEvent::Offloaded { id, bytes, tool }));
+            deps.sink.emit(AgentEvent::Context(ContextEvent::Offloaded {
+                id,
+                bytes,
+                tool,
+            }));
         }
 
         // (b) Compaction — async, gated by the high-water mark or an explicit request.
@@ -213,9 +216,10 @@ impl ContextManager for CuratedContext {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "compaction failed; leaving history intact");
-                    deps.sink.emit(AgentEvent::Context(ContextEvent::CompactionFailed {
-                        reason: e.to_string(),
-                    }));
+                    deps.sink
+                        .emit(AgentEvent::Context(ContextEvent::CompactionFailed {
+                            reason: e.to_string(),
+                        }));
                 }
             }
         }
@@ -246,7 +250,12 @@ mod tests {
         sink: &'a Arc<dyn EventSink>,
         cancel: &'a CancellationToken,
     ) -> MaintCtx<'a> {
-        MaintCtx { model_limit: 100_000, model, sink, cancel }
+        MaintCtx {
+            model_limit: 100_000,
+            model,
+            sink,
+            cancel,
+        }
     }
 
     #[test]
@@ -277,7 +286,9 @@ mod tests {
         let mut c = ctx();
         c.set_goal("the goal".into());
         for i in 0..50 {
-            c.append(Message::user(format!("message number {i} with padding text")));
+            c.append(Message::user(format!(
+                "message number {i} with padding text"
+            )));
         }
         let built = c.build(40);
         assert!(built.iter().any(|m| m.content == "Original goal: the goal"));
@@ -317,8 +328,15 @@ mod tests {
 
     #[tokio::test]
     async fn maintain_is_idempotent() {
-        let mut c = ctx().with_offload_config(OffloadConfig { keep_recent: 0, ..Default::default() });
-        c.append(Message::tool("call-1", "shell", format!("ERROR: {}", "x".repeat(400))));
+        let mut c = ctx().with_offload_config(OffloadConfig {
+            keep_recent: 0,
+            ..Default::default()
+        });
+        c.append(Message::tool(
+            "call-1",
+            "shell",
+            format!("ERROR: {}", "x".repeat(400)),
+        ));
         let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
         let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
         let cancel = CancellationToken::new();
@@ -335,10 +353,14 @@ mod tests {
         c.config.keep_recent = 1;
         for i in 0..6 {
             // Assistant chatter (not user instructions) is what gets summarized.
-            c.append(Message::assistant(format!("turn {i} with a fair bit of padding text here"), None));
+            c.append(Message::assistant(
+                format!("turn {i} with a fair bit of padding text here"),
+                None,
+            ));
         }
-        let model: Arc<dyn ModelClient> =
-            Arc::new(ScriptedModel::new(vec![Scripted::Text("compact summary".into())]));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "compact summary".into(),
+        )]));
         let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
         let cancel = CancellationToken::new();
         let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
@@ -360,15 +382,22 @@ mod tests {
         // Interleave user instructions with assistant chatter.
         for i in 0..4 {
             c.append(Message::user(format!("instruction {i}: add value {i}{i}")));
-            c.append(Message::assistant(format!("ok, acknowledged {i}, lots of filler chatter"), None));
+            c.append(Message::assistant(
+                format!("ok, acknowledged {i}, lots of filler chatter"),
+                None,
+            ));
         }
-        let model: Arc<dyn ModelClient> =
-            Arc::new(ScriptedModel::new(vec![Scripted::Text("chatter summary".into())]));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "chatter summary".into(),
+        )]));
         let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
         let cancel = CancellationToken::new();
         let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
 
-        assert!(report.compacted_turns > 0, "assistant chatter should have been summarized");
+        assert!(
+            report.compacted_turns > 0,
+            "assistant chatter should have been summarized"
+        );
         let built = c.build(100_000);
         // Every user instruction is still present verbatim, none lost to summarization.
         for i in 0..4 {
@@ -396,7 +425,11 @@ mod tests {
         assert_eq!(snap.model_limit, 10_000);
         assert!(snap.segments.iter().any(|s| s.category == "system"));
         assert!(snap.segments.iter().any(|s| s.category == "memory"));
-        let msgs = snap.segments.iter().find(|s| s.category == "messages").unwrap();
+        let msgs = snap
+            .segments
+            .iter()
+            .find(|s| s.category == "messages")
+            .unwrap();
         assert_eq!(msgs.count, 1);
     }
 
@@ -406,15 +439,23 @@ mod tests {
         c.high_water_pct = 0.0;
         c.config.keep_recent = 1;
         for i in 0..6 {
-            c.append(Message::assistant(format!("turn {i} with padding text"), None));
+            c.append(Message::assistant(
+                format!("turn {i} with padding text"),
+                None,
+            ));
         }
         let before = c.history().len();
         // Empty script => stream yields nothing => empty summary => not worthwhile => discarded.
-        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(String::new())]));
+        let model: Arc<dyn ModelClient> =
+            Arc::new(ScriptedModel::new(vec![Scripted::Text(String::new())]));
         let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
         let cancel = CancellationToken::new();
         let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
         assert_eq!(report.compacted_turns, 0);
-        assert_eq!(c.history().len(), before, "history must be untouched on failed/empty compaction");
+        assert_eq!(
+            c.history().len(),
+            before,
+            "history must be untouched on failed/empty compaction"
+        );
     }
 }

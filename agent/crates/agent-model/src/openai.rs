@@ -15,8 +15,14 @@ pub(crate) struct ThinkingSplitter {
 
 impl ThinkingSplitter {
     fn emit(out: &mut Vec<Chunk>, in_think: bool, s: &str) {
-        if s.is_empty() { return; }
-        out.push(if in_think { Chunk::Reasoning(s.to_string()) } else { Chunk::Text(s.to_string()) });
+        if s.is_empty() {
+            return;
+        }
+        out.push(if in_think {
+            Chunk::Reasoning(s.to_string())
+        } else {
+            Chunk::Text(s.to_string())
+        });
     }
 
     pub(crate) fn push(&mut self, content: &str) -> Vec<Chunk> {
@@ -102,11 +108,21 @@ impl OpenAiCompatClient {
         if let Some(mt) = req.max_tokens {
             b["max_tokens"] = json!(mt);
         }
-        if let Some(v) = req.top_p { b["top_p"] = json!(v); }
-        if let Some(v) = req.top_k { b["top_k"] = json!(v); }
-        if let Some(v) = req.min_p { b["min_p"] = json!(v); }
-        if let Some(v) = req.presence_penalty { b["presence_penalty"] = json!(v); }
-        if let Some(v) = req.repeat_penalty { b["repeat_penalty"] = json!(v); }
+        if let Some(v) = req.top_p {
+            b["top_p"] = json!(v);
+        }
+        if let Some(v) = req.top_k {
+            b["top_k"] = json!(v);
+        }
+        if let Some(v) = req.min_p {
+            b["min_p"] = json!(v);
+        }
+        if let Some(v) = req.presence_penalty {
+            b["presence_penalty"] = json!(v);
+        }
+        if let Some(v) = req.repeat_penalty {
+            b["repeat_penalty"] = json!(v);
+        }
         if !req.tools.is_empty() {
             b["tools"] = json!(req
                 .tools
@@ -148,11 +164,18 @@ impl SseLineBuffer {
     fn next_line(&mut self) -> Option<String> {
         let idx = self.buf.iter().position(|&c| c == b'\n')?;
         let line: Vec<u8> = self.buf.drain(..=idx).collect();
-        Some(String::from_utf8_lossy(&line[..line.len() - 1]).trim().to_string())
+        Some(
+            String::from_utf8_lossy(&line[..line.len() - 1])
+                .trim()
+                .to_string(),
+        )
     }
 }
 
-fn parse_sse_line(line: &str, splitter: &mut ThinkingSplitter) -> Option<Result<Vec<Chunk>, ModelError>> {
+fn parse_sse_line(
+    line: &str,
+    splitter: &mut ThinkingSplitter,
+) -> Option<Result<Vec<Chunk>, ModelError>> {
     let data = line.strip_prefix("data:")?.trim();
     if data == "[DONE]" {
         return Some(Ok(vec![]));
@@ -164,10 +187,14 @@ fn parse_sse_line(line: &str, splitter: &mut ThinkingSplitter) -> Option<Result<
     // A 200-status stream can still carry an error object instead of choices
     // (e.g. llama.cpp slot limits). Surface it instead of parsing empty deltas.
     if let Some(err) = v.get("error") {
-        let msg = err.get("message").and_then(Value::as_str)
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| err.to_string());
-        return Some(Err(ModelError::Stream(format!("server error in stream: {msg}"))));
+        return Some(Err(ModelError::Stream(format!(
+            "server error in stream: {msg}"
+        ))));
     }
     let choice = &v["choices"][0];
     let mut out = Vec::new();
@@ -205,11 +232,20 @@ fn parse_sse_line(line: &str, splitter: &mut ThinkingSplitter) -> Option<Result<
     if let Some(u) = v.get("usage").and_then(Value::as_object) {
         out.push(Chunk::Usage {
             prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-            completion_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-            reasoning_tokens: u.get("completion_tokens_details")
-                .and_then(|d| d.get("reasoning_tokens")).and_then(Value::as_u64).map(|n| n as u32),
-            cached_tokens: u.get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens")).and_then(Value::as_u64).map(|n| n as u32),
+            completion_tokens: u
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
+            reasoning_tokens: u
+                .get("completion_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+                .map(|n| n as u32),
+            cached_tokens: u
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .map(|n| n as u32),
             cost_usd: None,
         });
     }
@@ -320,7 +356,9 @@ mod tests {
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut chunks: Vec<Chunk> = Vec::new();
-        for p in parts { chunks.extend(s.push(p)); }
+        for p in parts {
+            chunks.extend(s.push(p));
+        }
         chunks.extend(s.flush());
         for c in chunks {
             match c {
@@ -339,7 +377,11 @@ mod tests {
         let out = parse_sse_line(line, &mut s).unwrap().unwrap();
         assert!(matches!(
             out.as_slice(),
-            [Chunk::Usage { prompt_tokens: 1234, completion_tokens: 56, .. }]
+            [Chunk::Usage {
+                prompt_tokens: 1234,
+                completion_tokens: 56,
+                ..
+            }]
         ));
     }
 
@@ -383,7 +425,10 @@ mod tests {
         // "5°C" — '°' is 0xC2 0xB0; split the two bytes across separate pushes,
         // mid-line. A per-chunk lossy decode would corrupt it to replacement chars.
         b.push(b"data: {\"t\":\"5\xc2");
-        assert!(b.next_line().is_none(), "no newline yet -> hold the partial char");
+        assert!(
+            b.next_line().is_none(),
+            "no newline yet -> hold the partial char"
+        );
         b.push(b"\xb0C\"}\n");
         assert_eq!(b.next_line().as_deref(), Some("data: {\"t\":\"5°C\"}"));
         assert!(b.next_line().is_none());
@@ -481,7 +526,10 @@ mod tests {
             .mount(&server)
             .await;
         let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
-        let req = CompletionRequest { messages: vec![Message::user("hi")], ..Default::default() };
+        let req = CompletionRequest {
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
         let mut stream = client.stream(req).await.unwrap();
         let mut text = String::new();
         let mut done = None;
@@ -501,8 +549,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(500)
-                .set_body_string("{\"error\":\"n_cmpl cannot be greater than slots\"}"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("{\"error\":\"n_cmpl cannot be greater than slots\"}"),
+            )
             .mount(&server)
             .await;
         let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
@@ -514,7 +564,10 @@ mod tests {
         match err {
             ModelError::Status { code, body } => {
                 assert_eq!(code, 500);
-                assert!(body.contains("cannot be greater than slots"), "body was: {body}");
+                assert!(
+                    body.contains("cannot be greater than slots"),
+                    "body was: {body}"
+                );
             }
             other => panic!("expected Status, got {other:?}"),
         }
@@ -523,7 +576,8 @@ mod tests {
     #[tokio::test]
     async fn streams_reasoning_content_separately() {
         let server = MockServer::start().await;
-        let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard\"}}]}\n\n\
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard\"}}]}\n\n\
                     data: {\"choices\":[{\"delta\":{\"content\":\"the answer\"}}]}\n\n\
                     data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
                     data: [DONE]\n\n";
@@ -570,13 +624,20 @@ mod tests {
                     data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n\n\
                     data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
                     data: [DONE]\n\n";
-        Mock::given(method("POST")).and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(body))
-            .mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
         let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
-        let req = CompletionRequest { messages: vec![Message::user("hi")], ..Default::default() };
+        let req = CompletionRequest {
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
         let mut stream = client.stream(req).await.unwrap();
 
         let mut text = String::new();
@@ -589,7 +650,10 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(text, "AB", "the malformed line is skipped, both good deltas survive");
+        assert_eq!(
+            text, "AB",
+            "the malformed line is skipped, both good deltas survive"
+        );
         assert_eq!(done, Some(StopReason::Stop));
     }
 
@@ -597,18 +661,28 @@ mod tests {
     async fn surfaces_in_band_error_object_in_200_body() {
         let server = MockServer::start().await;
         let body = "data: {\"error\":{\"message\":\"boom\"}}\n\n";
-        Mock::given(method("POST")).and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(body))
-            .mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
         let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
-        let req = CompletionRequest { messages: vec![Message::user("hi")], ..Default::default() };
+        let req = CompletionRequest {
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
         let mut stream = client.stream(req).await.unwrap();
 
         let mut err = None;
         while let Some(item) = stream.next().await {
-            if let Err(e) = item { err = Some(e); break; }
+            if let Err(e) = item {
+                err = Some(e);
+                break;
+            }
         }
         match err {
             Some(ModelError::Stream(m)) => assert!(m.contains("boom"), "message was: {m}"),
@@ -621,13 +695,20 @@ mod tests {
         let server = MockServer::start().await;
         // A content delta, then the body just ends — no finish_reason, no [DONE].
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
-        Mock::given(method("POST")).and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(body))
-            .mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
         let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
-        let req = CompletionRequest { messages: vec![Message::user("hi")], ..Default::default() };
+        let req = CompletionRequest {
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
         let mut stream = client.stream(req).await.unwrap();
 
         let mut text = String::new();
@@ -636,10 +717,16 @@ mod tests {
             match item {
                 Ok(Chunk::Text(t)) => text.push_str(&t),
                 Ok(_) => {}
-                Err(e) => { err = Some(e); break; }
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
             }
         }
-        assert_eq!(text, "partial", "deltas before the cut-off are still delivered");
+        assert_eq!(
+            text, "partial",
+            "deltas before the cut-off are still delivered"
+        );
         match err {
             Some(ModelError::Stream(m)) => assert!(m.contains("truncat"), "message was: {m}"),
             other => panic!("expected a truncation Stream error, got {other:?}"),
@@ -682,10 +769,16 @@ mod tests {
         // f32 0.8 serialises as an f64 approximation; compare via as_f64.
         assert!((b["top_p"].as_f64().unwrap() - 0.8_f32 as f64).abs() < 1e-6);
         assert_eq!(b["top_k"], serde_json::json!(30));
-        assert_eq!(b["chat_template_kwargs"]["enable_thinking"], serde_json::json!(false));
+        assert_eq!(
+            b["chat_template_kwargs"]["enable_thinking"],
+            serde_json::json!(false)
+        );
         // preserve_thinking rides alongside enable_thinking (Qwen3.6 keeps prior
         // reasoning only when this is true); default is false here.
-        assert_eq!(b["chat_template_kwargs"]["preserve_thinking"], serde_json::json!(false));
+        assert_eq!(
+            b["chat_template_kwargs"]["preserve_thinking"],
+            serde_json::json!(false)
+        );
         // Unset params are omitted entirely.
         assert!(b.get("min_p").is_none());
         assert!(b.get("presence_penalty").is_none());

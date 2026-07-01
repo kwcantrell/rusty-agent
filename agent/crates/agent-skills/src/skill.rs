@@ -55,7 +55,11 @@ pub fn parse_skill_md(text: &str) -> Result<ParsedSkill, String> {
         .filter(|d| !d.trim().is_empty())
         .ok_or("front matter is missing a non-empty `description`")?;
     let body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
-    Ok(ParsedSkill { name, description, body })
+    Ok(ParsedSkill {
+        name,
+        description,
+        body,
+    })
 }
 
 fn unquote(s: &str) -> &str {

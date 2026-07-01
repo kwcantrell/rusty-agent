@@ -84,7 +84,12 @@ pub(crate) fn build_snapshot(
     });
 
     let est_total = segments.iter().map(|s| s.est_tokens).sum();
-    ContextSnapshot { turn, model_limit, est_total, segments }
+    ContextSnapshot {
+        turn,
+        model_limit,
+        est_total,
+        segments,
+    }
 }
 
 #[cfg(test)]
@@ -95,7 +100,8 @@ mod tests {
     #[test]
     fn snapshot_has_system_and_messages_and_sums_total() {
         let snap = build_snapshot(
-            3, 1000,
+            3,
+            1000,
             &Message::system("SYSTEM PROMPT"),
             None,
             &[],
@@ -105,30 +111,45 @@ mod tests {
         assert_eq!(snap.turn, 3);
         let cats: Vec<&str> = snap.segments.iter().map(|s| s.category.as_str()).collect();
         assert_eq!(cats, vec!["system", "messages"]);
-        let messages = snap.segments.iter().find(|s| s.category == "messages").unwrap();
+        let messages = snap
+            .segments
+            .iter()
+            .find(|s| s.category == "messages")
+            .unwrap();
         assert_eq!(messages.count, 2);
-        assert_eq!(snap.est_total, snap.segments.iter().map(|s| s.est_tokens).sum::<usize>());
+        assert_eq!(
+            snap.est_total,
+            snap.segments.iter().map(|s| s.est_tokens).sum::<usize>()
+        );
     }
 
     #[test]
     fn preview_collapses_newlines_and_truncates() {
-        assert_eq!(preview("a\nb\nc", 100), "a b c");     // newlines → single spaces
-        assert_eq!(preview("hello world", 5), "hello");   // truncates to n chars
-        assert_eq!(preview("anything", 0), "");           // n = 0 → empty
-        assert_eq!(preview("", 10), "");                  // empty input → empty
+        assert_eq!(preview("a\nb\nc", 100), "a b c"); // newlines → single spaces
+        assert_eq!(preview("hello world", 5), "hello"); // truncates to n chars
+        assert_eq!(preview("anything", 0), ""); // n = 0 → empty
+        assert_eq!(preview("", 10), ""); // empty input → empty
     }
 
     #[test]
     fn recall_block_becomes_memory_segment_with_previews() {
         let snap = build_snapshot(
-            1, 1000,
+            1,
+            1000,
             &Message::system("S"),
             None,
-            &["user likes rust".to_string(), "deploys on friday".to_string()],
+            &[
+                "user likes rust".to_string(),
+                "deploys on friday".to_string(),
+            ],
             None,
             &[],
         );
-        let mem = snap.segments.iter().find(|s| s.category == "memory").unwrap();
+        let mem = snap
+            .segments
+            .iter()
+            .find(|s| s.category == "memory")
+            .unwrap();
         assert_eq!(mem.count, 2);
         assert!(mem.items[0].contains("rust"));
     }

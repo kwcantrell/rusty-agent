@@ -19,9 +19,15 @@ pub struct MemoryRetriever {
 impl Retriever for MemoryRetriever {
     async fn retrieve(&self, query: &str) -> Vec<String> {
         match query_memories(
-            self.embedder.as_ref(), self.store.as_ref(), &self.cfg,
-            &self.project_key, query, self.cfg.default_k,
-        ).await {
+            self.embedder.as_ref(),
+            self.store.as_ref(),
+            &self.cfg,
+            &self.project_key,
+            query,
+            self.cfg.default_k,
+        )
+        .await
+        {
             Ok(hits) => hits.into_iter().map(|h| h.record.text).collect(),
             Err(e) => {
                 tracing::warn!(target: "memory", "auto-retrieval failed: {e}");
@@ -40,11 +46,19 @@ mod tests {
 
     async fn seed(store: &InMemoryStore, embedder: &dyn Embedder, key: &str, text: &str) {
         let v = embedder.embed(&[text.to_string()]).await.unwrap().remove(0);
-        store.upsert(MemoryRecord {
-            id: uuid::Uuid::new_v4().to_string(), text: text.into(),
-            scope: MemoryScope::Project(key.into()), tags: vec![], vector: v,
-            created_at: now_secs(), updated_at: now_secs(), source: "test".into(),
-        }).await.unwrap();
+        store
+            .upsert(MemoryRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                text: text.into(),
+                scope: MemoryScope::Project(key.into()),
+                tags: vec![],
+                vector: v,
+                created_at: now_secs(),
+                updated_at: now_secs(),
+                source: "test".into(),
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -53,8 +67,10 @@ mod tests {
         let store = Arc::new(InMemoryStore::new());
         seed(&store, embedder.as_ref(), "K", "user prefers rust").await;
         let r = MemoryRetriever {
-            embedder: embedder.clone(), store: store.clone(),
-            cfg: Arc::new(MemoryConfig::default()), project_key: "K".into(),
+            embedder: embedder.clone(),
+            store: store.clone(),
+            cfg: Arc::new(MemoryConfig::default()),
+            project_key: "K".into(),
         };
         // StubEmbedder only matches exact text above the relevance threshold.
         let lines = r.retrieve("user prefers rust").await;
@@ -68,7 +84,10 @@ mod tests {
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
         let store = Arc::new(InMemoryStore::new());
         let r = MemoryRetriever {
-            embedder, store, cfg: Arc::new(MemoryConfig::default()), project_key: "K".into(),
+            embedder,
+            store,
+            cfg: Arc::new(MemoryConfig::default()),
+            project_key: "K".into(),
         };
         assert!(r.retrieve("anything").await.is_empty());
     }
@@ -87,14 +106,39 @@ mod tests {
         let embedder: Arc<dyn Embedder> =
             Arc::new(crate::embedder::FastEmbedEmbedder::new(&cfg).expect("load BGE model"));
         let store = Arc::new(InMemoryStore::new());
-        seed(&store, embedder.as_ref(), "K", "the user's favorite programming language is Rust").await;
-        seed(&store, embedder.as_ref(), "K", "deployments happen on Friday afternoons").await;
-        seed(&store, embedder.as_ref(), "K", "the production database is PostgreSQL 16").await;
+        seed(
+            &store,
+            embedder.as_ref(),
+            "K",
+            "the user's favorite programming language is Rust",
+        )
+        .await;
+        seed(
+            &store,
+            embedder.as_ref(),
+            "K",
+            "deployments happen on Friday afternoons",
+        )
+        .await;
+        seed(
+            &store,
+            embedder.as_ref(),
+            "K",
+            "the production database is PostgreSQL 16",
+        )
+        .await;
 
-        let r = MemoryRetriever { embedder, store, cfg, project_key: "K".into() };
+        let r = MemoryRetriever {
+            embedder,
+            store,
+            cfg,
+            project_key: "K".into(),
+        };
         // Related to the Rust memory but NOT its stored wording — exactly what a
         // StubEmbedder cannot match.
-        let lines = r.retrieve("which language should I write this service in?").await;
+        let lines = r
+            .retrieve("which language should I write this service in?")
+            .await;
         assert!(
             lines.iter().any(|l| l.contains("Rust")),
             "expected the Rust memory retrieved by semantic similarity; got: {lines:?}"

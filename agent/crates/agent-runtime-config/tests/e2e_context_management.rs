@@ -14,7 +14,9 @@ use agent_core::{
 };
 use agent_model::{Message, NativeProtocol, Role};
 use agent_policy::RulePolicy;
-use agent_tools::{Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema};
+use agent_tools::{
+    Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema,
+};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,9 +34,16 @@ impl EventSink for Capture {
         match e {
             // Failures now also emit ToolResult (Task 1); filter on Ok so this sink counts
             // only successful blob results, mirroring pre-change semantics.
-            AgentEvent::ToolResult { name, output, status: agent_core::ToolStatus::Ok, .. } => {
-                self.tool_results.lock().unwrap().push((name, output.content))
-            }
+            AgentEvent::ToolResult {
+                name,
+                output,
+                status: agent_core::ToolStatus::Ok,
+                ..
+            } => self
+                .tool_results
+                .lock()
+                .unwrap()
+                .push((name, output.content)),
             AgentEvent::Done(_) => *self.done.lock().unwrap() = true,
             _ => {}
         }
@@ -81,7 +90,10 @@ impl Tool for BoomTool {
         })
     }
     async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        Err(ToolError::Failed { message: self.message.clone(), stderr: None })
+        Err(ToolError::Failed {
+            message: self.message.clone(),
+            stderr: None,
+        })
     }
 }
 
@@ -99,12 +111,21 @@ fn loop_config(workspace: std::path::PathBuf) -> LoopConfig {
     }
 }
 
-fn build_loop(reg: ToolRegistry, model: ScriptedModel, sink: Arc<Capture>, ws: std::path::PathBuf) -> AgentLoop {
+fn build_loop(
+    reg: ToolRegistry,
+    model: ScriptedModel,
+    sink: Arc<Capture>,
+    ws: std::path::PathBuf,
+) -> AgentLoop {
     AgentLoop::new(
         Arc::new(model),
         Arc::new(NativeProtocol),
         Arc::new(reg),
-        Arc::new(RulePolicy { workspace: ws.clone(), command_allowlist: vec![], command_denylist: vec![] }),
+        Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        }),
         Arc::new(AlwaysApprove),
         sink,
         loop_config(ws),
@@ -125,7 +146,9 @@ async fn offload_then_recall_round_trips_through_the_loop() {
 
     let big_message = format!("disk exploded at sector {}", "9".repeat(300));
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(BoomTool { message: big_message.clone() }));
+    reg.register(Arc::new(BoomTool {
+        message: big_message.clone(),
+    }));
     reg.register(Arc::new(ContextRecallTool::new(store.clone())));
 
     let model = ScriptedModel::new(vec![
@@ -137,7 +160,11 @@ async fn offload_then_recall_round_trips_through_the_loop() {
 
     // keep_recent: 0 makes the single turn-1 error immediately eligible to offload.
     let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag)
-        .with_offload_config(OffloadConfig { keep_recent: 0, error_min_bytes: 50, ..Default::default() });
+        .with_offload_config(OffloadConfig {
+            keep_recent: 0,
+            error_min_bytes: 50,
+            ..Default::default()
+        });
 
     build_loop(reg, model, sink.clone(), ws)
         .run(&mut ctx, "Trigger the failure, then recover it.".into())
@@ -146,14 +173,24 @@ async fn offload_then_recall_round_trips_through_the_loop() {
 
     // The boom error was offloaded (entry #1) and recall returned it verbatim.
     let expected = format!("ERROR: failed: {big_message}");
-    assert!(store.get(1).is_some(), "the large error must have been offloaded as entry #1");
-    assert_eq!(store.get(1).unwrap().content, expected, "stored content must be the raw error");
+    assert!(
+        store.get(1).is_some(),
+        "the large error must have been offloaded as entry #1"
+    );
+    assert_eq!(
+        store.get(1).unwrap().content,
+        expected,
+        "stored content must be the raw error"
+    );
     assert_eq!(
         sink.recall_content().as_deref(),
         Some(expected.as_str()),
         "context_recall must return the exact offloaded bytes"
     );
-    assert!(*sink.done.lock().unwrap(), "the run reached a normal completion");
+    assert!(
+        *sink.done.lock().unwrap(),
+        "the run reached a normal completion"
+    );
 }
 
 /// The error path: recalling an id that was never offloaded feeds a normal tool
@@ -185,7 +222,10 @@ async fn recall_unknown_id_feeds_error_back_and_continues() {
         .unwrap();
 
     // The loop continued to a clean finish despite the recall error.
-    assert!(*sink.done.lock().unwrap(), "an unknown-id recall must not abort the run");
+    assert!(
+        *sink.done.lock().unwrap(),
+        "an unknown-id recall must not abort the run"
+    );
     // The not-found error was appended to the transcript as a tool message.
     let built = ctx.build(100_000);
     let fed_back = built.iter().any(|m| {
@@ -193,5 +233,8 @@ async fn recall_unknown_id_feeds_error_back_and_continues() {
             && m.name.as_deref() == Some("context_recall")
             && m.content.contains("no offloaded entry #999")
     });
-    assert!(fed_back, "the unknown-id error must be fed back as a context_recall tool result");
+    assert!(
+        fed_back,
+        "the unknown-id error must be fed back as a context_recall tool result"
+    );
 }

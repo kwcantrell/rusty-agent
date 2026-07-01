@@ -1,16 +1,16 @@
 //! Shared tool vocabulary and the `Tool` trait.
-mod types;
-mod tool;
-mod registry;
 mod contract;
-mod render;
 pub mod fs;
-pub mod shell;
 pub mod git;
+mod registry;
+mod render;
 pub mod sandbox;
-pub use types::*;
-pub use tool::*;
-pub use registry::*;
+pub mod shell;
+mod tool;
+mod types;
 pub use contract::*;
+pub use registry::*;
 pub use render::*;
 pub use sandbox::*;
+pub use tool::*;
+pub use types::*;

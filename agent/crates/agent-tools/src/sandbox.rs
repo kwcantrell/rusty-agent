@@ -1,13 +1,20 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::process::{Child, ChildStdin, ChildStdout, ChildStderr};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcKind { OneShot, Service }
+pub enum ProcKind {
+    OneShot,
+    Service,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Off, Auto, Enforce }
+pub enum Mode {
+    Off,
+    Auto,
+    Enforce,
+}
 
 #[derive(Debug, Clone)]
 pub struct Limits {
@@ -53,13 +60,27 @@ pub struct SandboxedChild {
 }
 
 impl SandboxedChild {
-    pub fn new_host(child: Child) -> Self { Self { child, container: None } }
-    pub fn new_container(child: Child, name: String) -> Self {
-        Self { child, container: Some(name) }
+    pub fn new_host(child: Child) -> Self {
+        Self {
+            child,
+            container: None,
+        }
     }
-    pub fn take_stdin(&mut self) -> Option<ChildStdin> { self.child.stdin.take() }
-    pub fn take_stdout(&mut self) -> Option<ChildStdout> { self.child.stdout.take() }
-    pub fn take_stderr(&mut self) -> Option<ChildStderr> { self.child.stderr.take() }
+    pub fn new_container(child: Child, name: String) -> Self {
+        Self {
+            child,
+            container: Some(name),
+        }
+    }
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
+    }
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }
@@ -67,7 +88,9 @@ impl SandboxedChild {
     pub async fn kill(&mut self) {
         if let Some(name) = &self.container {
             let _ = tokio::process::Command::new("docker")
-                .args(["kill", name]).output().await;
+                .args(["kill", name])
+                .output()
+                .await;
         }
         // Intentional dual-kill: docker kill stops the container; start_kill reaps
         // the local foreground `docker run` client process.
@@ -103,21 +126,34 @@ pub struct HostExecutor;
 impl SandboxStrategy for HostExecutor {
     fn launch(&self, spec: CommandSpec) -> Result<SandboxedChild, SandboxError> {
         let mut cmd = tokio::process::Command::new(&spec.program);
-        cmd.args(&spec.args).current_dir(&spec.cwd).envs(&spec.env)
+        cmd.args(&spec.args)
+            .current_dir(&spec.cwd)
+            .envs(&spec.env)
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Service (mcp) needs an open stdin pipe; OneShot does not read stdin.
         match spec.kind {
-            ProcKind::Service => { cmd.stdin(Stdio::piped()); }
-            ProcKind::OneShot => { cmd.stdin(Stdio::null()); }
+            ProcKind::Service => {
+                cmd.stdin(Stdio::piped());
+            }
+            ProcKind::OneShot => {
+                cmd.stdin(Stdio::null());
+            }
         }
-        let child = cmd.spawn().map_err(|e| SandboxError::LaunchFailed(e.to_string()))?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| SandboxError::LaunchFailed(e.to_string()))?;
         Ok(SandboxedChild::new_host(child))
     }
     fn describe(&self) -> SandboxDescriptor {
-        SandboxDescriptor { mode: Mode::Off, mechanism: "host", image: None,
-            network: true, degraded: None }
+        SandboxDescriptor {
+            mode: Mode::Off,
+            mechanism: "host",
+            image: None,
+            network: true,
+            degraded: None,
+        }
     }
 }
 
@@ -127,9 +163,13 @@ mod tests {
     use std::time::Duration;
 
     fn spec(program: &str, args: &[&str]) -> CommandSpec {
-        CommandSpec { program: program.into(),
+        CommandSpec {
+            program: program.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
-            cwd: std::env::temp_dir(), env: Default::default(), kind: ProcKind::OneShot }
+            cwd: std::env::temp_dir(),
+            env: Default::default(),
+            kind: ProcKind::OneShot,
+        }
     }
 
     fn service_spec(program: &str, args: &[&str]) -> CommandSpec {
@@ -146,7 +186,9 @@ mod tests {
     async fn kill_reaps_a_long_running_child() {
         // A 30s sleeper: kill() must return almost immediately (kill + reap), not
         // block until the process would naturally exit.
-        let mut sb = HostExecutor.launch(service_spec("sh", &["-c", "sleep 30"])).unwrap();
+        let mut sb = HostExecutor
+            .launch(service_spec("sh", &["-c", "sleep 30"]))
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), sb.kill())
             .await
             .expect("kill() must return promptly, not wait out the sleep");
@@ -154,7 +196,9 @@ mod tests {
 
     #[tokio::test]
     async fn kill_is_idempotent() {
-        let mut sb = HostExecutor.launch(service_spec("sh", &["-c", "sleep 30"])).unwrap();
+        let mut sb = HostExecutor
+            .launch(service_spec("sh", &["-c", "sleep 30"]))
+            .unwrap();
         sb.kill().await;
         // A second kill on an already-reaped child returns promptly and does not panic.
         tokio::time::timeout(Duration::from_secs(5), sb.kill())
@@ -170,7 +214,9 @@ mod tests {
         use tokio::io::AsyncReadExt;
         out.read_to_string(&mut buf).await.unwrap();
         let status = tokio::time::timeout(Duration::from_secs(5), sb.wait())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert!(status.success());
         assert!(buf.contains("hi"));
     }

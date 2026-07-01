@@ -13,13 +13,19 @@ async fn filesystem_server_tools_register_and_execute() {
     std::fs::write(tmp.path().join("hello.txt"), "hi from mcp").unwrap();
 
     let mut servers = BTreeMap::new();
-    servers.insert("filesystem".to_string(), McpServerSpec {
-        command: "npx".into(),
-        args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into(),
-                   tmp.path().to_string_lossy().into_owned()],
-        env: BTreeMap::new(),
-        trust: Trust::Ask,
-    });
+    servers.insert(
+        "filesystem".to_string(),
+        McpServerSpec {
+            command: "npx".into(),
+            args: vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-filesystem".into(),
+                tmp.path().to_string_lossy().into_owned(),
+            ],
+            env: BTreeMap::new(),
+            trust: Trust::Ask,
+        },
+    );
     let cfg = McpServersConfig { servers };
 
     let sandbox: std::sync::Arc<dyn agent_tools::SandboxStrategy> =
@@ -28,8 +34,10 @@ async fn filesystem_server_tools_register_and_execute() {
     eprintln!("{}", mgr.summary_line());
     let tools = mgr.tools();
     assert!(!tools.is_empty(), "filesystem server should expose tools");
-    assert!(tools.iter().any(|t| t.name().starts_with("filesystem__")),
-        "tools should be namespaced by server");
+    assert!(
+        tools.iter().any(|t| t.name().starts_with("filesystem__")),
+        "tools should be namespaced by server"
+    );
 
     mgr.shutdown().await;
 }

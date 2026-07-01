@@ -20,7 +20,9 @@ impl ChannelEventSink {
 
 impl EventSink for ChannelEventSink {
     fn emit(&self, event: AgentEvent) {
-        let Some(ev) = server_event_from(event) else { return };
+        let Some(ev) = server_event_from(event) else {
+            return;
+        };
         if let Some(out) = self.slot.lock().unwrap().clone() {
             out.send(ev);
         }
@@ -37,7 +39,9 @@ mod tests {
     #[derive(Default)]
     struct Captured(Mutex<Vec<ServerEvent>>);
     impl crate::wire::EventOut for Captured {
-        fn send(&self, ev: ServerEvent) { self.0.lock().unwrap().push(ev); }
+        fn send(&self, ev: ServerEvent) {
+            self.0.lock().unwrap().push(ev);
+        }
     }
 
     fn slot_with(out: Arc<Captured>) -> EventSlot {
@@ -60,9 +64,15 @@ mod tests {
         let cap = Arc::new(Captured::default());
         let sink = ChannelEventSink::new(slot_with(cap.clone()));
         sink.emit(AgentEvent::Approval(ApprovalRequest {
-            intent: ToolIntent { tool: "x".into(), access: Access::Read, paths: vec![],
-                command: None, summary: "s".into() },
-            display: None }));
+            intent: ToolIntent {
+                tool: "x".into(),
+                access: Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "s".into(),
+            },
+            display: None,
+        }));
         assert!(cap.0.lock().unwrap().is_empty());
     }
 

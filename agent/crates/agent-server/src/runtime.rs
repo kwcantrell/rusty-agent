@@ -2,7 +2,9 @@ use crate::approval::IpcApprovalChannel;
 use crate::sink::ChannelEventSink;
 use crate::wire::{DiscoveredSkill, SettingsState};
 use agent_core::{AgentLoop, OffloadStore, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT};
-use agent_runtime_config::{assemble_loop, build_model, BuiltLoop, LoopParts, RuntimeConfig, HARD_FLOOR_DENYLIST};
+use agent_runtime_config::{
+    assemble_loop, build_model, BuiltLoop, LoopParts, RuntimeConfig, HARD_FLOOR_DENYLIST,
+};
 use agent_skills::SkillRegistry;
 use agent_tools::Tool;
 use std::path::{Path, PathBuf};
@@ -59,18 +61,41 @@ impl RuntimeState {
         let stats: Arc<std::sync::RwLock<agent_core::SessionStats>> = Arc::default();
         let trace = agent_runtime_config::build_trace(&config);
         let built = build_loop(
-            &config, &sink, &approval, &workspace, &api_key, &claude_binary, &mcp_tools,
-            &memory_tools, memory_retriever.as_ref(), &base_system_prompt,
-            &offload_store, &compact_flag, &stats, &trace);
+            &config,
+            &sink,
+            &approval,
+            &workspace,
+            &api_key,
+            &claude_binary,
+            &mcp_tools,
+            &memory_tools,
+            memory_retriever.as_ref(),
+            &base_system_prompt,
+            &offload_store,
+            &compact_flag,
+            &stats,
+            &trace,
+        );
         // Startup is lenient: an unknown persisted preset is already warned + dropped
         // inside build_loop, so the daemon always boots.
         Self {
             loop_cell: Mutex::new(built.loop_),
             config: Mutex::new(config),
             system_prompt: Mutex::new(built.system_prompt),
-            sink, approval, workspace, api_key, claude_binary, config_path,
-            mcp_tools, memory_tools, memory_retriever, base_system_prompt,
-            offload_store, compact_flag, stats, trace,
+            sink,
+            approval,
+            workspace,
+            api_key,
+            claude_binary,
+            config_path,
+            mcp_tools,
+            memory_tools,
+            memory_retriever,
+            base_system_prompt,
+            offload_store,
+            compact_flag,
+            stats,
+            trace,
         }
     }
 
@@ -106,15 +131,30 @@ impl RuntimeState {
         let cfg = incoming.normalized();
         cfg.validate()?;
         let built = build_loop(
-            &cfg, &self.sink, &self.approval, &self.workspace, &self.api_key,
-            &self.claude_binary, &self.mcp_tools, &self.memory_tools,
-            self.memory_retriever.as_ref(), &self.base_system_prompt,
-            &self.offload_store, &self.compact_flag, &self.stats, &self.trace);
+            &cfg,
+            &self.sink,
+            &self.approval,
+            &self.workspace,
+            &self.api_key,
+            &self.claude_binary,
+            &self.mcp_tools,
+            &self.memory_tools,
+            self.memory_retriever.as_ref(),
+            &self.base_system_prompt,
+            &self.offload_store,
+            &self.compact_flag,
+            &self.stats,
+            &self.trace,
+        );
         if !built.unknown_presets.is_empty() {
             // Strict on the wire: a typo'd / missing active skill is a hard error.
-            return Err(format!("unknown active skill(s): {}", built.unknown_presets.join(", ")));
+            return Err(format!(
+                "unknown active skill(s): {}",
+                built.unknown_presets.join(", ")
+            ));
         }
-        cfg.save(&self.config_path).map_err(|e| format!("persist failed: {e}"))?;
+        cfg.save(&self.config_path)
+            .map_err(|e| format!("persist failed: {e}"))?;
         *self.loop_cell.lock().unwrap() = built.loop_;
         *self.system_prompt.lock().unwrap() = built.system_prompt;
         *self.config.lock().unwrap() = cfg;
@@ -126,10 +166,13 @@ impl RuntimeState {
         let discovered = SkillRegistry::from_config(&cfg.skills_dirs, &self.workspace)
             .scan()
             .into_iter()
-            .map(|s| DiscoveredSkill { name: s.name, description: s.description })
+            .map(|s| DiscoveredSkill {
+                name: s.name,
+                description: s.description,
+            })
             .collect();
-        let sandbox_degraded = crate::wire::sandbox_degraded_from(
-            self.current_loop().sandbox_descriptor());
+        let sandbox_degraded =
+            crate::wire::sandbox_degraded_from(self.current_loop().sandbox_descriptor());
         SettingsState {
             settings: cfg,
             workspace: self.workspace.display().to_string(),
@@ -162,22 +205,31 @@ fn build_loop(
     stats: &Arc<std::sync::RwLock<agent_core::SessionStats>>,
     trace: &Option<Arc<agent_runtime_config::TraceWriter>>,
 ) -> BuiltLoop {
-    let model = build_model(&cfg.backend, &cfg.base_url, &cfg.model, claude_binary, api_key.clone());
-    assemble_loop(cfg, LoopParts {
-        model,
-        sink: sink.clone(),
-        approval: approval.clone(),
-        workspace: workspace.to_path_buf(),
-        mcp_tools: mcp_tools.to_vec(),
-        memory_tools: memory_tools.to_vec(),
-        memory_retriever: memory_retriever.cloned(),
-        stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
-        base_system_prompt: base_system_prompt.to_string(),
-        offload_store: offload_store.clone(),
-        compact_flag: compact_flag.clone(),
-        stats: stats.clone(),
-        trace: trace.clone(),
-    })
+    let model = build_model(
+        &cfg.backend,
+        &cfg.base_url,
+        &cfg.model,
+        claude_binary,
+        api_key.clone(),
+    );
+    assemble_loop(
+        cfg,
+        LoopParts {
+            model,
+            sink: sink.clone(),
+            approval: approval.clone(),
+            workspace: workspace.to_path_buf(),
+            mcp_tools: mcp_tools.to_vec(),
+            memory_tools: memory_tools.to_vec(),
+            memory_retriever: memory_retriever.cloned(),
+            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            base_system_prompt: base_system_prompt.to_string(),
+            offload_store: offload_store.clone(),
+            compact_flag: compact_flag.clone(),
+            stats: stats.clone(),
+            trace: trace.clone(),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -187,7 +239,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    fn slot() -> crate::sink::EventSlot { Arc::new(Mutex::new(None)) }
+    fn slot() -> crate::sink::EventSlot {
+        Arc::new(Mutex::new(None))
+    }
 
     fn parts() -> (Arc<ChannelEventSink>, Arc<IpcApprovalChannel>) {
         let s = slot();
@@ -201,11 +255,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rt.json");
         let cfg = RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
-        let rs = RuntimeState::new(cfg, sink, approval, dir.path().to_path_buf(), None,
-            "claude".into(), path, Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            Arc::from(Vec::<Arc<dyn Tool>>::new()), None,
-            crate::daemon::SYSTEM_PROMPT.to_string());
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m1".into(),
+            "native".into(),
+            8192,
+        );
+        let rs = RuntimeState::new(
+            cfg,
+            sink,
+            approval,
+            dir.path().to_path_buf(),
+            None,
+            "claude".into(),
+            path,
+            Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            None,
+            crate::daemon::SYSTEM_PROMPT.to_string(),
+        );
         (rs, dir)
     }
 
@@ -214,7 +282,12 @@ mod tests {
         let (rs, dir) = make();
         let before = rs.current_loop();
         let mut next = RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m2".into(), "native".into(), 8192);
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m2".into(),
+            "native".into(),
+            8192,
+        );
         next.temperature = 0.9;
         rs.apply(next).unwrap();
         let after = rs.current_loop();
@@ -227,11 +300,19 @@ mod tests {
         let (rs, _dir) = make();
         let before = rs.current_loop();
         let mut bad = RuntimeConfig::from_launch(
-            "openai".into(), "   ".into(), "m".into(), "native".into(), 8192); // empty base_url
+            "openai".into(),
+            "   ".into(),
+            "m".into(),
+            "native".into(),
+            8192,
+        ); // empty base_url
         bad.base_url = "  ".into();
         let err = rs.apply(bad).unwrap_err();
         assert!(err.contains("base_url"));
-        assert!(Arc::ptr_eq(&before, &rs.current_loop()), "loop unchanged on rejection");
+        assert!(
+            Arc::ptr_eq(&before, &rs.current_loop()),
+            "loop unchanged on rejection"
+        );
     }
 
     #[test]
@@ -249,18 +330,28 @@ mod tests {
         // Author a skill under the workspace default writable root.
         let sdir = dir.path().join(".agent").join("skills").join("greeter");
         fs::create_dir_all(&sdir).unwrap();
-        fs::write(sdir.join("SKILL.md"),
-            "---\nname: greeter\ndescription: d\n---\nSay hi politely.").unwrap();
+        fs::write(
+            sdir.join("SKILL.md"),
+            "---\nname: greeter\ndescription: d\n---\nSay hi politely.",
+        )
+        .unwrap();
 
         let before = rs.current_loop();
         let mut next = RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m1".into(),
+            "native".into(),
+            8192,
+        );
         next.active_skills = vec!["greeter".into()];
         rs.apply(next).unwrap();
 
         assert!(!Arc::ptr_eq(&before, &rs.current_loop()), "loop swapped");
-        assert!(rs.current_system_prompt().contains("Say hi politely."),
-            "preset body folded into the live system prompt");
+        assert!(
+            rs.current_system_prompt().contains("Say hi politely."),
+            "preset body folded into the live system prompt"
+        );
     }
 
     #[test]
@@ -268,11 +359,22 @@ mod tests {
         let (rs, _dir) = make();
         let before = rs.current_loop();
         let mut bad = RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m1".into(),
+            "native".into(),
+            8192,
+        );
         bad.active_skills = vec!["does-not-exist".into()];
         let err = rs.apply(bad).unwrap_err();
-        assert!(err.contains("does-not-exist"), "error names the missing skill: {err}");
-        assert!(Arc::ptr_eq(&before, &rs.current_loop()), "loop unchanged on rejection");
+        assert!(
+            err.contains("does-not-exist"),
+            "error names the missing skill: {err}"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &rs.current_loop()),
+            "loop unchanged on rejection"
+        );
     }
 
     #[test]
@@ -282,12 +384,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rt.json");
         let mut cfg = RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m1".into(),
+            "native".into(),
+            8192,
+        );
         cfg.active_skills = vec!["ghost".into()];
-        let rs = RuntimeState::new(cfg, sink, approval, dir.path().to_path_buf(), None,
-            "claude".into(), path, Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            Arc::from(Vec::<Arc<dyn Tool>>::new()), None,
-            crate::daemon::SYSTEM_PROMPT.to_string());
+        let rs = RuntimeState::new(
+            cfg,
+            sink,
+            approval,
+            dir.path().to_path_buf(),
+            None,
+            "claude".into(),
+            path,
+            Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            None,
+            crate::daemon::SYSTEM_PROMPT.to_string(),
+        );
         // Booted: base prompt present, the ghost preset silently dropped.
         assert!(rs.current_system_prompt().contains("local coding agent"));
         assert!(!rs.current_system_prompt().contains("ghost"));
@@ -301,16 +417,37 @@ mod tests {
         // Put a skill in <workspace>/.agent/skills/greeter (the default writable root).
         let sdir = dir.path().join(".agent").join("skills").join("greeter");
         fs::create_dir_all(&sdir).unwrap();
-        fs::write(sdir.join("SKILL.md"), "---\nname: greeter\ndescription: says hi\n---\nbody").unwrap();
+        fs::write(
+            sdir.join("SKILL.md"),
+            "---\nname: greeter\ndescription: says hi\n---\nbody",
+        )
+        .unwrap();
         let path = dir.path().join("rt.json");
         let cfg = RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
-        let rs = RuntimeState::new(cfg, sink, approval, dir.path().to_path_buf(), None,
-            "claude".into(), path, Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            Arc::from(Vec::<Arc<dyn Tool>>::new()), None,
-            crate::daemon::SYSTEM_PROMPT.to_string());
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m1".into(),
+            "native".into(),
+            8192,
+        );
+        let rs = RuntimeState::new(
+            cfg,
+            sink,
+            approval,
+            dir.path().to_path_buf(),
+            None,
+            "claude".into(),
+            path,
+            Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            None,
+            crate::daemon::SYSTEM_PROMPT.to_string(),
+        );
         let st = rs.settings_state();
-        assert!(st.discovered_skills.iter().any(|s| s.name == "greeter" && s.description == "says hi"));
+        assert!(st
+            .discovered_skills
+            .iter()
+            .any(|s| s.name == "greeter" && s.description == "says hi"));
     }
 
     #[test]
@@ -319,15 +456,32 @@ mod tests {
         let (sink, approval) = parts();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m1".into(),
+            "native".into(),
+            8192,
+        );
         cfg.sandbox_mode = "off".into();
         // build_loop must succeed — off → HostExecutor, no Docker required.
         let store: Arc<dyn OffloadStore> = Arc::new(agent_core::InMemoryOffloadStore::new());
         let flag = Arc::new(AtomicBool::new(false));
         let result = build_loop(
-            &cfg, &sink, &approval, dir.path(), &None, "claude",
-            &[], &[], None, crate::daemon::SYSTEM_PROMPT, &store, &flag,
-            &Arc::default(), &None);
+            &cfg,
+            &sink,
+            &approval,
+            dir.path(),
+            &None,
+            "claude",
+            &[],
+            &[],
+            None,
+            crate::daemon::SYSTEM_PROMPT,
+            &store,
+            &flag,
+            &Arc::default(),
+            &None,
+        );
         // If we get here without panic/error the strategy was constructed OK.
         let _loop = result.loop_; // just confirm it's built
     }
@@ -338,15 +492,31 @@ mod tests {
         let (sink, approval) = parts();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = RuntimeConfig::from_launch(
-            "openai".into(), "http://localhost:8080".into(), "m1".into(), "native".into(), 8192);
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m1".into(),
+            "native".into(),
+            8192,
+        );
         cfg.sandbox_mode = "auto".into();
         let store: Arc<dyn OffloadStore> = Arc::new(agent_core::InMemoryOffloadStore::new());
         let flag = Arc::new(AtomicBool::new(false));
         let result = build_loop(
-            &cfg, &sink, &approval, dir.path(), &None, "claude",
-            &[], &[], None, crate::daemon::SYSTEM_PROMPT, &store, &flag,
-            &Arc::default(), &None);
+            &cfg,
+            &sink,
+            &approval,
+            dir.path(),
+            &None,
+            "claude",
+            &[],
+            &[],
+            None,
+            crate::daemon::SYSTEM_PROMPT,
+            &store,
+            &flag,
+            &Arc::default(),
+            &None,
+        );
         let _loop = result.loop_;
     }
-
 }

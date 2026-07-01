@@ -3,20 +3,29 @@ use std::path::{Path, PathBuf};
 
 pub fn validate_mount(path: &str, home: Option<&Path>) -> Result<PathBuf, SandboxError> {
     let expanded: PathBuf = if let Some(rest) = path.strip_prefix("~/") {
-        match home { Some(h) => h.join(rest),
-            None => return Err(SandboxError::InvalidMount(format!("~ unsupported: {path}"))) }
+        match home {
+            Some(h) => h.join(rest),
+            None => return Err(SandboxError::InvalidMount(format!("~ unsupported: {path}"))),
+        }
     } else if path == "~" {
-        match home { Some(h) => h.to_path_buf(),
-            None => return Err(SandboxError::InvalidMount(format!("~ unsupported: {path}"))) }
-    } else { PathBuf::from(path) };
+        match home {
+            Some(h) => h.to_path_buf(),
+            None => return Err(SandboxError::InvalidMount(format!("~ unsupported: {path}"))),
+        }
+    } else {
+        PathBuf::from(path)
+    };
 
-    let canon = expanded.canonicalize()
+    let canon = expanded
+        .canonicalize()
         .map_err(|e| SandboxError::InvalidMount(format!("{}: {e}", expanded.display())))?;
 
     // A ':' in the path corrupts the `docker -v src:dst:mode` argument (src == dst here).
     if canon.to_string_lossy().contains(':') {
-        return Err(SandboxError::InvalidMount(
-            format!("path contains ':': {}", canon.display())));
+        return Err(SandboxError::InvalidMount(format!(
+            "path contains ':': {}",
+            canon.display()
+        )));
     }
 
     // The filesystem root is rejected on exact match only (every absolute path is a
@@ -28,14 +37,29 @@ pub fn validate_mount(path: &str, home: Option<&Path>) -> Result<PathBuf, Sandbo
     // NOTE: on modern Linux /var/run is a symlink to /run, so canonicalize() maps
     // /var/run* -> /run*; keeping both is belt-and-suspenders.
     const SYSTEM_ROOTS: &[&str] = &[
-        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot",
-        "/sys", "/proc", "/dev", "/var/lib/docker",
-        "/run", "/var/run", "/var/run/docker.sock", "/run/docker.sock",
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/boot",
+        "/sys",
+        "/proc",
+        "/dev",
+        "/var/lib/docker",
+        "/run",
+        "/var/run",
+        "/var/run/docker.sock",
+        "/run/docker.sock",
     ];
     for root in SYSTEM_ROOTS {
         let r = Path::new(root);
         if canon == r || canon.starts_with(r) {
-            return Err(SandboxError::InvalidMount(format!("refusing to mount {}", canon.display())));
+            return Err(SandboxError::InvalidMount(format!(
+                "refusing to mount {}",
+                canon.display()
+            )));
         }
     }
 
@@ -44,19 +68,29 @@ pub fn validate_mount(path: &str, home: Option<&Path>) -> Result<PathBuf, Sandbo
         let h_canon = h.canonicalize();
         let h_cmp = h_canon.as_deref().unwrap_or(h);
         if canon == h_cmp {
-            return Err(SandboxError::InvalidMount("refusing to mount \\$HOME root".into()));
+            return Err(SandboxError::InvalidMount(
+                "refusing to mount \\$HOME root".into(),
+            ));
         }
         // Credential directories under HOME (and their descendants) stay off-limits,
         // while ordinary project dirs elsewhere under HOME remain allowed.
         const HOME_SECRETS: &[&str] = &[
-            ".ssh", ".aws", ".gnupg", ".kube", ".docker",
-            ".config/gcloud", ".netrc", ".git-credentials",
+            ".ssh",
+            ".aws",
+            ".gnupg",
+            ".kube",
+            ".docker",
+            ".config/gcloud",
+            ".netrc",
+            ".git-credentials",
         ];
         for sub in HOME_SECRETS {
             let secret = h_cmp.join(sub);
             if canon == secret || canon.starts_with(&secret) {
-                return Err(SandboxError::InvalidMount(
-                    format!("refusing to mount credential path {}", canon.display())));
+                return Err(SandboxError::InvalidMount(format!(
+                    "refusing to mount credential path {}",
+                    canon.display()
+                )));
             }
         }
     }

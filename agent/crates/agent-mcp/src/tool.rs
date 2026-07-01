@@ -10,7 +10,13 @@ use std::time::Duration;
 pub fn namespaced_name(server: &str, tool: &str) -> String {
     fn clean(s: &str) -> String {
         s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect()
     }
     format!("{}__{}", clean(server), clean(tool))
@@ -20,8 +26,8 @@ pub fn namespaced_name(server: &str, tool: &str) -> String {
 pub struct McpTool {
     server: String,
     client: Arc<McpClient>,
-    local_name: String,   // server-local name used on the wire
-    namespaced: String,   // exposed to the model + registry
+    local_name: String, // server-local name used on the wire
+    namespaced: String, // exposed to the model + registry
     description: String,
     input_schema: Value,
     trust: Trust,
@@ -72,7 +78,10 @@ impl Tool for McpTool {
             access,
             paths: vec![],
             command: None,
-            summary: format!("MCP {}::{} (third-party server)", self.server, self.local_name),
+            summary: format!(
+                "MCP {}::{} (third-party server)",
+                self.server, self.local_name
+            ),
         })
     }
 
@@ -162,7 +171,10 @@ mod tests {
 
     #[test]
     fn name_is_namespaced_and_sanitized() {
-        assert_eq!(namespaced_name("git hub", "create.issue"), "git_hub__create_issue");
+        assert_eq!(
+            namespaced_name("git hub", "create.issue"),
+            "git_hub__create_issue"
+        );
     }
 
     #[tokio::test]

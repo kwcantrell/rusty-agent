@@ -98,7 +98,10 @@ impl FastEmbedEmbedder {
             opts = opts.with_cache_dir(dir.clone());
         }
         let model = TextEmbedding::try_new(opts).map_err(|e| EmbedError::Failed(e.to_string()))?;
-        Ok(Self { model: std::sync::Mutex::new(model), dim: 384 })
+        Ok(Self {
+            model: std::sync::Mutex::new(model),
+            dim: 384,
+        })
     }
 }
 
@@ -125,7 +128,10 @@ mod tests {
     #[tokio::test]
     async fn identical_text_is_cosine_one_distinct_is_low() {
         let e = StubEmbedder::d384();
-        let v = e.embed(&["alpha".into(), "alpha".into(), "totally different".into()]).await.unwrap();
+        let v = e
+            .embed(&["alpha".into(), "alpha".into(), "totally different".into()])
+            .await
+            .unwrap();
         assert_eq!(v[0].len(), 384);
         assert!((cosine(&v[0], &v[1]) - 1.0).abs() < 1e-5, "same text → 1.0");
         assert!(cosine(&v[0], &v[2]) < 0.5, "distinct text → low similarity");

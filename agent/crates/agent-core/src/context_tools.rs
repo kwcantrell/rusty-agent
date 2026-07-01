@@ -26,8 +26,10 @@ impl Tool for ContextRecallTool {
          (the number in a [tool_result#N offloaded ...] placeholder)."
     }
     fn when_not_to_call(&self) -> Option<&str> {
-        Some("Not for semantic search of saved memories — use recall. Use \
-              context_recall only to rehydrate a specific offloaded entry by its id.")
+        Some(
+            "Not for semantic search of saved memories — use recall. Use \
+              context_recall only to rehydrate a specific offloaded entry by its id.",
+        )
     }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -49,13 +51,20 @@ impl Tool for ContextRecallTool {
             summary: "recall offloaded content".into(),
         })
     }
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         let id = args
             .get("id")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| ToolError::InvalidArgs("missing integer 'id'".into()))?;
         match self.store.get(id) {
-            Some(entry) => Ok(ToolOutput { content: entry.content, display: None }),
+            Some(entry) => Ok(ToolOutput {
+                content: entry.content,
+                display: None,
+            }),
             None => Err(ToolError::NotFound(format!(
                 "no offloaded entry #{id} (may have been cleared)"
             ))),
@@ -99,7 +108,11 @@ impl Tool for ContextCompactTool {
             summary: "request context compaction".into(),
         })
     }
-    async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         self.flag.store(true, Ordering::SeqCst);
         Ok(ToolOutput {
             content: "Compaction requested; it will run on the next turn.".into(),
@@ -145,14 +158,20 @@ mod tests {
             turn: 0,
         });
         let tool = ContextRecallTool::new(store);
-        let out = tool.execute(json!({ "id": id }), &tool_ctx()).await.unwrap();
+        let out = tool
+            .execute(json!({ "id": id }), &tool_ctx())
+            .await
+            .unwrap();
         assert_eq!(out.content, "the full stack trace");
     }
 
     #[tokio::test]
     async fn recall_unknown_id_is_not_found() {
         let tool = ContextRecallTool::new(Arc::new(InMemoryOffloadStore::new()));
-        let err = tool.execute(json!({ "id": 999 }), &tool_ctx()).await.unwrap_err();
+        let err = tool
+            .execute(json!({ "id": 999 }), &tool_ctx())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
     }
 

@@ -1,10 +1,10 @@
 //! Claude Code CLI as a pure text-generation backend (`ModelClient`).
 use crate::{Chunk, Message, ModelError, Role, StopReason};
-use serde_json::Value;
 use crate::{CompletionRequest, ModelClient};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use serde_json::Value;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -23,7 +23,10 @@ pub struct ClaudeCliClient {
 
 impl ClaudeCliClient {
     pub fn new(binary: impl Into<String>, model: impl Into<String>) -> Self {
-        Self { binary: binary.into(), model: model.into() }
+        Self {
+            binary: binary.into(),
+            model: model.into(),
+        }
     }
 }
 
@@ -37,18 +40,23 @@ impl ModelClient for ClaudeCliClient {
 
         let mut child = Command::new(&self.binary)
             .arg("-p")
-            .arg("--output-format").arg("stream-json")
+            .arg("--output-format")
+            .arg("stream-json")
             .arg("--verbose")
-            .arg("--allowedTools").arg("")
-            .arg("--model").arg(&self.model)
+            .arg("--allowedTools")
+            .arg("")
+            .arg("--model")
+            .arg(&self.model)
             // Run the CLI as a pure generator without losing subscription auth.
             // `--system-prompt` REPLACES the "you are Claude Code" harness prompt
             // (so it can't compete with the Prompted tool preamble on stdin); the
             // transcript still carries our own instructions in the piped prompt.
-            .arg("--system-prompt").arg(BARE_SYSTEM_PROMPT)
+            .arg("--system-prompt")
+            .arg(BARE_SYSTEM_PROMPT)
             // Don't load the user's settings — that's where SessionStart hooks
             // live, which otherwise inject the whole skill harness into context.
-            .arg("--setting-sources").arg("project")
+            .arg("--setting-sources")
+            .arg("project")
             // Skip MCP discovery and session-to-disk writes (we're stateless).
             .arg("--strict-mcp-config")
             .arg("--no-session-persistence")
@@ -172,7 +180,8 @@ pub(crate) fn parse_event_line(line: &str) -> Result<Vec<Chunk>, ModelError> {
         Some("result") => {
             if let Some(u) = v.get("usage").and_then(Value::as_object) {
                 out.push(Chunk::Usage {
-                    prompt_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    prompt_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0)
+                        as u32,
                     completion_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
                         as u32,
                     reasoning_tokens: None,
@@ -205,7 +214,10 @@ mod proc_tests {
 
     /// Write an executable shell stub to a temp path and return it.
     fn write_fake(script: &str) -> tempfile::TempPath {
-        let mut f = tempfile::Builder::new().prefix("fake-claude-").tempfile().unwrap();
+        let mut f = tempfile::Builder::new()
+            .prefix("fake-claude-")
+            .tempfile()
+            .unwrap();
         write!(f, "{script}").unwrap();
         f.flush().unwrap();
         f.as_file().sync_all().unwrap(); // settle the executable before exec() to avoid ETXTBSY under parallel test runs
@@ -263,7 +275,9 @@ mod proc_tests {
             }
         }
         match err {
-            Some(ModelError::Process(msg)) => assert!(msg.contains("not authenticated"), "got: {msg}"),
+            Some(ModelError::Process(msg)) => {
+                assert!(msg.contains("not authenticated"), "got: {msg}")
+            }
             other => panic!("expected Process error, got {other:?}"),
         }
     }
@@ -319,14 +333,19 @@ mod proc_tests {
         let collect = async {
             let mut err = None;
             while let Some(item) = stream.next().await {
-                if let Err(e) = item { err = Some(e); }
+                if let Err(e) = item {
+                    err = Some(e);
+                }
             }
             err
         };
         let err = tokio::time::timeout(std::time::Duration::from_secs(10), collect)
             .await
             .expect("stream must not deadlock on large stderr");
-        assert!(matches!(err, Some(ModelError::Process(_))), "expected Process error, got {err:?}");
+        assert!(
+            matches!(err, Some(ModelError::Process(_))),
+            "expected Process error, got {err:?}"
+        );
     }
 }
 
@@ -381,7 +400,10 @@ mod tests {
 
     #[test]
     fn non_json_line_is_decode_error() {
-        assert!(matches!(parse_event_line("not json"), Err(ModelError::Decode(_))));
+        assert!(matches!(
+            parse_event_line("not json"),
+            Err(ModelError::Decode(_))
+        ));
     }
 
     #[test]
@@ -401,7 +423,10 @@ mod tests {
     fn tool_message_includes_tool_name_in_header() {
         let msgs = vec![Message::tool("call_0", "read_file", "file contents here")];
         let p = render_transcript(&msgs);
-        assert!(p.contains("## Tool (read_file)\nfile contents here"), "got: {p}");
+        assert!(
+            p.contains("## Tool (read_file)\nfile contents here"),
+            "got: {p}"
+        );
     }
 
     #[test]
@@ -415,7 +440,10 @@ mod tests {
     fn preserved_reasoning_renders_as_think_block_before_content() {
         let msgs = vec![Message::assistant("final answer", None).with_reasoning("secret plan")];
         let p = render_transcript(&msgs);
-        assert!(p.contains("## Assistant\n<think>secret plan</think>\nfinal answer"), "got: {p}");
+        assert!(
+            p.contains("## Assistant\n<think>secret plan</think>\nfinal answer"),
+            "got: {p}"
+        );
     }
 
     #[test]

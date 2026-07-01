@@ -20,7 +20,9 @@ pub struct MemoryConfig {
 }
 
 pub fn default_db_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join(".agent").join("memory.db")
 }
 

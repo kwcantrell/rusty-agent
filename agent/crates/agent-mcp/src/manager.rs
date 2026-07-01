@@ -65,12 +65,20 @@ impl McpManager {
             }
         }
         statuses.sort_by(|a, b| a.name.cmp(&b.name));
-        Self { clients, tools, statuses }
+        Self {
+            clients,
+            tools,
+            statuses,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn from_parts(tools: Vec<Arc<dyn Tool>>, statuses: Vec<ServerStatus>) -> Self {
-        Self { clients: vec![], tools, statuses }
+        Self {
+            clients: vec![],
+            tools,
+            statuses,
+        }
     }
 
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
@@ -81,13 +89,21 @@ impl McpManager {
         if self.statuses.is_empty() {
             return "mcp: no servers configured".to_string();
         }
-        let parts: Vec<String> = self.statuses.iter().map(|s| {
-            if s.connected {
-                format!("{} \u{2713} ({} tools)", s.name, s.tool_count)
-            } else {
-                format!("{} \u{2717} ({})", s.name, s.error.as_deref().unwrap_or("error"))
-            }
-        }).collect();
+        let parts: Vec<String> = self
+            .statuses
+            .iter()
+            .map(|s| {
+                if s.connected {
+                    format!("{} \u{2713} ({} tools)", s.name, s.tool_count)
+                } else {
+                    format!(
+                        "{} \u{2717} ({})",
+                        s.name,
+                        s.error.as_deref().unwrap_or("error")
+                    )
+                }
+            })
+            .collect();
         format!("mcp: {}", parts.join(", "))
     }
 
@@ -111,13 +127,23 @@ async fn connect_one(
     let attempt = async move {
         let transport = StdioTransport::spawn(&spec_owned, &sandbox).map_err(|e| e.to_string())?;
         let client = McpClient::new(Arc::new(transport));
-        client.initialize(timeout).await.map_err(|e| e.to_string())?;
-        let raw = client.list_tools(timeout).await.map_err(|e| e.to_string())?;
+        client
+            .initialize(timeout)
+            .await
+            .map_err(|e| e.to_string())?;
+        let raw = client
+            .list_tools(timeout)
+            .await
+            .map_err(|e| e.to_string())?;
         let tools: Vec<Arc<dyn Tool>> = raw
             .into_iter()
             .map(|r| {
-                Arc::new(McpTool::new(&name_owned, client.clone(), r, spec_owned.trust))
-                    as Arc<dyn Tool>
+                Arc::new(McpTool::new(
+                    &name_owned,
+                    client.clone(),
+                    r,
+                    spec_owned.trust,
+                )) as Arc<dyn Tool>
             })
             .collect();
         Ok::<_, String>((client, tools))
@@ -158,7 +184,12 @@ mod tests {
 
     #[tokio::test]
     async fn empty_config_connects_nothing() {
-        let mgr = McpManager::connect(&McpServersConfig::default(), Duration::from_secs(1), host_sandbox()).await;
+        let mgr = McpManager::connect(
+            &McpServersConfig::default(),
+            Duration::from_secs(1),
+            host_sandbox(),
+        )
+        .await;
         assert!(mgr.tools().is_empty());
         assert_eq!(mgr.summary_line(), "mcp: no servers configured");
     }

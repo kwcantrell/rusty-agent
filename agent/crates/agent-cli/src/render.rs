@@ -21,7 +21,11 @@ pub fn render_diff(before: &str, after: &str) -> String {
 }
 
 fn fmt_k(n: u64) -> String {
-    if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 /// One dim summary line printed after each run (pure for testability).
@@ -29,9 +33,16 @@ pub fn format_stats_line(s: &agent_core::SessionStats) -> String {
     let failed = s.tools_denied + s.tools_error + s.tools_timeout + s.tools_panic;
     let mut line = format!(
         "— session: {} turns · {} in / {} out tokens · {} tools ({} failed) · {:.1}s in tools",
-        s.turns, fmt_k(s.prompt_tokens), fmt_k(s.completion_tokens),
-        s.tool_calls, failed, s.tool_time_ms as f64 / 1000.0);
-    if s.cost_usd > 0.0 { line.push_str(&format!(" · ${:.2}", s.cost_usd)); }
+        s.turns,
+        fmt_k(s.prompt_tokens),
+        fmt_k(s.completion_tokens),
+        s.tool_calls,
+        failed,
+        s.tool_time_ms as f64 / 1000.0
+    );
+    if s.cost_usd > 0.0 {
+        line.push_str(&format!(" · ${:.2}", s.cost_usd));
+    }
     line
 }
 
@@ -64,10 +75,20 @@ impl EventSink for TerminalSink {
             AgentEvent::ToolStart { name, args, .. } => {
                 let _ = writeln!(out, "\n\x1b[36m⚙ {name}\x1b[0m {args}");
             }
-            AgentEvent::ToolResult { name, status, output, duration_ms, .. } => {
+            AgentEvent::ToolResult {
+                name,
+                status,
+                output,
+                duration_ms,
+                ..
+            } => {
                 if status != ToolStatus::Ok {
-                    let _ = writeln!(out, "\x1b[31m✗ {name} ({}, {duration_ms}ms)\x1b[0m {}",
-                        status.as_str(), output.content);
+                    let _ = writeln!(
+                        out,
+                        "\x1b[31m✗ {name} ({}, {duration_ms}ms)\x1b[0m {}",
+                        status.as_str(),
+                        output.content
+                    );
                 } else if let Some(Display::Diff {
                     path,
                     before,
@@ -86,10 +107,7 @@ impl EventSink for TerminalSink {
                     ..
                 }) = &output.display
                 {
-                    let _ = writeln!(
-                        out,
-                        "\x1b[90m$ exit={exit_code}\x1b[0m\n{stdout}{stderr}"
-                    );
+                    let _ = writeln!(out, "\x1b[90m$ exit={exit_code}\x1b[0m\n{stdout}{stderr}");
                 } else {
                     let _ = writeln!(out, "\x1b[32m✓ {name}\x1b[0m");
                 }
@@ -109,9 +127,11 @@ impl EventSink for TerminalSink {
             }
             AgentEvent::Approval(_) => {} // the TerminalApproval channel prints its own prompt
             AgentEvent::SandboxDegraded { mechanism, reason } => {
-                let _ = writeln!(out,
+                let _ = writeln!(
+                    out,
                     "\n\x1b[33m⚠ sandbox degraded: {mechanism} unavailable ({reason}); \
-                     tools run UNSANDBOXED on the host\x1b[0m");
+                     tools run UNSANDBOXED on the host\x1b[0m"
+                );
             }
             AgentEvent::Error(e) => {
                 let _ = writeln!(out, "\n\x1b[31m✗ {e}\x1b[0m");
@@ -135,12 +155,19 @@ mod tests {
         assert!(out.contains(" foo")); // unchanged context kept
     }
 
+    // Legacy lint, unrelated to this branch: field-by-field build reads clearly in a test.
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn stats_line_summarizes_session() {
         let mut s = agent_core::SessionStats::default();
-        s.turns = 3; s.prompt_tokens = 12_400; s.completion_tokens = 2_100;
-        s.tool_calls = 7; s.tools_error = 1; s.tools_timeout = 1;
-        s.tool_time_ms = 4_200; s.cost_usd = 0.05;
+        s.turns = 3;
+        s.prompt_tokens = 12_400;
+        s.completion_tokens = 2_100;
+        s.tool_calls = 7;
+        s.tools_error = 1;
+        s.tools_timeout = 1;
+        s.tool_time_ms = 4_200;
+        s.cost_usd = 0.05;
         let line = format_stats_line(&s);
         assert!(line.contains("3 turns"));
         assert!(line.contains("12.4k in"));

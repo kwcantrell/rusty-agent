@@ -48,7 +48,11 @@ fn main() {
             let overflowed = args.iter().any(|a| a == "--overflowed");
             let verdict = admit(&fav, &real, overflowed);
             println!("{verdict:?}");
-            exit(if verdict == Admissibility::Admitted { 0 } else { 1 });
+            exit(if verdict == Admissibility::Admitted {
+                0
+            } else {
+                1
+            });
         }
         _ => {
             eprintln!("usage: eval_gate <gate|admit> <a.jsonl> <b.jsonl> [--overflowed]");

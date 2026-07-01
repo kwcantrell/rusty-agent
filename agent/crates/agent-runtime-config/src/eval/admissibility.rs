@@ -41,24 +41,42 @@ mod tests {
     use crate::eval::result::{BatchResult, RunResult};
     fn batch(passes: usize, n: usize) -> BatchResult {
         BatchResult {
-            runs: (0..n).map(|i| RunResult { passed: i < passes, tokens: 1, turns: 1 }).collect(),
+            runs: (0..n)
+                .map(|i| RunResult {
+                    passed: i < passes,
+                    tokens: 1,
+                    turns: 1,
+                })
+                .collect(),
         }
     }
     #[test]
     fn admits_when_favorable_passes_and_realistic_fails() {
         // favorable 5/5 green, realistic 1/5 red -> a real, capturable weakness
-        assert_eq!(admit(&batch(5, 5), &batch(1, 5), false), Admissibility::Admitted);
+        assert_eq!(
+            admit(&batch(5, 5), &batch(1, 5), false),
+            Admissibility::Admitted
+        );
     }
     #[test]
     fn ill_sized_when_favorable_overflowed() {
-        assert_eq!(admit(&batch(5, 5), &batch(0, 5), true), Admissibility::IllSized);
+        assert_eq!(
+            admit(&batch(5, 5), &batch(0, 5), true),
+            Admissibility::IllSized
+        );
     }
     #[test]
     fn capability_bound_when_favorable_also_fails() {
-        assert_eq!(admit(&batch(1, 5), &batch(0, 5), false), Admissibility::CapabilityBound);
+        assert_eq!(
+            admit(&batch(1, 5), &batch(0, 5), false),
+            Admissibility::CapabilityBound
+        );
     }
     #[test]
     fn no_weakness_when_realistic_already_passes() {
-        assert_eq!(admit(&batch(5, 5), &batch(4, 5), false), Admissibility::NoWeakness);
+        assert_eq!(
+            admit(&batch(5, 5), &batch(4, 5), false),
+            Admissibility::NoWeakness
+        );
     }
 }

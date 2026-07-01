@@ -35,8 +35,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let sdir = dir.path().join(name);
         fs::create_dir_all(&sdir).unwrap();
-        fs::write(sdir.join("SKILL.md"), format!("---\nname: {name}\ndescription: d\n---\n{body}")).unwrap();
-        (Arc::new(SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf())), dir)
+        fs::write(
+            sdir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d\n---\n{body}"),
+        )
+        .unwrap();
+        (
+            Arc::new(SkillRegistry::new(
+                vec![dir.path().to_path_buf()],
+                dir.path().to_path_buf(),
+            )),
+            dir,
+        )
     }
 
     #[test]

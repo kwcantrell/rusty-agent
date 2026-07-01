@@ -94,12 +94,7 @@ pub fn select_offloads(history: &[Message], config: &OffloadConfig) -> Vec<Offlo
 }
 
 /// The compact stub left in the live window in place of offloaded content.
-pub fn placeholder_for(
-    id: OffloadId,
-    tool_name: &str,
-    kind: &OffloadKind,
-    bytes: usize,
-) -> String {
+pub fn placeholder_for(id: OffloadId, tool_name: &str, kind: &OffloadKind, bytes: usize) -> String {
     let kind_str = match kind {
         OffloadKind::Error => "error",
         OffloadKind::Output => "output",
@@ -122,7 +117,13 @@ mod tests {
     #[test]
     fn large_error_is_selected() {
         let history = vec![tool_msg("shell", &format!("ERROR: {}", "x".repeat(300)))];
-        let hits = select_offloads(&history, &OffloadConfig { keep_recent: 0, ..Default::default() });
+        let hits = select_offloads(
+            &history,
+            &OffloadConfig {
+                keep_recent: 0,
+                ..Default::default()
+            },
+        );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entry.kind, OffloadKind::Error);
         assert_eq!(hits[0].history_index, 0);
@@ -131,14 +132,26 @@ mod tests {
     #[test]
     fn small_error_under_threshold_is_kept() {
         let history = vec![tool_msg("shell", "ERROR: nope")];
-        let hits = select_offloads(&history, &OffloadConfig { keep_recent: 0, ..Default::default() });
+        let hits = select_offloads(
+            &history,
+            &OffloadConfig {
+                keep_recent: 0,
+                ..Default::default()
+            },
+        );
         assert!(hits.is_empty());
     }
 
     #[test]
     fn large_success_output_is_selected() {
         let history = vec![tool_msg("read_file", &"y".repeat(2000))];
-        let hits = select_offloads(&history, &OffloadConfig { keep_recent: 0, ..Default::default() });
+        let hits = select_offloads(
+            &history,
+            &OffloadConfig {
+                keep_recent: 0,
+                ..Default::default()
+            },
+        );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entry.kind, OffloadKind::Output);
     }
@@ -150,7 +163,13 @@ mod tests {
             tool_msg("shell", &format!("ERROR: {}", "b".repeat(300))),
             tool_msg("shell", &format!("ERROR: {}", "c".repeat(300))),
         ];
-        let hits = select_offloads(&history, &OffloadConfig { keep_recent: 2, ..Default::default() });
+        let hits = select_offloads(
+            &history,
+            &OffloadConfig {
+                keep_recent: 2,
+                ..Default::default()
+            },
+        );
         // Only the oldest of three is eligible.
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].history_index, 0);
@@ -169,18 +188,38 @@ mod tests {
 
     #[test]
     fn already_offloaded_placeholder_is_skipped() {
-        let history = vec![tool_msg("shell", &placeholder_for(7, "shell", &OffloadKind::Error, 300))];
-        let hits = select_offloads(&history, &OffloadConfig { keep_recent: 0, ..Default::default() });
-        assert!(hits.is_empty(), "must be idempotent — never re-offload a placeholder");
+        let history = vec![tool_msg(
+            "shell",
+            &placeholder_for(7, "shell", &OffloadKind::Error, 300),
+        )];
+        let hits = select_offloads(
+            &history,
+            &OffloadConfig {
+                keep_recent: 0,
+                ..Default::default()
+            },
+        );
+        assert!(
+            hits.is_empty(),
+            "must be idempotent — never re-offload a placeholder"
+        );
     }
 
+    // Legacy lint, unrelated to this branch.
+    #[allow(clippy::needless_borrows_for_generic_args)]
     #[test]
     fn non_tool_messages_are_ignored() {
         let history = vec![
             Message::user(&"u".repeat(3000)),
             Message::assistant(&"a".repeat(3000), None),
         ];
-        let hits = select_offloads(&history, &OffloadConfig { keep_recent: 0, ..Default::default() });
+        let hits = select_offloads(
+            &history,
+            &OffloadConfig {
+                keep_recent: 0,
+                ..Default::default()
+            },
+        );
         assert!(hits.is_empty());
     }
 

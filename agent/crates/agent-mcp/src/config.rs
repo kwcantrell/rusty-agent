@@ -41,7 +41,10 @@ impl McpServersConfig {
                 Err(e) => (Self::default(), Some(format!("malformed mcp config ({e})"))),
             },
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
-            Err(e) => (Self::default(), Some(format!("mcp config unreadable ({e})"))),
+            Err(e) => (
+                Self::default(),
+                Some(format!("mcp config unreadable ({e})")),
+            ),
         }
     }
 }

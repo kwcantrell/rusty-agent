@@ -29,6 +29,9 @@ mod tests {
     #[tokio::test]
     async fn retriever_is_object_safe_and_returns_lines() {
         let r: Arc<dyn Retriever> = Arc::new(Two);
-        assert_eq!(r.retrieve("q").await, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            r.retrieve("q").await,
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 }

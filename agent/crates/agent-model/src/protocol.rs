@@ -18,7 +18,9 @@ impl ToolCallProtocol for NativeProtocol {
     fn parse(&self, raw: &AssistantTurn) -> Result<ParsedTurn, ProtocolError> {
         let mut tool_calls = Vec::new();
         for (i, rc) in raw.raw_tool_calls.iter().enumerate() {
-            let name = rc.name.clone()
+            let name = rc
+                .name
+                .clone()
                 .ok_or_else(|| ProtocolError(format!("tool call {i} missing name")))?;
             let args: serde_json::Value = if rc.args_fragment.trim().is_empty() {
                 serde_json::json!({})
@@ -29,7 +31,10 @@ impl ToolCallProtocol for NativeProtocol {
             let id = rc.id.clone().unwrap_or_else(|| format!("call_{i}"));
             tool_calls.push(ToolCall { id, name, args });
         }
-        Ok(ParsedTurn { text: raw.text.clone(), tool_calls })
+        Ok(ParsedTurn {
+            text: raw.text.clone(),
+            tool_calls,
+        })
     }
 }
 
@@ -43,8 +48,11 @@ mod tests {
         let turn = AssistantTurn {
             text: "ok".into(),
             raw_tool_calls: vec![RawToolCall {
-                index: None, id: Some("c1".into()), name: Some("read_file".into()),
-                args_fragment: r#"{"path":"a.txt"}"#.into() }],
+                index: None,
+                id: Some("c1".into()),
+                name: Some("read_file".into()),
+                args_fragment: r#"{"path":"a.txt"}"#.into(),
+            }],
             stop: StopReason::ToolCalls,
             reasoning: String::new(),
             ..Default::default()
@@ -58,19 +66,32 @@ mod tests {
 
     #[test]
     fn native_rejects_malformed_args() {
-        let turn = AssistantTurn { text: "".into(),
-            raw_tool_calls: vec![RawToolCall { index: None, id: Some("c1".into()),
-                name: Some("x".into()), args_fragment: "{not json".into() }],
-            stop: StopReason::ToolCalls, reasoning: String::new(), ..Default::default() };
+        let turn = AssistantTurn {
+            text: "".into(),
+            raw_tool_calls: vec![RawToolCall {
+                index: None,
+                id: Some("c1".into()),
+                name: Some("x".into()),
+                args_fragment: "{not json".into(),
+            }],
+            stop: StopReason::ToolCalls,
+            reasoning: String::new(),
+            ..Default::default()
+        };
         assert!(NativeProtocol.parse(&turn).is_err());
     }
 
     #[test]
     fn native_prepare_keeps_tools_field() {
-        let mut req = CompletionRequest { messages: vec![], tools: vec![
-            agent_tools::ToolSchema { name: "t".into(), description: "d".into(),
-                parameters: serde_json::json!({}) }],
-            ..Default::default() };
+        let mut req = CompletionRequest {
+            messages: vec![],
+            tools: vec![agent_tools::ToolSchema {
+                name: "t".into(),
+                description: "d".into(),
+                parameters: serde_json::json!({}),
+            }],
+            ..Default::default()
+        };
         NativeProtocol.prepare(&mut req);
         assert_eq!(req.tools.len(), 1); // native leaves tools for the client to send
     }
