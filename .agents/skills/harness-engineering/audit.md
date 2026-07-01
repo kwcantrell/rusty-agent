@@ -178,7 +178,9 @@ co-design harness with eval, arXiv 2503.16416).
 
 ---
 
-## Findings (last audit: 2026-06-30)
+## Example findings (last audit: 2026-06-30)
+
+*Illustrative snapshot from a 2026-06-30 run — re-stamp or replace when you run the audit; these cite live line numbers that drift.*
 
 Record one finding block per gap discovered. Multiple gaps per component → multiple blocks.
 Update this section when the audit is re-run; stamp with the new date. On re-run: remove findings whose proposed fix has been applied, retain still-open ones, and add new ones.

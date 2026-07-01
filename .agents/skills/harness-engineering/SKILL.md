@@ -11,8 +11,8 @@ description: >-
 
 # harness-engineering
 
-**Agent = Model + Harness.** The harness is "the scaffolding wrapped around the
-model that lets it actually finish something" and accounts for **~90% of agent
+**Agent = Model + Harness.** The harness is the scaffolding wrapped around the
+model that lets it actually finish something, and accounts for **~90% of agent
 behavior vs ~10% for the model** (whitepaper Fig. 7). Leading principle:
 
 > "Most agent failures, examined honestly, are configuration failures."
