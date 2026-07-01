@@ -4,8 +4,11 @@ use std::path::Path;
 
 /// Commands ALWAYS denied regardless of user settings — defense-in-depth against
 /// the model (or an injected settings frame), not against the operator. Intersected
-/// into the effective denylist by `RuntimeConfig::effective_denylist`.
-pub const HARD_FLOOR_DENYLIST: &[&str] = &["rm -rf /", "sudo", ":(){", "mkfs", "dd if="];
+/// into the effective denylist by `RuntimeConfig::effective_denylist`. Bare-program-name
+/// catastrophes (sudo/su/doas, mkfs) are handled structurally & position-aware in
+/// agent-policy (so `man mkfs` is not over-denied); only specific multi-token strings and
+/// the forkbomb signature live here as substring backstop literals.
+pub const HARD_FLOOR_DENYLIST: &[&str] = &["rm -rf /", ":(){", "dd if="];
 
 /// The editable runtime surface, persisted to disk and mirrored on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -390,7 +393,7 @@ mod tests {
     #[test]
     fn effective_denylist_floor_survives_empty_user_list() {
         let c = base(); // command_denylist empty
-        assert!(c.effective_denylist().iter().any(|d| d == "sudo"));
+        assert!(c.effective_denylist().iter().any(|d| d == "rm -rf /"));
     }
 
     #[test]

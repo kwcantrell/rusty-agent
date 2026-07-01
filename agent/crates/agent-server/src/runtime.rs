@@ -223,7 +223,7 @@ mod tests {
         let (rs, _dir) = make();
         let st = rs.settings_state();
         assert!(!st.api_key_set);
-        assert!(st.hard_floor.iter().any(|d| d == "sudo"));
+        assert!(st.hard_floor.iter().any(|d| d == "rm -rf /"));
     }
 
     #[test]

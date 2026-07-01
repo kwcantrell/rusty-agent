@@ -61,14 +61,27 @@ fn targets_root(args: &[String]) -> bool {
     args.iter().any(|a| a == "/" || a == "/*" || a == "--no-preserve-root")
 }
 
+/// Catastrophe check keyed on a program's basename alone (no arguments needed): privilege-
+/// escalation shims and filesystem-format tools. Shared by the structural per-simple-command
+/// check (on argv[0]) and the raw-string boundary scan.
+fn program_name_is_catastrophic(name: &str) -> Option<String> {
+    if matches!(name, "sudo" | "doas" | "su") {
+        return Some(format!("privilege escalation via `{name}` is denied"));
+    }
+    if name == "mkfs" || name.starts_with("mkfs.") {
+        return Some(format!("filesystem creation via `{name}` is denied"));
+    }
+    None
+}
+
 /// Structural catastrophe check for a single simple command (argv vector).
 fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
     let prog = argv.first()?;
     let name = basename(prog);
     let rest = &argv[1..];
 
-    if matches!(name, "sudo" | "doas" | "su") {
-        return Some(format!("privilege escalation via `{name}` is denied"));
+    if let Some(reason) = program_name_is_catastrophic(name) {
+        return Some(reason);
     }
     if name == "rm" && rest.iter().any(|a| is_recursive_flag(a)) && targets_root(rest) {
         return Some("recursive delete of a root path is denied".to_string());
@@ -78,15 +91,32 @@ fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
     {
         return Some("`dd` writing to a block device is denied".to_string());
     }
-    if name == "mkfs" || name.starts_with("mkfs.") {
-        return Some(format!("filesystem creation via `{name}` is denied"));
-    }
     None
 }
 
-/// Hard floor: a command that is denied even if a user would approve it. Two layers:
-/// (A) structural per-simple-command checks, (B) an always-on normalized-substring
-/// backstop against the configured denylist. Either firing means deny.
+/// Leading program token at each shell command boundary in the RAW string: start-of-string
+/// and immediately after a control-operator char (`&`, `|`, `;`, newline). Operates on the
+/// raw text (not shell-words), so it works on glued operators (`x&&sudo`) and unparseable
+/// input (unbalanced quotes) alike. Surrounding quote chars are stripped so a quoted program
+/// name (`"sudo"`) is still caught.
+///
+/// NOTE: intentionally NOT quote-aware about operators — an operator inside a quoted string
+/// (`echo "a; sudo b"`) is treated as a boundary, so such a command is over-denied. This is
+/// fail-safe (a hard floor errs toward denial), rare, and consistent with the
+/// SHELL_SIGNIFICANT over-approximation elsewhere in this file. A full quote-aware parser is
+/// deliberately out of scope.
+fn command_boundary_programs(cmd: &str) -> impl Iterator<Item = &str> {
+    cmd.split(|c| matches!(c, '&' | '|' | ';' | '\n'))
+        .filter_map(|seg| seg.split_whitespace().next())
+        .map(|tok| tok.trim_matches(|c| c == '"' || c == '\''))
+        .filter(|tok| !tok.is_empty())
+}
+
+/// Hard floor: a command that is denied even if a user would approve it. Three layers:
+/// (A) structural per-simple-command checks over shell-words tokenization; (A2) a raw-string
+/// command-boundary scan for bare-program-name catastrophes hidden by glued operators or
+/// unparseable input; (B) an always-on normalized-substring backstop against the configured
+/// denylist. Any layer firing means deny.
 pub fn hard_floor_violation(cmd: &str, denylist: &[String]) -> Option<String> {
     // Layer A: structural (only when the string tokenizes).
     if let Some(simples) = split_simple_commands(cmd) {
@@ -96,8 +126,16 @@ pub fn hard_floor_violation(cmd: &str, denylist: &[String]) -> Option<String> {
             }
         }
     }
-    // Layer B: always-on substring backstop (catches no-space operators, parse failures,
-    // and configured denylist literals). Fail-safe.
+    // Layer A2: raw-string boundary scan — position-aware, so a catastrophe name in argument
+    // position (`man mkfs`) is NOT flagged, but glued (`x&&sudo`) / unparseable (`sudo "oops`)
+    // program-position uses that Layer A misses are caught.
+    for prog in command_boundary_programs(cmd) {
+        if let Some(reason) = program_name_is_catastrophic(basename(prog)) {
+            return Some(reason);
+        }
+    }
+    // Layer B: always-on substring backstop (catches configured denylist literals, including
+    // specific multi-token strings and the forkbomb signature). Fail-safe.
     let norm = normalize_ws(cmd);
     let stripped = strip_ws(cmd);
     for pat in denylist {
@@ -182,8 +220,9 @@ mod tests {
 
     fn floor(cmd: &str) -> Option<String> {
         // Default hard-floor denylist literals (mirrors the runtime's HARD_FLOOR set).
-        let deny = vec!["sudo".to_string(), "rm -rf /".to_string(),
-            "dd if=".to_string(), ":(){".to_string()];
+        // Bare program names (sudo/mkfs) are NOT here — they are caught structurally &
+        // position-aware, not by the substring backstop.
+        let deny = vec!["rm -rf /".to_string(), "dd if=".to_string(), ":(){".to_string()];
         hard_floor_violation(cmd, &deny)
     }
 
@@ -204,8 +243,9 @@ mod tests {
     }
 
     #[test]
-    fn floor_denies_no_space_operator_via_backstop() {
-        // No spaces around && — tokenizes as one token; caught by the substring backstop.
+    fn floor_denies_no_space_operator_via_boundary_scan() {
+        // Glued && hides sudo from shell-words (one token `x&&sudo`); the raw-string
+        // boundary scan splits on the operator and catches `sudo` in program position.
         assert!(floor("echo x&&sudo reboot").is_some());
     }
 
@@ -225,6 +265,30 @@ mod tests {
     }
 
     #[test]
+    fn floor_allows_catastrophe_name_in_argument_position() {
+        // The win: bare catastrophe names as ARGUMENTS are no longer over-denied.
+        assert!(floor("man mkfs").is_none());
+        assert!(floor("grep mkfs /var/log").is_none());
+        assert!(floor("man sudo").is_none());
+        assert!(floor("which sudo").is_none());
+        assert!(floor("pseudocode").is_none()); // 'sudo' is a substring of 'pseudo'
+    }
+
+    #[test]
+    fn floor_denies_catastrophe_name_in_program_position_via_boundary_scan() {
+        assert!(floor("ls|mkfs /dev/sda").is_some());        // glued pipe
+        assert!(floor("echo x&&mkfs /dev/sda").is_some());   // glued &&
+        assert!(floor("\"sudo reboot").is_some());           // unbalanced quote before program name
+    }
+
+    #[test]
+    fn floor_over_denies_quoted_operator_and_name_fail_safe() {
+        // Accepted over-approximation: the boundary scan is not quote-aware about operators,
+        // so an operator + catastrophe name both inside quotes is denied. Fail-safe & rare.
+        assert!(floor(r#"echo "a; sudo b""#).is_some());
+    }
+
+    #[test]
     fn floor_denies_spaced_fork_bomb_via_stripped_backstop() {
         // Spaced variant dodges normalize_ws (single spaces remain) but not the
         // all-whitespace-removed pass, which collapses it to ":(){:|:&};:".
@@ -236,14 +300,15 @@ mod tests {
         assert!(floor("ls -la").is_none());
         assert!(floor("git status").is_none());
         assert!(floor("make build").is_none());   // 'mk' prefix must not trip mkfs
-        // 'mkfs' as an arg substring passes only because THIS test's denylist omits "mkfs";
-        // the real HARD_FLOOR_DENYLIST contains "mkfs", so the backstop denies this in prod.
+        // 'mkfs' as an argument (not program position) is fine in BOTH this test and prod:
+        // the real HARD_FLOOR_DENYLIST no longer contains a bare "mkfs" substring.
         assert!(floor("cat mkfs-notes.txt").is_none());
     }
 
     #[test]
-    fn floor_denies_unparseable_with_denylisted_literal() {
-        // Unbalanced quote -> tokenization fails -> backstop still matches "sudo".
+    fn floor_denies_unparseable_via_boundary_scan() {
+        // Unbalanced quote -> shell-words fails -> Layer A skipped. The boundary scan runs
+        // on the raw string and still finds `sudo` at the start.
         assert!(floor(r#"sudo "oops"#).is_some());
     }
 
