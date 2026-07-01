@@ -163,3 +163,57 @@ Commands: `cargo test -p agent-policy -p agent-runtime-config`, then whole-works
 |---|---|
 | `agent/crates/agent-policy/src/command.rs` | extract `program_name_is_catastrophic`; add `command_boundary_programs` + Layer-A2 pass; update `floor()` test helper + tests |
 | `agent/crates/agent-runtime-config/src/runtime_config.rs` | shrink `HARD_FLOOR_DENYLIST` to 3 entries; update doc comment + one test assertion |
+
+---
+
+## Addendum (2026-07-01): auto-allow guard for exec-wrapped catastrophes
+
+**Discovered during implementation review.** Removing the bare `sudo`/`mkfs` substring literals
+from `HARD_FLOOR_DENYLIST` did not only relax hard-deny for benign argument-position uses — it also
+removed the blunt guard that kept a catastrophe program name, when passed as an **argument to an
+allowlisted, exec-capable program**, out of the **auto-allow** path.
+
+**Verified regression:** `find . -exec sudo reboot +` — `find` is on the default allowlist
+(`default_allowlist()` = `ls cat pwd echo git grep find rg cargo head tail wc`) and the argument
+string carries no shell-significant character, so `hard_floor_violation` returns `None` and
+`is_auto_allowed` returns `true` → **silent execution, no approval prompt**. Before the substring
+removal this was hard-denied (`Some("command matches denylist: sudo")`). This is a Critical
+under-denial (Deny → auto-Allow), strictly worse than the interpreter-wrapping residual below (which
+only reaches Ask, since interpreters are not default-allowlisted).
+
+### Fix — name-exact catastrophe guard in the auto-allow gate
+
+Add to `is_auto_allowed` (`command.rs`), after the shell-significant check and before the allowlist
+lookup: refuse to auto-allow if **any** token's basename is a catastrophe program name
+(`program_name_is_catastrophic(basename(tok))`). This is name-**exact** on whole-token basenames, not
+a substring test, so it does not reintroduce the false positives this spec set out to remove:
+
+- `find . -exec sudo reboot +` → token `sudo` → not auto-allowed → **Ask** (approval required).
+- `xargs mkfs` → token `mkfs` → **Ask**.
+- `cat sudoku.txt` → basename `sudoku.txt` ≠ `sudo` → **still auto-allows** (no false positive).
+- `man mkfs` → unchanged (not hard-denied; `man` not allowlisted → already Ask).
+- Accepted mild cost: `grep mkfs /var/log` → Ask instead of auto-Allow (rare; a command naming a
+  catastrophe program as an exact argument is worth a human glance). This is fail-safe (Ask, never a
+  hard-deny), so it does not resurrect the "blocked benign command" bug.
+
+Hard-deny stays position-aware (Layers A/A2 unchanged); this guard only affects the auto-allow gate,
+downgrading exec-wrapped catastrophes to Ask, never to Deny.
+
+### Known limitation — interpreter-wrapping (documented, not fixed)
+
+`bash -c "sudo reboot"`, `sh -c "…"`, `eval "sudo x"`, `xargs sudo` pass the catastrophe program as a
+string *interpreted* by another program. A position-aware scan fundamentally cannot see this: the
+leading token is `bash`/`sh`/`eval`, and the name-exact guard does not fire because `"sudo reboot"` is
+a single quoted token (basename `sudo reboot` ≠ `sudo`). Under the default allowlist these reach
+**Ask** (interpreters are not allowlisted), which is the correct security boundary — hard-denying them
+is a slippery slope (`env`/`nice`/`timeout`/`nohup`/`setsid`/`watch` wrappers chain without terminus).
+Documented as a known limitation in the code, regression-tested to assert Ask (not Deny, not Allow)
+under the default allowlist, with allowlist guidance: **do not add shell interpreters
+(`bash`/`sh`/`zsh`/`dash`/`eval`/`xargs`) to `command_allowlist`** — the guard cannot inspect their
+quoted command-string arguments.
+
+### Additional files touched
+
+| File | Change |
+|---|---|
+| `agent/crates/agent-policy/src/command.rs` | catastrophe-token guard in `is_auto_allowed`; interpreter-limitation doc comment; auto-allow + interpreter-residual tests |
