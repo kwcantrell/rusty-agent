@@ -7,6 +7,9 @@ pub use runtime_config::{RuntimeConfig, HARD_FLOOR_DENYLIST};
 mod assemble;
 pub use assemble::{assemble_loop, loop_config_from, BuiltLoop, LoopParts};
 
+pub mod trace;
+pub use trace::{build_trace, ObservedSink, TraceWriter};
+
 pub mod eval;
 
 use agent_mcp::McpServersConfig;

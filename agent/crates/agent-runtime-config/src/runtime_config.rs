@@ -64,6 +64,12 @@ pub struct RuntimeConfig {
     pub sandbox_extra_rw: Vec<String>,
     #[serde(default)]
     pub sandbox_extra_ro: Vec<String>,
+    #[serde(default = "default_true")]
+    pub trace: bool,
+    #[serde(default)]
+    pub trace_dir: Option<String>,
+    #[serde(default = "default_trace_max_mb")]
+    pub trace_max_mb: u64,
 }
 
 /// All-optional mirror used only for on-disk merge: a file written by an older
@@ -100,6 +106,9 @@ struct PartialRuntimeConfig {
     sandbox_tmp_size: Option<String>,
     sandbox_extra_rw: Option<Vec<String>>,
     sandbox_extra_ro: Option<Vec<String>>,
+    trace: Option<bool>,
+    trace_dir: Option<String>,
+    trace_max_mb: Option<u64>,
 }
 
 fn default_true() -> bool { true }
@@ -109,6 +118,7 @@ fn default_sandbox_memory() -> String { "2g".into() }
 fn default_sandbox_cpus() -> String { "2".into() }
 fn default_sandbox_pids() -> u32 { 512 }
 fn default_sandbox_tmp_size() -> String { "256m".into() }
+fn default_trace_max_mb() -> u64 { 64 }
 
 impl RuntimeConfig {
     /// Seed a config from launch flags + sensible defaults for the rest.
@@ -147,6 +157,9 @@ impl RuntimeConfig {
             sandbox_tmp_size: default_sandbox_tmp_size(),
             sandbox_extra_rw: Vec::new(),
             sandbox_extra_ro: Vec::new(),
+            trace: true,
+            trace_dir: None,
+            trace_max_mb: default_trace_max_mb(),
         }
     }
 
@@ -245,6 +258,9 @@ impl RuntimeConfig {
         if let Some(v) = p.sandbox_tmp_size { self.sandbox_tmp_size = v; }
         if let Some(v) = p.sandbox_extra_rw { self.sandbox_extra_rw = v; }
         if let Some(v) = p.sandbox_extra_ro { self.sandbox_extra_ro = v; }
+        if let Some(v) = p.trace { self.trace = v; }
+        if let Some(v) = p.trace_dir { self.trace_dir = Some(v); }
+        if let Some(v) = p.trace_max_mb { self.trace_max_mb = v; }
         self
     }
 
@@ -544,6 +560,33 @@ mod tests {
         assert_eq!(b.sandbox_tmp_size, "256m");
         assert!(b.sandbox_extra_rw.is_empty());
         assert!(b.sandbox_extra_ro.is_empty());
+    }
+
+    #[test]
+    fn trace_defaults_and_round_trip() {
+        let b = base();
+        assert!(b.trace, "trace should default on");
+        assert!(b.trace_dir.is_none());
+        assert_eq!(b.trace_max_mb, 64);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.json");
+        let mut c = base();
+        c.trace = false;
+        c.trace_dir = Some("/tmp/traces".into());
+        c.trace_max_mb = 8;
+        c.save(&path).unwrap();
+        let loaded = RuntimeConfig::load_over(base(), &path);
+        assert!(!loaded.trace);
+        assert_eq!(loaded.trace_dir.as_deref(), Some("/tmp/traces"));
+        assert_eq!(loaded.trace_max_mb, 8);
+
+        // A file predating the trace fields keeps the base defaults (trace stays on).
+        std::fs::write(&path, r#"{"model":"only-model"}"#).unwrap();
+        let loaded = RuntimeConfig::load_over(base(), &path);
+        assert!(loaded.trace);
+        assert!(loaded.trace_dir.is_none());
+        assert_eq!(loaded.trace_max_mb, 64);
     }
 
     #[test]
