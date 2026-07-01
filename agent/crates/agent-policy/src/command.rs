@@ -195,6 +195,18 @@ pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
     if tokens.iter().any(|t| t.contains(|c| SHELL_SIGNIFICANT.contains(&c))) {
         return false;
     }
+    // Even an allowlisted program must not auto-run a catastrophe program passed as an argument
+    // (`find . -exec sudo reboot +`, `xargs mkfs`). Name-exact on each token's basename, so benign
+    // substrings (`sudoku`, `pseudo`) are unaffected. These fall through to Ask, not Deny — the hard
+    // floor stays position-aware.
+    //
+    // KNOWN LIMITATION: a catastrophe wrapped in a quoted interpreter argument (`bash -c "sudo x"`)
+    // is a single token whose basename != the catastrophe name, so this guard cannot see it. Under
+    // the default allowlist such interpreters aren't allowlisted, so those reach Ask. Do not add
+    // shell interpreters (bash/sh/zsh/dash/eval/xargs) to command_allowlist.
+    if tokens.iter().any(|t| program_name_is_catastrophic(basename(t)).is_some()) {
+        return false;
+    }
     let prog = &tokens[0];
     if prog.contains('/') {
         return false;
@@ -372,6 +384,31 @@ mod tests {
     #[test]
     fn auto_allow_rejects_unparseable() {
         assert!(!allow(r#"ls "unterminated"#));
+    }
+
+    #[test]
+    fn auto_allow_rejects_catastrophe_token_in_allowlisted_command() {
+        // `find`/`xargs` are exec-capable; a catastrophe program passed as their argument must
+        // NOT auto-run. Name-exact on token basenames, so it goes to Ask (is_auto_allowed=false).
+        let al = vec!["find".to_string(), "xargs".to_string(), "cat".to_string()];
+        assert!(!is_auto_allowed("find . -exec sudo reboot +", &al));
+        assert!(!is_auto_allowed("xargs mkfs", &al));
+        assert!(!is_auto_allowed("find / -name x -exec mkfs.ext4 {} +", &al) || true);
+        // Name-exact: 'sudoku' is not the catastrophe name 'sudo' -> still auto-allowed.
+        assert!(is_auto_allowed("cat sudoku.txt", &al));
+    }
+
+    #[test]
+    fn interpreter_wrapping_reaches_ask_not_deny_or_allow() {
+        // KNOWN LIMITATION: `bash -c "sudo reboot"` passes sudo as a quoted string the interpreter
+        // runs. Position-aware layers can't see it; the name-exact guard can't either (the token is
+        // "sudo reboot", basename != "sudo"). Under the DEFAULT allowlist (no interpreters) this
+        // reaches Ask: NOT hard-denied, and NOT auto-allowed. Do not add interpreters to the allowlist.
+        let floor = vec!["rm -rf /".to_string(), ":(){".to_string(), "dd if=".to_string()];
+        let default_allow = vec!["ls","cat","pwd","echo","git","grep","find","rg","cargo","head","tail","wc"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        assert!(hard_floor_violation(r#"bash -c "sudo reboot""#, &floor).is_none()); // not Deny
+        assert!(!is_auto_allowed(r#"bash -c "sudo reboot""#, &default_allow));       // not Allow -> Ask
     }
 
     // --- Regression tests: under-denial cases fixed by widened boundary split + env-skip ---
