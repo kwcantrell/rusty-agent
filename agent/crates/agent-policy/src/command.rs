@@ -271,7 +271,7 @@ mod tests {
         assert!(floor("grep mkfs /var/log").is_none());
         assert!(floor("man sudo").is_none());
         assert!(floor("which sudo").is_none());
-        assert!(floor("pseudocode").is_none()); // 'sudo' is a substring of 'pseudo'
+        assert!(floor("cat sudoku.txt").is_none()); // 'sudo' is a substring of 'sudoku'
     }
 
     #[test]
