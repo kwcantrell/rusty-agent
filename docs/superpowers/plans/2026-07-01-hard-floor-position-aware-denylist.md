@@ -385,3 +385,116 @@ git commit -m "fix(policy): auto-allow gate rejects catastrophe program passed t
 - Interpreter-wrapping documented as known limitation + tested to reach Ask (not Deny/Allow) under default allowlist + allowlist guidance → Step 1 (`interpreter_wrapping_reaches_ask_not_deny_or_allow`), Step 3 (doc comment). ✔
 - No new hard-denies; guard only affects the auto-allow gate → Step 3 placement (in `is_auto_allowed`, not `hard_floor_violation`). ✔
 - Type consistency: `program_name_is_catastrophic(basename(t))` matches the helper from Task 1. ✔
+
+---
+
+### Task 3: CLI default-denylist parity (Finding B) + exec-vehicle residual docs (Finding A)
+
+Final whole-branch review found the false-positive fix never reached the CLI (`default_denylist()` still carried `sudo`/`mkfs`, and the CLI seeds its user denylist from it), and that allowlisted exec-capable programs (`git -c core.pager="sudo …"`) reach silent auto-Allow. See spec Addendum 2. Finding B is a bug fix; Finding A is documented + regression-tested as an accepted residual (user decision).
+
+**Files:**
+- Modify: `agent/crates/agent-runtime-config/src/lib.rs:174` (`default_denylist()`)
+- Modify: `agent/crates/agent-runtime-config/src/runtime_config.rs` (new integration regression test in `mod tests`)
+- Modify: `agent/crates/agent-policy/src/command.rs` (extend known-limitation comment; accepted-residual test in `mod tests`)
+
+**Interfaces:**
+- Consumes: `crate::default_denylist()`, `RuntimeConfig::effective_denylist()`, `agent_policy::hard_floor_violation`, `is_auto_allowed`.
+- Produces: `default_denylist()` returns `["rm -rf /", ":(){", "dd if="]` (was 5 entries). No signature changes.
+
+- [ ] **Step 1: Write the failing Finding-B regression test (RED)**
+
+In `agent/crates/agent-runtime-config/src/runtime_config.rs`, add to `mod tests`:
+
+```rust
+    #[test]
+    fn cli_default_config_does_not_over_deny_benign_catastrophe_names() {
+        // The CLI seeds command_denylist = default_denylist(); the policy denylist is
+        // effective_denylist() = HARD_FLOOR ∪ that. Regression (Finding B): benign catastrophe-name
+        // arguments must NOT be hard-denied under the REAL assembled denylist — not just the floor.
+        let mut c = base();
+        c.command_denylist = crate::default_denylist();
+        let deny = c.effective_denylist();
+        assert!(agent_policy::hard_floor_violation("man mkfs", &deny).is_none());
+        assert!(agent_policy::hard_floor_violation("man sudo", &deny).is_none());
+        assert!(agent_policy::hard_floor_violation("cat sudoku.txt", &deny).is_none());
+        // Direct catastrophe invocation is still denied (structural / boundary scan):
+        assert!(agent_policy::hard_floor_violation("sudo reboot", &deny).is_some());
+        assert!(agent_policy::hard_floor_violation("mkfs /dev/sda", &deny).is_some());
+    }
+```
+
+- [ ] **Step 2: Run to verify RED**
+
+Run: `cd agent && cargo test -p agent-runtime-config cli_default_config_does_not_over_deny_benign_catastrophe_names`
+Expected: FAIL — `hard_floor_violation("man mkfs", &deny)` returns `Some(...)` because `default_denylist()` still contains the `"mkfs"` substring, which the effective denylist unions in. (`agent_policy` is already a dependency; if the test can't resolve the path, add `use agent_policy;` — the crate is in `Cargo.toml`.)
+
+- [ ] **Step 3: Fix `default_denylist()` (Finding B)**
+
+In `agent/crates/agent-runtime-config/src/lib.rs:174`:
+
+```rust
+pub fn default_denylist() -> Vec<String> {
+    // Bare program-name catastrophes (sudo/mkfs) are handled position-aware in agent-policy;
+    // keeping them here as substrings would re-introduce the `man mkfs` false positive on the CLI.
+    // Mirrors HARD_FLOOR_DENYLIST.
+    ["rm -rf /",":(){","dd if="].into_iter().map(String::from).collect()
+}
+```
+
+- [ ] **Step 4: Run to verify GREEN (Finding B)**
+
+Run: `cd agent && cargo test -p agent-runtime-config`
+Expected: PASS — the new test plus all existing (`main.rs:327`'s `!command_denylist.is_empty()` still holds: 3 entries).
+
+- [ ] **Step 5: Document the exec-vehicle residual (Finding A) + pin it with a test**
+
+In `agent/crates/agent-policy/src/command.rs`, extend the KNOWN LIMITATION comment block in `is_auto_allowed` (the one about interpreter-wrapping) by appending:
+
+```rust
+    // The same blind spot applies to allowlisted exec-CAPABLE programs — `git` (via `-c
+    // core.pager=…`/`core.editor=…`/aliases/hooks, run through `sh -c`), `cargo` (build scripts,
+    // aliases), `find -exec sh -c …`. They can run arbitrary sub-commands (including catastrophes)
+    // that neither the position-aware layers nor this name-exact guard can inspect. ACCEPTED
+    // RESIDUAL: the hard floor covers DIRECT catastrophe invocation, not catastrophes smuggled
+    // through allowlisted exec vehicles. Mitigations: don't allowlist exec-capable programs if the
+    // floor must hold, and rely on the execution sandbox (agent-sandbox).
+```
+
+Then add a regression test in `mod tests` pinning the documented behavior:
+
+```rust
+    #[test]
+    fn auto_allow_exec_vehicle_residual_is_documented_not_a_regression() {
+        // ACCEPTED RESIDUAL (see is_auto_allowed comment + spec Addendum 2): an allowlisted
+        // exec-capable program runs sub-commands the floor cannot inspect. `git -c core.pager=…`
+        // runs its value via `sh -c`. This is auto-allowed by design; pinned so any future change
+        // that alters it is noticed and re-evaluated. Mitigation = allowlist policy + sandbox.
+        let al = vec!["git".to_string()];
+        assert!(is_auto_allowed(r#"git -c core.pager="sudo reboot" log"#, &al));
+    }
+```
+
+- [ ] **Step 6: Run to verify GREEN (Finding A test) + whole workspace**
+
+Run: `cd agent && cargo test -p agent-policy`
+Expected: PASS including the new residual test.
+
+Run: `cd agent && cargo test`
+Expected: whole workspace green.
+
+- [ ] **Step 7: Commit**
+
+```bash
+cd agent && git add crates/agent-runtime-config/src/lib.rs \
+  crates/agent-runtime-config/src/runtime_config.rs \
+  crates/agent-policy/src/command.rs
+git commit -m "fix(config): drop sudo/mkfs from default_denylist so CLI gets position-aware floor; document exec-vehicle residual"
+```
+
+## Task 3 Self-Review
+
+- Finding B fixed: `default_denylist()` mirrors the floor → Step 3; verified by a test over the REAL effective denylist → Steps 1-2. ✔
+- Finding B test exercises `effective_denylist()` (not the private `floor()` helper), closing the masking gap the reviewer flagged. ✔
+- Finding A documented in code (exec-vehicle limitation) → Step 5; pinned by a regression test → Step 5. ✔
+- No new hard-deny; no is_auto_allowed logic change (A is doc-only + a pin test). ✔
+- Type consistency: `agent_policy::hard_floor_violation` / `is_auto_allowed` signatures match existing; `default_denylist()` return type unchanged. ✔
