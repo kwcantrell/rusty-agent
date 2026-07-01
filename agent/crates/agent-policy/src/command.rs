@@ -204,6 +204,14 @@ pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
     // is a single token whose basename != the catastrophe name, so this guard cannot see it. Under
     // the default allowlist such wrappers aren't allowlisted, so those reach Ask. Do not add shell
     // interpreters or exec-capable arg runners (bash/sh/zsh/dash/eval/xargs) to command_allowlist.
+    //
+    // The same blind spot applies to allowlisted exec-CAPABLE programs — `git` (via `-c
+    // core.pager=…`/`core.editor=…`/aliases/hooks, run through `sh -c`), `cargo` (build scripts,
+    // aliases), `find -exec sh -c …`. They can run arbitrary sub-commands (including catastrophes)
+    // that neither the position-aware layers nor this name-exact guard can inspect. ACCEPTED
+    // RESIDUAL: the hard floor covers DIRECT catastrophe invocation, not catastrophes smuggled
+    // through allowlisted exec vehicles. Mitigations: don't allowlist exec-capable programs if the
+    // floor must hold, and rely on the execution sandbox (agent-sandbox).
     if tokens.iter().any(|t| program_name_is_catastrophic(basename(t)).is_some()) {
         return false;
     }
@@ -438,5 +446,15 @@ mod tests {
     #[test]
     fn auto_allow_rejects_env_prefixed_program() {
         assert!(!allow("FOO=bar sudo reboot")); // program token is FOO=bar, not allowlisted
+    }
+
+    #[test]
+    fn auto_allow_exec_vehicle_residual_is_documented_not_a_regression() {
+        // ACCEPTED RESIDUAL (see is_auto_allowed comment + spec Addendum 2): an allowlisted
+        // exec-capable program runs sub-commands the floor cannot inspect. `git -c core.pager=…`
+        // runs its value via `sh -c`. This is auto-allowed by design; pinned so any future change
+        // that alters it is noticed and re-evaluated. Mitigation = allowlist policy + sandbox.
+        let al = vec!["git".to_string()];
+        assert!(is_auto_allowed(r#"git -c core.pager="sudo reboot" log"#, &al));
     }
 }

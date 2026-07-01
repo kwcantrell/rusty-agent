@@ -597,4 +597,20 @@ mod tests {
         assert!(loaded.enable_thinking); // base default preserved
         assert!(loaded.top_k.is_none());
     }
+
+    #[test]
+    fn cli_default_config_does_not_over_deny_benign_catastrophe_names() {
+        // The CLI seeds command_denylist = default_denylist(); the policy denylist is
+        // effective_denylist() = HARD_FLOOR ∪ that. Regression (Finding B): benign catastrophe-name
+        // arguments must NOT be hard-denied under the REAL assembled denylist — not just the floor.
+        let mut c = base();
+        c.command_denylist = crate::default_denylist();
+        let deny = c.effective_denylist();
+        assert!(agent_policy::hard_floor_violation("man mkfs", &deny).is_none());
+        assert!(agent_policy::hard_floor_violation("man sudo", &deny).is_none());
+        assert!(agent_policy::hard_floor_violation("cat sudoku.txt", &deny).is_none());
+        // Direct catastrophe invocation is still denied (structural / boundary scan):
+        assert!(agent_policy::hard_floor_violation("sudo reboot", &deny).is_some());
+        assert!(agent_policy::hard_floor_violation("mkfs /dev/sda", &deny).is_some());
+    }
 }

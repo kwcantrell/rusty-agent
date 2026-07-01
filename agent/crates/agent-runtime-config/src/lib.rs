@@ -172,7 +172,10 @@ pub fn default_allowlist() -> Vec<String> {
         .into_iter().map(String::from).collect()
 }
 pub fn default_denylist() -> Vec<String> {
-    ["rm -rf /","sudo",":(){","mkfs","dd if="].into_iter().map(String::from).collect()
+    // Bare program-name catastrophes (sudo/mkfs) are handled position-aware in agent-policy;
+    // keeping them here as substrings would re-introduce the `man mkfs` false positive on the CLI.
+    // Mirrors HARD_FLOOR_DENYLIST.
+    ["rm -rf /",":(){","dd if="].into_iter().map(String::from).collect()
 }
 
 /// Map a `RuntimeConfig` to a `SandboxStrategy`:
