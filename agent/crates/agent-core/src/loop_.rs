@@ -1756,6 +1756,8 @@ mod tests {
         let events = sink.events.lock().unwrap().clone();
         assert!(events.iter().any(|e| e.starts_with("error:") && e.contains("panicked")),
             "a panic emits a loud AgentEvent::Error: {events:?}");
+        assert!(events.iter().any(|e| e == "tool_result:boom:panic"),
+            "the panicking call emits a terminal ToolResult with Panic status: {events:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1792,6 +1794,8 @@ mod tests {
         let events = sink.events.lock().unwrap().clone();
         assert!(events.iter().any(|e| e.starts_with("error:") && e.contains("backstop")),
             "the backstop emits a loud AgentEvent::Error: {events:?}");
+        assert!(events.iter().any(|e| e == "tool_result:hang:timeout"),
+            "the force-stopped call emits a terminal ToolResult with Timeout status: {events:?}");
     }
 
     #[tokio::test(start_paused = true)]

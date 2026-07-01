@@ -30,6 +30,8 @@ struct Capture {
 impl EventSink for Capture {
     fn emit(&self, e: AgentEvent) {
         match e {
+            // Failures now also emit ToolResult (Task 1); filter on Ok so this sink counts
+            // only successful blob results, mirroring pre-change semantics.
             AgentEvent::ToolResult { name, output, status: agent_core::ToolStatus::Ok, .. } => {
                 self.tool_results.lock().unwrap().push((name, output.content))
             }
