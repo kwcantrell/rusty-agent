@@ -116,12 +116,15 @@ impl RuntimeState {
             .into_iter()
             .map(|s| DiscoveredSkill { name: s.name, description: s.description })
             .collect();
+        let sandbox_degraded = crate::wire::sandbox_degraded_from(
+            self.current_loop().sandbox_descriptor());
         SettingsState {
             settings: cfg,
             workspace: self.workspace.display().to_string(),
             api_key_set: self.api_key.is_some(),
             hard_floor: HARD_FLOOR_DENYLIST.iter().map(|s| s.to_string()).collect(),
             discovered_skills: discovered,
+            sandbox_degraded,
         }
     }
 }

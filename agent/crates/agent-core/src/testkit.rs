@@ -121,6 +121,7 @@ impl EventSink for CollectingSink {
                 format!("compacted:{turns_replaced}")
             }
             AgentEvent::Context(ContextEvent::CompactionFailed { .. }) => "compaction_failed".into(),
+            AgentEvent::SandboxDegraded { mechanism, .. } => format!("sandbox_degraded:{mechanism}"),
         };
         self.events.lock().unwrap().push(label);
     }

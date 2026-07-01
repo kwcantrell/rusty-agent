@@ -76,6 +76,12 @@ impl AgentLoop {
         Self { model, protocol, tools, policy, approval, sink, config, retriever: None }
     }
 
+    /// The live sandbox posture (cached; never re-probes Docker). `None` when
+    /// no sandbox is wired (host executor installed directly).
+    pub fn sandbox_descriptor(&self) -> Option<agent_tools::SandboxDescriptor> {
+        self.config.sandbox.as_ref().map(|s| s.describe())
+    }
+
     /// Attach a memory retriever. When set, each turn auto-retrieves relevant
     /// memories and injects them into the context before the model runs.
     pub fn with_retriever(mut self, retriever: Arc<dyn Retriever>) -> Self {
@@ -154,6 +160,18 @@ impl AgentLoop {
 
     pub async fn run_with_cancel(&self, ctx: &mut dyn ContextManager, user_input: String,
                                  cancel: CancellationToken) -> Result<(), AgentError> {
+        // Surface a silently-degraded sandbox loudly at run start. If the
+        // configured strategy fell back to unsandboxed host execution (e.g.
+        // Docker unavailable in `auto` mode), every tool call runs with ambient
+        // host access despite the config asking for isolation. The per-approval
+        // posture string already carries this, but a run may never hit an
+        // approval prompt — emit it unconditionally, once, here.
+        if let Some(d) = self.sandbox_descriptor() {
+            if let Some(reason) = d.degraded {
+                self.sink.emit(AgentEvent::SandboxDegraded { mechanism: d.mechanism, reason });
+            }
+        }
+
         if let Some(retriever) = &self.retriever {
             let lines = retriever.retrieve(&user_input).await;
             if !lines.is_empty() {
@@ -1417,6 +1435,45 @@ mod tests {
             self.inflight.fetch_sub(1, Ordering::SeqCst);
             ApprovalResponse::Approve
         }
+    }
+
+    #[tokio::test]
+    async fn run_emits_sandbox_degraded_even_without_tool_calls() {
+        use agent_tools::{CommandSpec, SandboxStrategy, SandboxedChild, SandboxError,
+            SandboxDescriptor, Mode, HostExecutor};
+        use std::sync::Arc;
+
+        struct DegradedFake;
+        impl SandboxStrategy for DegradedFake {
+            fn launch(&self, spec: CommandSpec) -> Result<SandboxedChild, SandboxError> {
+                HostExecutor.launch(spec)
+            }
+            fn describe(&self) -> SandboxDescriptor {
+                SandboxDescriptor { mode: Mode::Auto, mechanism: "docker",
+                    image: Some("debian:stable-slim".into()), network: false,
+                    degraded: Some("no daemon".into()) }
+            }
+        }
+
+        let ws = std::env::temp_dir();
+        // A plain text turn: no tool calls, so no approval prompt is ever hit.
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("hi".into())]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), sink.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1,
+                temperature: 0.0, max_tokens: None, workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                sandbox: Some(Arc::new(DegradedFake)), ..Default::default() });
+
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "hello".into()).await.unwrap();
+
+        let events = sink.events.lock().unwrap();
+        assert!(events.iter().any(|e| e == "sandbox_degraded:docker"),
+            "degraded sandbox must be surfaced even with no tool calls: {events:?}");
     }
 
     #[tokio::test]

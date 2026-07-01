@@ -36,6 +36,7 @@ pub enum ServerEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<Display>,
     },
+    SandboxDegraded { mechanism: String, reason: String },
 }
 
 /// Settings snapshot returned by the `settings_get` command (was `WireBody::SettingsState`).
@@ -46,6 +47,21 @@ pub struct SettingsState {
     pub api_key_set: bool,
     pub hard_floor: Vec<String>,
     pub discovered_skills: Vec<DiscoveredSkill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_degraded: Option<SandboxDegraded>,
+}
+
+/// Degraded-sandbox posture carried in `SettingsState` (connect-time) and as a
+/// streamed `ServerEvent` (run-start). Present only when isolation was requested
+/// but not delivered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SandboxDegraded { pub mechanism: String, pub reason: String }
+
+/// Extract the degraded posture from a sandbox descriptor, if any. Pure so the
+/// daemon's `settings_state()` stays trivial and this stays unit-testable.
+pub fn sandbox_degraded_from(desc: Option<agent_tools::SandboxDescriptor>) -> Option<SandboxDegraded> {
+    desc.and_then(|d| d.degraded.map(|reason| SandboxDegraded {
+        mechanism: d.mechanism.to_string(), reason }))
 }
 
 /// Read-only skill info surfaced in `settings_state` for the Settings UI's
@@ -103,6 +119,8 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
         AgentEvent::Context(_) => return None, // curation telemetry; not forwarded to clients in v1
         AgentEvent::ServerUsage { prompt_tokens, completion_tokens, turn } =>
             ServerEvent::ServerUsage { prompt_tokens, completion_tokens, turn },
+        AgentEvent::SandboxDegraded { mechanism, reason } =>
+            ServerEvent::SandboxDegraded { mechanism: mechanism.to_string(), reason },
     })
 }
 
@@ -158,5 +176,29 @@ mod tests {
     #[test]
     fn decision_into_response() {
         assert_eq!(ApprovalResponse::from(Decision::ApproveAlways), ApprovalResponse::ApproveAlways);
+    }
+
+    #[test]
+    fn sandbox_degraded_event_serializes_with_type_tag() {
+        let ev = server_event_from(AgentEvent::SandboxDegraded {
+            mechanism: "docker", reason: "no daemon".into() }).unwrap();
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains(r#""type":"sandbox_degraded""#), "missing type tag: {j}");
+        assert!(j.contains(r#""mechanism":"docker""#), "missing mechanism: {j}");
+        assert!(j.contains(r#""reason":"no daemon""#), "missing reason: {j}");
+    }
+
+    #[test]
+    fn sandbox_degraded_from_maps_only_when_degraded() {
+        use agent_tools::{SandboxDescriptor, Mode};
+        let degraded = SandboxDescriptor { mode: Mode::Auto, mechanism: "docker",
+            image: None, network: false, degraded: Some("no daemon".into()) };
+        assert_eq!(sandbox_degraded_from(Some(degraded)),
+            Some(SandboxDegraded { mechanism: "docker".into(), reason: "no daemon".into() }));
+
+        let healthy = SandboxDescriptor { mode: Mode::Off, mechanism: "host",
+            image: None, network: true, degraded: None };
+        assert_eq!(sandbox_degraded_from(Some(healthy)), None);
+        assert_eq!(sandbox_degraded_from(None), None);
     }
 }
