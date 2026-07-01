@@ -215,7 +215,8 @@ async fn main() {
     let stats = Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default()));
     let trace = agent_runtime_config::build_trace(&rt);
     if let Some(t) = &trace {
-        eprintln!("\x1b[2mtrace: ~/.agent/sessions/{}.jsonl\x1b[0m", t.session_id());
+        let dir = rt.trace_dir.as_deref().unwrap_or("~/.agent/sessions");
+        eprintln!("\x1b[2mtrace: {}/{}.jsonl\x1b[0m", dir, t.session_id());
     }
     let built = assemble_loop(&rt, LoopParts {
         model,
@@ -266,6 +267,9 @@ async fn main() {
         };
         if let Err(e) = result {
             eprintln!("\x1b[31mfatal: {e}\x1b[0m");
+        }
+        if let Ok(s) = stats.read() {
+            eprintln!("\x1b[2m{}\x1b[0m", render::format_stats_line(&s));
         }
     }
     // Keep MCP manager alive for the entire REPL session (dropping it would kill server processes).
