@@ -213,7 +213,7 @@ async fn main() {
     let built = assemble_loop(&rt, LoopParts {
         model,
         sink: Arc::new(TerminalSink::default()),
-        approval: Arc::new(TerminalApproval),
+        approval: Arc::new(TerminalApproval::default()),
         workspace: workspace.clone(),
         mcp_tools,
         memory_tools: memory.tools.clone(),
