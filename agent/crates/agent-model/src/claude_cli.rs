@@ -170,6 +170,16 @@ pub(crate) fn parse_event_line(line: &str) -> Result<Vec<Chunk>, ModelError> {
             }
         }
         Some("result") => {
+            if let Some(u) = v.get("usage").and_then(Value::as_object) {
+                out.push(Chunk::Usage {
+                    prompt_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    completion_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
+                        as u32,
+                    reasoning_tokens: None,
+                    cached_tokens: None,
+                    cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+                });
+            }
             // `Length` only when the CLI signals truncation; otherwise a normal stop.
             let truncated = v["subtype"].as_str() == Some("error_max_turns")
                 || v["stop_reason"].as_str() == Some("max_tokens");
@@ -345,6 +355,17 @@ mod tests {
     fn result_event_emits_done_stop() {
         let chunks = parse_event_line(RESULT_LINE).unwrap();
         assert!(matches!(chunks.as_slice(), [Chunk::Done(StopReason::Stop)]));
+    }
+
+    #[test]
+    fn result_event_carries_usage_and_cost() {
+        let line = r#"{"type":"result","subtype":"success","total_cost_usd":0.0421,"usage":{"input_tokens":1200,"output_tokens":345}}"#;
+        let chunks = parse_event_line(line).unwrap();
+        assert!(chunks.iter().any(|c| matches!(c,
+            Chunk::Usage { prompt_tokens: 1200, completion_tokens: 345,
+                           cost_usd: Some(c), .. } if (*c - 0.0421).abs() < 1e-9)));
+        // Done must still be emitted after the usage chunk
+        assert!(matches!(chunks.last(), Some(Chunk::Done(StopReason::Stop))));
     }
 
     #[test]
