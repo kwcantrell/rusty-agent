@@ -221,26 +221,24 @@ policy and the execution sandbox. See
 `docs/superpowers/specs/2026-07-01-hard-floor-position-aware-denylist-design.md` (+ Addenda 1–2) and
 commits `d1e0f21`/`1aadf3d`/`a616750`/`59ed233`. No open Guardrails finding remains.
 
----
-
-**Finding 1 — Observability: tool failures, durations, and context events are invisible**
-
-```
-severity: med
-file:line: agent/crates/agent-core/src/loop_.rs:304-308; wire.rs:103; agent-model/src/openai.rs:205-209
-violated principle: "every tool call and model turn is logged with enough context to replay and
-  diagnose" — SKILL.md Spine A component 6; co-design harness with eval (arXiv 2503.16416)
-concrete proposed fix: [REFINED] prompt/completion tokens ARE emitted per turn (ServerUsage). Still
-  open: (a) Resolved::Err emits no event — tool denials/errors are invisible to observers/evals;
-  (b) no Instant measures tool duration_ms; (c) reasoning_tokens streamed as text but never counted
-  (undercounts spend); (d) ContextEvent (offload/compaction) dropped at wire.rs:103, so the web UI
-  never learns the window was truncated. Add a tool-error/status event + duration_ms, parse
-  reasoning_tokens, and forward ContextEvents to the wire.
-```
+Re-stamp note (2026-07-01, observability cluster): a full 7-dimension deep audit was run (report:
+`docs/superpowers/audits/2026-07-01-harness-deep-audit.md` — treat it as the current findings
+snapshot superseding this section's inline list). Its "cluster 2" — the prior **Observability**
+Finding 1 plus the missing-CI eval finding — is now **fixed and merged to `main`** (16 commits,
+tip `5009f71`): every resolved tool call emits a terminal `ToolResult{id,status,duration_ms}`
+(denied/error/timeout/panic included), reasoning/cached tokens + claude-cli `total_cost_usd` are
+parsed, a JSONL `TraceWriter` persists every session by default (`~/.agent/sessions/`, 64 MB cap,
+keep-50), `SessionStats` feed a CLI summary line + web StatsPanel, `ContextEvent`s reach both UIs,
+and a CI gate exists (`scripts/ci.sh` + `.githooks/pre-push` + GitHub Actions). See
+`docs/superpowers/specs/2026-07-01-harness-observability-ci-design.md` and its plan. Follow-up
+backlog (non-blocking, from the final whole-branch review) lives in the merge notes:
+turns=max(turn) semantics, session_stats query has no client caller yet, trace file perms 0600,
+live trace toggle needs restart, id-based tool correlation in the web reducer. Remaining open
+finding below renumbered to 1.
 
 ---
 
-**Finding 2 — Instructions: duplicated system prompt + skill files lack negative constraints**
+**Finding 1 — Instructions: duplicated system prompt + skill files lack negative constraints**
 
 ```
 severity: low
@@ -258,17 +256,13 @@ concrete proposed fix: The coding-agent system prompt is byte-identical but dupl
 
 ## Top highest-leverage fixes
 
-Ranked by impact (severity × remediation cost). The two HIGH findings and the top three `med` findings
-(parallel-dispatch isolation, tool "when NOT to call" contract, guardrails denylist + CLI approval hang)
-are **done** — the two remaining findings rank as follows:
+Ranked by impact (severity × remediation cost). All prior HIGH findings and the observability
+cluster (per-call terminal events + durations, JSONL session traces, usage/cost parsing,
+SessionStats + web panel, ContextEvent forwarding, CI gate) are **done** — for the full current
+backlog see `docs/superpowers/audits/2026-07-01-harness-deep-audit.md` (its Top-10 table; items
+3, 4, and 6 are now complete). Of this file's inline findings, one remains:
 
-1. **[Component 6 — Observability] Make tool failures + durations visible** (Finding 1)
-   `agent/crates/agent-core/src/loop_.rs:304-308`; `wire.rs:103`; `agent-model/src/openai.rs:205-209` —
-   emit a tool-error/status event + `duration_ms`, count streamed `reasoning_tokens`, and forward
-   `ContextEvent`s to the wire so the web UI learns the window was truncated. Pairs with the
-   eval-harness work. Highest leverage of what remains.
-
-2. **[Component 1 — Instructions] De-duplicate the system prompt + add negative constraints** (Finding 2)
+1. **[Component 1 — Instructions] De-duplicate the system prompt + add negative constraints** (Finding 1)
    `agent/crates/agent-server/src/daemon.rs:23` + `agent/crates/agent-cli/src/main.rs:15`; `.agents/skills/`
    — hoist the byte-identical coding-agent system prompt to one shared const, and add a
    "Forbidden"/negative-constraint section to the skill files. `low` severity; polish.
