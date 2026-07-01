@@ -76,13 +76,6 @@ impl MemoryAdmin {
         })
     }
 
-    pub async fn get(&self, id: &str) -> Result<Option<MemoryRow>, StoreError> {
-        Ok(self.fetch_editable(id).await?.map(|rec| MemoryRow {
-            id: rec.id, text: rec.text, tags: rec.tags,
-            scope_kind: rec.scope.kind().into(), updated_at: rec.updated_at,
-        }))
-    }
-
     pub async fn delete(&self, id: &str) -> Result<bool, StoreError> {
         match self.fetch_editable(id).await? {
             Some(_) => self.store.delete(id).await,
@@ -234,7 +227,7 @@ mod admin_tests {
         // A cross-project record is invisible AND indistinguishable from missing:
         // no method leaks that it exists.
         assert!(admin.list(20, 0).await.unwrap().is_empty());
-        assert!(admin.get("x").await.unwrap().is_none());          // Ok(None), not Err
+        assert!(admin.fetch_editable("x").await.unwrap().is_none()); // fetch layer hides it (Ok(None), not Err)
         assert_eq!(admin.delete("x").await.unwrap(), false);       // silent no-op, not Err
         assert!(admin.update("x", Some("new text".into()), None).await.is_err()); // "not found"
     }
