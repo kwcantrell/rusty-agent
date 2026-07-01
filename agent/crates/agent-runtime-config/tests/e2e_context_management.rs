@@ -30,7 +30,7 @@ struct Capture {
 impl EventSink for Capture {
     fn emit(&self, e: AgentEvent) {
         match e {
-            AgentEvent::ToolResult { name, output } => {
+            AgentEvent::ToolResult { name, output, .. } => {
                 self.tool_results.lock().unwrap().push((name, output.content))
             }
             AgentEvent::Done(_) => *self.done.lock().unwrap() = true,

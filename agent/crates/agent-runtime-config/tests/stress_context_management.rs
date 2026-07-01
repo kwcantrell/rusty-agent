@@ -87,7 +87,7 @@ impl EventSink for StressSink {
                 let mut m = self.max_prompt_tokens.lock().unwrap();
                 *m = (*m).max(prompt_tokens);
             }
-            AgentEvent::ToolResult { name, output } if name == "context_recall" => {
+            AgentEvent::ToolResult { name, output, .. } if name == "context_recall" => {
                 self.recalls.lock().unwrap().push(output.content)
             }
             AgentEvent::ToolResult { name, .. } if name == "blob" => {

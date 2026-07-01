@@ -112,7 +112,8 @@ impl EventSink for CollectingSink {
                 format!("server_usage:{prompt_tokens}:{completion_tokens}")
             }
             AgentEvent::ToolStart { name, .. } => format!("tool_start:{name}"),
-            AgentEvent::ToolResult { name, .. } => format!("tool_result:{name}"),
+            AgentEvent::ToolResult { name, status, .. } =>
+                format!("tool_result:{name}:{}", status.as_str()),
             AgentEvent::Approval(_) => "approval".into(),
             AgentEvent::Error(e) => format!("error:{e}"),
             AgentEvent::Done(_) => "done".into(),

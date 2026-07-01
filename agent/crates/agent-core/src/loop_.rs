@@ -1,4 +1,4 @@
-use crate::{built_tokens, AgentEvent, ContextManager, EventSink, Retriever};
+use crate::{built_tokens, AgentEvent, ContextManager, EventSink, Retriever, ToolStatus};
 use agent_model::{AssistantTurn, Chunk, CompletionRequest, Message, ModelClient, ModelError,
                   RawToolCall, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse, Decision, PolicyEngine};
@@ -213,6 +213,7 @@ impl AgentLoop {
                 enable_thinking: self.config.enable_thinking,
                 preserve_thinking,
             };
+            let turn_started = std::time::Instant::now();
             let assistant = match self.completion_with_retry(&base, &cancel).await {
                 Ok(t) => t,
                 Err(AgentError::Cancelled) => {
@@ -224,6 +225,10 @@ impl AgentLoop {
             self.sink.emit(AgentEvent::ServerUsage {
                 prompt_tokens: assistant.prompt_tokens,
                 completion_tokens: assistant.completion_tokens,
+                reasoning_tokens: None,  // wired in Task 2
+                cached_tokens: None,     // wired in Task 2
+                cost_usd: None,          // wired in Task 3
+                turn_duration_ms: turn_started.elapsed().as_millis() as u64,
                 turn: turn + 1,
             });
 
@@ -281,7 +286,8 @@ impl AgentLoop {
                 match self.gate_tool(call, &cancel).await {
                     GateOutcome::Rejected { id, name, content } => {
                         order.push(id.clone());
-                        results.insert(id, (name, Resolved::Err(content)));
+                        results.insert(id, (name, Resolved::Err {
+                            status: ToolStatus::Denied, content, duration_ms: 0 }));
                     }
                     GateOutcome::Ready(rc) => {
                         order.push(rc.id.clone());
@@ -295,33 +301,35 @@ impl AgentLoop {
             // neither crash the loop nor wedge the batch.
             let cap = if self.config.max_parallel_tools == 0 {
                 DEFAULT_MAX_PARALLEL_TOOLS } else { self.config.max_parallel_tools };
-            let executed: Vec<(String, String, Executed)> =
+            let executed: Vec<(String, String, Executed, u64)> =
                 futures::stream::iter(ready.into_iter().map(|rc| {
                     let ReadyCall { tool, args, id, name, ctx } = rc;
                     async move {
+                        let started = std::time::Instant::now();
                         let ex = execute_isolated(tool, args, &name, &ctx).await;
-                        (id, name, ex)
+                        (id, name, ex, started.elapsed().as_millis() as u64)
                     }
                 }))
                 .buffer_unordered(cap)
                 .collect()
                 .await;
-            for (id, name, ex) in executed {
+            for (id, name, ex, duration_ms) in executed {
                 let resolved = match ex {
-                    Executed::Ok(o) => Resolved::Ok(o),
-                    Executed::ToolErr(s) => Resolved::Err(s),
+                    Executed::Ok(o) => Resolved::Ok(o, duration_ms),
+                    Executed::ToolErr(s) => Resolved::Err {
+                        status: ToolStatus::Error, content: s, duration_ms },
                     Executed::Panicked(s) => {
                         tracing::error!(target: "loop", tool = %name,
                             "tool panicked during parallel dispatch");
                         self.sink.emit(AgentEvent::Error(s.clone()));
-                        Resolved::Err(s)
+                        Resolved::Err { status: ToolStatus::Panic, content: s, duration_ms }
                     }
                     Executed::TimedOut(s) => {
                         tracing::warn!(target: "loop", tool = %name,
                             timeout = ?self.config.tool_timeout,
                             "tool timed out during parallel dispatch");
                         self.sink.emit(AgentEvent::Error(s.clone()));
-                        Resolved::Err(s)
+                        Resolved::Err { status: ToolStatus::Timeout, content: s, duration_ms }
                     }
                 };
                 results.insert(id, (name, resolved));
@@ -337,16 +345,24 @@ impl AgentLoop {
                     // change ever breaks the one-slot-per-id invariant, emit an error
                     // rather than silently drop the result and desync the transcript
                     // (an assistant tool_call with no matching tool message).
-                    None => (String::new(), Resolved::Err(
-                        format!("ERROR: internal: no result for tool_call_id {id}"))),
+                    None => (String::new(), Resolved::Err {
+                        status: ToolStatus::Error,
+                        content: format!("ERROR: internal: no result for tool_call_id {id}"),
+                        duration_ms: 0 }),
                 };
                 let content = match resolved {
-                    Resolved::Ok(output) => {
-                        self.sink.emit(AgentEvent::ToolResult {
-                            name: name.clone(), output: output.clone() });
+                    Resolved::Ok(output, duration_ms) => {
+                        self.sink.emit(AgentEvent::ToolResult { id: id.clone(), name: name.clone(),
+                            status: ToolStatus::Ok, output: output.clone(), duration_ms });
                         output.content
                     }
-                    Resolved::Err(content) => content,
+                    Resolved::Err { status, content, duration_ms } => {
+                        self.sink.emit(AgentEvent::ToolResult { id: id.clone(), name: name.clone(),
+                            status, output: agent_tools::ToolOutput {
+                                content: content.clone(), display: None },
+                            duration_ms });
+                        content
+                    }
                 };
                 ctx.append(Message::tool(id, name, content));
             }
@@ -374,7 +390,8 @@ impl AgentLoop {
     /// Resolve, policy-check, and (if needed) get approval for one call — but do NOT
     /// execute it. Sequential by design so approval prompts never overlap.
     async fn gate_tool(&self, call: ToolCall, cancel: &CancellationToken) -> GateOutcome {
-        self.sink.emit(AgentEvent::ToolStart { name: call.name.clone(), args: call.args.clone() });
+        self.sink.emit(AgentEvent::ToolStart { id: call.id.clone(), name: call.name.clone(),
+            args: call.args.clone() });
         let tool = match self.tools.get(&call.name) {
             Some(t) => t,
             None => return GateOutcome::Rejected { id: call.id, name: call.name.clone(),
@@ -443,11 +460,11 @@ enum GateOutcome {
     Rejected { id: String, name: String, content: String },
 }
 
-/// Final per-call result feeding the tool-result message.
+/// Final per-call result feeding the tool-result message + terminal event.
 enum Resolved {
-    Ok(agent_tools::ToolOutput),
-    /// Terminal `ERROR: …` content (rejected, failed, or timed out).
-    Err(String),
+    Ok(agent_tools::ToolOutput, u64),
+    /// Terminal `ERROR: …` content (rejected, failed, timed out, or panicked).
+    Err { status: ToolStatus, content: String, duration_ms: u64 },
 }
 
 /// Outcome of an isolated tool execution: the terminal result plus a tag the
@@ -754,7 +771,7 @@ mod tests {
 
         // Both calls produced a result — the second was not dropped by a collision.
         let events = sink.events.lock().unwrap().clone();
-        assert_eq!(events.iter().filter(|e| *e == "tool_result:read_file").count(), 2);
+        assert_eq!(events.iter().filter(|e| *e == "tool_result:read_file:ok").count(), 2);
 
         // The transcript carries two DISTINCT tool ids.
         let built = ctx.build(100_000);
@@ -839,7 +856,7 @@ mod tests {
 
         let events = sink.events.lock().unwrap().clone();
         assert!(events.iter().any(|e| e == "tool_start:read_file"));
-        assert!(events.iter().any(|e| e == "tool_result:read_file"));
+        assert!(events.iter().any(|e| e == "tool_result:read_file:ok"));
         assert!(events.last().unwrap() == "done");
     }
 
@@ -901,8 +918,11 @@ mod tests {
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
         let events = sink.events.lock().unwrap().clone();
-        // No tool_result (it was denied), but the loop still reached done.
-        assert!(!events.iter().any(|e| e == "tool_result:read_file"));
+        // No successful tool_result (it was denied) — the call terminates in a
+        // Denied ToolResult instead — and the loop still reached done.
+        assert!(!events.iter().any(|e| e == "tool_result:read_file:ok"));
+        assert!(events.iter().any(|e| e == "tool_result:read_file:denied"),
+            "a denied call must still emit a terminal ToolResult: {events:?}");
         assert_eq!(events.last().unwrap(), "done");
     }
 
@@ -1473,9 +1493,12 @@ mod tests {
         assert_eq!(msgs[1].0, "c2");
         assert!(msgs[1].1.starts_with("ERROR:"), "got {:?}", msgs[1].1);
         assert_eq!(msgs[2], ("c3".into(), "CCC".into()));
-        // Only the two successes emit ToolResult; the loop still completes.
+        // Every call terminates in a ToolResult — two ok, one denied (unknown
+        // tool is gate-rejected) — and the loop still completes.
         let events = sink.events.lock().unwrap().clone();
-        assert_eq!(events.iter().filter(|e| e.starts_with("tool_result:")).count(), 2);
+        assert_eq!(events.iter().filter(|e| e.starts_with("tool_result:")).count(), 3);
+        assert_eq!(events.iter().filter(|e| e.ends_with(":ok")).count(), 2);
+        assert!(events.iter().any(|e| e == "tool_result:tb:denied"), "events: {events:?}");
         assert_eq!(events.last().unwrap(), "done");
     }
 
@@ -1800,5 +1823,140 @@ mod tests {
         let events = sink.events.lock().unwrap().clone();
         assert!(!events.iter().any(|e| e.starts_with("error:")),
             "a tool-honored timeout must NOT emit a loud AgentEvent::Error: {events:?}");
+    }
+
+    // ---- Per-call terminal ToolResult events (id, status, duration_ms) -----
+    use crate::ToolStatus;
+    use std::sync::Mutex;
+
+    /// Structured capture sink for fields the CollectingSink string labels
+    /// can't carry: ids, statuses, and durations.
+    #[derive(Default)]
+    struct ToolEventCapture {
+        results: Mutex<Vec<(String, String, ToolStatus, u64)>>,
+        starts: Mutex<Vec<String>>,
+    }
+    impl EventSink for ToolEventCapture {
+        fn emit(&self, event: AgentEvent) {
+            match event {
+                AgentEvent::ToolStart { id, .. } => self.starts.lock().unwrap().push(id),
+                AgentEvent::ToolResult { id, name, status, duration_ms, .. } =>
+                    self.results.lock().unwrap().push((id, name, status, duration_ms)),
+                _ => {}
+            }
+        }
+    }
+
+    fn loop_with_capture(model: Arc<ScriptedModel>, tools: ToolRegistry,
+        capture: Arc<ToolEventCapture>) -> AgentLoop {
+        AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), Arc::new(tools), Arc::new(AllowAll),
+            Arc::new(AlwaysApprove), capture,
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: std::env::temp_dir(),
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() })
+    }
+
+    #[tokio::test]
+    async fn every_resolved_call_emits_tool_result() {
+        // One turn with three calls: one ok, one unknown tool (gate-rejected ->
+        // Denied), one erroring tool (-> Error). Every call must terminate in
+        // exactly one ToolResult event.
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(FakeTool { name: "echo".into(), delay_ms: 0, body: "OK".into() }));
+        r.register(Arc::new(ErrTool { name: "err".into() }));
+        // "ghost" is intentionally NOT registered -> unknown-tool rejection.
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                ("c1".into(), "echo".into(), "{}".into()),
+                ("c2".into(), "ghost".into(), "{}".into()),
+                ("c3".into(), "err".into(), "{}".into())]),
+            Scripted::Text("done".into()),
+        ]));
+        let capture = Arc::new(ToolEventCapture::default());
+        let agent = loop_with_capture(model, r, capture.clone());
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let results = capture.results.lock().unwrap();
+        assert_eq!(results.len(), 3, "one terminal event per call, got {results:?}");
+        let statuses: std::collections::HashSet<_> = results.iter().map(|r| r.2).collect();
+        assert!(statuses.contains(&ToolStatus::Ok));
+        assert!(statuses.contains(&ToolStatus::Denied));
+        assert!(statuses.contains(&ToolStatus::Error));
+    }
+
+    #[tokio::test]
+    async fn tool_result_ids_match_tool_start() {
+        // Two parallel ok calls: every ToolResult id must match a ToolStart id.
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(FakeTool { name: "ta".into(), delay_ms: 0, body: "A".into() }));
+        r.register(Arc::new(FakeTool { name: "tb".into(), delay_ms: 0, body: "B".into() }));
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                ("c1".into(), "ta".into(), "{}".into()),
+                ("c2".into(), "tb".into(), "{}".into())]),
+            Scripted::Text("done".into()),
+        ]));
+        let capture = Arc::new(ToolEventCapture::default());
+        let agent = loop_with_capture(model, r, capture.clone());
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let starts: std::collections::HashSet<_> =
+            capture.starts.lock().unwrap().iter().cloned().collect();
+        let result_ids: std::collections::HashSet<_> =
+            capture.results.lock().unwrap().iter().map(|r| r.0.clone()).collect();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts, result_ids);
+    }
+
+    #[tokio::test]
+    async fn executed_calls_report_nonzero_duration_and_denied_zero() {
+        // One ok call whose tool sleeps ~10ms, one unknown tool (never executed).
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(FakeTool { name: "sleepy".into(), delay_ms: 10, body: "Z".into() }));
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                ("c1".into(), "sleepy".into(), "{}".into()),
+                ("c2".into(), "ghost".into(), "{}".into())]),
+            Scripted::Text("done".into()),
+        ]));
+        let capture = Arc::new(ToolEventCapture::default());
+        let agent = loop_with_capture(model, r, capture.clone());
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let results = capture.results.lock().unwrap();
+        let ok = results.iter().find(|r| r.2 == ToolStatus::Ok).unwrap();
+        let denied = results.iter().find(|r| r.2 == ToolStatus::Denied).unwrap();
+        assert!(ok.3 >= 5, "executed duration_ms should reflect the ~10ms sleep, got {}", ok.3);
+        assert_eq!(denied.3, 0, "gate-rejected calls never executed");
+    }
+
+    #[tokio::test]
+    async fn server_usage_carries_turn_duration() {
+        struct UsageCapture { turn_duration_ms: Mutex<Option<u64>> }
+        impl EventSink for UsageCapture {
+            fn emit(&self, event: AgentEvent) {
+                if let AgentEvent::ServerUsage { turn_duration_ms, .. } = event {
+                    *self.turn_duration_ms.lock().unwrap() = Some(turn_duration_ms);
+                }
+            }
+        }
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("hi".into())]));
+        let capture = Arc::new(UsageCapture { turn_duration_ms: Mutex::new(None) });
+        let agent = AgentLoop::new(
+            model, Arc::new(PassthroughProtocol), registry(), policy(ws.clone()),
+            Arc::new(AlwaysApprove), capture.clone(),
+            LoopConfig { model_limit: 100_000, max_turns: 10, max_retries: 1, temperature: 0.0,
+                max_tokens: None, workspace: ws, tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60), ..Default::default() });
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert!(capture.turn_duration_ms.lock().unwrap().is_some(),
+            "ServerUsage must carry a measured turn_duration_ms");
     }
 }

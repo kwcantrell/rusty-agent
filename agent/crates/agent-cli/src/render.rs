@@ -1,4 +1,4 @@
-use agent_core::{AgentEvent, EventSink};
+use agent_core::{AgentEvent, EventSink, ToolStatus};
 use agent_tools::Display;
 use similar::{ChangeTag, TextDiff};
 use std::io::Write;
@@ -46,11 +46,14 @@ impl EventSink for TerminalSink {
                 let _ = write!(out, "\x1b[2m{r}\x1b[0m");
                 let _ = out.flush();
             }
-            AgentEvent::ToolStart { name, args } => {
+            AgentEvent::ToolStart { name, args, .. } => {
                 let _ = writeln!(out, "\n\x1b[36m⚙ {name}\x1b[0m {args}");
             }
-            AgentEvent::ToolResult { name, output } => {
-                if let Some(Display::Diff {
+            AgentEvent::ToolResult { name, status, output, duration_ms, .. } => {
+                if status != ToolStatus::Ok {
+                    let _ = writeln!(out, "\x1b[31m✗ {name} ({}, {duration_ms}ms)\x1b[0m {}",
+                        status.as_str(), output.content);
+                } else if let Some(Display::Diff {
                     path,
                     before,
                     after,
