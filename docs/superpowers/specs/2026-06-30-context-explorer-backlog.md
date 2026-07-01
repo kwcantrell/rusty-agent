@@ -35,3 +35,11 @@ Line numbers are as-of-implementation and may have drifted; treat them as pointe
 16. **No populated-store `memory_list` happy-path test** at the `Session` level (`agent-server/src/session.rs`) — only the disabled/`None` path is exercised end-to-end.
 17. **`#[cfg(test)]` `generate_handler!` list omits `get_workspace`/`pick_workspace`** (`src-tauri/src/lib.rs`) — a pre-existing divergence from the production list, now wider. Consider a shared macro so the two lists can't drift.
 18. **No test for clicking the synthetic `unattributed` slice** in `ContextExplorer` (it maps to no `snap.segments` entry → the "gap" fallback panel).
+
+## Resolved
+
+All 18 items above were addressed in the **Context Explorer backlog cleanup** effort (merged to `main`, commits `a0e2c63`, `6e4a8bc`, `c3f2c4c`, `e37117f`). See `docs/superpowers/specs/2026-06-30-context-explorer-backlog-cleanup-design.md` (design) and `docs/superpowers/plans/2026-06-30-context-explorer-backlog-cleanup.md` (plan). The final whole-branch review confirmed the item-1 contract change (out-of-scope now indistinguishable from missing across `get`/`delete`/`update`) is safe — no Rust, Tauri, or frontend caller distinguished the two, and the UI only ever surfaces scope-filtered rows.
+
+## New follow-ups (surfaced by the cleanup's final review — deferred)
+- **Item 6 tokens are not theme-adaptive.** `--ctx-goal`/`--ctx-memory`/`--ctx-summary` (`web/src/index.css`) use identical hex in the `light` and `dark` blocks, unlike neighboring tokens. Item 6 is satisfied in letter (colors centralized to CSS custom properties) but not spirit (they don't adapt per theme). Pick per-theme values if theme adaptation is wanted.
+- **`MemoryAdmin::get` is still production-dead.** Item 1 chose "wire it in," and the correctness win (leak closure via the shared private `fetch_editable`) is done — but the public `get` still has no production caller (reachable only from tests). Either find it a real caller or drop the public method and keep `fetch_editable` internal.
