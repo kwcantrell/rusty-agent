@@ -44,13 +44,14 @@ export type WireEvent =
   | { type: "tool_start"; name: string; args: unknown }
   | { type: "tool_result"; name: string; content: string; display?: Display }
   | { type: "error"; message: string }
-  | { type: "done"; reason: string };
+  | { type: "done"; reason: string }
+  | { type: "sandbox_degraded"; mechanism: string; reason: string };
 
 export type Inbound =
   | { v: number; session_id: string; kind: "event"; payload: WireEvent }
   | { v: number; session_id: string; id: string; kind: "approval_request"; summary: string; command?: string; display?: Display }
   | { v: number; session_id: string; kind: "presence"; online: boolean }
-  | { v: number; session_id: string; kind: "settings_state"; settings: RuntimeSettings; workspace: string; api_key_set: boolean; hard_floor: string[]; discovered_skills: DiscoveredSkill[] }
+  | { v: number; session_id: string; kind: "settings_state"; settings: RuntimeSettings; workspace: string; api_key_set: boolean; hard_floor: string[]; discovered_skills: DiscoveredSkill[]; sandbox_degraded?: { mechanism: string; reason: string } | null }
   | { v: number; session_id: string; kind: "settings_error"; message: string };
 
 export type Decision = "approve" | "approve_always" | "deny";

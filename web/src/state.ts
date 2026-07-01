@@ -31,6 +31,7 @@ export interface ConversationState {
   settings: RuntimeSettings | null;
   settingsMeta: { workspace: string; apiKeySet: boolean; hardFloor: string[]; discoveredSkills: import("./wire").DiscoveredSkill[] } | null;
   settingsError: string | null;
+  sandboxDegraded: { mechanism: string; reason: string } | null;
 }
 
 export type Action =
@@ -38,11 +39,12 @@ export type Action =
   | { type: "frame"; frame: Inbound }
   | { type: "user_send"; text: string }
   | { type: "approval_sent" }
-  | { type: "status"; status: ConnectionStatus };
+  | { type: "status"; status: ConnectionStatus }
+  | { type: "dismiss_sandbox_banner" };
 
 export function initialState(userMsgs: string[]): ConversationState {
   return { items: [], pendingApproval: null, usage: null, serverUsage: null, online: false, status: "connecting", userMsgs, turnIndex: 0, inTurn: false,
-    settings: null, settingsMeta: null, settingsError: null };
+    settings: null, settingsMeta: null, settingsError: null, sandboxDegraded: null };
 }
 
 /** Emit the stored user message that heads the current turn, if not already emitted. */
@@ -65,6 +67,8 @@ export function reduce(state: ConversationState, action: Action): ConversationSt
     }
     case "approval_sent":
       return { ...state, pendingApproval: null };
+    case "dismiss_sandbox_banner":
+      return { ...state, sandboxDegraded: null };
     case "frame":
       return reduceFrame(state, action.frame);
   }
@@ -76,7 +80,8 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
     return { ...state, settings: frame.settings,
       settingsMeta: { workspace: frame.workspace, apiKeySet: frame.api_key_set,
         hardFloor: frame.hard_floor, discoveredSkills: frame.discovered_skills },
-      settingsError: null };
+      settingsError: null,
+      sandboxDegraded: frame.sandbox_degraded ?? null };
   }
   if (frame.kind === "settings_error") {
     return { ...state, settingsError: frame.message };
@@ -127,6 +132,8 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
       }
       return { ...s, items };
     }
+    case "sandbox_degraded":
+      return { ...s, sandboxDegraded: { mechanism: p.mechanism, reason: p.reason } };
     case "error":
       return { ...s, items: [...s.items, { kind: "error", message: p.message }] };
     case "done": {
