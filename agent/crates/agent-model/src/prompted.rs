@@ -12,7 +12,10 @@ impl PromptedJsonProtocol {
              ```tool_call\n{\"name\":\"<tool>\",\"arguments\":{...}}\n```\n\
              Emit at most one tool_call block per reply. Available tools:\n");
         for t in &req.tools {
-            s.push_str(&format!("- {}: {} | schema: {}\n", t.name, t.description, t.parameters));
+            // Collapse internal whitespace so a multi-line description (e.g. one with
+            // a folded `When NOT to call:` paragraph) stays on this one-line bullet.
+            let desc = t.description.split_whitespace().collect::<Vec<_>>().join(" ");
+            s.push_str(&format!("- {}: {} | schema: {}\n", t.name, desc, t.parameters));
         }
         s
     }
@@ -60,6 +63,25 @@ impl ToolCallProtocol for PromptedJsonProtocol {
 mod tests {
     use super::*;
     use crate::*;
+
+    #[test]
+    fn tool_description_with_newlines_renders_on_one_bullet_line() {
+        // A folded `when_not_to_call` gives the description internal newlines
+        // (`desc\n\nWhen NOT to call: ...`); the one-line bullet must not break.
+        let req = CompletionRequest {
+            messages: vec![Message::user("hi")],
+            tools: vec![agent_tools::ToolSchema { name: "read_file".into(),
+                description: "Read a file.\n\nWhen NOT to call: use read_skill_file instead.".into(),
+                parameters: serde_json::json!({"type":"object"}) }],
+            ..Default::default() };
+        let preamble = PromptedJsonProtocol::system_preamble(&req);
+        let bullet = preamble.lines().find(|l| l.starts_with("- read_file:"))
+            .expect("read_file bullet present");
+        assert!(bullet.contains("When NOT to call: use read_skill_file instead."),
+            "exclusion prose stays on the bullet line: {bullet:?}");
+        assert!(bullet.contains("| schema:"),
+            "schema tail stays on the same line: {bullet:?}");
+    }
 
     #[test]
     fn prepare_moves_schemas_into_system_prompt_and_clears_tools() {
