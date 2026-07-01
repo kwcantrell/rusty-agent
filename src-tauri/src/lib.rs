@@ -62,6 +62,11 @@ fn settings_get(state: tauri::State<'_, AppState>) -> SettingsState {
 }
 
 #[tauri::command]
+fn session_stats(state: tauri::State<'_, AppState>) -> agent_core::SessionStats {
+    session(&state).session_stats()
+}
+
+#[tauri::command]
 fn settings_update(
     state: tauri::State<'_, AppState>,
     settings: RuntimeConfig,
@@ -156,6 +161,7 @@ macro_rules! all_handlers {
             approve,
             cancel,
             settings_get,
+            session_stats,
             settings_update,
             context_get,
             get_workspace,

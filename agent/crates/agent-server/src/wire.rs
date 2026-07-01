@@ -50,6 +50,12 @@ pub enum ServerEvent {
         display: Option<Display>,
     },
     SandboxDegraded { mechanism: String, reason: String },
+    /// Context-curation telemetry (offload/compaction), forwarded from
+    /// `AgentEvent::Context`. `kind` discriminates the payload in `detail`.
+    Context { kind: String, detail: serde_json::Value },
+    /// Cumulative per-session counters, pushed once per completed run so an
+    /// attached client needs no poll.
+    SessionStats { stats: agent_core::SessionStats },
 }
 
 /// Settings snapshot returned by the `settings_get` command (was `WireBody::SettingsState`).
@@ -130,7 +136,19 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
         AgentEvent::Error(m) => ServerEvent::Error { message: m },
         AgentEvent::Done(r) => ServerEvent::Done { reason: stop_reason_str(&r).into() },
         AgentEvent::Approval(_) => return None,
-        AgentEvent::Context(_) => return None, // curation telemetry; not forwarded to clients in v1
+        AgentEvent::Context(c) => {
+            use agent_core::ContextEvent as CE;
+            let (kind, detail) = match c {
+                CE::Offloaded { id, bytes, tool } =>
+                    ("offloaded", serde_json::json!({"id": id, "bytes": bytes, "tool": tool})),
+                CE::Compacted { turns_replaced, tokens_before, tokens_after } =>
+                    ("compacted", serde_json::json!({"turns_replaced": turns_replaced,
+                        "tokens_before": tokens_before, "tokens_after": tokens_after})),
+                CE::CompactionFailed { reason } =>
+                    ("compaction_failed", serde_json::json!({"reason": reason})),
+            };
+            ServerEvent::Context { kind: kind.into(), detail }
+        }
         AgentEvent::ServerUsage { prompt_tokens, completion_tokens, reasoning_tokens,
             cached_tokens, cost_usd, turn_duration_ms, turn } =>
             ServerEvent::ServerUsage { prompt_tokens, completion_tokens, turn,
@@ -209,6 +227,34 @@ mod tests {
         assert!(j.contains(r#""status":"denied""#), "missing snake_case status: {j}");
         assert!(j.contains(r#""duration_ms":0"#), "missing duration_ms: {j}");
         assert!(j.contains(r#""content":"ERROR: nope""#), "missing content: {j}");
+    }
+
+    #[test]
+    fn context_events_are_forwarded() {
+        use agent_core::ContextEvent;
+        for (ev, kind) in [
+            (ContextEvent::Offloaded { id: 4, bytes: 2048, tool: "read_file".into() }, "offloaded"),
+            (ContextEvent::Compacted { turns_replaced: 3, tokens_before: 900, tokens_after: 200 }, "compacted"),
+            (ContextEvent::CompactionFailed { reason: "model err".into() }, "compaction_failed"),
+        ] {
+            let out = server_event_from(AgentEvent::Context(ev)).expect("must forward");
+            let j = serde_json::to_value(&out).unwrap();
+            assert_eq!(j["type"], "context");
+            assert_eq!(j["kind"], kind);
+        }
+    }
+
+    #[test]
+    fn tool_result_wire_carries_status_and_duration() {
+        let out = server_event_from(AgentEvent::ToolResult {
+            id: "c1".into(), name: "t".into(), status: agent_core::ToolStatus::Timeout,
+            output: agent_tools::ToolOutput { content: "e".into(), display: None },
+            duration_ms: 60000 }).unwrap();
+        let j = serde_json::to_value(&out).unwrap();
+        assert_eq!(j["type"], "tool_result");
+        assert_eq!(j["id"], "c1");
+        assert_eq!(j["status"], "timeout");
+        assert_eq!(j["duration_ms"], 60000);
     }
 
     #[test]

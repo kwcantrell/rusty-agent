@@ -82,6 +82,8 @@ impl Session {
         let system_prompt = self.runtime.current_system_prompt();
         let ctx = self.ctx.clone();
         let active_slot = self.active.clone();
+        let runtime = self.runtime.clone();
+        let slot = self.slot.clone();
         tokio::spawn(async move {
             {
                 let mut guard = ctx.lock().await;
@@ -89,6 +91,11 @@ impl Session {
                 if let Err(e) = agent.run_with_cancel(&mut *guard, text, cancel).await {
                     tracing::error!(error=%e, "run failed");
                 }
+            }
+            // Push a final stats snapshot so an attached client needs no poll.
+            let snapshot = runtime.stats().read().map(|s| s.clone()).unwrap_or_default();
+            if let Some(out) = slot.lock().unwrap().clone() {
+                out.send(crate::wire::ServerEvent::SessionStats { stats: snapshot });
             }
             *active_slot.lock().unwrap() = None;
         });
@@ -106,6 +113,11 @@ impl Session {
 
     pub fn settings_get(&self) -> SettingsState {
         self.runtime.settings_state()
+    }
+
+    /// Snapshot of the cumulative per-session counters (the `session_stats` query).
+    pub fn session_stats(&self) -> agent_core::SessionStats {
+        self.runtime.stats().read().map(|s| s.clone()).unwrap_or_default()
     }
 
     pub async fn context_get(&self) -> agent_core::ContextSnapshot {
@@ -289,6 +301,12 @@ mod tests {
         let (sess, _cap) = session_with_scripted();
         let st = sess.settings_get();
         assert!(!st.api_key_set);
+    }
+
+    #[tokio::test]
+    async fn session_stats_starts_at_default() {
+        let (sess, _cap) = session_with_scripted();
+        assert_eq!(sess.session_stats(), agent_core::SessionStats::default());
     }
 
     #[tokio::test]

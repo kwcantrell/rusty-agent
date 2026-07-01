@@ -33,8 +33,8 @@ impl EventSink for Capture {
             AgentEvent::ToolStart { name, .. } => {
                 self.events.lock().unwrap().push(format!("tool_start:{name}"))
             }
-            AgentEvent::ToolResult { name, .. } => {
-                self.events.lock().unwrap().push(format!("tool_result:{name}"))
+            AgentEvent::ToolResult { name, status, .. } => {
+                self.events.lock().unwrap().push(format!("tool_result:{name}:{}", status.as_str()))
             }
             AgentEvent::Approval(req) => self
                 .events
@@ -108,7 +108,7 @@ async fn b1_duplicate_tool_call_ids_through_assembled_loop() {
 
     let events = sink.events.lock().unwrap().clone();
     assert_eq!(
-        events.iter().filter(|e| *e == "tool_result:read_file").count(),
+        events.iter().filter(|e| *e == "tool_result:read_file:ok").count(),
         2,
         "both reads should produce a result; events: {events:?}"
     );
@@ -173,6 +173,9 @@ async fn c_escaping_read_requests_approval_through_assembled_loop() {
         events.iter().any(|e| e.starts_with("approval:read_file")),
         "escaping read must request approval (normalized gate); events: {events:?}"
     );
+    // Cluster-2 pinning: a denied call must surface a terminal tool_result with its status.
+    assert!(events.iter().any(|e| e.starts_with("tool_result:") && e.ends_with(":denied")),
+        "denied call must emit a terminal ToolResult event, got: {events:?}");
 }
 
 // T4 — B2: a truncated model stream (no finish_reason / [DONE]) is detected,
