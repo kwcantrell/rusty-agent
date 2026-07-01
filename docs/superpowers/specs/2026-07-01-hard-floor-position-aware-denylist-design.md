@@ -217,3 +217,50 @@ quoted command-string arguments.
 | File | Change |
 |---|---|
 | `agent/crates/agent-policy/src/command.rs` | catastrophe-token guard in `is_auto_allowed`; interpreter-limitation doc comment; auto-allow + interpreter-residual tests |
+
+---
+
+## Addendum 2 (2026-07-01): CLI default-denylist parity + exec-vehicle residual
+
+Final whole-branch review (driving the real assembled denylists through `RulePolicy::check`) found
+two blocking issues:
+
+**B — the win did not reach the CLI.** `default_denylist()` (`agent-runtime-config/src/lib.rs:174`),
+which the CLI seeds as its user denylist (`agent-cli/src/main.rs:53`), still contained `"sudo"` and
+`"mkfs"`. Since the CLI's policy denylist is `effective_denylist()` = `HARD_FLOOR_DENYLIST ∪
+config.command_denylist`, `man mkfs`/`man sudo`/`cat sudoku.txt` stayed hard-denied on the CLI — the
+false-positive fix only landed on the server surface (whose config denylist is empty). The unit tests
+masked this: the in-file `floor()` helper mirrors only `HARD_FLOOR`, never the assembled
+`effective_denylist()`.
+
+**Fix B:** drop `"sudo"`/`"mkfs"` from `default_denylist()` → `["rm -rf /", ":(){", "dd if="]`
+(mirror the floor). Add a regression test in `agent-runtime-config` that drives
+`agent_policy::hard_floor_violation` with the **real** effective denylist (`default_denylist()`
+unioned via `effective_denylist()`), asserting `man mkfs`/`man sudo`/`cat sudoku.txt` are not denied
+while `sudo reboot`/`mkfs /dev/sda` still are.
+
+**A — allowlisted exec-capable programs smuggle catastrophes to silent auto-Allow.** `git -c
+core.pager="sudo reboot" -p log` reaches auto-Allow (git runs its pager via `sh -c`; the token
+`core.pager=sudo reboot` has no shell-significant char and its basename ≠ a catastrophe name, so
+neither the boundary scan nor the name-exact guard sees it). Same class for `cargo` and
+`find -exec sh -c`. This is fundamentally a property of allowlisting programs that execute arbitrary
+sub-commands — `git -c core.pager=poweroff`/`shutdown` were silently auto-allowed before and after
+this branch; the removed substring only ever caught the literal `sudo`/`mkfs` spelling, never a
+coherent defense.
+
+**Resolution A (chosen): document + regression-test as an accepted residual.** For a coding-agent
+runtime that runs `git`/`cargo` constantly, forcing them to Ask is too disruptive, and enumerating
+git/cargo exec vectors (`-c core.pager`/`core.editor`/`core.sshCommand`/`core.hooksPath`/`alias.*`,
+cargo build scripts/aliases, `find -exec`) is a slippery slope with no terminus. The honest boundary:
+**the hard floor protects against direct catastrophe invocation, not against catastrophes smuggled
+through allowlisted exec-capable programs.** Mitigations are the allowlist policy (do not allowlist
+exec-vehicles if the floor must hold) and the execution sandbox (`agent-sandbox`). Documented in code
++ a regression test pinning the observed behavior so any future change is noticed.
+
+### Additional files touched
+
+| File | Change |
+|---|---|
+| `agent/crates/agent-runtime-config/src/lib.rs` | drop `"sudo"`/`"mkfs"` from `default_denylist()` |
+| `agent/crates/agent-runtime-config/src/runtime_config.rs` | real-effective-denylist regression test (Finding B) |
+| `agent/crates/agent-policy/src/command.rs` | extend known-limitation comment to exec-vehicles; accepted-residual regression test (Finding A) |
