@@ -178,7 +178,7 @@ co-design harness with eval, arXiv 2503.16416).
 
 ---
 
-## Example findings (last audit: 2026-06-30; re-stamped 2026-07-01 after the guardrails finding fixed)
+## Example findings (last audit: 2026-06-30; re-stamped 2026-07-01 after the guardrails finding + its position-aware-denylist follow-up fixed)
 
 *Illustrative snapshot from a 2026-06-30 six-component fan-out run — re-stamp or replace when you run the audit; these cite live line numbers that drift.*
 
@@ -204,6 +204,22 @@ denylist's structural gaps (`mkfs`, the `:(){` forkbomb) and the un-timed `Termi
 `docs/superpowers/specs/2026-07-01-guardrails-denylist-approval-hardening-design.md` and commits
 `4408060`/`be58ca5`/`b147d7e`. The two findings below — one `med`, one `low` — remain open and are
 renumbered 1–2.
+
+Re-stamp note (2026-07-01, guardrails follow-up): the residual bare-`mkfs`/`sudo` **denylist
+false-positive** flagged during the above finding's review — the position-blind substring backstop
+hard-denied benign `man mkfs` / `man sudo` / `which sudo` — is now **fixed and merged to `main`**,
+completing the Guardrails cluster. Catastrophe detection is made position-aware (a raw-string
+command-boundary scan, "Layer A2", catches `sudo`/`mkfs` in program position incl. glued operators,
+`$()`/backtick/subshell/group, env-prefix, and unparseable forms), `sudo`/`mkfs` were dropped from
+both `HARD_FLOOR_DENYLIST` and `default_denylist()` (so the fix lands on the CLI **and** server), and
+a name-exact catastrophe-token guard in `is_auto_allowed` keeps a catastrophe passed to an allowlisted
+exec-capable program (`find . -exec sudo …`) out of auto-Allow (→ Ask). One **accepted, documented
+residual**: catastrophes smuggled through allowlisted exec-vehicles that interpret their arguments
+(`git -c core.pager="sudo …"`, `bash -c`, `cargo`, `find -exec sh -c`) reach Ask, not Deny — the hard
+floor covers direct invocation, not arbitrary sub-command execution; mitigations are the allowlist
+policy and the execution sandbox. See
+`docs/superpowers/specs/2026-07-01-hard-floor-position-aware-denylist-design.md` (+ Addenda 1–2) and
+commits `d1e0f21`/`1aadf3d`/`a616750`/`59ed233`. No open Guardrails finding remains.
 
 ---
 
