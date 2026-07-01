@@ -41,6 +41,9 @@ pub struct BuiltLoop {
     /// Tool names registered at build time — retained so tests can assert injection.
     #[cfg(test)]
     pub registered_names: Vec<String>,
+    /// Assembled, folded tool schemas — retained so tests can assert the tool contract.
+    #[cfg(test)]
+    pub schemas: Vec<agent_tools::ToolSchema>,
 }
 
 /// The single RuntimeConfig → LoopConfig mapping. Constants that are identical on
@@ -115,7 +118,9 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     };
 
     #[cfg(test)]
-    let registered_names: Vec<String> = registry.schemas().into_iter().map(|s| s.name).collect();
+    let schemas = registry.schemas();
+    #[cfg(test)]
+    let registered_names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
 
     let policy = Arc::new(RulePolicy {
         workspace: parts.workspace.clone(),
@@ -143,6 +148,8 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         unknown_presets,
         #[cfg(test)]
         registered_names,
+        #[cfg(test)]
+        schemas,
     }
 }
 
@@ -258,5 +265,43 @@ mod tests {
         assert!(lc.preserve_thinking);
         assert!((lc.temperature - 0.7).abs() < 1e-6);
         assert!(lc.sandbox.is_some());
+    }
+
+    #[test]
+    fn every_required_param_is_described_in_the_assembled_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        // Default config (memory off): base + context + skill tools are real; the
+        // runtime-injected `recall` is intentionally absent (enforced in agent-memory).
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        for s in &built.schemas {
+            let missing = agent_tools::required_params_missing_description(s);
+            assert!(missing.is_empty(), "{} has undescribed required params: {missing:?}", s.name);
+        }
+    }
+
+    #[test]
+    fn confusable_tools_carry_disambiguation_in_the_assembled_registry() {
+        use std::collections::HashSet;
+        let dir = tempfile::tempdir().unwrap();
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        let present: HashSet<&str> = built.schemas.iter().map(|s| s.name.as_str()).collect();
+
+        // Every confusable tool that IS assembled here must carry the folded marker.
+        for name in agent_tools::CONFUSABLE_TOOLS {
+            if let Some(s) = built.schemas.iter().find(|s| s.name == *name) {
+                assert!(s.description.contains(agent_tools::WHEN_NOT_TO_CALL_MARKER),
+                    "{name} is missing '{}' in its description: {}",
+                    agent_tools::WHEN_NOT_TO_CALL_MARKER, s.description);
+            }
+        }
+
+        // Coverage ratchet: the ONLY confusable tool absent from this assembly is
+        // `recall` (runtime-injected, enforced in agent-memory). If a future
+        // confusable tool becomes invisible here without separate coverage, this
+        // fails and forces a decision.
+        let absent: HashSet<&str> = agent_tools::CONFUSABLE_TOOLS.iter().copied()
+            .filter(|n| !present.contains(n)).collect();
+        assert_eq!(absent, HashSet::from(["recall"]),
+            "unexpected confusable tools missing from the assembled registry: {absent:?}");
     }
 }
