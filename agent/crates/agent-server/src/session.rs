@@ -237,6 +237,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_list_returns_seeded_rows() {
+        use agent_memory::{MemoryConfig, MemoryParts, MemoryRecord, MemoryScope, MemoryStore,
+            InMemoryStore, StubEmbedder, now_secs};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        store.upsert(MemoryRecord {
+            id: "seed".into(), text: "hello world".into(), scope: MemoryScope::Global,
+            tags: vec![], vector: vec![0.1, 0.2], created_at: now_secs(), updated_at: now_secs(),
+            source: "test".into(),
+        }).await.unwrap();
+        let parts = MemoryParts {
+            embedder: Arc::new(StubEmbedder::new(384)),
+            store: store.clone(),
+            cfg: Arc::new(MemoryConfig::default()),
+        };
+        let params = crate::setup::local_params(
+            dir.path().to_path_buf(), dir.path().join("rt.json"),
+            "http://localhost:8080".into(), "m".into(), Some(&parts));
+        let sess = Session::from_params(params);
+        std::mem::forget(dir); // keep temp dir alive for the test process
+        let rows = sess.memory_list(20, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "seed");
+        assert_eq!(rows[0].scope_kind, "global");
+    }
+
+    #[tokio::test]
     async fn memory_list_is_empty_on_fresh_store() {
         let (sess, _cap) = session_with_scripted(); // scripted setup passes memory_parts: None
         let rows = sess.memory_list(20, 0).await.unwrap_or_default();

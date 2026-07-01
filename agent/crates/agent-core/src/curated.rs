@@ -393,6 +393,7 @@ mod tests {
         c.append(Message::user("hello"));
         let snap = c.snapshot(10_000, 7);
         assert_eq!(snap.turn, 7);
+        assert_eq!(snap.model_limit, 10_000);
         assert!(snap.segments.iter().any(|s| s.category == "system"));
         assert!(snap.segments.iter().any(|s| s.category == "memory"));
         let msgs = snap.segments.iter().find(|s| s.category == "messages").unwrap();

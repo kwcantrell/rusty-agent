@@ -317,6 +317,27 @@ mod sqlite_tests {
     }
 
     #[tokio::test]
+    async fn list_orders_newest_first_and_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = SqliteStore::open(&tmp.path().join("m.db")).unwrap();
+        let sc = MemoryScope::Project("A".into());
+        for (id, t) in [("a", 100i64), ("b", 200), ("c", 300)] {
+            let mut r = rec(id, sc.clone(), vec![1.0, 0.0]);
+            r.updated_at = t;
+            s.upsert(r).await.unwrap();
+        }
+        let f = ScopeFilter::Exact(sc);
+        // Newest first, full page.
+        let all = s.list(&f, 10, 0).await.unwrap();
+        let ids: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "b", "a"]);
+        // LIMIT 1 OFFSET 1 → the second-newest.
+        let page = s.list(&f, 1, 1).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "b");
+    }
+
+    #[tokio::test]
     async fn count_delete_evict_oldest() {
         let tmp = tempfile::tempdir().unwrap();
         let s = SqliteStore::open(&tmp.path().join("m.db")).unwrap();

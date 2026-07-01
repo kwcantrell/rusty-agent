@@ -77,6 +77,8 @@ pub(crate) fn build_snapshot(
     segments.push(ContextSegment {
         category: "messages".into(),
         est_tokens: msg_tokens,
+        // Intentionally empty: message bodies are rendered in the main transcript,
+        // not the explorer drill-in. Only the count/token total is surfaced here.
         items: Vec::new(),
         count: history.len(),
     });
@@ -106,6 +108,14 @@ mod tests {
         let messages = snap.segments.iter().find(|s| s.category == "messages").unwrap();
         assert_eq!(messages.count, 2);
         assert_eq!(snap.est_total, snap.segments.iter().map(|s| s.est_tokens).sum::<usize>());
+    }
+
+    #[test]
+    fn preview_collapses_newlines_and_truncates() {
+        assert_eq!(preview("a\nb\nc", 100), "a b c");     // newlines → single spaces
+        assert_eq!(preview("hello world", 5), "hello");   // truncates to n chars
+        assert_eq!(preview("anything", 0), "");           // n = 0 → empty
+        assert_eq!(preview("", 10), "");                  // empty input → empty
     }
 
     #[test]

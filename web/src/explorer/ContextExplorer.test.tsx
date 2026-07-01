@@ -20,6 +20,15 @@ describe("ContextExplorer", () => {
     expect(await screen.findByText(/system/i)).toBeInTheDocument();
   });
 
+  it("clicking the synthetic unattributed slice shows the gap panel", async () => {
+    render(<ContextExplorer realTotal={100} refreshKey={0} skills={[]} lastQuery={null} />);
+    // realTotal (100) > est_total (60) → an "unattributed" legend button appears.
+    const btn = await screen.findByRole("button", { name: /unattributed/i });
+    fireEvent.click(btn);
+    expect(await screen.findByText(/Gap between server total and estimated sum/)).toBeInTheDocument();
+    expect(screen.getByText(/40 tokens unaccounted/)).toBeInTheDocument();
+  });
+
   it("clicking a segment legend button shows its items; clicking again collapses", async () => {
     render(<ContextExplorer realTotal={null} refreshKey={0} skills={[]} lastQuery={null} />);
     // Wait for snapshot to load — the legend button for "system" will appear
