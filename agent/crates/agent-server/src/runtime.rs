@@ -30,6 +30,11 @@ pub struct RuntimeState {
     /// so a settings change never orphans the offload table from its tools.
     offload_store: Arc<dyn OffloadStore>,
     compact_flag: Arc<AtomicBool>,
+    /// Session-stable observability handles. Created ONCE here and reused across
+    /// every loop rebuild — a per-rebuild TraceWriter would mint a colliding
+    /// `{epoch}-{pid}` session id and interleave two writers into one file.
+    stats: Arc<std::sync::RwLock<agent_core::SessionStats>>,
+    trace: Option<Arc<agent_runtime_config::TraceWriter>>,
 }
 
 impl RuntimeState {
@@ -51,10 +56,12 @@ impl RuntimeState {
         let offload_store: Arc<dyn OffloadStore> =
             Arc::new(agent_core::InMemoryOffloadStore::new());
         let compact_flag = Arc::new(AtomicBool::new(false));
+        let stats: Arc<std::sync::RwLock<agent_core::SessionStats>> = Arc::default();
+        let trace = agent_runtime_config::build_trace(&config);
         let built = build_loop(
             &config, &sink, &approval, &workspace, &api_key, &claude_binary, &mcp_tools,
             &memory_tools, memory_retriever.as_ref(), &base_system_prompt,
-            &offload_store, &compact_flag);
+            &offload_store, &compact_flag, &stats, &trace);
         // Startup is lenient: an unknown persisted preset is already warned + dropped
         // inside build_loop, so the daemon always boots.
         Self {
@@ -63,8 +70,13 @@ impl RuntimeState {
             system_prompt: Mutex::new(built.system_prompt),
             sink, approval, workspace, api_key, claude_binary, config_path,
             mcp_tools, memory_tools, memory_retriever, base_system_prompt,
-            offload_store, compact_flag,
+            offload_store, compact_flag, stats, trace,
         }
+    }
+
+    /// Session-stable stats handle (folded by the loop's ObservedSink; read by RPCs).
+    pub fn stats(&self) -> Arc<std::sync::RwLock<agent_core::SessionStats>> {
+        self.stats.clone()
     }
 
     /// Conversation-stable offload table (shared with the session's `CuratedContext`).
@@ -97,7 +109,7 @@ impl RuntimeState {
             &cfg, &self.sink, &self.approval, &self.workspace, &self.api_key,
             &self.claude_binary, &self.mcp_tools, &self.memory_tools,
             self.memory_retriever.as_ref(), &self.base_system_prompt,
-            &self.offload_store, &self.compact_flag);
+            &self.offload_store, &self.compact_flag, &self.stats, &self.trace);
         if !built.unknown_presets.is_empty() {
             // Strict on the wire: a typo'd / missing active skill is a hard error.
             return Err(format!("unknown active skill(s): {}", built.unknown_presets.join(", ")));
@@ -147,6 +159,8 @@ fn build_loop(
     base_system_prompt: &str,
     offload_store: &Arc<dyn OffloadStore>,
     compact_flag: &Arc<AtomicBool>,
+    stats: &Arc<std::sync::RwLock<agent_core::SessionStats>>,
+    trace: &Option<Arc<agent_runtime_config::TraceWriter>>,
 ) -> BuiltLoop {
     let model = build_model(&cfg.backend, &cfg.base_url, &cfg.model, claude_binary, api_key.clone());
     assemble_loop(cfg, LoopParts {
@@ -161,6 +175,8 @@ fn build_loop(
         base_system_prompt: base_system_prompt.to_string(),
         offload_store: offload_store.clone(),
         compact_flag: compact_flag.clone(),
+        stats: stats.clone(),
+        trace: trace.clone(),
     })
 }
 
@@ -310,7 +326,8 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let result = build_loop(
             &cfg, &sink, &approval, dir.path(), &None, "claude",
-            &[], &[], None, crate::daemon::SYSTEM_PROMPT, &store, &flag);
+            &[], &[], None, crate::daemon::SYSTEM_PROMPT, &store, &flag,
+            &Arc::default(), &None);
         // If we get here without panic/error the strategy was constructed OK.
         let _loop = result.loop_; // just confirm it's built
     }
@@ -327,7 +344,8 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let result = build_loop(
             &cfg, &sink, &approval, dir.path(), &None, "claude",
-            &[], &[], None, crate::daemon::SYSTEM_PROMPT, &store, &flag);
+            &[], &[], None, crate::daemon::SYSTEM_PROMPT, &store, &flag,
+            &Arc::default(), &None);
         let _loop = result.loop_;
     }
 

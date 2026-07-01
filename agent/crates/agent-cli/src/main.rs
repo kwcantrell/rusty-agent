@@ -210,6 +210,13 @@ async fn main() {
     let offload_store: Arc<dyn agent_core::OffloadStore> =
         Arc::new(agent_core::InMemoryOffloadStore::new());
     let compact_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Session-lifetime observability handles: created ONCE (a per-assemble
+    // TraceWriter would mint a colliding {epoch}-{pid} session id).
+    let stats = Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default()));
+    let trace = agent_runtime_config::build_trace(&rt);
+    if let Some(t) = &trace {
+        eprintln!("\x1b[2mtrace: ~/.agent/sessions/{}.jsonl\x1b[0m", t.session_id());
+    }
     let built = assemble_loop(&rt, LoopParts {
         model,
         sink: Arc::new(TerminalSink::default()),
@@ -222,6 +229,8 @@ async fn main() {
         base_system_prompt: BASE_SYSTEM_PROMPT.to_string(),
         offload_store: offload_store.clone(),
         compact_flag: compact_flag.clone(),
+        stats: stats.clone(),
+        trace,
     });
     if !built.unknown_presets.is_empty() {
         eprintln!("skills: unknown active skill(s): {}", built.unknown_presets.join(", "));

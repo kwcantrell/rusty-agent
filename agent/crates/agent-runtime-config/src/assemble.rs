@@ -30,6 +30,12 @@ pub struct LoopParts {
     pub offload_store: Arc<dyn agent_core::OffloadStore>,
     /// Flag the `context_compact` tool sets; the caller's `CuratedContext` reads it.
     pub compact_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Session-stable stats handle; caller-owned (survives server loop rebuilds).
+    pub stats: Arc<std::sync::RwLock<agent_core::SessionStats>>,
+    /// Session-stable trace writer; None = tracing disabled. Caller-owned: create
+    /// ONCE per frontend lifetime (`TraceWriter::create` mints a `{epoch}-{pid}`
+    /// session id, so per-assemble writers would interleave into one file).
+    pub trace: Option<Arc<crate::trace::TraceWriter>>,
 }
 
 /// Result of assembling a loop: the loop itself, the composed system prompt, and
@@ -128,13 +134,21 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         command_denylist: cfg.effective_denylist(),
     });
 
+    // Every event the loop emits flows through the observability wrapper:
+    // fold stats, write the trace, then forward to the frontend sink.
+    let sink: Arc<dyn EventSink> = Arc::new(crate::trace::ObservedSink {
+        inner: parts.sink.clone(),
+        stats: parts.stats.clone(),
+        trace: parts.trace.clone(),
+    });
+
     let agent = AgentLoop::new(
         parts.model,
         pick_protocol(&cfg.protocol),
         Arc::new(registry),
         policy,
         parts.approval,
-        parts.sink,
+        sink,
         loop_config_from(cfg, parts.workspace.clone(), parts.stream_idle_timeout),
     );
     let agent = match (cfg.memory, &parts.memory_retriever) {
@@ -207,11 +221,31 @@ mod tests {
             base_system_prompt: "BASE".into(),
             offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
+            trace: None,
         }
     }
 
     fn cfg() -> RuntimeConfig {
         RuntimeConfig::from_launch("openai".into(), "http://x".into(), "m".into(), "native".into(), 8192)
+    }
+
+    #[test]
+    fn assemble_wires_stats_through_observed_sink() {
+        // The loop's installed sink is not directly reachable, so assert at the
+        // unit level: LoopParts carries the caller-owned handles, and an
+        // ObservedSink built over them folds stats AND forwards to the inner sink.
+        let dir = tempfile::tempdir().unwrap();
+        let p = parts(dir.path().to_path_buf(), vec![]);
+        let stats = p.stats.clone();
+        let inner = Arc::new(agent_core::testkit::CollectingSink::default());
+        let sink = crate::trace::ObservedSink {
+            inner: inner.clone(), stats: stats.clone(), trace: p.trace.clone() };
+        sink.emit(AgentEvent::Error("x".into()));
+        assert_eq!(stats.read().unwrap().errors, 1);          // folded
+        assert_eq!(inner.events.lock().unwrap().len(), 1);    // forwarded
+        // And the loop still assembles with the new fields present.
+        let _ = assemble_loop(&cfg(), p);
     }
 
     #[test]

@@ -80,6 +80,8 @@ fn assemble_test(
             base_system_prompt: "You are a test agent.".into(),
             offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
+            trace: None,
         },
     );
     (built, sink)

@@ -174,6 +174,8 @@ async fn eval_context_run() {
                     .into(),
                 offload_store: offload.clone(),
                 compact_flag: flag.clone(),
+                stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
+                trace: None,
             },
         );
         let agent = built.loop_;
