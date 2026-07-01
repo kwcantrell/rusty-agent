@@ -87,7 +87,10 @@ The premier dynamic-context pattern is **Agent Skills via progressive disclosure
 metadata at startup → full instructions on task match → deep reference only when
 needed. This maps directly to this repo's `.agents/skills/` model and is the
 concrete application of Spine B to this runtime. Drives `eval.md` + context
-guidance.
+guidance. This repo already applies these ideas: `context-management` is a live
+static/dynamic-context skill, and `context-evolve` runs a correctness-gated
+context-tuning campaign — read them as concrete examples; this skill
+cross-references them but does not depend on them.
 
 ## Corroborating durable principles
 
