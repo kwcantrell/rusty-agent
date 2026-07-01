@@ -12,6 +12,7 @@ import { appendUserMsg, loadSessionId, loadTheme, loadUserMsgs, saveTheme, loadR
 import type { RightTab } from "./storage";
 import { ContextExplorer } from "./explorer/ContextExplorer";
 import { RightPaneTabs } from "./components/RightPaneTabs";
+import { SandboxBanner } from "./components/SandboxBanner";
 
 export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(loadSessionId());
@@ -148,6 +149,10 @@ export default function App() {
       {showSettings && state.settings && (
         <SettingsPanel settings={state.settings} meta={state.settingsMeta} error={state.settingsError}
           disabled={!connected} onSave={saveSettings} onClose={() => setShowSettings(false)} />
+      )}
+      {state.sandboxDegraded && (
+        <SandboxBanner info={state.sandboxDegraded}
+          onDismiss={() => dispatch({ type: "dismiss_sandbox_banner" })} />
       )}
       <div className="relative flex min-h-0 flex-1">
         <div className="min-w-0 flex-1" style={!narrow ? { flexBasis: "38%", maxWidth: "42%", borderRight: "1px solid var(--border)" } : undefined}>
