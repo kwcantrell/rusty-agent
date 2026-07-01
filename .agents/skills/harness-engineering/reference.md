@@ -89,6 +89,7 @@ The durable position, from the same whitepaper corpus, is:
 The practical guidance: use specs when the harness decision is design-bearing or
 high-blast-radius (e.g. static/dynamic context boundary, tool schema changes,
 orchestration topology). Skip the ceremony for low-stakes, obviously-correct fixes.
+— *[SYNTHESIZED guidance: drawn from the sources cited above, no single source]*
 See `SKILL.md` Spine B for the static/dynamic boundary as "a first-class
 architectural decision, reviewed and versioned like code."
 
@@ -114,6 +115,7 @@ context engineering.
 There is no authoritative "right number" — the benchmark is: can the model
 reliably choose the correct tool, given only the descriptions, without ambiguity?
 If not, consolidate or sharpen descriptions before adding more tools.
+— *[SYNTHESIZED guidance: drawn from the sources cited above, no single source]*
 
 Numbers like "< N tools per agent" or "MCP server tool limits" are **[DATED as of
 2026-06]** and tied to specific model context windows that change with each release.
