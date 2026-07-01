@@ -130,7 +130,7 @@ async fn execute_isolated(
         Ok(Err(_panic))         => Executed::Panicked(
             format!("ERROR: tool '{name}' panicked during execution")),
         Err(_elapsed)           => Executed::TimedOut(
-            format!("ERROR: tool '{name}' ignored its {:?} timeout and was \
+            format!("ERROR: tool '{name}' exceeded its {:?} timeout and was \
                      force-stopped by the dispatch backstop", ctx.timeout)),
     }
 }
