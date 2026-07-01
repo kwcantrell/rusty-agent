@@ -94,20 +94,37 @@ fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
     None
 }
 
+/// A `NAME=value` shell env-assignment prefix token (`FOO=bar` in `FOO=bar cmd`).
+/// Such prefixes precede the real program, so the boundary scan skips them.
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.find('=') {
+        Some(eq) if eq > 0 => {
+            let name = &tok[..eq];
+            !name.contains('/')
+                && name.chars().enumerate().all(|(i, c)| {
+                    c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Leading program token at each shell command boundary in the RAW string: start-of-string
-/// and immediately after a control-operator char (`&`, `|`, `;`, newline). Operates on the
-/// raw text (not shell-words), so it works on glued operators (`x&&sudo`) and unparseable
-/// input (unbalanced quotes) alike. Surrounding quote chars are stripped so a quoted program
-/// name (`"sudo"`) is still caught.
+/// and immediately after any boundary char (`&`, `|`, `;`, newline, `(`, `)`, `{`, `}`,
+/// backtick). Operates on the raw text (not shell-words), so it works on glued operators
+/// (`x&&sudo`), command substitution (`$(sudo …)`), subshells/groups (`(sudo …)`,
+/// `{ sudo; }`), and unparseable input (unbalanced quotes) alike. Surrounding quote chars
+/// are stripped so a quoted program name (`"sudo"`) is still caught. Leading `VAR=val`
+/// env-assignment tokens are skipped so `FOO=bar sudo …` yields `sudo`.
 ///
-/// NOTE: intentionally NOT quote-aware about operators — an operator inside a quoted string
-/// (`echo "a; sudo b"`) is treated as a boundary, so such a command is over-denied. This is
-/// fail-safe (a hard floor errs toward denial), rare, and consistent with the
-/// SHELL_SIGNIFICANT over-approximation elsewhere in this file. A full quote-aware parser is
-/// deliberately out of scope.
+/// NOTE: intentionally NOT quote-aware about operators — an operator or grouping character
+/// inside a quoted string (`echo "a; sudo b"`) is treated as a boundary, so such a command
+/// is over-denied. This is fail-safe (a hard floor errs toward denial), rare, and consistent
+/// with the SHELL_SIGNIFICANT over-approximation elsewhere in this file. A full quote-aware
+/// parser is deliberately out of scope.
 fn command_boundary_programs(cmd: &str) -> impl Iterator<Item = &str> {
-    cmd.split(|c| matches!(c, '&' | '|' | ';' | '\n'))
-        .filter_map(|seg| seg.split_whitespace().next())
+    cmd.split(|c| matches!(c, '&' | '|' | ';' | '\n' | '(' | ')' | '{' | '}' | '`'))
+        .filter_map(|seg| seg.split_whitespace().find(|&tok| !is_env_assignment(tok)))
         .map(|tok| tok.trim_matches(|c| c == '"' || c == '\''))
         .filter(|tok| !tok.is_empty())
 }
@@ -355,5 +372,35 @@ mod tests {
     #[test]
     fn auto_allow_rejects_unparseable() {
         assert!(!allow(r#"ls "unterminated"#));
+    }
+
+    // --- Regression tests: under-denial cases fixed by widened boundary split + env-skip ---
+
+    #[test]
+    fn floor_denies_catastrophe_in_substitution_and_grouping() {
+        assert!(floor("echo $(sudo reboot)").is_some());
+        assert!(floor("echo `sudo reboot`").is_some());
+        assert!(floor("(sudo reboot)").is_some());
+        assert!(floor("{ sudo reboot; }").is_some());
+        assert!(floor("echo $(mkfs.ext4 /dev/sda)").is_some());
+    }
+
+    #[test]
+    fn floor_denies_catastrophe_behind_env_assignment() {
+        assert!(floor("FOO=bar sudo reboot").is_some());
+        assert!(floor("FOO=bar mkfs /dev/sda").is_some());
+    }
+
+    #[test]
+    fn floor_still_allows_benign_substitution_and_assignment() {
+        // Widened boundary set must not over-deny these benign forms.
+        assert!(floor("echo $(date)").is_none());
+        assert!(floor("(ls -la)").is_none());
+        assert!(floor("FOO=bar make build").is_none());
+    }
+
+    #[test]
+    fn auto_allow_rejects_env_prefixed_program() {
+        assert!(!allow("FOO=bar sudo reboot")); // program token is FOO=bar, not allowlisted
     }
 }
