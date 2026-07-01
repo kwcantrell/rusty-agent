@@ -178,7 +178,7 @@ co-design harness with eval, arXiv 2503.16416).
 
 ---
 
-## Example findings (last audit: 2026-06-30; re-stamped 2026-06-30 after Findings 1–2 fixed)
+## Example findings (last audit: 2026-06-30; re-stamped 2026-07-01 after the guardrails finding fixed)
 
 *Illustrative snapshot from a 2026-06-30 six-component fan-out run — re-stamp or replace when you run the audit; these cite live line numbers that drift.*
 
@@ -193,8 +193,17 @@ backstop), see `docs/superpowers/specs/2026-06-30-parallel-tool-dispatch-hardeni
 commits `96ec134`/`7329bd1`. Tool contract: a `Tool::when_not_to_call()` folded into the model-facing
 schema + required-param descriptions + a curated-confusable enforcement ratchet, see
 `docs/superpowers/specs/2026-06-30-tool-when-not-to-call-contract-design.md` and commits
-`955fc15`/`76fc4ae`/`0dc6cc2`. The three findings below — two `med`, one `low` — remain open and are
-renumbered 1–3.
+`955fc15`/`76fc4ae`/`0dc6cc2`.
+
+Re-stamp note (2026-07-01): the prior top-ranked `med` **Guardrails** finding — the catastrophic-command
+denylist's structural gaps (`mkfs`, the `:(){` forkbomb) and the un-timed `TerminalApproval` stdin read
+— is now **fixed and merged to `main`**, and has been removed from the list below. A structural
+`mkfs`/`mkfs.*` handler + an all-whitespace-removed backstop pass close the denylist gap; a configurable
+`TerminalApproval` timeout (300s `Default`, matching the server) wraps the `spawn_blocking` stdin read in
+`tokio::time::timeout` and denies on elapse. See
+`docs/superpowers/specs/2026-07-01-guardrails-denylist-approval-hardening-design.md` and commits
+`4408060`/`be58ca5`/`b147d7e`. The two findings below — one `med`, one `low` — remain open and are
+renumbered 1–2.
 
 ---
 
@@ -215,24 +224,7 @@ concrete proposed fix: [REFINED] prompt/completion tokens ARE emitted per turn (
 
 ---
 
-**Finding 2 — Guardrails: catastrophic-command denylist has structural gaps; CLI approval can hang**
-
-```
-severity: med
-file:line: agent/crates/agent-policy/src/command.rs:59-76; agent/crates/agent-cli/src/approval.rs:13-28
-violated principle: "hooks are fast, side-effect-free validators; block bad actions, not delay good
-  ones" — SKILL.md Spine A component 5
-concrete proposed fix: (a) Structural Layer-A detection covers sudo/rm/dd but NOT `mkfs` or the
-  `:(){` forkbomb (they rely solely on the substring backstop) and no test exercises mkfs through
-  hard_floor_violation — add structural handlers + tests. (b) TerminalApproval's spawn_blocking
-  stdin read has NO timeout (unlike IpcApprovalChannel) — a caller holding stdin open hangs the agent;
-  add a timeout defaulting to Deny.
-  NOTE: gate ordering (policy → approval → execute) and default-Deny-when-no-approver are both SOUND.
-```
-
----
-
-**Finding 3 — Instructions: duplicated system prompt + skill files lack negative constraints**
+**Finding 2 — Instructions: duplicated system prompt + skill files lack negative constraints**
 
 ```
 severity: low
@@ -248,26 +240,19 @@ concrete proposed fix: The coding-agent system prompt is byte-identical but dupl
 
 ---
 
-## Top 3 highest-leverage fixes
+## Top highest-leverage fixes
 
-Ranked by impact (severity × remediation cost). The two HIGH findings and the top two `med` findings
-(parallel-dispatch isolation, tool "when NOT to call" contract) are **done** — the three remaining
-findings rank as follows:
+Ranked by impact (severity × remediation cost). The two HIGH findings and the top three `med` findings
+(parallel-dispatch isolation, tool "when NOT to call" contract, guardrails denylist + CLI approval hang)
+are **done** — the two remaining findings rank as follows:
 
-1. **[Component 5 — Guardrails] Close denylist gaps + the CLI approval hang** (Finding 2)
-   `agent/crates/agent-policy/src/command.rs:59-76`; `agent/crates/agent-cli/src/approval.rs:13-28` —
-   add structural handlers (+ tests) for `mkfs` and the `:(){` forkbomb (currently substring-backstop
-   only), and give `TerminalApproval`'s stdin read a timeout defaulting to Deny so a caller holding
-   stdin open can't hang the agent. Safety-adjacent, small, well-scoped — highest leverage of what
-   remains.
-
-2. **[Component 6 — Observability] Make tool failures + durations visible** (Finding 1)
+1. **[Component 6 — Observability] Make tool failures + durations visible** (Finding 1)
    `agent/crates/agent-core/src/loop_.rs:304-308`; `wire.rs:103`; `agent-model/src/openai.rs:205-209` —
    emit a tool-error/status event + `duration_ms`, count streamed `reasoning_tokens`, and forward
    `ContextEvent`s to the wire so the web UI learns the window was truncated. Pairs with the
-   eval-harness work.
+   eval-harness work. Highest leverage of what remains.
 
-3. **[Component 1 — Instructions] De-duplicate the system prompt + add negative constraints** (Finding 3)
+2. **[Component 1 — Instructions] De-duplicate the system prompt + add negative constraints** (Finding 2)
    `agent/crates/agent-server/src/daemon.rs:23` + `agent/crates/agent-cli/src/main.rs:15`; `.agents/skills/`
    — hoist the byte-identical coding-agent system prompt to one shared const, and add a
    "Forbidden"/negative-constraint section to the skill files. `low` severity; polish.
