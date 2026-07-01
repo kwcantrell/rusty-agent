@@ -266,6 +266,10 @@ impl Tool for ReadSkillFile {
     fn description(&self) -> &str {
         "Read a bundled file belonging to a skill (e.g. a script or reference), so you can inspect it before acting."
     }
+    fn when_not_to_call(&self) -> Option<&str> {
+        Some("Not for arbitrary workspace files — use read_file. Use read_skill_file \
+              only for files bundled inside a loaded skill's directory.")
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: self.name().into(),

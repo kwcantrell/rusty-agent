@@ -25,6 +25,10 @@ impl Tool for ContextRecallTool {
         "Recall the full content of a previously offloaded tool result by its id \
          (the number in a [tool_result#N offloaded ...] placeholder)."
     }
+    fn when_not_to_call(&self) -> Option<&str> {
+        Some("Not for semantic search of saved memories — use recall. Use \
+              context_recall only to rehydrate a specific offloaded entry by its id.")
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "context_recall".into(),

@@ -162,6 +162,10 @@ impl Tool for Recall {
         "Search long-term memory for facts relevant to a query. Returns the most similar \
          stored memories from this project and the global tier. Args: query (required), k (optional)."
     }
+    fn when_not_to_call(&self) -> Option<&str> {
+        Some("Not for rehydrating offloaded conversation context — use context_recall. \
+              Use recall only for semantic search over saved long-term memories.")
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "recall".into(),
@@ -169,7 +173,7 @@ impl Tool for Recall {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
+                    "query": {"type": "string", "description": "Natural-language query to search saved memories for."},
                     "k": {"type": "integer", "minimum": 1}
                 },
                 "required": ["query"]
@@ -438,6 +442,31 @@ pub(crate) mod test_support {
             cancel: tokio_util::sync::CancellationToken::new(),
             sandbox: Arc::new(agent_tools::HostExecutor),
         }
+    }
+}
+
+#[cfg(test)]
+mod recall_contract_tests {
+    use super::*;
+    use crate::config::MemoryConfig;
+    use crate::embedder::StubEmbedder;
+    use crate::store::InMemoryStore;
+
+    #[test]
+    fn recall_carries_disambiguation_and_described_query() {
+        let rec = Recall {
+            embedder: std::sync::Arc::new(StubEmbedder::d384()),
+            store: std::sync::Arc::new(InMemoryStore::new()),
+            cfg: std::sync::Arc::new(MemoryConfig::default()),
+            project_key: "A".into(),
+        };
+        // Confusable contract present in the curated list AND on the tool.
+        assert!(agent_tools::CONFUSABLE_TOOLS.contains(&"recall"));
+        let wntc = rec.when_not_to_call().expect("recall must disambiguate vs context_recall");
+        assert!(wntc.contains("context_recall"), "prose names the sibling: {wntc}");
+        // Required param `query` is described.
+        assert!(agent_tools::required_params_missing_description(&rec.schema()).is_empty(),
+            "recall.query must have a description");
     }
 }
 
