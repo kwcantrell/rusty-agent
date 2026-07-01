@@ -206,12 +206,12 @@ stands alone.
   cross-referencing them where relevant.
 
 ## Source recovery
-The whitepaper PDF (authoritative spine) is at Google Drive file id
-`1IR7CddF_2FyQo_PdfBNTaEA50EGiVt2r`
-(`https://drive.google.com/uc?export=download&id=1IR7CddF_2FyQo_PdfBNTaEA50EGiVt2r`). The
-implementation plan can re-fetch and re-extract verbatim quotes from it as needed; the
-sections used here are pp. 6-10 (intro/agent loop), 15-18 (context engineering), 26-35
-(harness engineering + roles).
+The whitepaper PDF (authoritative spine) is **vendored in-repo** at
+`docs/superpowers/context/the-new-sdlc-with-vibe-coding-google-2026.pdf` (~10 MB). The
+implementation plan reads/quotes it directly — no network needed. Sections used: pp. 6-10
+(intro/agent loop), 15-18 (context engineering), 26-35 (harness engineering + roles).
+Original source: Google Drive id `1IR7CddF_2FyQo_PdfBNTaEA50EGiVt2r`
+(`https://drive.google.com/uc?export=download&id=1IR7CddF_2FyQo_PdfBNTaEA50EGiVt2r`).
 
 ## Open follow-ups (not blocking this skill)
 The deep-research thinly covered error-recovery/retry, guardrails/permission tiers, and
