@@ -34,6 +34,10 @@ pub struct Session {
     approval: Arc<IpcApprovalChannel>,
     active: Arc<Mutex<Option<CancellationToken>>>,
     recall_budget: usize,
+    /// The live workspace for this session. `set_workspace` updates only this copy
+    /// (so memory scope + skills follow the current workspace); it intentionally does
+    /// NOT touch `RuntimeState`'s own workspace, which the run loop owns. Do not "sync"
+    /// them — the divergence is by design.
     workspace: Mutex<PathBuf>,
     memory_parts: Option<agent_memory::MemoryParts>,
 }
@@ -158,7 +162,12 @@ impl Session {
 
     pub async fn skill_get(&self, name: String) -> Result<SkillDto, String> {
         let reg = self.skill_registry();
-        let s = reg.find(&name).ok_or_else(|| format!("skill not found: {name}"))?;
+        // Normalize to a slug for lookup (ignore errors), then fall through to the raw
+        // name so non-slug callers still resolve.
+        let slug = agent_skills::sanitize_slug(&name).ok();
+        let s = slug.as_deref().and_then(|sl| reg.find(sl))
+            .or_else(|| reg.find(&name))
+            .ok_or_else(|| format!("skill not found: {name}"))?;
         Ok(SkillDto {
             name: s.name,
             description: s.description,
@@ -178,6 +187,7 @@ impl Session {
             .or_else(|| reg.find(&slug))
             .map(|s| s.description)
             .unwrap_or_else(|| format!("{slug} skill"));
+        let desc = desc.replace('\n', " "); // frontmatter is single-line; harden interpolation
         let md = format!("---\nname: {slug}\ndescription: {desc}\n---\n{body}\n");
         std::fs::write(dir.join("SKILL.md"), md).map_err(|e| e.to_string())?;
         Ok(())

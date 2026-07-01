@@ -66,32 +66,34 @@ impl MemoryAdmin {
         }).collect())
     }
 
+    /// Full record iff it exists AND is editable in this scope. `Ok(None)` for both
+    /// "missing" and "out of scope" — callers cannot distinguish the two, so we never
+    /// leak that an out-of-scope record exists.
+    async fn fetch_editable(&self, id: &str) -> Result<Option<MemoryRecord>, StoreError> {
+        Ok(match self.store.get(id).await? {
+            Some(rec) if self.editable(&rec.scope) => Some(rec),
+            _ => None,
+        })
+    }
+
     pub async fn get(&self, id: &str) -> Result<Option<MemoryRow>, StoreError> {
-        match self.store.get(id).await? {
-            Some(rec) if self.editable(&rec.scope) => Ok(Some(MemoryRow {
-                id: rec.id, text: rec.text, tags: rec.tags,
-                scope_kind: rec.scope.kind().into(), updated_at: rec.updated_at,
-            })),
-            Some(_) => Err(StoreError::Io("refused: record belongs to another project".into())),
-            None => Ok(None),
-        }
+        Ok(self.fetch_editable(id).await?.map(|rec| MemoryRow {
+            id: rec.id, text: rec.text, tags: rec.tags,
+            scope_kind: rec.scope.kind().into(), updated_at: rec.updated_at,
+        }))
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool, StoreError> {
-        match self.store.get(id).await? {
-            Some(rec) if self.editable(&rec.scope) => self.store.delete(id).await,
-            Some(_) => Err(StoreError::Io("refused: record belongs to another project".into())),
+        match self.fetch_editable(id).await? {
+            Some(_) => self.store.delete(id).await,
             None => Ok(false),
         }
     }
 
     pub async fn update(&self, id: &str, text: Option<String>, tags: Option<Vec<String>>)
         -> Result<MemoryRow, StoreError> {
-        let mut rec = self.store.get(id).await?
+        let mut rec = self.fetch_editable(id).await?
             .ok_or_else(|| StoreError::Io("not found".into()))?;
-        if !self.editable(&rec.scope) {
-            return Err(StoreError::Io("refused: record belongs to another project".into()));
-        }
         if let Some(t) = text {
             rec.vector = self.embedder.embed(&[t.clone()]).await
                 .map_err(|e| StoreError::Io(e.to_string()))?.remove(0);
@@ -113,7 +115,10 @@ impl MemoryAdmin {
             Ok(hits) => hits.into_iter().map(|h| ScoredRow {
                 id: h.record.id, text: h.record.text, score: h.score,
                 scope_kind: h.record.scope.kind().into() }).collect(),
-            Err(_) => Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "recall_preview failed; returning no results");
+                Vec::new()
+            }
         }
     }
 }
@@ -216,7 +221,7 @@ mod admin_tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn admin_lists_and_refuses_cross_project_delete() {
+    async fn admin_lists_and_hides_cross_project_records() {
         use crate::{Embedder, InMemoryStore, MemoryConfig, MemoryRecord, MemoryScope, StubEmbedder};
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
         let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
@@ -226,10 +231,12 @@ mod admin_tests {
             created_at: 1, updated_at: 1, source: "t".into() }).await.unwrap();
         let admin = MemoryAdmin::new(embedder, store, Arc::new(MemoryConfig::default()),
             MemoryScope::Project("MINE".into()));
-        // Cross-project record is not listed in MINE's scope and cannot be deleted.
+        // A cross-project record is invisible AND indistinguishable from missing:
+        // no method leaks that it exists.
         assert!(admin.list(20, 0).await.unwrap().is_empty());
-        assert!(admin.delete("x").await.is_err());
-        assert!(admin.update("x", Some("new text".into()), None).await.is_err());
+        assert!(admin.get("x").await.unwrap().is_none());          // Ok(None), not Err
+        assert_eq!(admin.delete("x").await.unwrap(), false);       // silent no-op, not Err
+        assert!(admin.update("x", Some("new text".into()), None).await.is_err()); // "not found"
     }
 }
 
