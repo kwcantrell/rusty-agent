@@ -236,7 +236,9 @@ mod tests {
         assert!(floor("ls -la").is_none());
         assert!(floor("git status").is_none());
         assert!(floor("make build").is_none());   // 'mk' prefix must not trip mkfs
-        assert!(floor("cat mkfs-notes.txt").is_none()); // 'mkfs' as an arg substring is fine (not in denylist)
+        // 'mkfs' as an arg substring passes only because THIS test's denylist omits "mkfs";
+        // the real HARD_FLOOR_DENYLIST contains "mkfs", so the backstop denies this in prod.
+        assert!(floor("cat mkfs-notes.txt").is_none());
     }
 
     #[test]

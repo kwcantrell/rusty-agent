@@ -32,9 +32,11 @@ impl ApprovalChannel for TerminalApproval {
         //
         // NOTE: std's blocking `read_line` cannot be cancelled, so on timeout the
         // spawned thread is orphaned — it stays parked on stdin until the next line or
-        // EOF arrives, then its result is discarded. Harmless: one idle thread, and the
-        // agent is no longer blocked. A clean cancel would need raw-fd polling, not worth
-        // the complexity for a CLI approval prompt.
+        // EOF arrives, then its result is discarded. Harmless: one idle thread per
+        // elapsed prompt (bounded by tokio's blocking pool), and the agent is no longer
+        // blocked. The approval loop prompts one at a time, so this does not accumulate
+        // in practice. A clean cancel would need raw-fd polling, not worth the
+        // complexity for a CLI approval prompt.
         let summary = req.intent.summary.clone();
         let handle = tokio::task::spawn_blocking(move || {
             print!("\n\x1b[35mAllow:\x1b[0m {summary} ? [y]es / [n]o / [a]lways: ");
@@ -82,8 +84,10 @@ mod tests {
 
     #[tokio::test]
     async fn denies_when_timeout_elapses() {
-        // A ~1ms timeout with no stdin input drives the timeout branch and returns Deny
-        // promptly (the blocking read parks; the timeout fires first).
+        // A ~1ms timeout returns Deny promptly. Which arm fires is env-dependent: with a
+        // blocking terminal stdin the read parks and the `Err(_elapsed)` timeout arm fires;
+        // under a closed/EOF stdin (e.g. `cargo test` in CI) `read_line` returns Ok(0) and
+        // the `_ => Deny` arm fires first. Both resolve to Deny — which is all we assert.
         let ch = TerminalApproval::new(Duration::from_millis(1));
         let resp = ch.request(req()).await;
         assert!(matches!(resp, ApprovalResponse::Deny));
