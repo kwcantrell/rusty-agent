@@ -213,6 +213,13 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
                 CE::CompactionFailed { reason } => {
                     ("compaction_failed", serde_json::json!({"reason": reason}))
                 }
+                CE::Evicted {
+                    messages,
+                    est_tokens,
+                } => (
+                    "evicted",
+                    serde_json::json!({"messages": messages, "est_tokens": est_tokens}),
+                ),
             };
             ServerEvent::Context {
                 kind: kind.into(),
@@ -390,6 +397,19 @@ mod tests {
             assert_eq!(j["type"], "context");
             assert_eq!(j["kind"], kind);
         }
+    }
+
+    #[test]
+    fn evicted_context_event_maps_to_wire() {
+        let ev = AgentEvent::Context(agent_core::ContextEvent::Evicted {
+            messages: 7,
+            est_tokens: 1234,
+        });
+        let se = server_event_from(ev).expect("mapped");
+        let js = serde_json::to_value(&se).unwrap();
+        assert_eq!(js["kind"], "evicted");
+        assert_eq!(js["detail"]["messages"], 7);
+        assert_eq!(js["detail"]["est_tokens"], 1234);
     }
 
     #[test]

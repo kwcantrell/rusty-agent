@@ -122,6 +122,8 @@ impl EventSink for TerminalSink {
                     CE::Compacted { turns_replaced, tokens_before, tokens_after } =>
                         format!("⟲ compacted {turns_replaced} turns: {tokens_before} → {tokens_after} tokens"),
                     CE::CompactionFailed { reason } => format!("⚠ compaction failed: {reason}"),
+                    CE::Evicted { messages, est_tokens } =>
+                        format!("⟲ evicted {messages} messages (~{est_tokens} tokens)"),
                 };
                 let _ = writeln!(out, "\x1b[2m{note}\x1b[0m");
             }

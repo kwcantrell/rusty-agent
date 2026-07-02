@@ -29,6 +29,9 @@ pub struct CuratedContext {
     pub(crate) config: OffloadConfig,
     pub(crate) high_water_pct: f32,
     pub(crate) compact_flag: Arc<AtomicBool>,
+    /// Message count omitted by eviction at the last maintain pass; dedups
+    /// repeated identical Evicted events while the window stays saturated.
+    last_evicted: usize,
 }
 
 impl CuratedContext {
@@ -48,6 +51,7 @@ impl CuratedContext {
             config: OffloadConfig::default(),
             high_water_pct: DEFAULT_HIGH_WATER_PCT,
             compact_flag,
+            last_evicted: 0,
         }
     }
 
@@ -170,62 +174,89 @@ impl ContextManager for CuratedContext {
             (used as f32) > (deps.model_limit as f32 * self.high_water_pct)
         };
         if (requested || over_high_water) && self.history.len() > self.config.keep_recent + 1 {
-            // Snap left to a unit boundary so the cut never separates a
-            // tool_calls parent from its results; the torn turn lands wholly
-            // in the recent window (keep_recent temporarily keeps a bit more).
-            let split = snap_split_to_unit_boundary(
-                &self.history,
-                self.history.len() - self.config.keep_recent,
-            );
-            let prior = self.compaction_summary.clone();
-            // User turns are durable, author-authored instructions — the facts most
-            // costly to lose. Keep them VERBATIM and never feed them to the lossy
-            // summarizer; only assistant/tool chatter in the old span is compacted, with
-            // the prior summary carried forward so re-compaction accumulates instead of
-            // collapsing to the most recent turn.
-            let (verbatim, to_summarize): (Vec<Message>, Vec<Message>) = self.history[..split]
-                .iter()
-                .cloned()
-                .partition(|m| matches!(m.role, Role::User));
-            // "Worthwhile" (non-empty AND a net token win) is judged against everything
-            // actually replaced: the prior summary plus the chatter being summarized.
-            let mut replaced: Vec<Message> = prior.iter().cloned().collect();
-            replaced.extend_from_slice(&to_summarize);
-            let tokens_before: usize = replaced.iter().map(message_tokens).sum();
-            // Nothing summarizable beyond the prior summary — the verbatim user turns are
-            // already the most compact faithful form, so don't burn a model call.
-            if to_summarize.is_empty() {
-                return report;
+            self.compact_old_span(deps, &mut report).await;
+        }
+
+        // (c) Eviction visibility — runs on EVERY maintain exit.
+        self.emit_eviction(deps);
+        report
+    }
+}
+
+impl CuratedContext {
+    /// Compact the old span into the pinned summary. Extracted from `maintain`
+    /// so its early exits cannot skip the eviction check that follows.
+    async fn compact_old_span(&mut self, deps: &MaintCtx<'_>, report: &mut MaintReport) {
+        // Snap left to a unit boundary so the cut never separates a
+        // tool_calls parent from its results; the torn turn lands wholly
+        // in the recent window (keep_recent temporarily keeps a bit more).
+        let split = snap_split_to_unit_boundary(
+            &self.history,
+            self.history.len() - self.config.keep_recent,
+        );
+        let prior = self.compaction_summary.clone();
+        // User turns are durable, author-authored instructions — the facts most
+        // costly to lose. Keep them VERBATIM and never feed them to the lossy
+        // summarizer; only assistant/tool chatter in the old span is compacted, with
+        // the prior summary carried forward so re-compaction accumulates instead of
+        // collapsing to the most recent turn.
+        let (verbatim, to_summarize): (Vec<Message>, Vec<Message>) = self.history[..split]
+            .iter()
+            .cloned()
+            .partition(|m| matches!(m.role, Role::User));
+        // "Worthwhile" (non-empty AND a net token win) is judged against everything
+        // actually replaced: the prior summary plus the chatter being summarized.
+        let mut replaced: Vec<Message> = prior.iter().cloned().collect();
+        replaced.extend_from_slice(&to_summarize);
+        let tokens_before: usize = replaced.iter().map(message_tokens).sum();
+        // Nothing summarizable beyond the prior summary — the verbatim user turns are
+        // already the most compact faithful form, so don't burn a model call.
+        if to_summarize.is_empty() {
+            return;
+        }
+        match run_compaction(&to_summarize, prior.as_ref(), deps.model, deps.cancel).await {
+            Ok(summary) if compaction_is_worthwhile(&summary, &replaced) => {
+                let tokens_after = message_tokens(&summary);
+                // Reassemble history: verbatim user instructions (chronological), then
+                // the recent window. The summarized chatter becomes the pinned summary.
+                let recent = self.history.split_off(split);
+                self.history = verbatim;
+                self.history.extend(recent);
+                self.compaction_summary = Some(summary);
+                report.compacted_turns = to_summarize.len();
+                deps.sink.emit(AgentEvent::Context(ContextEvent::Compacted {
+                    turns_replaced: to_summarize.len(),
+                    tokens_before,
+                    tokens_after,
+                }));
             }
-            match run_compaction(&to_summarize, prior.as_ref(), deps.model, deps.cancel).await {
-                Ok(summary) if compaction_is_worthwhile(&summary, &replaced) => {
-                    let tokens_after = message_tokens(&summary);
-                    // Reassemble history: verbatim user instructions (chronological), then
-                    // the recent window. The summarized chatter becomes the pinned summary.
-                    let recent = self.history.split_off(split);
-                    self.history = verbatim;
-                    self.history.extend(recent);
-                    self.compaction_summary = Some(summary);
-                    report.compacted_turns = to_summarize.len();
-                    deps.sink.emit(AgentEvent::Context(ContextEvent::Compacted {
-                        turns_replaced: to_summarize.len(),
-                        tokens_before,
-                        tokens_after,
+            Ok(_) => {
+                tracing::debug!("compaction not worthwhile; discarded");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "compaction failed; leaving history intact");
+                deps.sink
+                    .emit(AgentEvent::Context(ContextEvent::CompactionFailed {
+                        reason: e.to_string(),
                     }));
-                }
-                Ok(_) => {
-                    tracing::debug!("compaction not worthwhile; discarded");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "compaction failed; leaving history intact");
-                    deps.sink
-                        .emit(AgentEvent::Context(ContextEvent::CompactionFailed {
-                            reason: e.to_string(),
-                        }));
-                }
             }
         }
-        report
+    }
+
+    /// Emit `ContextEvent::Evicted` when the built window omits history
+    /// messages and the count changed since the last pass.
+    fn emit_eviction(&mut self, deps: &MaintCtx<'_>) {
+        let pinned_tokens: usize = self.pinned().iter().map(message_tokens).sum();
+        let budget = deps.model_limit.saturating_sub(pinned_tokens);
+        let start = evict_start(&self.history, budget);
+        if start > 0 && start != self.last_evicted {
+            let est_tokens: usize = self.history[..start].iter().map(message_tokens).sum();
+            deps.sink.emit(AgentEvent::Context(ContextEvent::Evicted {
+                messages: start,
+                est_tokens,
+            }));
+        }
+        self.last_evicted = start;
     }
 }
 
@@ -525,6 +556,70 @@ mod tests {
                 "orphan at model_limit={limit}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn maintain_emits_evicted_once_per_change() {
+        let mut c = ctx();
+        c.high_water_pct = 2.0; // compaction off; isolate eviction
+        for i in 0..30 {
+            c.append(Message::user(format!(
+                "filler message number {i} with padding text"
+            )));
+        }
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
+        let sink = Arc::new(CollectingSink::default());
+        let sink_dyn: Arc<dyn EventSink> = sink.clone();
+        let cancel = CancellationToken::new();
+        let mut deps = maint_deps(&model, &sink_dyn, &cancel);
+        deps.model_limit = 100; // tiny window → eviction certain
+        c.maintain(&deps).await;
+        let events = sink.events.lock().unwrap().clone();
+        let evicted: Vec<_> = events
+            .iter()
+            .filter(|e| e.starts_with("evicted:"))
+            .collect();
+        assert_eq!(
+            evicted.len(),
+            1,
+            "one Evicted on first saturated pass: {events:?}"
+        );
+
+        // Same state → same count → no duplicate event.
+        c.maintain(&deps).await;
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(
+            events.iter().filter(|e| e.starts_with("evicted:")).count(),
+            1,
+            "unchanged eviction count must not re-emit"
+        );
+
+        // More history → count changes → re-emit.
+        c.append(Message::user(
+            "one more message with plenty of padding here",
+        ));
+        c.maintain(&deps).await;
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(
+            events.iter().filter(|e| e.starts_with("evicted:")).count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn maintain_emits_nothing_under_budget() {
+        let mut c = ctx();
+        c.append(Message::user("hello"));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
+        let sink = Arc::new(CollectingSink::default());
+        let sink_dyn: Arc<dyn EventSink> = sink.clone();
+        let cancel = CancellationToken::new();
+        c.maintain(&maint_deps(&model, &sink_dyn, &cancel)).await;
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e.starts_with("evicted:")),
+            "no Evicted under budget: {events:?}"
+        );
     }
 
     #[tokio::test]

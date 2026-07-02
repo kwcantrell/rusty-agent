@@ -2,7 +2,7 @@ use agent_model::StopReason;
 use agent_policy::ApprovalRequest;
 use agent_tools::ToolOutput;
 
-/// Telemetry for context-window curation (offload / compaction).
+/// Telemetry for context-window curation (offload / compaction / eviction).
 #[derive(Debug, Clone)]
 pub enum ContextEvent {
     Offloaded {
@@ -17,6 +17,13 @@ pub enum ContextEvent {
     },
     CompactionFailed {
         reason: String,
+    },
+    /// Plain window eviction omitted history messages from the built request
+    /// (distinct from offload/compaction, which transform rather than drop).
+    /// `est_tokens` uses the same estimate the window evicts against.
+    Evicted {
+        messages: usize,
+        est_tokens: usize,
     },
 }
 

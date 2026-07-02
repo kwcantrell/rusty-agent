@@ -187,6 +187,9 @@ impl EventSink for CollectingSink {
             AgentEvent::Context(ContextEvent::CompactionFailed { .. }) => {
                 "compaction_failed".into()
             }
+            AgentEvent::Context(ContextEvent::Evicted { messages, .. }) => {
+                format!("evicted:{messages}")
+            }
             AgentEvent::SandboxDegraded { mechanism, .. } => {
                 format!("sandbox_degraded:{mechanism}")
             }

@@ -25,6 +25,15 @@ describe("cluster-2 observability frames", () => {
     expect((last as { text: string }).text).toContain("compacted 3 turns");
   });
 
+  it("renders an evicted context marker", () => {
+    const s = reduce(initialState([]), { type: "frame",
+      frame: frame({ type: "context", kind: "evicted",
+        detail: { messages: 7, est_tokens: 1234 } }) });
+    const item = s.items.find((i) => i.kind === "context");
+    expect((item as { text: string } | undefined)?.text)
+      .toBe("evicted 7 messages (~1234 tokens)");
+  });
+
   it("marks a failed tool result with status and duration", () => {
     let s = reduce(initialState([]), { type: "frame",
       frame: frame({ type: "tool_start", id: "c1", name: "read_file", args: {} }) });

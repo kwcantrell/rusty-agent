@@ -273,6 +273,13 @@ fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
                 kind: "compaction_failed",
                 detail: serde_json::json!({"reason": reason}),
             },
+            ContextEvent::Evicted {
+                messages,
+                est_tokens,
+            } => TraceEvent::Context {
+                kind: "evicted",
+                detail: serde_json::json!({"messages": messages, "est_tokens": est_tokens}),
+            },
         },
         AgentEvent::SandboxDegraded { mechanism, reason } => {
             TraceEvent::SandboxDegraded { mechanism, reason }
