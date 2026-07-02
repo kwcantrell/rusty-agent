@@ -594,6 +594,37 @@ literals to touch on any future field. Session discovery queued to drain cluster
 `agent-cli approval::denies_when_timeout_elapses` parks a thread on real stdin — under an
 open-pipe stdin, tokio teardown wedges the whole test binary (observed 874 s); make it hermetic.
 
+Re-stamp note (2026-07-02, small-residuals sweep — **BACKLOG DRAIN COMPLETE, 6/6**): the
+accumulated small accepted-residuals from all prior clusters are now **fixed and merged to
+`main`** (4 commits, `9e44ed6..39932bf`, merge `92fbad6`; spec
+`docs/superpowers/specs/2026-07-02-small-residuals-sweep-design.md`, items S1-S13). Trace files
+created 0600 (unix); dead web `ToolCall.tsx` deleted; `use_skill` listings cap at 50/section with
+an "…and N more" marker; retry backoff gained bounded jitter (+≤25%) and honors integer-seconds
+`Retry-After` (capped 30 s, `ModelError::Status.retry_after`); `Evicted` dedup keys on
+`(messages, est_tokens)`; claude-cli spawns without `AGENT_API_KEY` and folds
+cache_read/cache_creation into `prompt_tokens` (cluster-3 calibration no longer inert on that
+backend); `enforce` refusals carry the actionable copy; duplicate tool-name registration warns
+(last-wins kept); memory tools' optional params are described; non-cloning `pinned_tokens()`;
+the snapshot memory segment reports the capped recall block the context actually injects; a
+compose-time warn fires when the static prompt exceeds a quarter of the window; and the
+`denies_when_timeout_elapses` test is hermetic (open-stdin wedge: 874 s → 0.5 s, reproduced by
+review). Accepted residuals (merge-clean, cosmetic): snapshot memory est is content-only
+(±4 tokens vs siblings); the S12 warn's "composed" wording also covers the Err-fallback prompt;
+`remember` tags/scope descriptions not contract-asserted; HTTP-date `Retry-After` ignored
+(pinned); last-wins duplicate registration by design.
+
+**2026-07 BACKLOG DRAIN — CLOSED.** All six clusters merged: 1 Instructions (`bc8934e`),
+2 Loop robustness (`f419188`), 3 Calibrated budgeting (`ae3750d`), 4 git --output arg-scan
+(`669972d`), 5 Eval flywheel (`7f7c601`), 6 Small-residuals sweep (`92fbad6`). Every finding,
+build opportunity, and deferred-work residual from
+`docs/superpowers/audits/2026-07-01-harness-deep-audit.md` is now either FIXED, explicitly
+ACCEPTED-BY-DESIGN (triage list in the drain ledger / `harness-backlog-drain-2026-07` memory),
+or parked as a named PRODUCT DECISION awaiting the human (git-tool consolidation, persisted
+OffloadStore, example auto-injection, CandidateConfig widening, catalog inlining, post-exec
+validator hook, graceful max_turns landing, max_parallel_tools→RuntimeConfig, live trace toggle,
+dd-redirection parity, lexical/FS split of the read-boundary hook). The next audit run starts
+from a genuinely clean slate.
+
 ---
 
 ## Top highest-leverage fixes
