@@ -844,14 +844,20 @@ mod tests {
     fn default_allowlist_is_subcommand_aware_for_exec_capable_programs() {
         let al = crate::default_allowlist();
         // Read-safe subcommands stay frictionless.
-        assert!(agent_policy::is_auto_allowed("git status --porcelain -b", &al));
+        assert!(agent_policy::is_auto_allowed(
+            "git status --porcelain -b",
+            &al
+        ));
         // NOTE: `git diff HEAD~1` from the plan can't be auto-allowed — `~` is a
         // SHELL_SIGNIFICANT char (pre-existing agent-policy behavior, out of scope
         // here), so any command containing it goes to Ask. Use a shell-safe argument
         // that exercises the same "read-safe `git diff` subcommand is frictionless" intent.
         assert!(agent_policy::is_auto_allowed("git diff HEAD", &al));
         assert!(agent_policy::is_auto_allowed("git log --oneline -5", &al));
-        assert!(agent_policy::is_auto_allowed("cargo test -p agent-core", &al));
+        assert!(agent_policy::is_auto_allowed(
+            "cargo test -p agent-core",
+            &al
+        ));
         assert!(agent_policy::is_auto_allowed("ls -la", &al));
         // Destructive / unlisted forms are no longer auto-allowed (audit Top-10 #9).
         assert!(!agent_policy::is_auto_allowed("git push --force", &al));

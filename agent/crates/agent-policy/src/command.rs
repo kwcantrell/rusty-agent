@@ -245,7 +245,10 @@ pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
         let want: Vec<&str> = entry.split_whitespace().collect();
         !want.is_empty()
             && want.len() <= tokens.len()
-            && want.iter().zip(tokens.iter()).all(|(w, t)| *w == t.as_str())
+            && want
+                .iter()
+                .zip(tokens.iter())
+                .all(|(w, t)| *w == t.as_str())
     })
 }
 
