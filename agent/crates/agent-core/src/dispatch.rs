@@ -1,7 +1,14 @@
 //! Sub-agent dispatch: sub-agents-as-tools (spec 2026-07-01-subagent-dispatch-core).
-use crate::{AgentEvent, EventSink};
-use agent_model::StopReason;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::{
+    AgentEvent, AgentLoop, CuratedContext, EventSink, InMemoryOffloadStore, LoopConfig,
+    OffloadConfig,
+};
+use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
+use agent_policy::{ApprovalChannel, PolicyEngine};
+use agent_tools::{
+    Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema,
+};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Appended to the parent's composed system prompt for every child.
@@ -114,6 +121,211 @@ impl EventSink for SubagentSink {
             // business, not the parent transcript's).
             _ => {}
         }
+    }
+}
+
+/// Everything `DispatchAgentTool` needs to spawn a child `AgentLoop`.
+pub struct DispatchDeps {
+    pub model: Arc<dyn ModelClient>,
+    pub protocol: Arc<dyn ToolCallProtocol>,
+    pub policy: Arc<dyn PolicyEngine>,
+    pub approval: Arc<dyn ApprovalChannel>,
+    /// The parent's (Observed) sink — forwarded child events reach stats/trace/UI.
+    pub sink: Arc<dyn EventSink>,
+    /// Snapshot of the parent's tools taken BEFORE dispatch_agent and the
+    /// parent's context tools were registered (spec D4: structural depth-1).
+    pub base_tools: Vec<Arc<dyn Tool>>,
+    pub child_system_prompt: String,
+    /// Parent LoopConfig clone with max_turns = subagent_max_turns (shares the
+    /// parent's sandbox Arc — spec Invariant).
+    pub loop_config: LoopConfig,
+    pub max_result_bytes: usize,
+    pub subagent_timeout: std::time::Duration,
+}
+
+pub struct DispatchAgentTool {
+    deps: DispatchDeps,
+}
+
+impl DispatchAgentTool {
+    pub fn new(deps: DispatchDeps) -> Self {
+        Self { deps }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for DispatchAgentTool {
+    fn name(&self) -> &str {
+        "dispatch_agent"
+    }
+    fn description(&self) -> &str {
+        "Delegate an independent, multi-step subtask to an isolated sub-agent with \
+         its own fresh context window. The sub-agent has the same permissions and \
+         tools as you (minus dispatch_agent itself), works autonomously on the \
+         prompt you give it, and its final answer is returned as this tool's \
+         result. Make the prompt self-contained: the sub-agent cannot see this \
+         conversation."
+    }
+    fn when_not_to_call(&self) -> Option<&str> {
+        Some(
+            "Do NOT use for a single operation another tool does directly — call \
+             that tool. Do not use when the answer depends on this conversation's \
+             context (the sub-agent cannot see it), and do not expect it to ask \
+             you questions — it runs unattended.",
+        )
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "dispatch_agent".into(),
+            description: self.description().into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The complete, self-contained task for the sub-agent: goal, relevant paths/facts, and what to return."
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way."
+                    }
+                },
+                "required": ["prompt"]
+            }),
+        }
+    }
+    fn timeout_override(&self) -> Option<std::time::Duration> {
+        Some(self.deps.subagent_timeout)
+    }
+    fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        let head: String = prompt.chars().take(80).collect();
+        // Read: spawning computation is not an effect — every effectful child
+        // action is gated by the same policy + approval as the parent (spec D3).
+        Ok(ToolIntent {
+            tool: "dispatch_agent".into(),
+            access: Access::Read,
+            paths: vec![],
+            command: None,
+            summary: format!("dispatch sub-agent: {head}"),
+        })
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .filter(|p| !p.trim().is_empty())
+            .ok_or_else(|| ToolError::InvalidArgs("prompt (non-empty string) is required".into()))?
+            .to_string();
+        let allow: Option<Vec<String>> = match args.get("tools") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(a)) => Some(
+                a.iter()
+                    .map(|v| {
+                        v.as_str().map(str::to_string).ok_or_else(|| {
+                            ToolError::InvalidArgs("tools must be an array of strings".into())
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(_) => {
+                return Err(ToolError::InvalidArgs(
+                    "tools must be an array of strings".into(),
+                ))
+            }
+        };
+        if let Some(names) = &allow {
+            let available: Vec<&str> = self.deps.base_tools.iter().map(|t| t.name()).collect();
+            for n in names {
+                if !available.contains(&n.as_str()) {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "unknown tool '{n}'; available: {}",
+                        available.join(", ")
+                    )));
+                }
+            }
+        }
+
+        // Child registry: (filtered) base snapshot + child-bound context tools.
+        // dispatch_agent is structurally absent (spec D4: no recursion).
+        let mut reg = ToolRegistry::new();
+        for t in &self.deps.base_tools {
+            if allow
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|n| n == t.name()))
+            {
+                reg.register(t.clone());
+            }
+        }
+        let store: Arc<dyn crate::OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        for t in crate::context_tools(store.clone(), flag.clone(), self.deps.max_result_bytes) {
+            reg.register(t);
+        }
+        let mut child_ctx = CuratedContext::new(
+            Message::system(self.deps.child_system_prompt.clone()),
+            store,
+            flag,
+        )
+        .with_offload_config(OffloadConfig {
+            max_result_bytes: self.deps.max_result_bytes,
+            ..OffloadConfig::default()
+        });
+
+        let sink = Arc::new(SubagentSink::new(self.deps.sink.clone(), next_dispatch_n()));
+        let child = AgentLoop::new(
+            self.deps.model.clone(),
+            self.deps.protocol.clone(),
+            Arc::new(reg),
+            self.deps.policy.clone(),
+            self.deps.approval.clone(),
+            sink.clone(),
+            self.deps.loop_config.clone(),
+        );
+
+        // Parent cancel propagates down; child self-cancel never travels up (D8).
+        let child_cancel = ctx.cancel.child_token();
+        let run = child.run_with_cancel(&mut child_ctx, prompt, child_cancel.clone());
+        match tokio::time::timeout(ctx.timeout, run).await {
+            Err(_elapsed) => {
+                child_cancel.cancel();
+                return Err(ToolError::Timeout);
+            }
+            Ok(Err(e)) => {
+                return Err(ToolError::Failed {
+                    message: format!("sub-agent failed: {e}"),
+                    stderr: None,
+                })
+            }
+            Ok(Ok(())) => {}
+        }
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Failed {
+                message: "sub-agent cancelled".into(),
+                stderr: None,
+            });
+        }
+
+        let s = sink.summary();
+        let mut content = s.final_text;
+        if matches!(s.stop, Some(StopReason::BudgetExhausted)) {
+            content = format!("[sub-agent hit its turn budget before finishing]\n{content}");
+        }
+        let stop = s.stop.unwrap_or(StopReason::Stop);
+        content.push_str(&format!(
+            "\n\n[sub-agent: {} turns, {} tool calls, stop: {stop:?}]",
+            s.turns, s.tool_calls
+        ));
+        Ok(ToolOutput {
+            content,
+            display: None,
+        })
     }
 }
 
