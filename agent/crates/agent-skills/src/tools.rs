@@ -55,7 +55,12 @@ impl Tool for ListSkills {
         }
         let mut content = String::from("Available skills (load one with use_skill):\n");
         for s in &skills {
-            content.push_str(&format!("- {}: {}\n", s.name, s.description));
+            let mark = match s.examples.len() {
+                0 => String::new(),
+                1 => " [1 example]".to_string(),
+                n => format!(" [{n} examples]"),
+            };
+            content.push_str(&format!("- {}: {}{mark}\n", s.name, s.description));
         }
         Ok(ToolOutput {
             content,
@@ -121,15 +126,44 @@ impl Tool for UseSkill {
             ))
         })?;
         let mut content = format!("# Skill: {}\n\n{}\n", skill.name, skill.body);
-        if skill.files.is_empty() {
-            content.push_str("\n(No bundled files.)\n");
-        } else {
-            content.push_str("\n## Bundled files\n");
-            for f in &skill.files {
-                content.push_str(&format!("- {}\n", f.display()));
+        let rel = |p: &std::path::Path| {
+            p.strip_prefix(&skill.dir)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| p.to_string_lossy().into_owned())
+        };
+        if !skill.examples.is_empty() {
+            content.push_str(&format!(
+                "\n## Examples (worked exemplars, dir: {})\n",
+                skill.dir.display()
+            ));
+            for p in &skill.examples {
+                content.push_str(&format!("- {}\n", rel(p)));
             }
             content.push_str(
-                "\nRead a bundled file with read_skill_file; run a bundled script with execute_command.\n",
+                "Read one with read_skill_file and imitate its shape and conventions; \
+                 do not copy content verbatim.\n",
+            );
+        }
+        let others: Vec<&std::path::PathBuf> = skill
+            .files
+            .iter()
+            .filter(|p| !skill.examples.contains(p))
+            .collect();
+        if others.is_empty() {
+            if skill.examples.is_empty() {
+                content.push_str("\n(No bundled files.)\n");
+            }
+        } else {
+            content.push_str(&format!(
+                "\n## Bundled files (dir: {})\n",
+                skill.dir.display()
+            ));
+            for p in others {
+                content.push_str(&format!("- {}\n", rel(p)));
+            }
+            content.push_str(
+                "Read a bundled file with read_skill_file (paths above are relative, as it \
+                 expects); run a bundled script with execute_command using the dir above.\n",
             );
         }
         Ok(ToolOutput {
@@ -156,7 +190,7 @@ impl Tool for CreateSkill {
         "create_skill"
     }
     fn description(&self) -> &str {
-        "Author a new reusable skill (SKILL.md + optional bundled files) under the writable skills directory."
+        "Author a new reusable skill (SKILL.md + optional bundled files) under the writable skills directory. Put worked exemplars under examples/ — they surface to consumers as a distinct Examples section with imitate-don't-copy guidance."
     }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -170,7 +204,7 @@ impl Tool for CreateSkill {
                     "body": { "type": "string", "description": "Markdown instructions." },
                     "files": {
                         "type": "array",
-                        "description": "Optional bundled files.",
+                        "description": "Optional bundled files. Files under examples/ are surfaced as worked exemplars.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -573,5 +607,223 @@ mod tests {
             .unwrap();
         assert!(matches!(intent.access, Access::Write));
         assert!(intent.paths[0].ends_with("greeter"));
+    }
+
+    /// Build a registry whose single skill "demo" carries the given nested
+    /// bundled files (paths relative to the skill dir). Mirrors `reg_with_skill`
+    /// but creates intermediate directories so `examples/` subtrees exist.
+    fn reg_with_nested_skill(name: &str, files: &[(&str, &str)]) -> (Arc<SkillRegistry>, TempDir) {
+        let dir = tempdir().unwrap();
+        let sdir = dir.path().join(name);
+        fs::create_dir_all(&sdir).unwrap();
+        fs::write(
+            sdir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d\n---\nbody"),
+        )
+        .unwrap();
+        for (rel, content) in files {
+            let full = sdir.join(rel);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(full, content).unwrap();
+        }
+        let reg = Arc::new(SkillRegistry::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().to_path_buf(),
+        ));
+        (reg, dir)
+    }
+
+    #[tokio::test]
+    async fn use_skill_renders_examples_section_and_relative_bundled_paths() {
+        let (reg, _tmp) = reg_with_nested_skill(
+            "demo",
+            &[("examples/a.md", "EX"), ("references/r.md", "REF")],
+        );
+        let out = UseSkill::new(reg)
+            .execute(json!({"name": "demo"}), &ctx())
+            .await
+            .unwrap();
+        let c = &out.content;
+        // Examples section, relative path, contract line:
+        assert!(c.contains("## Examples (worked exemplars"), "{c}");
+        assert!(c.contains("- examples/a.md"), "{c}");
+        assert!(c.contains("imitate its shape and conventions"), "{c}");
+        assert!(c.contains("do not copy content verbatim"), "{c}");
+        // Bundled section: relative path, dir in header, examples EXCLUDED:
+        assert!(c.contains("## Bundled files (dir: "), "{c}");
+        assert!(c.contains("- references/r.md"), "{c}");
+        let bundled = c.split("## Bundled files").nth(1).unwrap();
+        assert!(
+            !bundled.contains("examples/a.md"),
+            "examples double-listed: {c}"
+        );
+        // No absolute paths in the LISTS (the only absolute path is the dir header):
+        let after_body = c.split("## Examples").nth(1).unwrap();
+        for line in after_body.lines().filter(|l| l.starts_with("- ")) {
+            assert!(
+                !line.contains(_tmp.path().to_str().unwrap()),
+                "absolute path leaked: {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn use_skill_without_examples_has_no_examples_section() {
+        let (reg, _tmp) = reg_with_nested_skill("demo", &[("references/r.md", "REF")]);
+        let out = UseSkill::new(reg)
+            .execute(json!({"name": "demo"}), &ctx())
+            .await
+            .unwrap();
+        let c = &out.content;
+        assert!(!c.contains("## Examples"), "{c}");
+        assert!(c.contains("## Bundled files (dir: "), "{c}");
+        // Bundled list uses relative form; no absolute-path leak in `- ` lines
+        // (the only absolute path is the dir header).
+        assert!(c.contains("- references/r.md"), "{c}");
+        let after_header = c.split("## Bundled files").nth(1).unwrap();
+        for line in after_header.lines().filter(|l| l.starts_with("- ")) {
+            assert!(
+                !line.contains(_tmp.path().to_str().unwrap()),
+                "absolute path leaked: {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn use_skill_examples_only_carries_dir_and_no_bundled_section() {
+        // Examples present, no other bundled files: the Examples header must carry
+        // the skill dir (so a script-shaped exemplar is runnable) and there must be
+        // no "## Bundled files" section at all.
+        let (reg, _tmp) = reg_with_nested_skill("demo", &[("examples/run.sh", "echo hi")]);
+        let out = UseSkill::new(reg)
+            .execute(json!({"name": "demo"}), &ctx())
+            .await
+            .unwrap();
+        let c = &out.content;
+        assert!(c.contains("## Examples (worked exemplars"), "{c}");
+        assert!(c.contains("dir: "), "{c}");
+        assert!(c.contains("- examples/run.sh"), "{c}");
+        assert!(!c.contains("## Bundled files"), "{c}");
+    }
+
+    #[tokio::test]
+    async fn use_skill_no_files_at_all_states_empty() {
+        let (reg, _tmp) = reg_with_nested_skill("demo", &[]);
+        let out = UseSkill::new(reg)
+            .execute(json!({"name": "demo"}), &ctx())
+            .await
+            .unwrap();
+        let c = &out.content;
+        assert!(c.contains("(No bundled files.)"), "{c}");
+        assert!(!c.contains("## Examples"), "{c}");
+        assert!(!c.contains("## Bundled files"), "{c}");
+    }
+
+    #[tokio::test]
+    async fn list_skills_marks_example_bearing_skills() {
+        let dir = tempdir().unwrap();
+        for (name, has_ex) in [("withex", true), ("plain", false)] {
+            let sdir = dir.path().join(name);
+            fs::create_dir_all(&sdir).unwrap();
+            fs::write(
+                sdir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n---\nbody"),
+            )
+            .unwrap();
+            if has_ex {
+                fs::create_dir_all(sdir.join("examples")).unwrap();
+                fs::write(sdir.join("examples/a.md"), "EX").unwrap();
+            }
+        }
+        let reg = Arc::new(SkillRegistry::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().to_path_buf(),
+        ));
+        let out = ListSkills::new(reg)
+            .execute(json!({}), &ctx())
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("withex:") && out.content.contains("[1 example]"),
+            "{}",
+            out.content
+        );
+        let plain_line = out.content.lines().find(|l| l.contains("plain:")).unwrap();
+        assert!(!plain_line.contains("examples"), "{plain_line}");
+    }
+
+    #[tokio::test]
+    async fn create_skill_examples_round_trip_surfaces_the_section() {
+        let (reg, _d) = writable_reg();
+        CreateSkill::new(reg.clone())
+            .execute(
+                json!({"name": "authored", "description": "d", "body": "b",
+                       "files": [{"path": "examples/sample.md", "content": "EX"}]}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let out = UseSkill::new(reg)
+            .execute(json!({"name": "authored"}), &ctx())
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("## Examples (worked exemplars"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("- examples/sample.md"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn examples_flow_l1_marker_l2_section_l3_read() {
+        // One temp skill "flow" with examples/sample.md containing "EXEMPLAR BODY".
+        let (reg, _tmp) = reg_with_nested_skill("flow", &[("examples/sample.md", "EXEMPLAR BODY")]);
+        // L1: list marker.
+        let l1 = ListSkills::new(reg.clone())
+            .execute(json!({}), &ctx())
+            .await
+            .unwrap();
+        assert!(l1.content.contains("[1 example]"), "{}", l1.content);
+        // L2: use_skill Examples section with relative path.
+        let l2 = UseSkill::new(reg.clone())
+            .execute(json!({"name": "flow"}), &ctx())
+            .await
+            .unwrap();
+        assert!(
+            l2.content.contains("- examples/sample.md"),
+            "{}",
+            l2.content
+        );
+        // L3: read_skill_file returns the example body.
+        let l3 = ReadSkillFile::new(reg.clone())
+            .execute(
+                json!({"skill": "flow", "path": "examples/sample.md"}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(l3.content.contains("EXEMPLAR BODY"), "{}", l3.content);
+        // Confinement unchanged: escape still rejected.
+        let escape = ReadSkillFile::new(reg)
+            .execute(json!({"skill": "flow", "path": "../escape"}), &ctx())
+            .await;
+        assert!(escape.is_err(), "escape not rejected");
+    }
+
+    #[test]
+    fn create_skill_schema_teaches_the_examples_convention() {
+        let (reg, _d) = writable_reg();
+        let t = CreateSkill::new(reg);
+        let s = t.schema();
+        let text = serde_json::to_string(&s.parameters).unwrap();
+        assert!(text.contains("examples/"), "{text}");
+        assert!(t.description().contains("examples/"), "{}", t.description());
     }
 }

@@ -2,7 +2,8 @@ use crate::registry::SkillRegistry;
 
 /// Short note appended to every system prompt so the model knows skills exist.
 pub const SKILLS_AWARENESS: &str = "You have skills available — reusable instruction packages. \
-Call `list_skills` to see them and `use_skill` to load one before tackling a matching task.";
+Call `list_skills` to see them and `use_skill` to load one before tackling a matching task. \
+Some skills bundle worked examples — when a loaded skill lists them, read a relevant one before producing your first artifact of that kind.";
 
 /// Build the full system prompt: the base prompt, then the skills-awareness note,
 /// then the full body of each preset skill (preloaded so it is active from turn one).
@@ -56,6 +57,10 @@ mod tests {
         let out = compose_system_prompt("BASE", &reg, &[]).unwrap();
         assert!(out.starts_with("BASE"));
         assert!(out.contains(SKILLS_AWARENESS));
+        assert!(
+            SKILLS_AWARENESS.contains("worked examples"),
+            "{SKILLS_AWARENESS}"
+        );
     }
 
     #[test]
