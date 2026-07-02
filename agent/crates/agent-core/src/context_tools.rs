@@ -197,6 +197,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancel: CancellationToken::new(),
             sandbox: Arc::new(agent_tools::HostExecutor),
+            call_id: "test".into(),
         }
     }
 

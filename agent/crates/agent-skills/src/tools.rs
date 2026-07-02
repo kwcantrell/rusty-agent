@@ -360,6 +360,7 @@ mod tests {
             cancel: CancellationToken::new(),
             // stopgap; Task 3 replaces this with the config-driven strategy
             sandbox: std::sync::Arc::new(agent_tools::HostExecutor),
+            call_id: "test".into(),
         }
     }
 

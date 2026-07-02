@@ -137,6 +137,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancel: CancellationToken::new(),
             sandbox: Arc::new(crate::HostExecutor),
+            call_id: "test".into(),
         }
     }
 

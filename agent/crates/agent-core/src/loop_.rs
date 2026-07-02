@@ -690,6 +690,7 @@ impl AgentLoop {
             timeout: tool.timeout_override().unwrap_or(self.config.tool_timeout),
             cancel: cancel.clone(),
             sandbox: self.config.sandbox.clone(),
+            call_id: call.id.clone(),
         };
         GateOutcome::Ready(ReadyCall {
             tool,
@@ -2882,6 +2883,7 @@ mod tests {
             timeout,
             cancel: CancellationToken::new(),
             sandbox: Arc::new(agent_tools::HostExecutor),
+            call_id: "test".into(),
         }
     }
 

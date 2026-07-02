@@ -203,6 +203,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             cancel: CancellationToken::new(),
             sandbox: Arc::new(crate::HostExecutor),
+            call_id: "test".into(),
         }
     }
 
@@ -255,6 +256,7 @@ mod tests {
             sandbox: Arc::new(RecordingExecutor {
                 calls: calls.clone(),
             }),
+            call_id: "test".into(),
         };
         (ctx, calls)
     }

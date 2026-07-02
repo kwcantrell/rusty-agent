@@ -106,6 +106,7 @@ fn tool_ctx() -> ToolCtx {
         timeout: Duration::from_secs(600),
         cancel: CancellationToken::new(),
         sandbox: Arc::new(agent_tools::HostExecutor),
+        call_id: "d1".into(),
     }
 }
 
