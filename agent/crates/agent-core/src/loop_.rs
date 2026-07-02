@@ -715,8 +715,9 @@ impl AgentLoop {
                 // violated, drop the result rather than crash on untrusted input.
                 let (name, resolved) = match results.remove(&id) {
                     Some(v) => v,
-                    // Unreachable while normalize_tool_call_ids holds. If a future
-                    // change ever breaks the one-slot-per-id invariant, emit an error
+                    // Unreachable while normalize_tool_call_ids and
+                    // normalize_invalid_ids hold. If a future change ever breaks
+                    // the one-slot-per-id invariant, emit an error
                     // rather than silently drop the result and desync the transcript
                     // (an assistant tool_call with no matching tool message).
                     None => (
