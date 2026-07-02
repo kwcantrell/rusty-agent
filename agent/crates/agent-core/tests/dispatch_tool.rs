@@ -681,6 +681,94 @@ async fn parent_cancel_mid_run_resolves_to_cancelled_promptly() {
     );
 }
 
+/// Records every CompletionRequest's system message, then delegates to a script.
+struct CapturingModel {
+    inner: ScriptedModel,
+    systems: Mutex<Vec<String>>,
+}
+#[async_trait::async_trait]
+impl agent_model::ModelClient for CapturingModel {
+    async fn stream(
+        &self,
+        req: agent_model::CompletionRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<agent_model::Chunk, agent_model::ModelError>>,
+        agent_model::ModelError,
+    > {
+        if let Some(m) = req.messages.first() {
+            self.systems.lock().unwrap().push(m.content.clone());
+        }
+        self.inner.stream(req).await
+    }
+}
+
+#[tokio::test]
+async fn role_arg_lands_in_the_child_system_prompt() {
+    let model = Arc::new(CapturingModel {
+        inner: ScriptedModel::new(vec![Scripted::Text("ok".into())]),
+        systems: Mutex::new(vec![]),
+    });
+    let mut d = deps(
+        ScriptedModel::new(vec![]),
+        Arc::new(FullSink::default()),
+        vec![],
+    );
+    d.model = model.clone();
+    let tool = DispatchAgentTool::new(d);
+    tool.execute(
+        serde_json::json!({"prompt": "p", "role": "You are a meticulous code reviewer."}),
+        &tool_ctx(),
+    )
+    .await
+    .unwrap();
+    let systems = model.systems.lock().unwrap().clone();
+    assert!(
+        systems[0].contains("Role: You are a meticulous code reviewer."),
+        "{systems:?}"
+    );
+}
+
+#[tokio::test]
+async fn role_is_optional_and_bounded() {
+    let mk = || {
+        DispatchAgentTool::new(deps(
+            ScriptedModel::new(vec![Scripted::Text("ok".into())]),
+            Arc::new(FullSink::default()),
+            vec![],
+        ))
+    };
+    // Absent role: fine (no Role block asserted via the capturing test above).
+    mk().execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+    // Whitespace-only role: treated as absent (no error).
+    mk().execute(
+        serde_json::json!({"prompt": "p", "role": "   "}),
+        &tool_ctx(),
+    )
+    .await
+    .unwrap();
+    // Over 2000 chars: InvalidArgs.
+    let long = "r".repeat(2001);
+    let err = mk()
+        .execute(
+            serde_json::json!({"prompt": "p", "role": long}),
+            &tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ToolError::InvalidArgs(ref m) if m.contains("role")),
+        "{err:?}"
+    );
+    // Non-string role: InvalidArgs.
+    let err = mk()
+        .execute(serde_json::json!({"prompt": "p", "role": 7}), &tool_ctx())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+}
+
 #[tokio::test]
 async fn parallel_dispatches_get_distinct_ordinals_and_both_complete() {
     let sink = Arc::new(FullSink::default());

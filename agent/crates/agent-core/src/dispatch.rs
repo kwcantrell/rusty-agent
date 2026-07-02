@@ -17,6 +17,9 @@ agent to complete one self-contained task. Work autonomously: no one can answer 
 questions. Your final message is returned verbatim to the parent as the task \
 result, so end with a complete, standalone answer.";
 
+/// Upper bound on the `role` arg (system-prompt injection; spec G6).
+pub const MAX_ROLE_CHARS: usize = 2000;
+
 static DISPATCH_ORDINAL: AtomicU64 = AtomicU64::new(1);
 
 /// Process-wide dispatch ordinal: keeps forwarded child event ids unique across
@@ -245,6 +248,10 @@ impl Tool for DispatchAgentTool {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tools (context_recall, context_compact) are always available."
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Optional persona/role instructions injected into the sub-agent's system prompt (stronger steering than putting them in the prompt). Max 2000 characters."
                     }
                 },
                 "required": ["prompt"]
@@ -285,6 +292,22 @@ impl Tool for DispatchAgentTool {
             .filter(|p| !p.trim().is_empty())
             .ok_or_else(|| ToolError::InvalidArgs("prompt (non-empty string) is required".into()))?
             .to_string();
+        let role: Option<String> = match args.get("role") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else if s.chars().count() > MAX_ROLE_CHARS {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "role must be at most {MAX_ROLE_CHARS} characters"
+                    )));
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Some(_) => return Err(ToolError::InvalidArgs("role must be a string".into())),
+        };
         let allow: Option<Vec<String>> = match args.get("tools") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::Array(a)) => Some(
@@ -337,15 +360,15 @@ impl Tool for DispatchAgentTool {
         for t in crate::context_tools(store.clone(), flag.clone(), self.deps.max_result_bytes) {
             reg.register(t);
         }
-        let mut child_ctx = CuratedContext::new(
-            Message::system(self.deps.child_system_prompt.clone()),
-            store,
-            flag,
-        )
-        .with_offload_config(OffloadConfig {
-            max_result_bytes: self.deps.max_result_bytes,
-            ..OffloadConfig::default()
-        });
+        let system = match &role {
+            Some(r) => format!("{}\n\nRole: {r}", self.deps.child_system_prompt),
+            None => self.deps.child_system_prompt.clone(),
+        };
+        let mut child_ctx = CuratedContext::new(Message::system(system), store, flag)
+            .with_offload_config(OffloadConfig {
+                max_result_bytes: self.deps.max_result_bytes,
+                ..OffloadConfig::default()
+            });
 
         let sink = Arc::new(SubagentSink::new(
             self.deps.sink.clone(),
