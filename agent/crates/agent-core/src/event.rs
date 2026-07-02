@@ -75,11 +75,15 @@ pub enum AgentEvent {
         cost_usd: Option<f64>,
         turn_duration_ms: u64,
         turn: usize,
+        /// Set when this event belongs to a sub-agent: the dispatching
+        /// `dispatch_agent` call's id (spec 2026-07-02 E1/E2).
+        parent_id: Option<String>,
     },
     ToolStart {
         id: String,
         name: String,
         args: serde_json::Value,
+        parent_id: Option<String>,
     },
     /// duration_ms is 0 for gate-rejected calls that never executed.
     ToolResult {
@@ -88,6 +92,7 @@ pub enum AgentEvent {
         status: ToolStatus,
         output: ToolOutput,
         duration_ms: u64,
+        parent_id: Option<String>,
     },
     Approval(ApprovalRequest),
     Error(String),

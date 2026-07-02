@@ -18,6 +18,7 @@ struct TimeoutProbe {
     name: &'static str,
     override_secs: Option<u64>,
     seen: Mutex<Option<Duration>>,
+    seen_call_id: Mutex<Option<String>>,
 }
 #[async_trait::async_trait]
 impl Tool for TimeoutProbe {
@@ -48,6 +49,7 @@ impl Tool for TimeoutProbe {
     }
     async fn execute(&self, _a: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         *self.seen.lock().unwrap() = Some(ctx.timeout);
+        *self.seen_call_id.lock().unwrap() = Some(ctx.call_id.clone());
         Ok(ToolOutput {
             content: "ok".into(),
             display: None,
@@ -104,6 +106,7 @@ fn tool_ctx_uses_timeout_override_when_present() {
         name: "probe_a",
         override_secs: Some(555),
         seen: Mutex::new(None),
+        seen_call_id: Mutex::new(None),
     });
     run_probe(probe.clone());
     assert_eq!(*probe.seen.lock().unwrap(), Some(Duration::from_secs(555)));
@@ -115,7 +118,20 @@ fn tool_ctx_defaults_to_loop_tool_timeout() {
         name: "probe_b",
         override_secs: None,
         seen: Mutex::new(None),
+        seen_call_id: Mutex::new(None),
     });
     run_probe(probe.clone());
     assert_eq!(*probe.seen.lock().unwrap(), Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn tool_ctx_carries_the_model_call_id() {
+    let probe = Arc::new(TimeoutProbe {
+        name: "probe_c",
+        override_secs: None,
+        seen: Mutex::new(None),
+        seen_call_id: Mutex::new(None),
+    });
+    run_probe(probe.clone());
+    assert_eq!(probe.seen_call_id.lock().unwrap().as_deref(), Some("c1"));
 }

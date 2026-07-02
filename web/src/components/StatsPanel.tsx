@@ -14,6 +14,8 @@ export function StatsPanel({ stats }: { stats: SessionStats | null }) {
     ["Model time", `${(stats.turn_time_ms / 1000).toFixed(1)}s`],
     ["Context events", String(stats.context_events)],
   ];
+  if ((stats.subagent_tool_calls ?? 0) > 0 || (stats.subagent_turns ?? 0) > 0)
+    rows.push(["Sub-agent", `${stats.subagent_tool_calls ?? 0} calls / ${stats.subagent_turns ?? 0} turns`]);
   if (stats.cost_usd > 0) rows.push(["Cost", `$${stats.cost_usd.toFixed(4)}`]);
   return (
     <section aria-label="Session stats" className="space-y-1 text-sm">

@@ -721,6 +721,7 @@ pub(crate) mod test_support {
             timeout: std::time::Duration::from_secs(5),
             cancel: tokio_util::sync::CancellationToken::new(),
             sandbox: Arc::new(agent_tools::HostExecutor),
+            call_id: "test".into(),
         }
     }
 }

@@ -43,7 +43,62 @@ pub fn format_stats_line(s: &agent_core::SessionStats) -> String {
     if s.cost_usd > 0.0 {
         line.push_str(&format!(" · ${:.2}", s.cost_usd));
     }
+    if s.subagent_tool_calls > 0 || s.subagent_turns > 0 {
+        line.push_str(&format!(
+            " · sub-agent: {} calls/{} turns",
+            s.subagent_tool_calls, s.subagent_turns
+        ));
+    }
     line
+}
+
+/// The ToolStart display line (pure for testability); child (attributed)
+/// calls get a two-space `↳` indent so nested activity reads as nested
+/// (spec E7). The caller prepends the leading blank line via `writeln!`.
+fn format_tool_start(name: &str, args: &serde_json::Value, parent_id: Option<&str>) -> String {
+    let indent = if parent_id.is_some() { "  ↳ " } else { "" };
+    format!("{indent}\x1b[36m⚙ {name}\x1b[0m {args}")
+}
+
+/// The ToolResult display block (pure for testability); child (attributed)
+/// results get the same two-space `↳` indent as their ToolStart so the row
+/// reads as nested (spec E7). Mirrors `format_tool_start`; the caller writes
+/// this via a single `writeln!`.
+fn format_tool_result(
+    name: &str,
+    status: ToolStatus,
+    output: &agent_tools::ToolOutput,
+    duration_ms: u64,
+    parent_id: Option<&str>,
+) -> String {
+    let indent = if parent_id.is_some() { "  ↳ " } else { "" };
+    if status != ToolStatus::Ok {
+        format!(
+            "{indent}\x1b[31m✗ {name} ({}, {duration_ms}ms)\x1b[0m {}",
+            status.as_str(),
+            output.content
+        )
+    } else if let Some(Display::Diff {
+        path,
+        before,
+        after,
+    }) = &output.display
+    {
+        format!(
+            "{indent}\x1b[33m✎ {path}\x1b[0m\n{}",
+            render_diff(before, after)
+        )
+    } else if let Some(Display::Terminal {
+        exit_code,
+        stdout,
+        stderr,
+        ..
+    }) = &output.display
+    {
+        format!("{indent}\x1b[90m$ exit={exit_code}\x1b[0m\n{stdout}{stderr}")
+    } else {
+        format!("{indent}\x1b[32m✓ {name}\x1b[0m")
+    }
 }
 
 /// Renders agent events to stdout/stderr. Buffers streamed tokens inline.
@@ -72,45 +127,31 @@ impl EventSink for TerminalSink {
                 let _ = write!(out, "\x1b[2m{r}\x1b[0m");
                 let _ = out.flush();
             }
-            AgentEvent::ToolStart { name, args, .. } => {
-                let _ = writeln!(out, "\n\x1b[36m⚙ {name}\x1b[0m {args}");
+            AgentEvent::ToolStart {
+                name,
+                args,
+                parent_id,
+                ..
+            } => {
+                let _ = writeln!(
+                    out,
+                    "\n{}",
+                    format_tool_start(&name, &args, parent_id.as_deref())
+                );
             }
             AgentEvent::ToolResult {
                 name,
                 status,
                 output,
                 duration_ms,
+                parent_id,
                 ..
             } => {
-                if status != ToolStatus::Ok {
-                    let _ = writeln!(
-                        out,
-                        "\x1b[31m✗ {name} ({}, {duration_ms}ms)\x1b[0m {}",
-                        status.as_str(),
-                        output.content
-                    );
-                } else if let Some(Display::Diff {
-                    path,
-                    before,
-                    after,
-                }) = &output.display
-                {
-                    let _ = writeln!(
-                        out,
-                        "\x1b[33m✎ {path}\x1b[0m\n{}",
-                        render_diff(before, after)
-                    );
-                } else if let Some(Display::Terminal {
-                    exit_code,
-                    stdout,
-                    stderr,
-                    ..
-                }) = &output.display
-                {
-                    let _ = writeln!(out, "\x1b[90m$ exit={exit_code}\x1b[0m\n{stdout}{stderr}");
-                } else {
-                    let _ = writeln!(out, "\x1b[32m✓ {name}\x1b[0m");
-                }
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    format_tool_result(&name, status, &output, duration_ms, parent_id.as_deref())
+                );
             }
             AgentEvent::Usage { .. } => {} // telemetry for the web context dashboard; not shown in the CLI
             AgentEvent::ServerUsage { .. } => {} // server-reported usage telemetry; not shown in the CLI
@@ -182,8 +223,55 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_helper_pins_ok_and_error_literals_and_indent() {
+        let ok = agent_tools::ToolOutput {
+            content: "unused".into(),
+            display: None,
+        };
+        let err = agent_tools::ToolOutput {
+            content: "ERROR: nope".into(),
+            display: None,
+        };
+        // Unattributed lines are byte-identical to the pre-helper literals.
+        assert_eq!(
+            format_tool_result("read_file", ToolStatus::Ok, &ok, 5, None),
+            "\x1b[32m✓ read_file\x1b[0m"
+        );
+        assert_eq!(
+            format_tool_result("read_file", ToolStatus::Denied, &err, 5, None),
+            "\x1b[31m✗ read_file (denied, 5ms)\x1b[0m ERROR: nope"
+        );
+        // Attributed (sub-agent) lines gain the two-space `↳` indent.
+        let ok_child = format_tool_result("sub:read_file", ToolStatus::Ok, &ok, 5, Some("d1"));
+        let err_child =
+            format_tool_result("sub:read_file", ToolStatus::Denied, &err, 5, Some("d1"));
+        assert!(ok_child.starts_with("  ↳ "), "{ok_child:?}");
+        assert!(err_child.starts_with("  ↳ "), "{err_child:?}");
+    }
+
+    #[test]
+    fn child_tool_rows_are_indented() {
+        let args = serde_json::json!({});
+        let top = format_tool_start("read_file", &args, None);
+        let child = format_tool_start("sub:read_file", &args, Some("d1"));
+        assert!(!top.contains('↳'));
+        assert!(child.starts_with("  ↳"), "{child:?}");
+        assert!(child.contains("sub:read_file"));
+    }
+
+    #[test]
     fn stats_line_omits_zero_cost() {
         let s = agent_core::SessionStats::default();
         assert!(!format_stats_line(&s).contains('$'));
+    }
+
+    #[test]
+    fn stats_line_mentions_subagents_only_when_present() {
+        let mut s = agent_core::SessionStats::default();
+        assert!(!format_stats_line(&s).contains("sub-agent"));
+        s.subagent_tool_calls = 3;
+        s.subagent_turns = 2;
+        let line = format_stats_line(&s);
+        assert!(line.contains("sub-agent: 3 calls/2 turns"), "{line}");
     }
 }

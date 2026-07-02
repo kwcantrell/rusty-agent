@@ -16,12 +16,17 @@ export function AnimatedToolCall({ item, artifactKey, active, onSelect }: Props)
   const isRunning = item.status === "running";
   const failed = !!item.resultStatus && item.resultStatus !== "ok";
   const clickable = !!artifactKey && !!onSelect;
+  // Attributed sub-agent tool rows nest under their dispatch parent: indent,
+  // prefix a ↳, and strip the `sub:` display prefix from the tool name.
+  const nested = !!item.parentId;
+  const displayName = nested && item.name.startsWith("sub:") ? item.name.slice(4) : item.name;
   return (
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, height: 0 }}
       className="my-1"
+      style={{ marginLeft: nested ? "1.25rem" : undefined }}
     >
       <button
         type="button"
@@ -35,8 +40,9 @@ export function AnimatedToolCall({ item, artifactKey, active, onSelect }: Props)
           cursor: clickable ? "pointer" : "default",
         }}
       >
+        {nested && <span style={{ color: "var(--text-muted)" }}>↳</span>}
         <span className="rounded-full px-1.5 text-[10px]"
-          style={{ background: "var(--accent)", color: "var(--accent-fg)" }}>{item.name}</span>
+          style={{ background: "var(--accent)", color: "var(--accent-fg)" }}>{displayName}</span>
         {isRunning ? (
           <motion.span animate={{ scale: [1, 1.15, 1] }} transition={{ repeat: Infinity, duration: 1.5 }}
             style={{ color: "var(--state-run)" }}>…</motion.span>

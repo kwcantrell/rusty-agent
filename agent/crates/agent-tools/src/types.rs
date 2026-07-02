@@ -133,6 +133,9 @@ pub struct ToolCtx {
     pub timeout: Duration,
     pub cancel: CancellationToken,
     pub sandbox: Arc<dyn SandboxStrategy>,
+    /// The tool_call id this execution serves (`gate_tool` fills it from the
+    /// model's call). Lineage root for sub-agent attribution (spec E2).
+    pub call_id: String,
 }
 
 #[cfg(test)]

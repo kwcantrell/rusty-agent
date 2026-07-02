@@ -39,11 +39,15 @@ pub enum ServerEvent {
         cost_usd: Option<f64>,
         #[serde(default)]
         turn_duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<String>,
     },
     ToolStart {
         id: String,
         name: String,
         args: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<String>,
     },
     ToolResult {
         id: String,
@@ -53,6 +57,8 @@ pub enum ServerEvent {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<Display>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<String>,
     },
     Error {
         message: String,
@@ -175,13 +181,24 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
             turn,
             max_turns,
         },
-        AgentEvent::ToolStart { id, name, args } => ServerEvent::ToolStart { id, name, args },
+        AgentEvent::ToolStart {
+            id,
+            name,
+            args,
+            parent_id,
+        } => ServerEvent::ToolStart {
+            id,
+            name,
+            args,
+            parent_id,
+        },
         AgentEvent::ToolResult {
             id,
             name,
             status,
             output,
             duration_ms,
+            parent_id,
         } => ServerEvent::ToolResult {
             id,
             name,
@@ -189,6 +206,7 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
             duration_ms,
             content: output.content,
             display: output.display,
+            parent_id,
         },
         AgentEvent::Error(m) => ServerEvent::Error { message: m },
         AgentEvent::Done(r) => ServerEvent::Done {
@@ -236,6 +254,7 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
             cost_usd,
             turn_duration_ms,
             turn,
+            parent_id,
         } => ServerEvent::ServerUsage {
             prompt_tokens,
             completion_tokens,
@@ -244,6 +263,7 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
             cached_tokens,
             cost_usd,
             turn_duration_ms,
+            parent_id,
         },
         AgentEvent::SandboxDegraded { mechanism, reason } => ServerEvent::SandboxDegraded {
             mechanism: mechanism.to_string(),
@@ -256,6 +276,54 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
 mod tests {
     use super::*;
     use agent_core::AgentEvent;
+
+    #[test]
+    fn parent_id_absent_from_json_when_none_and_present_when_some() {
+        // The None-omission / Some-presence pin covers every parent_id-bearing
+        // frame — ToolStart, ToolResult, and ServerUsage — so old-SPA byte-compat
+        // can't regress on one while another is checked (spec T2-a).
+        let tool_start = |parent_id: Option<String>| agent_core::AgentEvent::ToolStart {
+            id: "c1".into(),
+            name: "echo".into(),
+            args: serde_json::json!({}),
+            parent_id,
+        };
+        let tool_result = |parent_id: Option<String>| agent_core::AgentEvent::ToolResult {
+            id: "c1".into(),
+            name: "echo".into(),
+            status: agent_core::ToolStatus::Ok,
+            output: agent_tools::ToolOutput {
+                content: "r".into(),
+                display: None,
+            },
+            duration_ms: 1,
+            parent_id,
+        };
+        let server_usage = |parent_id: Option<String>| agent_core::AgentEvent::ServerUsage {
+            prompt_tokens: 42,
+            completion_tokens: 1,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            cost_usd: None,
+            turn_duration_ms: 1,
+            turn: 1,
+            parent_id,
+        };
+        for mk in [
+            &tool_start as &dyn Fn(Option<String>) -> AgentEvent,
+            &tool_result,
+            &server_usage,
+        ] {
+            let none = serde_json::to_string(&server_event_from(mk(None)).unwrap()).unwrap();
+            assert!(
+                !none.contains("parent_id"),
+                "old-SPA byte-compat broken: {none}"
+            );
+            let some =
+                serde_json::to_string(&server_event_from(mk(Some("d1".into()))).unwrap()).unwrap();
+            assert!(some.contains(r#""parent_id":"d1""#), "{some}");
+        }
+    }
 
     #[test]
     fn token_serializes_with_type_tag() {
@@ -300,6 +368,7 @@ mod tests {
             cost_usd: None,
             turn_duration_ms: 1234,
             turn: 3,
+            parent_id: None,
         })
         .unwrap();
         let j = serde_json::to_string(&ev).unwrap();
@@ -348,6 +417,7 @@ mod tests {
                 display: None,
             },
             duration_ms: 0,
+            parent_id: None,
         })
         .unwrap();
         let j = serde_json::to_string(&ev).unwrap();
@@ -426,6 +496,7 @@ mod tests {
                 display: None,
             },
             duration_ms: 60000,
+            parent_id: None,
         })
         .unwrap();
         let j = serde_json::to_value(&out).unwrap();

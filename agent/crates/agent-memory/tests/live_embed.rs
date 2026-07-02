@@ -54,5 +54,6 @@ fn test_ctx() -> agent_tools::ToolCtx {
         timeout: std::time::Duration::from_secs(30),
         cancel: tokio_util::sync::CancellationToken::new(),
         sandbox: Arc::new(agent_tools::HostExecutor),
+        call_id: "test".into(),
     }
 }

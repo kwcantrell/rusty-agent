@@ -21,7 +21,7 @@ describe("reducer", () => {
       frame({ v: 1, session_id: "s", kind: "event", payload: { type: "tool_start", id: "c1", name: "execute_command", args: {} } }),
       frame({ v: 1, session_id: "s", kind: "event", payload: { type: "tool_result", id: "c1", name: "execute_command", status: "ok", duration_ms: 12, content: "exit=0" } }),
     ]);
-    expect(s.items).toEqual([{ kind: "tool", name: "execute_command", args: {}, status: "done", content: "exit=0", display: undefined, resultStatus: "ok", durationMs: 12 }]);
+    expect(s.items).toEqual([{ kind: "tool", id: "c1", parentId: undefined, name: "execute_command", args: {}, status: "done", content: "exit=0", display: undefined, resultStatus: "ok", durationMs: 12 }]);
   });
 
   it("stores the latest usage event and clears it on reset", () => {
