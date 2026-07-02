@@ -78,6 +78,13 @@ pub enum ServerEvent {
         mechanism: String,
         reason: String,
     },
+    /// A mid-stream failure retracted the in-flight partial answer before a
+    /// retry re-streams (spec §2). Additive frame — old SPAs ignore the unknown
+    /// `stream_retry` kind and degrade to today's duplicate-text behavior.
+    StreamRetry {
+        discarded_text_chars: usize,
+        discarded_reasoning_chars: usize,
+    },
     /// Context-curation telemetry (offload/compaction), forwarded from
     /// `AgentEvent::Context`. `kind` discriminates the payload in `detail`.
     Context {
@@ -268,6 +275,13 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
         AgentEvent::SandboxDegraded { mechanism, reason } => ServerEvent::SandboxDegraded {
             mechanism: mechanism.to_string(),
             reason,
+        },
+        AgentEvent::StreamRetry {
+            discarded_text_chars,
+            discarded_reasoning_chars,
+        } => ServerEvent::StreamRetry {
+            discarded_text_chars,
+            discarded_reasoning_chars,
         },
     })
 }
@@ -545,6 +559,28 @@ mod tests {
             "missing mechanism: {j}"
         );
         assert!(j.contains(r#""reason":"no daemon""#), "missing reason: {j}");
+    }
+
+    #[test]
+    fn stream_retry_serializes_with_type_tag_and_char_counts() {
+        let ev = server_event_from(AgentEvent::StreamRetry {
+            discarded_text_chars: 4,
+            discarded_reasoning_chars: 2,
+        })
+        .unwrap();
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(
+            j.contains(r#""type":"stream_retry""#),
+            "missing type tag: {j}"
+        );
+        assert!(
+            j.contains(r#""discarded_text_chars":4"#),
+            "missing text chars: {j}"
+        );
+        assert!(
+            j.contains(r#""discarded_reasoning_chars":2"#),
+            "missing reasoning chars: {j}"
+        );
     }
 
     #[test]

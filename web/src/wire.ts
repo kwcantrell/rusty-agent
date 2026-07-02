@@ -63,7 +63,8 @@ export type WireEvent =
   | { type: "session_stats"; stats: SessionStats }
   | { type: "error"; message: string }
   | { type: "done"; reason: string }
-  | { type: "sandbox_degraded"; mechanism: string; reason: string };
+  | { type: "sandbox_degraded"; mechanism: string; reason: string }
+  | { type: "stream_retry"; discarded_text_chars: number; discarded_reasoning_chars: number };
 
 export type Inbound =
   | { v: number; session_id: string; kind: "event"; payload: WireEvent }

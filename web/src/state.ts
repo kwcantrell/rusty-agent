@@ -65,6 +65,28 @@ function describeContext(kind: string, detail: Record<string, unknown>): string 
   }
 }
 
+/**
+ * Trim `chars` code points off the tail of the last item of `kind`, in place.
+ * Removes the item entirely if it empties. Counts by Unicode code point to
+ * match the core's `chars().count()` (the source of `discarded_*_chars`).
+ */
+function trimTrailing(items: Item[], kind: "assistant" | "reasoning", chars: number): void {
+  if (chars <= 0) return;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.kind === kind) {
+      const cps = Array.from(it.text);
+      const kept = cps.slice(0, Math.max(0, cps.length - chars)).join("");
+      if (kept.length === 0) {
+        items.splice(i, 1);
+      } else {
+        items[i] = { ...it, text: kept };
+      }
+      return;
+    }
+  }
+}
+
 /** Emit the stored user message that heads the current turn, if not already emitted. */
 function startTurn(s: ConversationState): ConversationState {
   if (s.inTurn) return s;
@@ -165,6 +187,17 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
       return { ...s, stats: p.stats };
     case "sandbox_degraded":
       return { ...s, sandboxDegraded: { mechanism: p.mechanism, reason: p.reason } };
+    case "stream_retry": {
+      // A mid-stream failure abandoned the in-flight partial answer before a
+      // retry re-streams. Tokens only ever extend the LAST item of a kind (see
+      // the comment near isStreamingItem), so the discarded chars are exactly
+      // the tail of the last assistant/reasoning item — trim them off, dropping
+      // an item that empties completely.
+      const items = [...s.items];
+      trimTrailing(items, "assistant", p.discarded_text_chars);
+      trimTrailing(items, "reasoning", p.discarded_reasoning_chars);
+      return { ...s, items };
+    }
     case "error":
       return { ...s, items: [...s.items, { kind: "error", message: p.message }] };
     case "done": {

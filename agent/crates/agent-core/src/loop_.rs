@@ -48,8 +48,12 @@ enum RetryFailure {
     /// Cancellation observed (token or `ModelError::Cancelled`).
     Cancelled,
     /// Context overflow: the same request can never succeed. Not counted
-    /// against max_retries; the turn loop may compact-rebuild-retry once.
-    Overflow(String),
+    /// against max_retries; the turn loop may compact-rebuild-retry once. The
+    /// tuple carries the (text, reasoning) chars this attempt streamed before
+    /// overflowing, so the turn loop can retract a partial answer before the
+    /// once-per-turn rebuild re-streams (spec §2); the second-overflow arm
+    /// ignores it (that path is terminal, no further attempt).
+    Overflow(String, (usize, usize)),
 }
 
 #[derive(Clone)]
@@ -166,10 +170,16 @@ impl AgentLoop {
     }
 
     /// Drive one streamed completion to an `AssistantTurn`, emitting tokens as they arrive.
+    ///
+    /// `emitted` accumulates (text chars, reasoning chars) actually pushed to the
+    /// sink this attempt, so on an error return the caller knows what partial
+    /// output leaked and can retract it before a retry re-streams (spec §2). The
+    /// caller resets it per attempt.
     async fn one_completion(
         &self,
         req: CompletionRequest,
         cancel: &CancellationToken,
+        emitted: &mut (usize, usize),
     ) -> Result<AssistantTurn, ModelError> {
         let idle = self.config.stream_idle_timeout;
         let mut stream = tokio::select! {
@@ -197,10 +207,12 @@ impl AgentLoop {
                 Ok(Some(item)) => match item? {
                     Chunk::Text(t) => {
                         self.sink.emit(AgentEvent::Token(t.clone()));
+                        emitted.0 += t.chars().count();
                         text.push_str(&t);
                     }
                     Chunk::Reasoning(r) => {
                         self.sink.emit(AgentEvent::Reasoning(r.clone()));
+                        emitted.1 += r.chars().count();
                         reasoning.push_str(&r);
                     }
                     Chunk::ToolCallDelta(rc) => merge_tool_call(&mut raw_tool_calls, rc),
@@ -243,7 +255,10 @@ impl AgentLoop {
         loop {
             let mut req = base.clone();
             self.protocol.prepare(&mut req);
-            match self.one_completion(req, cancel).await {
+            // Chars this attempt streamed to the sink; feeds the StreamRetry
+            // retraction when another attempt follows a partial (spec §2).
+            let mut emitted = (0usize, 0usize);
+            match self.one_completion(req, cancel, &mut emitted).await {
                 Ok(turn) => return Ok(turn),
                 Err(ModelError::Cancelled) => return Err(RetryFailure::Cancelled),
                 Err(e) => {
@@ -254,7 +269,9 @@ impl AgentLoop {
                         ErrorClass::ContextOverflow => {
                             tracing::warn!(error = %e,
                                 "context overflow; deferring to turn-level recovery");
-                            return Err(RetryFailure::Overflow(e.to_string()));
+                            // Defer retraction to the turn loop: only its FIRST
+                            // overflow arm re-attempts; a second overflow is terminal.
+                            return Err(RetryFailure::Overflow(e.to_string(), emitted));
                         }
                         ErrorClass::Fatal => {
                             self.sink.emit(AgentEvent::Error(e.to_string()));
@@ -265,6 +282,15 @@ impl AgentLoop {
                             if attempt > self.config.max_retries {
                                 self.sink.emit(AgentEvent::Error(e.to_string()));
                                 return Err(RetryFailure::Fatal(e.to_string()));
+                            }
+                            // Another attempt follows: retract any partial output this
+                            // attempt already streamed, before the backoff sleep and
+                            // the fresh stream (spec §2). Skip when nothing leaked.
+                            if emitted != (0, 0) {
+                                self.sink.emit(AgentEvent::StreamRetry {
+                                    discarded_text_chars: emitted.0,
+                                    discarded_reasoning_chars: emitted.1,
+                                });
                             }
                             tracing::warn!(attempt, error = %e, "model error, retrying");
                             tokio::time::sleep(backoff_delay(attempt)).await;
@@ -365,8 +391,17 @@ impl AgentLoop {
                         self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
                         return Ok(());
                     }
-                    Err(RetryFailure::Overflow(_)) if !overflow_recovered => {
+                    Err(RetryFailure::Overflow(_, emitted)) if !overflow_recovered => {
                         overflow_recovered = true;
+                        // A partial answer streamed before the overflow is abandoned
+                        // by the compaction rebuild; retract it before the rebuilt
+                        // attempt re-streams (spec §2). Skip when nothing leaked.
+                        if emitted != (0, 0) {
+                            self.sink.emit(AgentEvent::StreamRetry {
+                                discarded_text_chars: emitted.0,
+                                discarded_reasoning_chars: emitted.1,
+                            });
+                        }
                         tracing::warn!("context overflow: forcing compaction and rebuilding once");
                         self.sink
                             .emit(AgentEvent::Context(crate::ContextEvent::OverflowRecovery));
@@ -389,7 +424,9 @@ impl AgentLoop {
                         });
                         base = self.completion_request(messages, preserve_thinking);
                     }
-                    Err(RetryFailure::Overflow(msg)) => {
+                    Err(RetryFailure::Overflow(msg, _)) => {
+                        // Second overflow in the turn — terminal, no further attempt,
+                        // so no StreamRetry (the partial stays; Done explains).
                         self.sink.emit(AgentEvent::Error(msg.clone()));
                         self.sink.emit(AgentEvent::Done(StopReason::Error));
                         return Err(AgentError::Model(msg));
@@ -1675,7 +1712,11 @@ mod tests {
 
         let ws = std::env::temp_dir();
         let model = Arc::new(ScriptedModel::new(vec![
-            Scripted::Call("c1".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()),
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
             Scripted::Text("should not run".into()),
         ]));
         let sink = Arc::new(CancelRaceSink::default());
@@ -1724,7 +1765,9 @@ mod tests {
             "cancel during a prompt must end the run as Cancelled"
         );
         let results = sink.results.lock().unwrap();
-        let (status, content) = results.last().expect("the gated call gets a terminal result");
+        let (status, content) = results
+            .last()
+            .expect("the gated call gets a terminal result");
         assert_eq!(*status, ToolStatus::Denied);
         assert!(
             content.contains("run cancelled"),
@@ -3866,6 +3909,165 @@ mod tests {
             sink.events.lock().unwrap().last().map(String::as_str),
             Some("done")
         );
+    }
+
+    /// A mid-stream failure that already emitted chunks must retract them before
+    /// the retry re-streams (spec §2); a clean or chunk-less failure must not.
+    #[tokio::test(start_paused = true)]
+    async fn stream_retry_retracts_partial_output() {
+        let ws = std::env::temp_dir();
+        // Attempt 1 streams "ab","cd" (4 chars) then the stream dies (retryable);
+        // attempt 2 succeeds with "xy".
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::ChunksThenFail(
+                vec![Chunk::Text("ab".into()), Chunk::Text("cd".into())],
+                ModelError::Http("mid-stream drop".into()),
+            ),
+            Scripted::Text("xy".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        // The retraction carries the exact char counts and sits between the
+        // abandoned partial and the re-streamed tokens.
+        let sr = events
+            .iter()
+            .position(|e| e == "stream_retry:4:0")
+            .unwrap_or_else(|| panic!("expected stream_retry:4:0; got {events:?}"));
+        let ab = events.iter().position(|e| e == "token:ab").unwrap();
+        let cd = events.iter().position(|e| e == "token:cd").unwrap();
+        let xy = events.iter().position(|e| e == "token:xy").unwrap();
+        assert!(
+            ab < sr && cd < sr,
+            "abandoned partial precedes the retraction: {events:?}"
+        );
+        assert!(sr < xy, "the re-stream follows the retraction: {events:?}");
+        // Exactly one retraction for one mid-stream failure.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.starts_with("stream_retry"))
+                .count(),
+            1
+        );
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_stream_retry_when_nothing_emitted() {
+        let ws = std::env::temp_dir();
+        // Attempt 1 fails before emitting any chunk; attempt 2 succeeds. Nothing
+        // streamed, so nothing to retract.
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Http("down".into())),
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e.starts_with("stream_retry")),
+            "no retraction when nothing was emitted: {events:?}"
+        );
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+    }
+
+    /// The once-per-turn overflow rebuild is also a "retry after a partial":
+    /// the partial answer is retracted before the rebuilt attempt re-streams,
+    /// and the retraction precedes the OverflowRecovery marker.
+    #[tokio::test]
+    async fn stream_retry_retracts_partial_before_overflow_rebuild() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::ChunksThenFail(
+                vec![Chunk::Text("part".into())], // 4 chars
+                ModelError::Status {
+                    code: 400,
+                    body: "maximum context length exceeded".into(),
+                },
+            ),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 0, // overflow recovery must not consume retry budget
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = OverflowCtx {
+            history: vec![],
+            compaction_requests: 0,
+            maintains: 0,
+        };
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        let sr = events
+            .iter()
+            .position(|e| e == "stream_retry:4:0")
+            .unwrap_or_else(|| panic!("expected stream_retry:4:0; got {events:?}"));
+        let or = events
+            .iter()
+            .position(|e| e == "overflow_recovery")
+            .unwrap_or_else(|| panic!("expected overflow_recovery; got {events:?}"));
+        assert!(
+            sr < or,
+            "retraction must precede the overflow rebuild: {events:?}"
+        );
+        assert_eq!(events.last().map(String::as_str), Some("done"));
     }
 
     /// A sink that keeps full per-event detail (ids, status, content, done

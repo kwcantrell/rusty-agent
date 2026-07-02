@@ -574,6 +574,7 @@ mod tests {
                 AgentEvent::Context(_) => "context",
                 AgentEvent::Approval(_) => "approval",
                 AgentEvent::SandboxDegraded { .. } => "sandbox_degraded",
+                AgentEvent::StreamRetry { .. } => "stream_retry",
                 AgentEvent::ToolStart { .. }
                 | AgentEvent::ToolResult { .. }
                 | AgentEvent::ServerUsage { .. } => "FORWARDED-KIND-MUST-NOT-BE-TAPPED",
