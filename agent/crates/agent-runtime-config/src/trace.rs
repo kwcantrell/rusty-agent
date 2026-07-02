@@ -64,6 +64,16 @@ impl TraceWriter {
     /// Append one event. Infallible; disables itself on error or cap breach.
     /// (Borrow order matters: read `seq`/`written` before taking `w` mutably.)
     pub fn record(&self, event: &AgentEvent) {
+        self.write_record(None, event);
+    }
+
+    /// Record a sub-agent child event, attributed to dispatch ordinal `n`
+    /// (spec 2026-07-02 E4). Same file, same seq counter, same size cap.
+    pub fn record_child(&self, n: u64, event: &AgentEvent) {
+        self.write_record(Some(n), event);
+    }
+
+    fn write_record(&self, sub: Option<u64>, event: &AgentEvent) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -73,6 +83,7 @@ impl TraceWriter {
         let rec = TraceRecord {
             seq: inner.seq,
             ts_ms: epoch_ms(),
+            sub,
             event: trace_event(event),
         };
         let line = match serde_json::to_string(&rec) {
@@ -140,6 +151,8 @@ fn prune_retention(dir: &Path, keep: usize) {
 struct TraceRecord<'a> {
     seq: u64,
     ts_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub: Option<u64>,
     event: TraceEvent<'a>,
 }
 
@@ -322,6 +335,15 @@ fn stop_reason_str(r: &StopReason) -> &'static str {
     }
 }
 
+/// `SubagentTrace` over the session TraceWriter: child transcript lines land in
+/// the same JSONL with a `sub` ordinal (spec E4).
+pub struct ChildTraceTap(pub Arc<TraceWriter>);
+impl agent_core::SubagentTrace for ChildTraceTap {
+    fn record(&self, n: u64, event: &agent_core::AgentEvent) {
+        self.0.record_child(n, event);
+    }
+}
+
 /// Composite sink: fold stats, write trace, forward to the frontend sink.
 pub struct ObservedSink {
     pub inner: Arc<dyn EventSink>,
@@ -396,6 +418,22 @@ mod tests {
         let lines: Vec<&str> = content.lines().collect();
         assert!(!lines[1].contains("parent_id"), "{}", lines[1]); // [0] is the header
         assert!(lines[2].contains(r#""parent_id":"d1""#), "{}", lines[2]);
+    }
+
+    #[test]
+    fn record_child_lines_carry_sub_ordinal_and_normal_lines_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = TraceWriter::create(dir.path(), 1024 * 1024).unwrap();
+        w.record(&agent_core::AgentEvent::Token("parent".into()));
+        w.record_child(3, &agent_core::AgentEvent::Token("child".into()));
+        w.record(&AgentEvent::Done(agent_model::StopReason::Stop)); // flushes the BufWriter
+        let path = dir.path().join(format!("{}.jsonl", w.session_id()));
+        let content = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert!(!lines[1].contains(r#""sub""#), "{}", lines[1]);
+        assert!(lines[2].contains(r#""sub":3"#), "{}", lines[2]);
+        // seq stays monotonic across both write paths:
+        assert!(lines[2].contains(r#""seq":1"#), "{}", lines[2]);
     }
 
     #[test]

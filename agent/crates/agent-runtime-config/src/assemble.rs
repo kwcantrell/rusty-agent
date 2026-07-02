@@ -171,7 +171,9 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 policy: policy.clone(),
                 approval: parts.approval.clone(),
                 sink: sink.clone(),
-                child_trace: None, // Task 4 wires the real tap
+                child_trace: parts.trace.clone().map(|t| {
+                    Arc::new(crate::trace::ChildTraceTap(t)) as Arc<dyn agent_core::SubagentTrace>
+                }),
                 base_tools: child_base,
                 child_system_prompt: format!(
                     "{system_prompt}\n\n{}",
@@ -327,6 +329,18 @@ mod tests {
         assert_eq!(stats.read().unwrap().errors, 1); // folded
         assert_eq!(inner.events.lock().unwrap().len(), 1); // forwarded
                                                            // And the loop still assembles with the new fields present.
+        let _ = assemble_loop(&cfg(), p);
+    }
+
+    #[test]
+    fn assemble_wires_child_trace_only_when_tracing_is_on() {
+        // No trace → assembles fine (child_trace None path).
+        let dir = tempfile::tempdir().unwrap();
+        let _ = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        // With a trace writer → also assembles fine (tap constructed).
+        let mut p = parts(dir.path().to_path_buf(), vec![]);
+        let tdir = tempfile::tempdir().unwrap();
+        p.trace = Some(crate::trace::TraceWriter::create(tdir.path(), 1024 * 1024).unwrap());
         let _ = assemble_loop(&cfg(), p);
     }
 
