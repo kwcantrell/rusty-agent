@@ -271,6 +271,32 @@ actionable copy; and — **new residual for the next audit pass** — `claude_cl
 Claude CLI model backend with the full inherited env including `AGENT_API_KEY` (trusted backend,
 outside the tool-execution threat model, but the last child process that still sees the secret).
 
+Re-stamp note (2026-07-01, tools cluster): the deep audit's "cluster 7" — the **Tools** HIGH
+(unbounded tool-result ingestion; Top-10 fix #7) plus two folded build opportunities
+(`read_file` pagination, `context_recall` pagination) — is now **fixed and merged to `main`**
+(8 commits, `9f9ed70..fbf8ad7`, merge commit): an eager size-based pass as step (0) of
+`CuratedContext::maintain` offloads any tool result over `OffloadConfig.max_result_bytes`
+(default `DEFAULT_MAX_TOOL_RESULT_BYTES = 16 KiB`) WHOLE into the offload store on the same
+pass — before the next model call — leaving a char-boundary-safe preview + recall marker whose
+total is ≤ cap (idempotent by arithmetic; marker-only degenerate case starts with
+`[tool_result#` so selectors skip it). `context_recall` pages by byte offset with each page
+≤ the same budget (so recall can never re-trip the cap); `read_file` gained line-based
+`offset`/`limit` (saturating arithmetic, `limit: 0` rejected); `RuntimeConfig.max_tool_result_bytes`
+(serde-default, partial-merge aware) wires the cap into both frontends and the recall page
+budget. Eager offloads reuse `ContextEvent::Offloaded` — zero wire/web changes. This also
+partially defuses the Spine-B "single oversized message → unfixable over-limit request" MED
+(tool results can no longer create an over-cap turn-unit; the compact-and-rebuild-on-overflow
+half stays open, folded into Top-10 #8 territory). The eval harness intentionally neutralizes
+the cap (`max_result_bytes: usize::MAX` in `eval/config.rs::offload_config` — not part of the
+candidate genome; the context-evolve champion was validated without it). See
+`docs/superpowers/specs/2026-07-01-tool-result-ingestion-cap-design.md` and its plan. Accepted
+residuals (final whole-branch review): server settings change updates the recall page budget
+on loop rebuild but the live context's cap only on workspace switch (bounded, convergent
+drift); `lift` callers double-clone content (peak-memory nicety: clone only ~cap head); sliced
+`read_file` normalizes CRLF; `MaintReport.offloaded_bytes` counts store writes (documented
+double-count when a preview is later age-offloaded); offload store growth is still the
+pre-existing RAM-only backlog item.
+
 ---
 
 **Finding 1 — Instructions: duplicated system prompt + skill files lack negative constraints**
@@ -295,10 +321,11 @@ Ranked by impact (severity × remediation cost). All prior HIGH findings, the ob
 cluster (per-call terminal events + durations, JSONL session traces, usage/cost parsing,
 SessionStats + web panel, ContextEvent forwarding, CI gate), the sandbox cluster
 (fail-closed degraded exec, env scrub, required `LoopConfig.sandbox`, MCP workspace cwd,
-nobody uid fallback), and the context cluster (turn-atomic eviction/compaction + visible
-eviction) are **done** — for the full current backlog see
+nobody uid fallback), the context cluster (turn-atomic eviction/compaction + visible
+eviction), and the tools cluster (16 KiB ingestion cap + eager offload, recall/read_file
+pagination) are **done** — for the full current backlog see
 `docs/superpowers/audits/2026-07-01-harness-deep-audit.md` (its Top-10 table; items
-1, 2, 3, 4, 5, and 6 are now complete). Of this file's inline findings, one remains:
+1, 2, 3, 4, 5, 6, and 7 are now complete). Of this file's inline findings, one remains:
 
 1. **[Component 1 — Instructions] De-duplicate the system prompt + add negative constraints** (Finding 1)
    `agent/crates/agent-server/src/daemon.rs:23` + `agent/crates/agent-cli/src/main.rs:15`; `.agents/skills/`
