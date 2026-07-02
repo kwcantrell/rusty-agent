@@ -36,7 +36,13 @@ mod tests {
             .canonicalize()
             .expect("repo root");
         let mut offenders = Vec::new();
-        for root in ["agent/crates", "src-tauri/src"] {
+        // agent/crates must exist wherever this crate compiles from source —
+        // assert so a bad repo_root can't turn the ratchet into a vacuous pass.
+        assert!(
+            repo_root.join("agent/crates").exists(),
+            "ratchet repo_root miscomputed: {repo_root:?}"
+        );
+        for root in ["agent/crates", "src-tauri/src", "src-tauri/tests"] {
             let dir = repo_root.join(root);
             if dir.exists() {
                 scan(&dir, NEEDLE, &mut offenders);
