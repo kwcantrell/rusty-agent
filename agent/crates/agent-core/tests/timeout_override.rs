@@ -1,10 +1,14 @@
 //! Pins spec D7: gate_tool builds ToolCtx with the tool's timeout_override
 //! when present, else the loop's tool_timeout.
-use agent_core::testkit::{AlwaysApprove, CollectingSink, PassthroughProtocol, Scripted, ScriptedModel};
+use agent_core::testkit::{
+    AlwaysApprove, CollectingSink, PassthroughProtocol, Scripted, ScriptedModel,
+};
 use agent_core::{AgentLoop, CuratedContext, InMemoryOffloadStore, LoopConfig};
 use agent_model::Message;
 use agent_policy::RulePolicy;
-use agent_tools::{Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema};
+use agent_tools::{
+    Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema,
+};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,12 +48,18 @@ impl Tool for TimeoutProbe {
     }
     async fn execute(&self, _a: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         *self.seen.lock().unwrap() = Some(ctx.timeout);
-        Ok(ToolOutput { content: "ok".into(), display: None })
+        Ok(ToolOutput {
+            content: "ok".into(),
+            display: None,
+        })
     }
 }
 
 fn run_probe(probe: Arc<TimeoutProbe>) {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let mut reg = ToolRegistry::new();
         reg.register(probe.clone());
@@ -90,14 +100,22 @@ fn run_probe(probe: Arc<TimeoutProbe>) {
 
 #[test]
 fn tool_ctx_uses_timeout_override_when_present() {
-    let probe = Arc::new(TimeoutProbe { name: "probe_a", override_secs: Some(555), seen: Mutex::new(None) });
+    let probe = Arc::new(TimeoutProbe {
+        name: "probe_a",
+        override_secs: Some(555),
+        seen: Mutex::new(None),
+    });
     run_probe(probe.clone());
     assert_eq!(*probe.seen.lock().unwrap(), Some(Duration::from_secs(555)));
 }
 
 #[test]
 fn tool_ctx_defaults_to_loop_tool_timeout() {
-    let probe = Arc::new(TimeoutProbe { name: "probe_b", override_secs: None, seen: Mutex::new(None) });
+    let probe = Arc::new(TimeoutProbe {
+        name: "probe_b",
+        override_secs: None,
+        seen: Mutex::new(None),
+    });
     run_probe(probe.clone());
     assert_eq!(*probe.seen.lock().unwrap(), Some(Duration::from_secs(5)));
 }

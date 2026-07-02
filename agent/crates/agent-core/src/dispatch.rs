@@ -58,7 +58,10 @@ impl SubagentSink {
         Self {
             parent,
             n,
-            cap: Mutex::new(Capture { segments: vec![String::new()], ..Capture::default() }),
+            cap: Mutex::new(Capture {
+                segments: vec![String::new()],
+                ..Capture::default()
+            }),
         }
     }
 
@@ -84,7 +87,10 @@ impl EventSink for SubagentSink {
         let mut cap = self.cap.lock().unwrap();
         match event {
             AgentEvent::Token(t) => {
-                cap.segments.last_mut().expect("segments never empty").push_str(&t);
+                cap.segments
+                    .last_mut()
+                    .expect("segments never empty")
+                    .push_str(&t);
             }
             AgentEvent::ToolStart { id, name, args } => {
                 cap.tool_calls += 1;
@@ -95,7 +101,13 @@ impl EventSink for SubagentSink {
                     args,
                 });
             }
-            AgentEvent::ToolResult { id, name, status, output, duration_ms } => {
+            AgentEvent::ToolResult {
+                id,
+                name,
+                status,
+                output,
+                duration_ms,
+            } => {
                 cap.segments.push(String::new());
                 drop(cap);
                 self.parent.emit(AgentEvent::ToolResult {
@@ -365,12 +377,14 @@ mod tests {
         fn emit(&self, event: AgentEvent) {
             let triple = match event {
                 AgentEvent::ToolStart { id, name, .. } => ("tool_start".into(), id, name),
-                AgentEvent::ToolResult { id, name, status, .. } => {
-                    (format!("tool_result:{}", status.as_str()), id, name)
-                }
-                AgentEvent::ServerUsage { prompt_tokens, .. } => {
-                    ("server_usage".into(), prompt_tokens.to_string(), String::new())
-                }
+                AgentEvent::ToolResult {
+                    id, name, status, ..
+                } => (format!("tool_result:{}", status.as_str()), id, name),
+                AgentEvent::ServerUsage { prompt_tokens, .. } => (
+                    "server_usage".into(),
+                    prompt_tokens.to_string(),
+                    String::new(),
+                ),
                 // Anything else reaching the parent is a forwarding-table bug —
                 // record it so the exact-equality assertion below catches the leak.
                 _ => ("unexpected".to_string(), String::new(), String::new()),
@@ -384,7 +398,10 @@ mod tests {
             id: id.into(),
             name: name.into(),
             status: ToolStatus::Ok,
-            output: ToolOutput { content: "r".into(), display: None },
+            output: ToolOutput {
+                content: "r".into(),
+                display: None,
+            },
             duration_ms: 1,
         }
     }
@@ -395,12 +412,26 @@ mod tests {
         let sink = SubagentSink::new(parent.clone(), 7);
         sink.emit(AgentEvent::Token("hi".into()));
         sink.emit(AgentEvent::Reasoning("r".into()));
-        sink.emit(AgentEvent::Usage { prompt_tokens: 1, context_limit: 10, turn: 1, max_turns: 5 });
-        sink.emit(AgentEvent::ToolStart { id: "c1".into(), name: "echo".into(), args: serde_json::json!({}) });
+        sink.emit(AgentEvent::Usage {
+            prompt_tokens: 1,
+            context_limit: 10,
+            turn: 1,
+            max_turns: 5,
+        });
+        sink.emit(AgentEvent::ToolStart {
+            id: "c1".into(),
+            name: "echo".into(),
+            args: serde_json::json!({}),
+        });
         sink.emit(tool_result("c1", "echo"));
         sink.emit(AgentEvent::ServerUsage {
-            prompt_tokens: 42, completion_tokens: 1, reasoning_tokens: None,
-            cached_tokens: None, cost_usd: None, turn_duration_ms: 1, turn: 1,
+            prompt_tokens: 42,
+            completion_tokens: 1,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            cost_usd: None,
+            turn_duration_ms: 1,
+            turn: 1,
         });
         sink.emit(AgentEvent::Error("boom".into()));
         sink.emit(AgentEvent::Context(ContextEvent::OverflowRecovery));
@@ -411,8 +442,16 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("tool_start".to_string(), "sub7:c1".to_string(), "sub:echo".to_string()),
-                ("tool_result:ok".to_string(), "sub7:c1".to_string(), "sub:echo".to_string()),
+                (
+                    "tool_start".to_string(),
+                    "sub7:c1".to_string(),
+                    "sub:echo".to_string()
+                ),
+                (
+                    "tool_result:ok".to_string(),
+                    "sub7:c1".to_string(),
+                    "sub:echo".to_string()
+                ),
                 ("server_usage".to_string(), "42".to_string(), String::new()),
             ]
         );
@@ -445,10 +484,28 @@ mod tests {
     #[test]
     fn summary_counts_tool_calls_and_turns() {
         let sink = SubagentSink::new(Arc::new(FullSink::default()), 1);
-        sink.emit(AgentEvent::Usage { prompt_tokens: 1, context_limit: 10, turn: 1, max_turns: 5 });
-        sink.emit(AgentEvent::ToolStart { id: "c1".into(), name: "a".into(), args: serde_json::json!({}) });
-        sink.emit(AgentEvent::ToolStart { id: "c2".into(), name: "b".into(), args: serde_json::json!({}) });
-        sink.emit(AgentEvent::Usage { prompt_tokens: 2, context_limit: 10, turn: 2, max_turns: 5 });
+        sink.emit(AgentEvent::Usage {
+            prompt_tokens: 1,
+            context_limit: 10,
+            turn: 1,
+            max_turns: 5,
+        });
+        sink.emit(AgentEvent::ToolStart {
+            id: "c1".into(),
+            name: "a".into(),
+            args: serde_json::json!({}),
+        });
+        sink.emit(AgentEvent::ToolStart {
+            id: "c2".into(),
+            name: "b".into(),
+            args: serde_json::json!({}),
+        });
+        sink.emit(AgentEvent::Usage {
+            prompt_tokens: 2,
+            context_limit: 10,
+            turn: 2,
+            max_turns: 5,
+        });
         let s = sink.summary();
         assert_eq!(s.tool_calls, 2);
         assert_eq!(s.turns, 2);

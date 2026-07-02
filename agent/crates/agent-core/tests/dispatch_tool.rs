@@ -1,6 +1,8 @@
 //! Integration tests for DispatchAgentTool (spec D1-D13 core behaviors).
 use agent_core::testkit::{AlwaysApprove, PassthroughProtocol, Scripted, ScriptedModel};
-use agent_core::{AgentEvent, DispatchAgentTool, DispatchDeps, EventSink, LoopConfig, SUBAGENT_PREAMBLE};
+use agent_core::{
+    AgentEvent, DispatchAgentTool, DispatchDeps, EventSink, LoopConfig, SUBAGENT_PREAMBLE,
+};
 use agent_policy::{Decision, PolicyEngine, RulePolicy};
 use agent_tools::{Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolSchema};
 use std::path::PathBuf;
@@ -17,9 +19,9 @@ impl EventSink for FullSink {
     fn emit(&self, event: AgentEvent) {
         let t = match event {
             AgentEvent::ToolStart { id, name, .. } => ("tool_start".to_string(), id, name),
-            AgentEvent::ToolResult { id, name, status, .. } => {
-                (format!("tool_result:{}", status.as_str()), id, name)
-            }
+            AgentEvent::ToolResult {
+                id, name, status, ..
+            } => (format!("tool_result:{}", status.as_str()), id, name),
             AgentEvent::Token(t) => ("token".to_string(), String::new(), t),
             AgentEvent::Done(_) => ("done".to_string(), String::new(), String::new()),
             _ => return,
@@ -32,16 +34,33 @@ impl EventSink for FullSink {
 struct Echo;
 #[async_trait::async_trait]
 impl Tool for Echo {
-    fn name(&self) -> &str { "echo" }
-    fn description(&self) -> &str { "echo" }
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> &str {
+        "echo"
+    }
     fn schema(&self) -> ToolSchema {
-        ToolSchema { name: "echo".into(), description: "echo".into(), parameters: serde_json::json!({"type":"object"}) }
+        ToolSchema {
+            name: "echo".into(),
+            description: "echo".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }
     }
     fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
-        Ok(ToolIntent { tool: "echo".into(), access: Access::Read, paths: vec![], command: None, summary: "echo".into() })
+        Ok(ToolIntent {
+            tool: "echo".into(),
+            access: Access::Read,
+            paths: vec![],
+            command: None,
+            summary: "echo".into(),
+        })
     }
     async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        Ok(ToolOutput { content: "echoed".into(), display: None })
+        Ok(ToolOutput {
+            content: "echoed".into(),
+            display: None,
+        })
     }
 }
 
@@ -66,7 +85,11 @@ fn deps(model: ScriptedModel, sink: Arc<dyn EventSink>, base: Vec<Arc<dyn Tool>>
     DispatchDeps {
         model: Arc::new(model),
         protocol: Arc::new(PassthroughProtocol),
-        policy: Arc::new(RulePolicy { workspace: ws.clone(), command_allowlist: vec![], command_denylist: vec![] }),
+        policy: Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        }),
         approval: Arc::new(AlwaysApprove),
         sink,
         base_tools: base,
@@ -98,7 +121,11 @@ async fn returns_child_final_text_with_footer() {
         .execute(serde_json::json!({"prompt": "do the thing"}), &tool_ctx())
         .await
         .unwrap();
-    assert!(out.content.starts_with("hello from child"), "{}", out.content);
+    assert!(
+        out.content.starts_with("hello from child"),
+        "{}",
+        out.content
+    );
     assert!(out.content.contains("[sub-agent: "), "{}", out.content);
     assert!(out.content.contains("stop: Stop"), "{}", out.content);
 }
@@ -121,9 +148,23 @@ async fn child_tool_calls_are_forwarded_rewritten_and_tokens_suppressed() {
     assert!(out.content.starts_with("final"));
     let events = sink.events.lock().unwrap().clone();
     // Child echo call forwarded with rewritten id/name; NO child token/done leaked.
-    assert!(events.iter().any(|(k, i, n)| k == "tool_start" && i.contains(":c1") && i.starts_with("sub") && n == "sub:echo"), "{events:?}");
-    assert!(events.iter().any(|(k, _, n)| k == "tool_result:ok" && n == "sub:echo"), "{events:?}");
-    assert!(!events.iter().any(|(k, _, _)| k == "token" || k == "done"), "{events:?}");
+    assert!(
+        events.iter().any(|(k, i, n)| k == "tool_start"
+            && i.contains(":c1")
+            && i.starts_with("sub")
+            && n == "sub:echo"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n)| k == "tool_result:ok" && n == "sub:echo"),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|(k, _, _)| k == "token" || k == "done"),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -139,9 +180,16 @@ async fn budget_exhausted_child_reports_it() {
     );
     d.loop_config.max_turns = 1;
     let tool = DispatchAgentTool::new(d);
-    let out = tool.execute(serde_json::json!({"prompt": "p"}), &tool_ctx()).await.unwrap();
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
     assert!(out.content.contains("turn budget"), "{}", out.content);
-    assert!(out.content.contains("stop: BudgetExhausted"), "{}", out.content);
+    assert!(
+        out.content.contains("stop: BudgetExhausted"),
+        "{}",
+        out.content
+    );
 }
 
 #[tokio::test]
@@ -154,10 +202,16 @@ async fn tools_allowlist_filters_and_rejects_unknown_names() {
         vec![Arc::new(Echo)],
     ));
     let err = tool
-        .execute(serde_json::json!({"prompt": "p", "tools": ["nope"]}), &tool_ctx())
+        .execute(
+            serde_json::json!({"prompt": "p", "tools": ["nope"]}),
+            &tool_ctx(),
+        )
         .await
         .unwrap_err();
-    assert!(matches!(err, ToolError::InvalidArgs(ref m) if m.contains("nope") && m.contains("echo")), "{err:?}");
+    assert!(
+        matches!(err, ToolError::InvalidArgs(ref m) if m.contains("nope") && m.contains("echo")),
+        "{err:?}"
+    );
 
     // Filtered-out tool is unknown to the child (gate rejects it as Denied).
     let tool = DispatchAgentTool::new(deps(
@@ -174,7 +228,12 @@ async fn tools_allowlist_filters_and_rejects_unknown_names() {
         .unwrap();
     assert!(out.content.starts_with("done"));
     let events = sink.events.lock().unwrap().clone();
-    assert!(events.iter().any(|(k, _, n)| k == "tool_result:denied" && n == "sub:echo"), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n)| k == "tool_result:denied" && n == "sub:echo"),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -184,7 +243,10 @@ async fn missing_prompt_is_invalid_args() {
         Arc::new(FullSink::default()),
         vec![],
     ));
-    let err = tool.execute(serde_json::json!({}), &tool_ctx()).await.unwrap_err();
+    let err = tool
+        .execute(serde_json::json!({}), &tool_ctx())
+        .await
+        .unwrap_err();
     assert!(matches!(err, ToolError::InvalidArgs(_)));
 }
 
@@ -195,12 +257,18 @@ fn intent_is_readonly_and_auto_allowed() {
         Arc::new(FullSink::default()),
         vec![],
     ));
-    let intent = tool.intent(&serde_json::json!({"prompt": "summarize the repo"})).unwrap();
+    let intent = tool
+        .intent(&serde_json::json!({"prompt": "summarize the repo"}))
+        .unwrap();
     assert!(matches!(intent.access, Access::Read));
     assert!(intent.paths.is_empty());
     assert!(intent.command.is_none());
     assert!(intent.summary.contains("summarize"));
-    let policy = RulePolicy { workspace: workspace(), command_allowlist: vec![], command_denylist: vec![] };
+    let policy = RulePolicy {
+        workspace: workspace(),
+        command_allowlist: vec![],
+        command_denylist: vec![],
+    };
     assert!(matches!(policy.check(&intent), Decision::Allow));
 }
 
@@ -239,7 +307,11 @@ fn intent_summary_is_single_line_for_a_multiline_prompt() {
         .unwrap();
     assert!(!intent.summary.contains('\n'), "{}", intent.summary);
     assert!(!intent.summary.contains('\r'), "{}", intent.summary);
-    assert!(intent.summary.contains("line one line two"), "{}", intent.summary);
+    assert!(
+        intent.summary.contains("line one line two"),
+        "{}",
+        intent.summary
+    );
 }
 
 /// Records approval requests; replies with a fixed response.
@@ -259,23 +331,43 @@ impl agent_policy::ApprovalChannel for RecordingApproval {
 struct Writey;
 #[async_trait::async_trait]
 impl Tool for Writey {
-    fn name(&self) -> &str { "writey" }
-    fn description(&self) -> &str { "writes" }
+    fn name(&self) -> &str {
+        "writey"
+    }
+    fn description(&self) -> &str {
+        "writes"
+    }
     fn schema(&self) -> ToolSchema {
-        ToolSchema { name: "writey".into(), description: "writes".into(), parameters: serde_json::json!({"type":"object"}) }
+        ToolSchema {
+            name: "writey".into(),
+            description: "writes".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }
     }
     fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
-        Ok(ToolIntent { tool: "writey".into(), access: Access::Write, paths: vec![], command: None, summary: "write something".into() })
+        Ok(ToolIntent {
+            tool: "writey".into(),
+            access: Access::Write,
+            paths: vec![],
+            command: None,
+            summary: "write something".into(),
+        })
     }
     async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        Ok(ToolOutput { content: "wrote".into(), display: None })
+        Ok(ToolOutput {
+            content: "wrote".into(),
+            display: None,
+        })
     }
 }
 
 #[tokio::test]
 async fn child_ask_routes_to_the_shared_approval_channel_and_deny_sticks() {
     let sink = Arc::new(FullSink::default());
-    let approval = Arc::new(RecordingApproval { seen: Mutex::new(vec![]), reply: agent_policy::ApprovalResponse::Deny });
+    let approval = Arc::new(RecordingApproval {
+        seen: Mutex::new(vec![]),
+        reply: agent_policy::ApprovalResponse::Deny,
+    });
     let mut d = deps(
         ScriptedModel::new(vec![
             Scripted::Call("c1".into(), "writey".into(), "{}".into()),
@@ -286,19 +378,33 @@ async fn child_ask_routes_to_the_shared_approval_channel_and_deny_sticks() {
     );
     d.approval = approval.clone();
     let tool = DispatchAgentTool::new(d);
-    let out = tool.execute(serde_json::json!({"prompt": "p"}), &tool_ctx()).await.unwrap();
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
     // The Ask reached the PARENT's channel (spec Invariant / D2)...
-    assert_eq!(approval.seen.lock().unwrap().as_slice(), &["write something".to_string()]);
+    assert_eq!(
+        approval.seen.lock().unwrap().as_slice(),
+        &["write something".to_string()]
+    );
     // ...and the denial reached the child (forwarded as a denied tool_result).
     let events = sink.events.lock().unwrap().clone();
-    assert!(events.iter().any(|(k, _, n)| k == "tool_result:denied" && n == "sub:writey"), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n)| k == "tool_result:denied" && n == "sub:writey"),
+        "{events:?}"
+    );
     assert!(out.content.starts_with("done"));
 }
 
 #[tokio::test]
 async fn child_ask_approve_executes() {
     let sink = Arc::new(FullSink::default());
-    let approval = Arc::new(RecordingApproval { seen: Mutex::new(vec![]), reply: agent_policy::ApprovalResponse::Approve });
+    let approval = Arc::new(RecordingApproval {
+        seen: Mutex::new(vec![]),
+        reply: agent_policy::ApprovalResponse::Approve,
+    });
     let mut d = deps(
         ScriptedModel::new(vec![
             Scripted::Call("c1".into(), "writey".into(), "{}".into()),
@@ -309,9 +415,16 @@ async fn child_ask_approve_executes() {
     );
     d.approval = approval;
     let tool = DispatchAgentTool::new(d);
-    tool.execute(serde_json::json!({"prompt": "p"}), &tool_ctx()).await.unwrap();
+    tool.execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
     let events = sink.events.lock().unwrap().clone();
-    assert!(events.iter().any(|(k, _, n)| k == "tool_result:ok" && n == "sub:writey"), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n)| k == "tool_result:ok" && n == "sub:writey"),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -319,17 +432,29 @@ async fn child_cannot_recurse_into_dispatch_agent() {
     let sink = Arc::new(FullSink::default());
     let tool = DispatchAgentTool::new(deps(
         ScriptedModel::new(vec![
-            Scripted::Call("c1".into(), "dispatch_agent".into(), r#"{"prompt":"nested"}"#.into()),
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"nested"}"#.into(),
+            ),
             Scripted::Text("done".into()),
         ]),
         sink.clone(),
         vec![Arc::new(Echo)],
     ));
-    let out = tool.execute(serde_json::json!({"prompt": "p"}), &tool_ctx()).await.unwrap();
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
     assert!(out.content.starts_with("done"));
     // The child's gate rejected the unknown tool (Denied, "not found").
     let events = sink.events.lock().unwrap().clone();
-    assert!(events.iter().any(|(k, _, n)| k == "tool_result:denied" && n == "sub:dispatch_agent"), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n)| k == "tool_result:denied" && n == "sub:dispatch_agent"),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -341,8 +466,14 @@ async fn pre_cancelled_parent_token_cancels_the_child() {
     ));
     let ctx = tool_ctx();
     ctx.cancel.cancel();
-    let err = tool.execute(serde_json::json!({"prompt": "p"}), &ctx).await.unwrap_err();
-    assert!(matches!(err, ToolError::Failed { ref message, .. } if message.contains("cancelled")), "{err:?}");
+    let err = tool
+        .execute(serde_json::json!({"prompt": "p"}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ToolError::Failed { ref message, .. } if message.contains("cancelled")),
+        "{err:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -355,7 +486,10 @@ async fn wall_clock_timeout_cancels_the_child_and_reports_timeout() {
     let mut ctx = tool_ctx();
     ctx.timeout = Duration::from_secs(1);
     let started = tokio::time::Instant::now();
-    let err = tool.execute(serde_json::json!({"prompt": "p"}), &ctx).await.unwrap_err();
+    let err = tool
+        .execute(serde_json::json!({"prompt": "p"}), &ctx)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ToolError::Timeout), "{err:?}");
     assert_eq!(started.elapsed(), Duration::from_secs(1)); // virtual time: exactly the budget
 }
@@ -383,7 +517,11 @@ async fn parallel_dispatches_get_distinct_ordinals_and_both_complete() {
     rb.unwrap();
     // Two children each made one echo call; the two forwarded start ids carry
     // distinct sub{n} prefixes even though both children used child-id c1.
-    let ids: Vec<String> = sink.events.lock().unwrap().iter()
+    let ids: Vec<String> = sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
         .filter(|(k, _, _)| k == "tool_start")
         .map(|(_, id, _)| id.clone())
         .collect();
