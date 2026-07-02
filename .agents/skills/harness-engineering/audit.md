@@ -352,6 +352,27 @@ HTTP Host→Access posture encodings, Write-vs-Destroy FS granularity (tracked-f
 overwrite vs scratch write), wire Access surfacing, and ApproveAlways persistence stay
 out of scope. **This closes the deep audit's Top-10.**
 
+Re-stamp note (2026-07-01, retry follow-up batch): the retry cluster's accepted-residual
+batch is now **fixed and merged to `main`** (6 commits, `1400ede..8bab0d6` merge commit; spec
+`docs/superpowers/specs/2026-07-01-retry-followup-batch-design.md`). (1) `ModelError::Process`
+bodies are overflow-signature-checked (one guard arm mirroring `Stream` in `class()`,
+`agent-model/src/types.rs`) — claude-cli overflow now triggers the once-per-turn
+compact-and-rebuild; end-to-end pinned via `Scripted::Fail(Process(..))`; the original retry
+spec's wrong edge-case claim ("only the Stream body check can catch it") carries a dated
+correction. (2) Recovery is observable everywhere: payload-free `ContextEvent::OverflowRecovery`
+emitted BEFORE `maintain()` (fires even when compaction no-ops), wire/trace kind
+`"overflow_recovery"`, CLI render line, web `describeContext` case; and `AgentEvent::Usage` is
+re-emitted after the rebuild so the turn's estimate reflects the rebuilt request (all consumers
+verified replace-or-ignore: web reducer replaces, `SessionStats::fold` ignores `Usage`, CLI
+ignores, trace appends). (3) Dead `AgentError::Cancelled` deleted (zero refs across both
+workspaces). (4) Retry tests run on tokio paused clocks (3 conversions) plus an in-situ
+backoff-growth pin: virtual elapsed exactly 700 ms (100+200+400) across three retries.
+Accepted residuals: a second overflow-classified error in a turn is FATAL by design (spec
+narrative corrected 74cd21b — bounded fail-fast, not Retryable fallback); overflow-recovery
+Usage assertion is `>= 2` without turn-parity pin; signatures scan the whole Process stderr
+(anchor to the CLI error prefix only if a real transient ever echoes an overflow phrase);
+Retry-After/jitter and server-usage-calibrated budgeting stay deferred.
+
 ---
 
 **Finding 1 — Instructions: duplicated system prompt + skill files lack negative constraints**
