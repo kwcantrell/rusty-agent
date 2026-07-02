@@ -532,6 +532,28 @@ coverage gaps only: no Fatal/second-overflow-with-partial absence tests, no abor
 composition test, no direct `normalize_invalid_ids` collision unit test; `Some(all_calls.clone())`
 allocation nit. Retry-After/jitter remains deferred to the small-residuals sweep.
 
+Re-stamp note (2026-07-02, calibrated-budgeting cluster — backlog drain 3/6): the deep audit's
+**Spine B #2 HIGH** (token accounting vs ground truth) and **#4 MED** (stale recall blocks) are
+now **fixed and merged to `main`** (2 commits, `d02b262..197378b`, merge `ae3750d`; spec
+`docs/superpowers/specs/2026-07-02-server-usage-calibrated-budgeting-design.md`).
+`AgentLoop.calib_ratio_micros` (AtomicU64) learns the (server `prompt_tokens` / chars-4
+estimate) density ratio per completed request — EMA α=0.5, clamped [1.0, 4.0], shrink-only —
+and `effective_model_limit()` applies it at the four budgeting sites (turn build, overflow
+MaintCtx + rebuild build, end-of-turn MaintCtx); `Usage` events and snapshots keep the
+CONFIGURED limit (display truth); backends reporting no usage behave exactly as before. The
+final review verified the feedback loop is structurally stable (density ratio is
+eviction-scale-invariant; non-destructive build; triple-bounded shrink) and that the ratio
+persists across runs on both frontends. `ctx.set_recall` is now unconditional — an
+empty retrieval clears the previous run's recall block. Overflow compact-and-rebuild is
+hereby demoted from de-facto safety net back to actual last resort (the
+`context-token-estimate-undercounts` memory item is addressed). Accepted residuals
+(merge-clean): claude-cli `prompt_tokens` omits cache_read/cache_creation tokens →
+calibration inert on that backend (queued in drain cluster 6); server shares one loop → the
+ratio is cross-session there (a backend property, desirable — recorded); `debug!` inside
+`fetch_update` may double-fire under CAS contention; calibration unit tests use a
+constant-est recorder (mechanism-level pin; no-oscillation is argued structurally); ratio
+resets on settings change / child loops / restart (converges in 1-2 turns).
+
 ---
 
 ## Top highest-leverage fixes
