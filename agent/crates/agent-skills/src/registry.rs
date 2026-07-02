@@ -140,10 +140,19 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         Err(_) => return,
     };
     for e in read.flatten() {
+        // Use the DirEntry's file_type(), which does NOT follow symlinks. This
+        // guards against symlinked-dir cycles (unbounded recursion) and symlinks
+        // that escape the skill dir. Symlinks in skill dirs are therefore not
+        // traversed — a symlink to a dir is not descended and a symlink to a file
+        // is skipped, matching the guard.rs no-symlink posture.
+        let ft = match e.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
         let p = e.path();
-        if p.is_dir() {
+        if ft.is_dir() {
             collect_files(root, &p, out);
-        } else if p.is_file() && p != root.join("SKILL.md") {
+        } else if ft.is_file() && p != root.join("SKILL.md") {
             out.push(p);
         }
     }
@@ -336,6 +345,47 @@ mod tests {
         let skill = reg.find("plain").expect("skill loads");
         assert!(skill.examples.is_empty(), "{:?}", skill.examples);
         assert_eq!(skill.files.len(), 1); // the odd file is still bundled
+    }
+
+    #[test]
+    fn nested_skill_md_is_bundled() {
+        // Only the ROOT SKILL.md is excluded; a file literally named SKILL.md in
+        // a subdir is a normal bundled file.
+        let dir = tempdir().unwrap();
+        let sd = dir.path().join("demo");
+        fs::create_dir_all(sd.join("examples")).unwrap();
+        fs::write(sd.join("SKILL.md"), "---\ndescription: d\n---\nbody").unwrap();
+        fs::write(sd.join("examples/SKILL.md"), "nested").unwrap();
+        let reg = SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf());
+        let skill = reg.find("demo").expect("skill loads");
+        let rel: Vec<String> = skill
+            .files
+            .iter()
+            .map(|p| p.strip_prefix(&skill.dir).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(rel, vec!["examples/SKILL.md".to_string()], "{rel:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_dir_is_not_traversed() {
+        // A symlink pointing at the skill dir itself forms a cycle. The scan must
+        // terminate (no unbounded recursion) and must not enumerate through the
+        // symlink — only the real files appear.
+        let dir = tempdir().unwrap();
+        let sd = dir.path().join("demo");
+        fs::create_dir_all(&sd).unwrap();
+        fs::write(sd.join("SKILL.md"), "---\ndescription: d\n---\nbody").unwrap();
+        fs::write(sd.join("real.txt"), "R").unwrap();
+        std::os::unix::fs::symlink(&sd, sd.join("loop")).unwrap();
+        let reg = SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf());
+        let skill = reg.find("demo").expect("skill loads");
+        let rel: Vec<String> = skill
+            .files
+            .iter()
+            .map(|p| p.strip_prefix(&skill.dir).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(rel, vec!["real.txt".to_string()], "{rel:?}");
     }
 
     #[test]
