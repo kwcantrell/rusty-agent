@@ -1,7 +1,7 @@
 # Turn-Atomic Context Curation — Design
 
 **Date:** 2026-07-01
-**Status:** Approved (brainstorming) → ready for plan
+**Status:** Implemented (this plan: docs/superpowers/plans/2026-07-01-turn-atomic-context-curation.md)
 **Source:** Cluster 5 of the harness deep audit
 (`docs/superpowers/audits/2026-07-01-harness-deep-audit.md`, Spine B — Context
 Engineering, HIGH at `context.rs:147-155; curated.rs:134-141,174-184`; Top-10
