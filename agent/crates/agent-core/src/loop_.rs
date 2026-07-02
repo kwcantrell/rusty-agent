@@ -125,6 +125,11 @@ pub struct AgentLoop {
     config: LoopConfig,
     retriever: Option<Arc<dyn Retriever>>,
     compaction_model: Option<Arc<dyn ModelClient>>,
+    /// Observed (server prompt_tokens / chars-4 estimate) ratio, EMA-smoothed,
+    /// fixed-point micros. 1_000_000 = 1.0 = uncalibrated. Shrink-only: clamped
+    /// to [1.0, 4.0] and applied as a divisor on model_limit (spec 2026-07-02
+    /// server-usage-calibrated budgeting).
+    calib_ratio_micros: std::sync::atomic::AtomicU64,
 }
 
 impl AgentLoop {
@@ -148,6 +153,7 @@ impl AgentLoop {
             config,
             retriever: None,
             compaction_model: None,
+            calib_ratio_micros: std::sync::atomic::AtomicU64::new(1_000_000),
         }
     }
 
@@ -173,6 +179,45 @@ impl AgentLoop {
     /// The model that serves maintenance (compaction) completions.
     fn maint_model(&self) -> &Arc<dyn ModelClient> {
         self.compaction_model.as_ref().unwrap_or(&self.model)
+    }
+
+    /// The configured window shrunk by the observed estimate-undercount ratio
+    /// (server prompt_tokens vs chars/4 estimate). Never exceeds the configured
+    /// limit; floor at 1/4 of it. Keeps chars/4 as the per-message currency while
+    /// making the *budget* honest (audit Spine B #2).
+    fn effective_model_limit(&self) -> usize {
+        let ratio = self
+            .calib_ratio_micros
+            .load(std::sync::atomic::Ordering::Relaxed) as f64
+            / 1e6;
+        ((self.config.model_limit as f64 / ratio) as usize).max(1)
+    }
+
+    /// Fold one completed request's ground-truth prompt_tokens against our chars/4
+    /// estimate into the EMA ratio (alpha 0.5), clamped to [1.0, 4.0] so the
+    /// effective limit only ever shrinks the configured window (spec §1). A backend
+    /// that reports no usage (`prompt_tokens == 0`) leaves the ratio untouched.
+    fn record_calibration_sample(&self, server_prompt_tokens: u32, est: usize) {
+        if server_prompt_tokens == 0 || est == 0 {
+            return;
+        }
+        let sample = server_prompt_tokens as f64 / est as f64;
+        let _ = self.calib_ratio_micros.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |old| {
+                let old_f = old as f64 / 1e6;
+                let new_f = (0.5 * old_f + 0.5 * sample).clamp(1.0, 4.0);
+                if (new_f - old_f).abs() / old_f > 0.05 {
+                    tracing::debug!(
+                        old = old_f,
+                        new = new_f,
+                        "token-estimate calibration shifted"
+                    );
+                }
+                Some((new_f * 1e6) as u64)
+            },
+        );
     }
 
     /// Drive one streamed completion to an `AssistantTurn`, emitting tokens as they arrive.
@@ -360,10 +405,10 @@ impl AgentLoop {
         }
 
         if let Some(retriever) = &self.retriever {
-            let lines = retriever.retrieve(&user_input).await;
-            if !lines.is_empty() {
-                ctx.set_recall(lines);
-            }
+            // Unconditional: an empty retrieval clears the prior run's recall
+            // block (contexts persist across runs). set_recall(vec![]) renders
+            // no block. (spec §2, audit Spine B #4)
+            ctx.set_recall(retriever.retrieve(&user_input).await);
         }
         ctx.set_goal(user_input.clone());
         ctx.append(Message::user(user_input));
@@ -388,9 +433,14 @@ impl AgentLoop {
                 self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
                 return Ok(());
             }
-            let messages = ctx.build(self.config.model_limit);
+            let messages = ctx.build(self.effective_model_limit());
+            // The chars/4 estimate for the request actually sent; reused for both the
+            // Usage event and the post-completion calibration sample. The
+            // overflow-recovery rebuild reassigns it so the sample always matches the
+            // FINAL request (spec §1).
+            let mut est_prompt_tokens = built_tokens(&messages);
             self.sink.emit(AgentEvent::Usage {
-                prompt_tokens: built_tokens(&messages),
+                prompt_tokens: est_prompt_tokens,
                 context_limit: self.config.model_limit,
                 turn: turn + 1,
                 max_turns: self.config.max_turns,
@@ -421,17 +471,19 @@ impl AgentLoop {
                             .emit(AgentEvent::Context(crate::ContextEvent::OverflowRecovery));
                         ctx.request_compaction();
                         let deps = crate::MaintCtx {
-                            model_limit: self.config.model_limit,
+                            model_limit: self.effective_model_limit(),
                             model: self.maint_model(),
                             sink: &self.sink,
                             cancel: &cancel,
                         };
                         ctx.maintain(&deps).await;
-                        let messages = ctx.build(self.config.model_limit);
+                        let messages = ctx.build(self.effective_model_limit());
                         // The pre-request Usage is stale after compaction; re-emit so
                         // every surface sees the rebuilt request's estimate (latest wins).
+                        // Reassign the calibration denominator to this FINAL request.
+                        est_prompt_tokens = built_tokens(&messages);
                         self.sink.emit(AgentEvent::Usage {
-                            prompt_tokens: built_tokens(&messages),
+                            prompt_tokens: est_prompt_tokens,
                             context_limit: self.config.model_limit,
                             turn: turn + 1,
                             max_turns: self.config.max_turns,
@@ -461,6 +513,9 @@ impl AgentLoop {
                 turn: turn + 1,
                 parent_id: None,
             });
+            // Fold the server's ground-truth prompt_tokens for the request just sent
+            // against our estimate into the shrink-only calibration ratio (spec §1).
+            self.record_calibration_sample(assistant.prompt_tokens, est_prompt_tokens);
 
             let mut parsed = match self.protocol.parse(&assistant) {
                 Ok(p) => {
@@ -775,7 +830,7 @@ impl AgentLoop {
             }
 
             let deps = crate::MaintCtx {
-                model_limit: self.config.model_limit,
+                model_limit: self.effective_model_limit(),
                 model: self.maint_model(),
                 sink: &self.sink,
                 cancel: &cancel,
@@ -1734,6 +1789,73 @@ mod tests {
             .iter()
             .any(|m| m.content.contains("Relevant memories")));
         assert!(sink.events.lock().unwrap().last().unwrap() == "done");
+    }
+
+    /// A run that retrieves nothing must CLEAR the previous run's recall block —
+    /// contexts persist across runs (spec §2, audit Spine B #4).
+    #[tokio::test]
+    async fn empty_retrieval_clears_stale_recall() {
+        // Retriever stub: first call returns ["fact A"], every later call [].
+        struct TogglingRetriever(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl crate::Retriever for TogglingRetriever {
+            async fn retrieve(&self, _q: &str) -> Vec<String> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    vec!["fact A".into()]
+                } else {
+                    vec![]
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Text("ok".into()),
+            Scripted::Text("ok".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .with_retriever(Arc::new(TogglingRetriever(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
+
+        // Shared real context across two runs (persists like a REPL/server session).
+        let mut ctx = WindowContext::new(Message::system("sys"));
+
+        agent.run(&mut ctx, "hello".into()).await.unwrap();
+        assert!(
+            ctx.build(100_000)
+                .iter()
+                .any(|m| m.content.contains("fact A")),
+            "run 1 (non-empty retrieval) should inject the recall block"
+        );
+
+        agent.run(&mut ctx, "again".into()).await.unwrap();
+        assert!(
+            !ctx.build(100_000)
+                .iter()
+                .any(|m| m.content.contains("fact A")),
+            "run 2 (empty retrieval) must clear the stale recall block"
+        );
     }
 
     #[tokio::test]
@@ -4521,6 +4643,219 @@ mod tests {
         assert!(
             sink.tool_results.lock().unwrap().is_empty(),
             "the Length-truncation path must not emit a tool result"
+        );
+    }
+
+    // ---- Server-usage-calibrated effective model limit (spec 2026-07-02 §1) ----
+
+    /// A ContextManager that records the `model_limit` passed to every `build`
+    /// call and returns a FIXED canned message list, so `built_tokens` of each
+    /// request is deterministic — the denominator of the calibration sample.
+    struct RecordingContext {
+        system: Message,
+        canned: Vec<Message>,
+        builds: Arc<Mutex<Vec<usize>>>,
+    }
+    impl ContextManager for RecordingContext {
+        fn append(&mut self, _msg: Message) {}
+        fn set_system(&mut self, system: Message) {
+            self.system = system;
+        }
+        fn build(&self, model_limit: usize) -> Vec<Message> {
+            self.builds.lock().unwrap().push(model_limit);
+            let mut out = Vec::with_capacity(self.canned.len() + 1);
+            out.push(self.system.clone());
+            out.extend(self.canned.iter().cloned());
+            out
+        }
+    }
+
+    /// Captures the `context_limit` field of every `Usage` event (the string
+    /// CollectingSink can't carry it).
+    #[derive(Default)]
+    struct UsageLimitSink {
+        limits: Mutex<Vec<usize>>,
+    }
+    impl EventSink for UsageLimitSink {
+        fn emit(&self, event: AgentEvent) {
+            if let AgentEvent::Usage { context_limit, .. } = event {
+                self.limits.lock().unwrap().push(context_limit);
+            }
+        }
+    }
+
+    /// One assistant turn: a `counter` tool call (distinct args per `n` so the
+    /// stuck-repeat detector never trips across the many calibration turns) plus a
+    /// server `Usage` chunk reporting `prompt_tokens`.
+    fn tool_turn_with_usage(n: usize, prompt_tokens: u32) -> Scripted {
+        Scripted::Chunks(vec![
+            Chunk::ToolCallDelta(RawToolCall {
+                index: Some(0),
+                id: Some(format!("c{n}")),
+                name: Some("counter".into()),
+                args_fragment: format!("{{\"n\":{n}}}"),
+            }),
+            Chunk::Usage {
+                prompt_tokens,
+                completion_tokens: 0,
+                reasoning_tokens: None,
+                cached_tokens: None,
+                cost_usd: None,
+            },
+            Chunk::Done(StopReason::ToolCalls),
+        ])
+    }
+
+    fn text_turn() -> Scripted {
+        Scripted::Chunks(vec![
+            Chunk::Text("done".into()),
+            Chunk::Done(StopReason::Stop),
+        ])
+    }
+
+    fn calib_agent(model: Arc<ScriptedModel>, sink: Arc<dyn EventSink>) -> AgentLoop {
+        let ws = std::env::temp_dir();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Counter(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        ))));
+        AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(reg),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 20,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The deterministic chars/4 estimate the loop computes for the canned request.
+    fn canned_est(system: &Message, canned: &[Message]) -> usize {
+        let mut all = vec![system.clone()];
+        all.extend(canned.iter().cloned());
+        built_tokens(&all)
+    }
+
+    fn recording_ctx(builds: Arc<Mutex<Vec<usize>>>) -> (RecordingContext, Message, Vec<Message>) {
+        let system = Message::system("sys");
+        let canned = vec![Message::user("x".repeat(400))];
+        let ctx = RecordingContext {
+            system: system.clone(),
+            canned: canned.clone(),
+            builds,
+        };
+        (ctx, system, canned)
+    }
+
+    /// Server-reported prompt_tokens 2× our estimate must shrink the NEXT turn's
+    /// build budget (EMA 0.5: 1.0 → 1.5), never the Usage event's configured
+    /// context_limit (spec §1).
+    #[tokio::test]
+    async fn server_usage_shrinks_effective_budget() {
+        let builds = Arc::new(Mutex::new(Vec::new()));
+        let (mut ctx, system, canned) = recording_ctx(builds.clone());
+        let est = canned_est(&system, &canned);
+
+        let model = Arc::new(ScriptedModel::new(vec![
+            tool_turn_with_usage(1, (2 * est) as u32), // turn 1: server says 2× est
+            text_turn(),                               // turn 2: plain-text stop
+        ]));
+        let sink: Arc<UsageLimitSink> = Arc::new(UsageLimitSink::default());
+        let agent = calib_agent(model, sink.clone());
+        agent.run(&mut ctx, "hi".into()).await.unwrap();
+
+        let recorded = builds.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2, "one build per turn: {recorded:?}");
+        assert_eq!(
+            recorded[0], 100_000,
+            "turn 1 builds at the configured limit"
+        );
+        let expected = (100_000f64 / 1.5) as usize; // 66_666
+        assert!(
+            (recorded[1] as i64 - expected as i64).abs() <= 1,
+            "turn 2 build shrinks to ~model_limit/1.5, got {}",
+            recorded[1]
+        );
+
+        // Usage EVENTS always carry the CONFIGURED limit (display truth).
+        let limits = sink.limits.lock().unwrap().clone();
+        assert!(!limits.is_empty(), "at least one Usage event expected");
+        assert!(
+            limits.iter().all(|&l| l == 100_000),
+            "Usage events must carry the configured limit: {limits:?}"
+        );
+    }
+
+    /// A backend that reports no usage leaves the budget exactly configured.
+    #[tokio::test]
+    async fn zero_prompt_tokens_leaves_budget_configured() {
+        let builds = Arc::new(Mutex::new(Vec::new()));
+        let (mut ctx, ..) = recording_ctx(builds.clone());
+
+        let model = Arc::new(ScriptedModel::new(vec![
+            tool_turn_with_usage(1, 0), // server reports 0 → no sample
+            text_turn(),
+        ]));
+        let sink: Arc<UsageLimitSink> = Arc::new(UsageLimitSink::default());
+        let agent = calib_agent(model, sink);
+        agent.run(&mut ctx, "hi".into()).await.unwrap();
+
+        let recorded = builds.lock().unwrap().clone();
+        assert!(
+            recorded.iter().all(|&l| l == 100_000),
+            "zero prompt_tokens keeps the configured limit every turn: {recorded:?}"
+        );
+    }
+
+    /// A wildly-high sample clamps the shrink at 4× (floor = model_limit/4), and a
+    /// run of low samples decays the ratio back toward 1.0 — never above the
+    /// configured limit.
+    #[tokio::test]
+    async fn calibration_clamps_at_4x_and_never_grows() {
+        let builds = Arc::new(Mutex::new(Vec::new()));
+        let (mut ctx, system, canned) = recording_ctx(builds.clone());
+        let est = canned_est(&system, &canned);
+
+        let mut turns = vec![tool_turn_with_usage(0, (100 * est) as u32)]; // 100× → clamp 4.0
+        for i in 1..=5 {
+            turns.push(tool_turn_with_usage(i, (est / 10) as u32)); // ~0.1× samples
+        }
+        turns.push(text_turn());
+        let model = Arc::new(ScriptedModel::new(turns));
+        let sink: Arc<UsageLimitSink> = Arc::new(UsageLimitSink::default());
+        let agent = calib_agent(model, sink);
+        agent.run(&mut ctx, "hi".into()).await.unwrap();
+
+        let recorded = builds.lock().unwrap().clone();
+        assert_eq!(recorded[0], 100_000, "turn 1 uncalibrated: {recorded:?}");
+        assert_eq!(
+            recorded[1],
+            100_000 / 4,
+            "a 100× sample clamps the ratio at 4.0 → build floor at model_limit/4: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().all(|&l| l <= 100_000),
+            "the effective limit never exceeds the configured window: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().all(|&l| l >= 100_000 / 4),
+            "the effective limit never drops below the model_limit/4 floor: {recorded:?}"
+        );
+        assert_eq!(
+            *recorded.last().unwrap(),
+            100_000,
+            "low samples decay the ratio back to 1.0 (configured limit): {recorded:?}"
         );
     }
 }
