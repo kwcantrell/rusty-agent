@@ -3,6 +3,12 @@ use agent_model::{Message, Role};
 
 const PLACEHOLDER_PREFIX: &str = "[tool_result#";
 
+/// Default eager ingestion cap (`OffloadConfig::max_result_bytes`), also the
+/// default for `RuntimeConfig::max_tool_result_bytes`. ~4K tokens: large
+/// enough for real command output, small enough that one result cannot
+/// swamp a small window.
+pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct OffloadConfig {
     /// Tool ERROR results at or above this many bytes are eligible.
@@ -13,6 +19,9 @@ pub struct OffloadConfig {
     pub keep_recent: usize,
     /// Tool names never offloaded.
     pub exclude_tools: Vec<String>,
+    /// Eager cap: any tool result larger than this many bytes is offloaded at
+    /// ingestion (bounded preview + recall marker), regardless of age.
+    pub max_result_bytes: usize,
 }
 
 impl Default for OffloadConfig {
@@ -22,6 +31,7 @@ impl Default for OffloadConfig {
             output_min_bytes: 1024,
             keep_recent: 3,
             exclude_tools: Vec::new(),
+            max_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
         }
     }
 }
@@ -103,6 +113,70 @@ pub fn placeholder_for(id: OffloadId, tool_name: &str, kind: &OffloadKind, bytes
         "[tool_result#{id} offloaded: {bytes}B {kind_str} from \"{tool_name}\" \
          — recall with context_recall({id})]"
     )
+}
+
+/// Marker appended to an ingestion-capped preview. `shown`/`total` are byte counts.
+pub fn truncation_marker(id: OffloadId, tool_name: &str, shown: usize, total: usize) -> String {
+    format!(
+        "\n[tool_result#{id} truncated: showing first {shown}B of {total}B from \
+         \"{tool_name}\" — continue with context_recall(id: {id}, offset: {shown})]"
+    )
+}
+
+/// Truncate `content` so preview + marker fit within `cap` bytes (char-boundary
+/// safe). When `cap` cannot even hold the marker, degrades to a marker-only
+/// string with no leading newline, which starts with `PLACEHOLDER_PREFIX` and
+/// is therefore never re-selected.
+pub fn capped_preview(content: &str, cap: usize, id: OffloadId, tool_name: &str) -> String {
+    let total = content.len();
+    // Budget against the widest the marker can render (`shown = total`), so the
+    // final string can only come in under `cap`.
+    let worst = truncation_marker(id, tool_name, total, total);
+    let mut cut = cap.saturating_sub(worst.len()).min(total);
+    while !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if cut == 0 {
+        return truncation_marker(id, tool_name, 0, total)
+            .trim_start()
+            .to_string();
+    }
+    format!(
+        "{}{}",
+        &content[..cut],
+        truncation_marker(id, tool_name, cut, total)
+    )
+}
+
+/// Select tool-result messages exceeding the eager ingestion cap, regardless
+/// of age. Pure: no I/O, deterministic. Skips excluded tools and placeholders.
+pub fn select_oversized(history: &[Message], config: &OffloadConfig) -> Vec<OffloadHit> {
+    let mut hits = Vec::new();
+    for (i, m) in history.iter().enumerate() {
+        if !matches!(m.role, Role::Tool)
+            || m.content.starts_with(PLACEHOLDER_PREFIX)
+            || m.content.len() <= config.max_result_bytes
+        {
+            continue;
+        }
+        let tool_name = m.name.clone().unwrap_or_default();
+        if config.exclude_tools.iter().any(|t| t == &tool_name) {
+            continue;
+        }
+        hits.push(OffloadHit {
+            history_index: i,
+            entry: OffloadEntry {
+                id: 0,
+                tool_call_id: m.tool_call_id.clone().unwrap_or_default(),
+                tool_name,
+                kind: classify(&m.content),
+                content: m.content.clone(),
+                bytes: m.content.len(),
+                turn: i,
+            },
+        });
+    }
+    hits
 }
 
 #[cfg(test)]
@@ -230,5 +304,103 @@ mod tests {
         assert!(p.contains("context_recall(7)"));
         assert!(p.contains("shell"));
         assert!(p.contains("3100B"));
+    }
+
+    fn cap_cfg(max: usize) -> OffloadConfig {
+        OffloadConfig {
+            max_result_bytes: max,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn oversized_fresh_result_is_selected_despite_keep_recent() {
+        // keep_recent protects by AGE; size-based selection must ignore it.
+        let history = vec![tool_msg("shell", &"x".repeat(5000))];
+        let hits = select_oversized(&history, &cap_cfg(1024));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].history_index, 0);
+        assert_eq!(hits[0].entry.bytes, 5000);
+        assert_eq!(hits[0].entry.kind, OffloadKind::Output);
+    }
+
+    #[test]
+    fn at_cap_result_is_not_selected() {
+        let history = vec![tool_msg("shell", &"x".repeat(1024))];
+        assert!(select_oversized(&history, &cap_cfg(1024)).is_empty());
+    }
+
+    #[test]
+    fn oversized_error_is_classified_error() {
+        let history = vec![tool_msg("shell", &format!("ERROR: {}", "x".repeat(5000)))];
+        let hits = select_oversized(&history, &cap_cfg(1024));
+        assert_eq!(hits[0].entry.kind, OffloadKind::Error);
+    }
+
+    #[test]
+    fn placeholders_and_excluded_tools_are_not_selected() {
+        let placeholder = format!(
+            "[tool_result#7 offloaded: 9000B output \
+             from \"shell\" — recall with context_recall(7)]{}",
+            "x".repeat(2000)
+        );
+        let history = vec![
+            Message::tool("c1", "shell", &placeholder),
+            Message::tool("c2", "use_skill", "y".repeat(5000)),
+        ];
+        let cfg = OffloadConfig {
+            max_result_bytes: 1024,
+            exclude_tools: vec!["use_skill".into()],
+            ..Default::default()
+        };
+        assert!(select_oversized(&history, &cfg).is_empty());
+    }
+
+    #[test]
+    fn non_tool_messages_are_never_selected() {
+        let history = vec![Message::user("x".repeat(5000))];
+        assert!(select_oversized(&history, &cap_cfg(1024)).is_empty());
+    }
+
+    #[test]
+    fn capped_preview_fits_cap_and_carries_the_recall_hint() {
+        let content = "x".repeat(50_000);
+        let out = capped_preview(&content, 1024, 42, "shell");
+        assert!(out.len() <= 1024, "preview+marker {} > cap", out.len());
+        assert!(out.starts_with("xxx"));
+        assert!(out.contains("tool_result#42 truncated"));
+        assert!(out.contains("of 50000B"));
+        assert!(out.contains("context_recall(id: 42, offset: "));
+    }
+
+    #[test]
+    fn capped_preview_respects_char_boundaries() {
+        // 4-byte scalars; a byte-index cut inside one would panic on slicing.
+        let content = "🦀".repeat(20_000);
+        let out = capped_preview(&content, 1024, 1, "shell");
+        assert!(out.len() <= 1024);
+        assert!(out.starts_with('🦀'));
+    }
+
+    #[test]
+    fn capped_preview_is_idempotent_under_reselection() {
+        let content = "x".repeat(50_000);
+        let out = capped_preview(&content, 1024, 1, "shell");
+        let history = vec![Message::tool("c1", "shell", &out)];
+        assert!(
+            select_oversized(&history, &cap_cfg(1024)).is_empty(),
+            "capped output must never be re-selected"
+        );
+    }
+
+    #[test]
+    fn pathological_small_cap_degrades_to_placeholder_prefix() {
+        // cap smaller than the marker itself: output is marker-only and must
+        // start with PLACEHOLDER_PREFIX so both selectors skip it forever.
+        let content = "x".repeat(50_000);
+        let out = capped_preview(&content, 16, 3, "shell");
+        assert!(out.starts_with("[tool_result#3"));
+        let history = vec![Message::tool("c1", "shell", &out)];
+        assert!(select_oversized(&history, &cap_cfg(16)).is_empty());
     }
 }

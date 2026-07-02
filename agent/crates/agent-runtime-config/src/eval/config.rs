@@ -55,6 +55,7 @@ impl CandidateConfig {
             output_min_bytes: self.output_min_bytes,
             keep_recent: self.keep_recent,
             exclude_tools: Vec::new(),
+            ..Default::default()
         }
     }
 }
