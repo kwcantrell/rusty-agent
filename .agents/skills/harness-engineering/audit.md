@@ -569,6 +569,31 @@ Remaining out of scope: FS Write-vs-Destroy granularity (standing product decisi
 non-allowlisted git write-sinks (`format-patch -o`) already fail the prefix match; user-added
 bare `git` entries keep legacy semantics.
 
+Re-stamp note (2026-07-02, eval-flywheel cluster — backlog drain 5/6): the deep audit's
+**Eval-dimension** MEDs/LOW are now **fixed and merged to `main`** (5 commits, `7e8c118..3c4a88f`,
+merge `7f7c601`; spec `docs/superpowers/specs/2026-07-02-eval-flywheel-design.md`).
+**Process signal:** `RunResult` gained `#[serde(default)] trajectory: Vec<TrajectoryStep{tool,args}>`
+(ToolStart order, captured by the eval sink across ALL sessions of a run), `denials` (SafeApproval
+denials — the accumulated-never-read counter now emits to stderr as `eval-denied:` lines + a count
+in the JSON), and `gold_matched: Option<bool>`; `TaskSpec.gold_trajectory` (ordered tool-name
+subsequence) + `trajectory_matches_gold` comparator (empty gold vacuous; duplicate-name semantics
+pinned). All additive: old JSON lines/frozen task files parse (pinned by test + verified through
+the real `eval_gate` binary both directions); the promotion gate is UNTOUCHED — trajectory is
+diagnostic until the campaign decides to gate on it. **Regression corpus:**
+`agent-runtime-config/tests/policy_corpus.{rs,tsv}` — 86 rows through the REAL engine path
+(`RulePolicy` + `ExecuteCommand::intent` + `default_allowlist()`/`effective_denylist()`, mirroring
+assemble.rs wiring) covering every closed-bypass class; new cases are one-line TSV additions.
+Discovery: the name-exact catastrophe-token guard drops `grep mkfs README` to Ask (fail-safe,
+documented row). **Coverage:** a `continue-on-error` GitHub Actions job runs
+`cargo llvm-cov --workspace --summary-only` (scripts/ci.sh untouched — pre-push stays fast; first
+real validation on the first Actions run). Accepted residuals (merge-clean): trajectory records
+full args (unbounded JSON line size on huge write_file args — truncate if campaign jsonl ever
+bites); TSV whitespace-smuggling rows could be silently degraded by a space-collapsing editor (no
+.gitattributes; in-test multi-space assertion is the cheap pin); three hand-built RunResult test
+literals to touch on any future field. Session discovery queued to drain cluster 6:
+`agent-cli approval::denies_when_timeout_elapses` parks a thread on real stdin — under an
+open-pipe stdin, tokio teardown wedges the whole test binary (observed 874 s); make it hermetic.
+
 ---
 
 ## Top highest-leverage fixes
