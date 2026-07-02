@@ -8,22 +8,52 @@ use std::time::Duration;
 /// timeout before auto-denying.
 const DEFAULT_TERMINAL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
+type BlockingPrompt = std::sync::Arc<dyn Fn(String) -> ApprovalResponse + Send + Sync>;
+
 pub struct TerminalApproval {
     timeout: Duration,
+    /// Serializes concurrent requesters (parallel sub-agents both hitting Ask)
+    /// so prompts never interleave on stdin.
+    gate: tokio::sync::Mutex<()>,
+    prompt: BlockingPrompt,
+}
+
+fn stdin_prompt(summary: String) -> ApprovalResponse {
+    print!("\n\x1b[35mAllow:\x1b[0m {summary} ? [y]es / [n]o / [a]lways: ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return ApprovalResponse::Deny;
+    }
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" => ApprovalResponse::Approve,
+        "a" | "always" => ApprovalResponse::ApproveAlways,
+        _ => ApprovalResponse::Deny,
+    }
 }
 
 impl TerminalApproval {
     #[allow(dead_code)]
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            gate: tokio::sync::Mutex::new(()),
+            prompt: std::sync::Arc::new(stdin_prompt),
+        }
+    }
+    #[cfg(test)]
+    fn with_prompt(timeout: Duration, prompt: BlockingPrompt) -> Self {
+        Self {
+            timeout,
+            gate: tokio::sync::Mutex::new(()),
+            prompt,
+        }
     }
 }
 
 impl Default for TerminalApproval {
     fn default() -> Self {
-        Self {
-            timeout: DEFAULT_TERMINAL_APPROVAL_TIMEOUT,
-        }
+        Self::new(DEFAULT_TERMINAL_APPROVAL_TIMEOUT)
     }
 }
 
@@ -36,23 +66,16 @@ impl ApprovalChannel for TerminalApproval {
         // spawned thread is orphaned — it stays parked on stdin until the next line or
         // EOF arrives, then its result is discarded. Harmless: one idle thread per
         // elapsed prompt (bounded by tokio's blocking pool), and the agent is no longer
-        // blocked. The approval loop prompts one at a time, so this does not accumulate
-        // in practice. A clean cancel would need raw-fd polling, not worth the
-        // complexity for a CLI approval prompt.
+        // blocked. The `gate` mutex below now enforces one-at-a-time for LIVE prompts
+        // (parallel sub-agents can each hit Ask — spec D12), so at most one prompt reads
+        // stdin at a time. But a timed-out orphan thread still holds its own `read_line`
+        // on stdin, so it can race the next prompt's read for the operator's keystrokes
+        // — an accepted residual: a clean cancel would need raw-fd polling, not worth
+        // the complexity for a CLI approval prompt.
+        let _serialized = self.gate.lock().await;
         let summary = req.intent.summary.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            print!("\n\x1b[35mAllow:\x1b[0m {summary} ? [y]es / [n]o / [a]lways: ");
-            let _ = std::io::stdout().flush();
-            let mut line = String::new();
-            if std::io::stdin().read_line(&mut line).is_err() {
-                return ApprovalResponse::Deny;
-            }
-            match line.trim().to_lowercase().as_str() {
-                "y" | "yes" => ApprovalResponse::Approve,
-                "a" | "always" => ApprovalResponse::ApproveAlways,
-                _ => ApprovalResponse::Deny,
-            }
-        });
+        let prompt = self.prompt.clone();
+        let handle = tokio::task::spawn_blocking(move || prompt(summary));
         match tokio::time::timeout(self.timeout, handle).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(_join_err)) => ApprovalResponse::Deny,
@@ -93,5 +116,29 @@ mod tests {
         let ch = TerminalApproval::new(Duration::from_millis(1));
         let resp = ch.request(req()).await;
         assert!(matches!(resp, ApprovalResponse::Deny));
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_serialize() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let live = Arc::new(AtomicUsize::new(0));
+        let max = Arc::new(AtomicUsize::new(0));
+        let (l, m) = (live.clone(), max.clone());
+        let ch = Arc::new(TerminalApproval::with_prompt(
+            Duration::from_secs(5),
+            Arc::new(move |_summary: String| {
+                let now = l.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                l.fetch_sub(1, Ordering::SeqCst);
+                ApprovalResponse::Approve
+            }),
+        ));
+        let (a, b) = tokio::join!(ch.request(req()), ch.request(req()));
+        assert!(matches!(a, ApprovalResponse::Approve));
+        assert!(matches!(b, ApprovalResponse::Approve));
+        // Two children prompting at once must never overlap on stdin (spec D12).
+        assert_eq!(max.load(Ordering::SeqCst), 1);
     }
 }

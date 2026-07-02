@@ -13,6 +13,12 @@ pub trait Tool: Send + Sync {
     fn when_not_to_call(&self) -> Option<&str> {
         None
     }
+    /// Per-tool execution budget. `None` (default) uses the loop's
+    /// `tool_timeout`. Long-lived tools (e.g. sub-agent dispatch) override this;
+    /// `execute_isolated`'s 2x backstop scales with it automatically.
+    fn timeout_override(&self) -> Option<std::time::Duration> {
+        None
+    }
     /// Declare what this call will do, for the policy engine to judge before execution.
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError>;
     async fn execute(

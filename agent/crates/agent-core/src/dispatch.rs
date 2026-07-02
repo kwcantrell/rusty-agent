@@ -1,0 +1,611 @@
+//! Sub-agent dispatch: sub-agents-as-tools (spec 2026-07-01-subagent-dispatch-core).
+use crate::{
+    AgentEvent, AgentLoop, CuratedContext, EventSink, InMemoryOffloadStore, LoopConfig,
+    OffloadConfig,
+};
+use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
+use agent_policy::{ApprovalChannel, PolicyEngine};
+use agent_tools::{
+    Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema,
+};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Appended to the parent's composed system prompt for every child.
+pub const SUBAGENT_PREAMBLE: &str = "You are a sub-agent dispatched by a parent \
+agent to complete one self-contained task. Work autonomously: no one can answer \
+questions. Your final message is returned verbatim to the parent as the task \
+result, so end with a complete, standalone answer.";
+
+static DISPATCH_ORDINAL: AtomicU64 = AtomicU64::new(1);
+
+/// Process-wide dispatch ordinal: keeps forwarded child event ids unique across
+/// parallel siblings and across the parent's own tool-call ids (spec D9).
+pub fn next_dispatch_n() -> u64 {
+    DISPATCH_ORDINAL.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Default)]
+struct Capture {
+    /// Token text split into segments at ToolResult boundaries; the last
+    /// segment is the child's final-turn text (spec D10).
+    segments: Vec<String>,
+    tool_calls: u64,
+    turns: usize,
+    stop: Option<StopReason>,
+}
+
+pub struct CaptureSummary {
+    pub final_text: String,
+    pub tool_calls: u64,
+    pub turns: usize,
+    pub stop: Option<StopReason>,
+}
+
+/// The child loop's sink: captures the transcript for the tool result and
+/// forwards ONLY ToolStart/ToolResult (ids `sub{n}:{id}`, names `sub:{name}`)
+/// plus ServerUsage (real cost) to the parent sink — all existing wire frames,
+/// so no wire/web/CLI changes (spec D9). Child Token/Done/Error/Context stay
+/// private: the parent's streamed transcript must not be corrupted.
+pub struct SubagentSink {
+    parent: Arc<dyn EventSink>,
+    n: u64,
+    cap: Mutex<Capture>,
+}
+
+impl SubagentSink {
+    pub fn new(parent: Arc<dyn EventSink>, n: u64) -> Self {
+        Self {
+            parent,
+            n,
+            cap: Mutex::new(Capture {
+                segments: vec![String::new()],
+                ..Capture::default()
+            }),
+        }
+    }
+
+    pub fn summary(&self) -> CaptureSummary {
+        let cap = self.cap.lock().unwrap();
+        let tail = cap.segments.last().cloned().unwrap_or_default();
+        let final_text = if tail.trim().is_empty() {
+            cap.segments.concat().trim().to_string()
+        } else {
+            tail.trim().to_string()
+        };
+        CaptureSummary {
+            final_text,
+            tool_calls: cap.tool_calls,
+            turns: cap.turns,
+            stop: cap.stop,
+        }
+    }
+}
+
+impl EventSink for SubagentSink {
+    fn emit(&self, event: AgentEvent) {
+        let mut cap = self.cap.lock().unwrap();
+        match event {
+            AgentEvent::Token(t) => {
+                cap.segments
+                    .last_mut()
+                    .expect("segments never empty")
+                    .push_str(&t);
+            }
+            AgentEvent::ToolStart { id, name, args } => {
+                cap.tool_calls += 1;
+                drop(cap);
+                self.parent.emit(AgentEvent::ToolStart {
+                    id: format!("sub{}:{}", self.n, id),
+                    name: format!("sub:{name}"),
+                    args,
+                });
+            }
+            AgentEvent::ToolResult {
+                id,
+                name,
+                status,
+                output,
+                duration_ms,
+            } => {
+                cap.segments.push(String::new());
+                drop(cap);
+                self.parent.emit(AgentEvent::ToolResult {
+                    id: format!("sub{}:{}", self.n, id),
+                    name: format!("sub:{name}"),
+                    status,
+                    output,
+                    duration_ms,
+                });
+            }
+            e @ AgentEvent::ServerUsage { .. } => {
+                drop(cap);
+                self.parent.emit(e);
+            }
+            AgentEvent::Usage { turn, .. } => {
+                cap.turns = cap.turns.max(turn);
+            }
+            AgentEvent::Done(reason) => {
+                cap.stop = Some(reason);
+            }
+            // Suppressed: Reasoning, Approval, Error, Context, SandboxDegraded
+            // (spec D9 — child terminal/context events are the tool result's
+            // business, not the parent transcript's).
+            _ => {}
+        }
+    }
+}
+
+/// Everything `DispatchAgentTool` needs to spawn a child `AgentLoop`.
+pub struct DispatchDeps {
+    pub model: Arc<dyn ModelClient>,
+    pub protocol: Arc<dyn ToolCallProtocol>,
+    pub policy: Arc<dyn PolicyEngine>,
+    pub approval: Arc<dyn ApprovalChannel>,
+    /// The parent's (Observed) sink — forwarded child events reach stats/trace/UI.
+    pub sink: Arc<dyn EventSink>,
+    /// Snapshot of the parent's tools taken BEFORE dispatch_agent and the
+    /// parent's context tools were registered (spec D4: structural depth-1).
+    pub base_tools: Vec<Arc<dyn Tool>>,
+    pub child_system_prompt: String,
+    /// Parent LoopConfig clone with max_turns = subagent_max_turns (shares the
+    /// parent's sandbox Arc — spec Invariant).
+    pub loop_config: LoopConfig,
+    pub max_result_bytes: usize,
+    pub subagent_timeout: std::time::Duration,
+}
+
+pub struct DispatchAgentTool {
+    deps: DispatchDeps,
+}
+
+impl DispatchAgentTool {
+    pub fn new(deps: DispatchDeps) -> Self {
+        Self { deps }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for DispatchAgentTool {
+    fn name(&self) -> &str {
+        "dispatch_agent"
+    }
+    fn description(&self) -> &str {
+        "Delegate an independent, multi-step subtask to an isolated sub-agent with \
+         its own fresh context window. The sub-agent has the same permissions and \
+         tools as you (minus dispatch_agent itself), works autonomously on the \
+         prompt you give it, and its final answer is returned as this tool's \
+         result. Make the prompt self-contained: the sub-agent cannot see this \
+         conversation."
+    }
+    fn when_not_to_call(&self) -> Option<&str> {
+        Some(
+            "Do NOT use for a single operation another tool does directly — call \
+             that tool. Do not use when the answer depends on this conversation's \
+             context (the sub-agent cannot see it), and do not expect it to ask \
+             you questions — it runs unattended.",
+        )
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "dispatch_agent".into(),
+            description: self.description().into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The complete, self-contained task for the sub-agent: goal, relevant paths/facts, and what to return."
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way."
+                    }
+                },
+                "required": ["prompt"]
+            }),
+        }
+    }
+    fn timeout_override(&self) -> Option<std::time::Duration> {
+        Some(self.deps.subagent_timeout)
+    }
+    fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        // Sanitize to a single line so the approval/trace summary can't be
+        // corrupted by embedded newlines before truncating to 80 chars.
+        let head: String = prompt
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .take(80)
+            .collect();
+        // Read: spawning computation is not an effect — every effectful child
+        // action is gated by the same policy + approval as the parent (spec D3).
+        Ok(ToolIntent {
+            tool: "dispatch_agent".into(),
+            access: Access::Read,
+            paths: vec![],
+            command: None,
+            summary: format!("dispatch sub-agent: {head}"),
+        })
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .filter(|p| !p.trim().is_empty())
+            .ok_or_else(|| ToolError::InvalidArgs("prompt (non-empty string) is required".into()))?
+            .to_string();
+        let allow: Option<Vec<String>> = match args.get("tools") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(a)) => Some(
+                a.iter()
+                    .map(|v| {
+                        v.as_str().map(str::to_string).ok_or_else(|| {
+                            ToolError::InvalidArgs("tools must be an array of strings".into())
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(_) => {
+                return Err(ToolError::InvalidArgs(
+                    "tools must be an array of strings".into(),
+                ))
+            }
+        };
+        if let Some(names) = &allow {
+            let available: Vec<&str> = self.deps.base_tools.iter().map(|t| t.name()).collect();
+            for n in names {
+                if !available.contains(&n.as_str()) {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "unknown tool '{n}'; available: {}",
+                        available.join(", ")
+                    )));
+                }
+            }
+        }
+
+        // Child registry: (filtered) base snapshot + child-bound context tools.
+        // dispatch_agent is structurally absent (spec D4: no recursion).
+        let mut reg = ToolRegistry::new();
+        for t in &self.deps.base_tools {
+            // Defense in depth for D4: dispatch_agent is never child-visible,
+            // even if a caller leaks it into the base snapshot. No recursion.
+            if t.name() == "dispatch_agent" {
+                continue;
+            }
+            if allow
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|n| n == t.name()))
+            {
+                reg.register(t.clone());
+            }
+        }
+        let store: Arc<dyn crate::OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        for t in crate::context_tools(store.clone(), flag.clone(), self.deps.max_result_bytes) {
+            reg.register(t);
+        }
+        let mut child_ctx = CuratedContext::new(
+            Message::system(self.deps.child_system_prompt.clone()),
+            store,
+            flag,
+        )
+        .with_offload_config(OffloadConfig {
+            max_result_bytes: self.deps.max_result_bytes,
+            ..OffloadConfig::default()
+        });
+
+        let sink = Arc::new(SubagentSink::new(self.deps.sink.clone(), next_dispatch_n()));
+        let child = AgentLoop::new(
+            self.deps.model.clone(),
+            self.deps.protocol.clone(),
+            Arc::new(reg),
+            self.deps.policy.clone(),
+            self.deps.approval.clone(),
+            sink.clone(),
+            self.deps.loop_config.clone(),
+        );
+
+        // Parent cancel propagates down; child self-cancel never travels up (D8).
+        let child_cancel = ctx.cancel.child_token();
+        let run = child.run_with_cancel(&mut child_ctx, prompt, child_cancel.clone());
+        match tokio::time::timeout(ctx.timeout, run).await {
+            Err(_elapsed) => {
+                child_cancel.cancel();
+                return Err(ToolError::Timeout);
+            }
+            Ok(Err(e)) => {
+                return Err(ToolError::Failed {
+                    message: format!("sub-agent failed: {e}"),
+                    stderr: None,
+                })
+            }
+            Ok(Ok(())) => {}
+        }
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Failed {
+                message: "sub-agent cancelled".into(),
+                stderr: None,
+            });
+        }
+
+        let s = sink.summary();
+        let stop = s.stop.unwrap_or(StopReason::Stop);
+        let footer = format!(
+            "[sub-agent: {} turns, {} tool calls, stop: {stop:?}]",
+            s.turns, s.tool_calls
+        );
+        let budget_note = matches!(s.stop, Some(StopReason::BudgetExhausted))
+            .then_some("[sub-agent hit its turn budget before finishing]");
+        // Apply the empty-check to the CHILD text first so a text-less child never
+        // emits a stray blank-line run: footer alone, or (budget) note + footer
+        // joined by a single newline. With text present: note prefix, the text, a
+        // blank line, then the footer.
+        let content = if s.final_text.is_empty() {
+            match budget_note {
+                Some(note) => format!("{note}\n{footer}"),
+                None => footer,
+            }
+        } else {
+            match budget_note {
+                Some(note) => format!("{note}\n{}\n\n{footer}", s.final_text),
+                None => format!("{}\n\n{footer}", s.final_text),
+            }
+        };
+        Ok(ToolOutput {
+            content,
+            display: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AgentEvent, ContextEvent, EventSink, ToolStatus};
+    use agent_model::StopReason;
+    use agent_tools::ToolOutput;
+    use std::sync::{Arc, Mutex};
+
+    /// Captures full (kind, id, name) triples — testkit's CollectingSink drops ids.
+    #[derive(Default)]
+    struct FullSink {
+        events: Mutex<Vec<(String, String, String)>>,
+    }
+    impl EventSink for FullSink {
+        fn emit(&self, event: AgentEvent) {
+            let triple = match event {
+                AgentEvent::ToolStart { id, name, .. } => ("tool_start".into(), id, name),
+                AgentEvent::ToolResult {
+                    id, name, status, ..
+                } => (format!("tool_result:{}", status.as_str()), id, name),
+                AgentEvent::ServerUsage { prompt_tokens, .. } => (
+                    "server_usage".into(),
+                    prompt_tokens.to_string(),
+                    String::new(),
+                ),
+                // Anything else reaching the parent is a forwarding-table bug —
+                // record it so the exact-equality assertion below catches the leak.
+                _ => ("unexpected".to_string(), String::new(), String::new()),
+            };
+            self.events.lock().unwrap().push(triple);
+        }
+    }
+
+    fn tool_result(id: &str, name: &str) -> AgentEvent {
+        AgentEvent::ToolResult {
+            id: id.into(),
+            name: name.into(),
+            status: ToolStatus::Ok,
+            output: ToolOutput {
+                content: "r".into(),
+                display: None,
+            },
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn forwards_tool_events_rewritten_and_suppresses_the_rest() {
+        let parent = Arc::new(FullSink::default());
+        let sink = SubagentSink::new(parent.clone(), 7);
+        sink.emit(AgentEvent::Token("hi".into()));
+        sink.emit(AgentEvent::Reasoning("r".into()));
+        sink.emit(AgentEvent::Usage {
+            prompt_tokens: 1,
+            context_limit: 10,
+            turn: 1,
+            max_turns: 5,
+        });
+        sink.emit(AgentEvent::ToolStart {
+            id: "c1".into(),
+            name: "echo".into(),
+            args: serde_json::json!({}),
+        });
+        sink.emit(tool_result("c1", "echo"));
+        sink.emit(AgentEvent::ServerUsage {
+            prompt_tokens: 42,
+            completion_tokens: 1,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            cost_usd: None,
+            turn_duration_ms: 1,
+            turn: 1,
+        });
+        sink.emit(AgentEvent::Error("boom".into()));
+        sink.emit(AgentEvent::Context(ContextEvent::OverflowRecovery));
+        sink.emit(AgentEvent::Done(StopReason::Stop));
+
+        let got = parent.events.lock().unwrap().clone();
+        // ONLY ToolStart/ToolResult (rewritten) + ServerUsage (verbatim) forwarded.
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "tool_start".to_string(),
+                    "sub7:c1".to_string(),
+                    "sub:echo".to_string()
+                ),
+                (
+                    "tool_result:ok".to_string(),
+                    "sub7:c1".to_string(),
+                    "sub:echo".to_string()
+                ),
+                ("server_usage".to_string(), "42".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn summary_final_text_is_tail_after_last_tool_result() {
+        let sink = SubagentSink::new(Arc::new(FullSink::default()), 1);
+        sink.emit(AgentEvent::Token("thinking...".into()));
+        sink.emit(tool_result("c1", "echo"));
+        sink.emit(AgentEvent::Token("final ".into()));
+        sink.emit(AgentEvent::Token("answer".into()));
+        sink.emit(AgentEvent::Done(StopReason::Stop));
+        let s = sink.summary();
+        assert_eq!(s.final_text, "final answer");
+        assert_eq!(s.tool_calls, 0); // no ToolStart was emitted
+        assert_eq!(s.stop, Some(StopReason::Stop));
+    }
+
+    #[test]
+    fn summary_falls_back_to_all_text_when_tail_is_blank() {
+        let sink = SubagentSink::new(Arc::new(FullSink::default()), 1);
+        sink.emit(AgentEvent::Token("early words".into()));
+        sink.emit(tool_result("c1", "echo"));
+        // no tokens after the last tool result
+        let s = sink.summary();
+        assert_eq!(s.final_text, "early words");
+    }
+
+    #[test]
+    fn summary_counts_tool_calls_and_turns() {
+        let sink = SubagentSink::new(Arc::new(FullSink::default()), 1);
+        sink.emit(AgentEvent::Usage {
+            prompt_tokens: 1,
+            context_limit: 10,
+            turn: 1,
+            max_turns: 5,
+        });
+        sink.emit(AgentEvent::ToolStart {
+            id: "c1".into(),
+            name: "a".into(),
+            args: serde_json::json!({}),
+        });
+        sink.emit(AgentEvent::ToolStart {
+            id: "c2".into(),
+            name: "b".into(),
+            args: serde_json::json!({}),
+        });
+        sink.emit(AgentEvent::Usage {
+            prompt_tokens: 2,
+            context_limit: 10,
+            turn: 2,
+            max_turns: 5,
+        });
+        let s = sink.summary();
+        assert_eq!(s.tool_calls, 2);
+        assert_eq!(s.turns, 2);
+    }
+
+    #[test]
+    fn dispatch_ordinals_are_unique() {
+        let a = next_dispatch_n();
+        let b = next_dispatch_n();
+        assert_ne!(a, b);
+    }
+
+    // --- Footer formatting pins (empty-text / budget-exhausted) -------------
+    use crate::testkit::{AlwaysApprove, PassthroughProtocol, Scripted, ScriptedModel};
+    use crate::LoopConfig;
+    use agent_tools::ToolCtx;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    fn exec_deps(model: ScriptedModel, max_turns: usize) -> DispatchDeps {
+        let ws = std::env::temp_dir();
+        DispatchDeps {
+            model: Arc::new(model),
+            protocol: Arc::new(PassthroughProtocol),
+            policy: Arc::new(agent_policy::RulePolicy {
+                workspace: ws.clone(),
+                command_allowlist: vec![],
+                command_denylist: vec![],
+            }),
+            approval: Arc::new(AlwaysApprove),
+            sink: Arc::new(FullSink::default()),
+            base_tools: vec![],
+            child_system_prompt: "SYS".into(),
+            loop_config: LoopConfig {
+                model_limit: 16384,
+                max_turns,
+                max_retries: 1,
+                tool_timeout: Duration::from_secs(5),
+                stream_idle_timeout: Duration::from_secs(3600),
+                workspace: ws,
+                ..LoopConfig::default()
+            },
+            max_result_bytes: 16 * 1024,
+            subagent_timeout: Duration::from_secs(600),
+        }
+    }
+
+    fn exec_ctx() -> ToolCtx {
+        ToolCtx {
+            workspace: std::env::temp_dir(),
+            timeout: Duration::from_secs(600),
+            cancel: CancellationToken::new(),
+            sandbox: Arc::new(agent_tools::HostExecutor),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_with_no_text_has_no_blank_line_run() {
+        // Child burns its 1-turn budget on a (denied) tool call and emits zero
+        // Token text. The budget note + footer must join without a stray blank
+        // line (no "\n\n\n"); the old prepend-then-append path produced one.
+        let tool = DispatchAgentTool::new(exec_deps(
+            ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "nope".into(), "{}".into()),
+                Scripted::Call("c2".into(), "nope".into(), "{}".into()),
+            ]),
+            1,
+        ));
+        let out = tool
+            .execute(serde_json::json!({"prompt": "p"}), &exec_ctx())
+            .await
+            .unwrap();
+        assert!(out.content.contains("turn budget"), "{:?}", out.content);
+        assert!(out.content.contains("[sub-agent:"), "{:?}", out.content);
+        assert!(!out.content.contains("\n\n\n"), "{:?}", out.content);
+    }
+
+    #[tokio::test]
+    async fn empty_text_child_returns_footer_alone_without_leading_whitespace() {
+        // Non-budget empty child: footer alone, no leading blank line/whitespace.
+        let tool = DispatchAgentTool::new(exec_deps(
+            ScriptedModel::new(vec![Scripted::Text(String::new())]),
+            5,
+        ));
+        let out = tool
+            .execute(serde_json::json!({"prompt": "p"}), &exec_ctx())
+            .await
+            .unwrap();
+        assert!(out.content.starts_with("[sub-agent:"), "{:?}", out.content);
+        assert!(out.content.contains("stop: Stop"), "{:?}", out.content);
+        assert!(
+            !out.content.starts_with(char::is_whitespace),
+            "{:?}",
+            out.content
+        );
+        assert!(!out.content.contains("\n\n\n"), "{:?}", out.content);
+    }
+}

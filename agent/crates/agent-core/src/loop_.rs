@@ -44,6 +44,7 @@ enum RetryFailure {
     Overflow(String),
 }
 
+#[derive(Clone)]
 pub struct LoopConfig {
     pub model_limit: usize,
     pub max_turns: usize,
@@ -482,7 +483,7 @@ impl AgentLoop {
             } else {
                 self.config.max_parallel_tools
             };
-            let executed: Vec<(String, String, Executed, u64)> =
+            let executed: Vec<(String, String, Executed, u64, Duration)> =
                 futures::stream::iter(ready.into_iter().map(|rc| {
                     let ReadyCall {
                         tool,
@@ -491,16 +492,19 @@ impl AgentLoop {
                         name,
                         ctx,
                     } = rc;
+                    // The effective per-call deadline (may be a tool's
+                    // timeout_override, not the loop default) — logged on timeout.
+                    let timeout = ctx.timeout;
                     async move {
                         let started = std::time::Instant::now();
                         let ex = execute_isolated(tool, args, &name, &ctx).await;
-                        (id, name, ex, started.elapsed().as_millis() as u64)
+                        (id, name, ex, started.elapsed().as_millis() as u64, timeout)
                     }
                 }))
                 .buffer_unordered(cap)
                 .collect()
                 .await;
-            for (id, name, ex, duration_ms) in executed {
+            for (id, name, ex, duration_ms, timeout) in executed {
                 let resolved = match ex {
                     Executed::Ok(o) => Resolved::Ok(o, duration_ms),
                     Executed::ToolErr(s) => Resolved::Err {
@@ -520,7 +524,7 @@ impl AgentLoop {
                     }
                     Executed::TimedOut(s) => {
                         tracing::warn!(target: "loop", tool = %name,
-                            timeout = ?self.config.tool_timeout,
+                            timeout = ?timeout,
                             "tool timed out during parallel dispatch");
                         self.sink.emit(AgentEvent::Error(s.clone()));
                         Resolved::Err {
@@ -683,7 +687,7 @@ impl AgentLoop {
         // aborts when the caller cancels the run (Ctrl-C / SIGINT via the CLI).
         let ctx = ToolCtx {
             workspace: self.config.workspace.clone(),
-            timeout: self.config.tool_timeout,
+            timeout: tool.timeout_override().unwrap_or(self.config.tool_timeout),
             cancel: cancel.clone(),
             sandbox: self.config.sandbox.clone(),
         };
