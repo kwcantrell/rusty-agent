@@ -236,6 +236,23 @@ turns=max(turn) semantics, session_stats query has no client caller yet, trace f
 live trace toggle needs restart, id-based tool correlation in the web reducer. Remaining open
 finding below renumbered to 1.
 
+Re-stamp note (2026-07-01, context cluster): the deep audit's "cluster 5" — the **Context
+Engineering** HIGH (torn eviction/compaction orphaning `Role::Tool` messages → mid-session 400;
+Top-10 fix #5) plus the folded silent-eviction MED — is now **fixed and merged to `main`**
+(5 commits, `c6a34d8..12a7841`, fast-forward): shared turn-unit helpers in
+`agent-core/src/context.rs` (`turn_unit_ranges` / `evict_start` / `snap_split_to_unit_boundary` /
+`orphaned_tool_positions`); both `build()`s evict whole units newest-first (keep-≥1-unit floor)
+under `debug_assert!` orphan guards; the compaction split snaps left to a unit boundary; and a
+change-deduped `ContextEvent::Evicted {messages, est_tokens}` emits on every `maintain` exit
+(compaction arm extracted into `compact_old_span` to kill its early return), surfaced on CLI,
+wire, trace, and web markers. Budget-sweep property tests pin the invariant for every limit.
+See `docs/superpowers/specs/2026-07-01-turn-atomic-context-curation-design.md`. Follow-up
+backlog (non-blocking, final review): dedup reset-re-emit test (the one untested spec behavior),
+dedup keyed on count only (consider `(messages, est_tokens)`), non-cloning `pinned_tokens()`
+helper. Design notes: `Evicted` is observable only after tool turns (emitted from `maintain`,
+same siting as offload/compaction); the `debug_assert` would panic debug builds on a corrupted
+pre-existing-orphan history if session rehydration ever lands.
+
 Re-stamp note (2026-07-01, sandbox cluster): the deep audit's "cluster 1" — **Sandboxes &
 Execution** (Component 3, Top-10 fixes #1 and #2) — is now **fixed and merged to `main`**
 (9 commits, `ffc8ac8..be67413`, fast-forward): a degraded sandbox **refuses** exec-capable
@@ -276,11 +293,12 @@ concrete proposed fix: The coding-agent system prompt is byte-identical but dupl
 
 Ranked by impact (severity × remediation cost). All prior HIGH findings, the observability
 cluster (per-call terminal events + durations, JSONL session traces, usage/cost parsing,
-SessionStats + web panel, ContextEvent forwarding, CI gate), and the sandbox cluster
+SessionStats + web panel, ContextEvent forwarding, CI gate), the sandbox cluster
 (fail-closed degraded exec, env scrub, required `LoopConfig.sandbox`, MCP workspace cwd,
-nobody uid fallback) are **done** — for the full current backlog see
+nobody uid fallback), and the context cluster (turn-atomic eviction/compaction + visible
+eviction) are **done** — for the full current backlog see
 `docs/superpowers/audits/2026-07-01-harness-deep-audit.md` (its Top-10 table; items
-1, 2, 3, 4, and 6 are now complete). Of this file's inline findings, one remains:
+1, 2, 3, 4, 5, and 6 are now complete). Of this file's inline findings, one remains:
 
 1. **[Component 1 — Instructions] De-duplicate the system prompt + add negative constraints** (Finding 1)
    `agent/crates/agent-server/src/daemon.rs:23` + `agent/crates/agent-cli/src/main.rs:15`; `.agents/skills/`
