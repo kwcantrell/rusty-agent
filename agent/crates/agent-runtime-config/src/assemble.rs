@@ -102,7 +102,7 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     for t in agent_core::context_tools(
         parts.offload_store.clone(),
         parts.compact_flag.clone(),
-        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
+        cfg.max_tool_result_bytes,
     ) {
         registry.register(t);
     }

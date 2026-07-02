@@ -270,7 +270,11 @@ async fn main() {
         offload_store,
         compact_flag,
     )
-    .with_recall_budget(memory.recall_token_budget);
+    .with_recall_budget(memory.recall_token_budget)
+    .with_offload_config(agent_core::OffloadConfig {
+        max_result_bytes: rt.max_tool_result_bytes,
+        ..Default::default()
+    });
 
     println!("agent ready. Type a task, or 'exit'.");
     let stdin = std::io::stdin();

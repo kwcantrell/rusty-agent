@@ -24,6 +24,8 @@ pub struct RuntimeConfig {
     pub max_tokens: u32,
     pub max_turns: usize,
     pub context_limit: usize,
+    #[serde(default = "default_max_tool_result_bytes")]
+    pub max_tool_result_bytes: usize,
     #[serde(default = "default_true")]
     pub memory: bool,
     #[serde(default)]
@@ -87,6 +89,7 @@ struct PartialRuntimeConfig {
     max_tokens: Option<u32>,
     max_turns: Option<usize>,
     context_limit: Option<usize>,
+    max_tool_result_bytes: Option<usize>,
     top_p: Option<f32>,
     top_k: Option<u32>,
     min_p: Option<f32>,
@@ -113,6 +116,9 @@ struct PartialRuntimeConfig {
 
 fn default_true() -> bool {
     true
+}
+fn default_max_tool_result_bytes() -> usize {
+    agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES
 }
 fn default_sandbox_mode() -> String {
     "auto".into()
@@ -160,6 +166,7 @@ impl RuntimeConfig {
             max_tokens: 16384,
             max_turns: 25,
             context_limit,
+            max_tool_result_bytes: default_max_tool_result_bytes(),
             memory: true,
             top_p: None,
             top_k: None,
@@ -306,6 +313,9 @@ impl RuntimeConfig {
         if let Some(v) = p.context_limit {
             self.context_limit = v;
         }
+        if let Some(v) = p.max_tool_result_bytes {
+            self.max_tool_result_bytes = v;
+        }
         if let Some(v) = p.top_p {
             self.top_p = Some(v);
         }
@@ -427,6 +437,43 @@ mod tests {
             "native".into(),
             8192,
         )
+    }
+
+    #[test]
+    fn max_tool_result_bytes_defaults_and_merges() {
+        // Old on-disk file without the field → default.
+        let c = RuntimeConfig::from_launch(
+            "openai".into(),
+            "http://x".into(),
+            "m".into(),
+            "native".into(),
+            8192,
+        );
+        assert_eq!(
+            c.max_tool_result_bytes,
+            agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES
+        );
+
+        // A serialized config missing the field deserializes to the default.
+        let mut v: serde_json::Value = serde_json::to_value(&c).unwrap();
+        v.as_object_mut().unwrap().remove("max_tool_result_bytes");
+        let parsed: RuntimeConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            parsed.max_tool_result_bytes,
+            agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES
+        );
+    }
+
+    #[test]
+    fn max_tool_result_bytes_partial_file_overrides_only_that_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.json");
+        std::fs::write(&path, r#"{"max_tool_result_bytes": 4096}"#).unwrap();
+        let b = base();
+        let loaded = RuntimeConfig::load_over(b.clone(), &path);
+        assert_eq!(loaded.max_tool_result_bytes, 4096); // file wins
+        assert_eq!(loaded.model, b.model); // absent fields fall back to base
+        assert_eq!(loaded.max_tokens, b.max_tokens);
     }
 
     #[test]
