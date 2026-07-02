@@ -454,6 +454,34 @@ Deferred (future work, on demand): skill-defined agent types / role registry, mo
 per-call model override, live child token streaming. **The audit's remaining absent capability
 is the Examples context type — the last open item from the 2026-07-01 deep audit.**
 
+Re-stamp note (2026-07-02, Examples context type — DEEP AUDIT FULLY CLOSED): the audit's
+**missing capability #2 — the Examples context type — is BUILT and merged to `main`** (7 commits
++ fix wave, `7d9e253..c899e7b`, merge `fdf37fd`; spec
+`docs/superpowers/specs/2026-07-02-examples-context-type-design.md`). Per-skill worked exemplars
+live under `<skill>/examples/` (`Skill.examples` = that subset of the bundled files) and surface
+through the existing progressive-disclosure levels: L1 `list_skills` marks example-bearing skills
+(`[N examples]`, pluralized); L2 `use_skill` renders a distinct `## Examples (worked exemplars,
+dir: …)` section with skill-relative paths and the imitate-don't-copy contract line, and the
+bundled-files section switched to relative paths with the absolute dir stated in the header
+(the read/exec guidance is self-consistent for both consumption paths); L3 `read_skill_file` is
+unchanged; `create_skill` teaches the convention in prose; `SKILLS_AWARENESS` grew by exactly one
+sentence (the feature's whole prompt-side static cost — `create_skill`'s schema prose also grew
+~30 words/request, H5-sanctioned). Model-initiative, pay-per-use — no injection, no new tools,
+no new caps. **Session discovery worth remembering:** `list_bundled_files` was NON-recursive all
+along — nested skill files (`references/…`) were L3-readable but never listed at L2; recursion
+was adjudicated in (dated spec correction) with symlink-traversal hardening (`DirEntry::file_type`
+gating — symlinked dirs/files never listed; loop-pinned). Accepted residuals: L3 reads follow
+symlinks (pre-existing lexical guard.rs limitation — unlisted-but-readable asymmetry, no new
+access); unbounded L2 listing for filesystem-authored skills (default ingestion cap degrades
+gracefully; the eval harness pins that cap OFF, so example-aware eval tasks should watch it;
+"…and N more" truncation is the cheap fix); auto-injection (H6b) deferred pending eval evidence
+that model-initiative loading under-triggers — the context-evolve harness is the natural
+measuring ground. **With this, every finding and both build opportunities from
+`docs/superpowers/audits/2026-07-01-harness-deep-audit.md` are closed: Top-10 fixed, sub-agent
+capability built (3 sub-specs), Examples built. Only this file's inline Finding 1 (low-severity
+prompt de-dup/negative-constraints polish) and per-cluster accepted residuals remain as backlog.
+The next audit run starts from a clean slate.**
+
 ---
 
 **Finding 1 — Instructions: duplicated system prompt + skill files lack negative constraints**
