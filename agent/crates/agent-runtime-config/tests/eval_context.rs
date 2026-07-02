@@ -14,7 +14,7 @@ use agent_memory::{
 };
 use agent_model::{Message, OpenAiCompatClient};
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse};
-use agent_runtime_config::eval::{CandidateConfig, RunResult, TaskSpec};
+use agent_runtime_config::eval::{CandidateConfig, RunResult, TaskSpec, TrajectoryStep};
 use agent_runtime_config::{assemble_loop, LoopParts, RuntimeConfig};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -64,25 +64,35 @@ impl ApprovalChannel for SafeApproval {
     }
 }
 
-/// Sums the faithful, server-reported token metric across every turn of every session.
+/// Sums the faithful, server-reported token metric across every turn of every session,
+/// and records the ordered ToolStart trajectory (diagnostic; spec 2026-07-02 eval-flywheel §3).
 #[derive(Default)]
 struct TokenMeter {
     total: AtomicU64,
     turns: AtomicU64,
+    trajectory: Mutex<Vec<TrajectoryStep>>,
 }
 impl EventSink for TokenMeter {
     fn emit(&self, e: AgentEvent) {
-        if let AgentEvent::ServerUsage {
-            prompt_tokens,
-            completion_tokens,
-            ..
-        } = e
-        {
-            self.total.fetch_add(
-                prompt_tokens as u64 + completion_tokens as u64,
-                Ordering::Relaxed,
-            );
-            self.turns.fetch_add(1, Ordering::Relaxed);
+        match e {
+            AgentEvent::ServerUsage {
+                prompt_tokens,
+                completion_tokens,
+                ..
+            } => {
+                self.total.fetch_add(
+                    prompt_tokens as u64 + completion_tokens as u64,
+                    Ordering::Relaxed,
+                );
+                self.turns.fetch_add(1, Ordering::Relaxed);
+            }
+            AgentEvent::ToolStart { name, args, .. } => {
+                self.trajectory
+                    .lock()
+                    .unwrap()
+                    .push(TrajectoryStep { tool: name, args });
+            }
+            _ => {}
         }
     }
 }
@@ -118,6 +128,11 @@ async fn eval_context_run() {
 
     let mem_db = ws.join("memory.db");
     let meter = Arc::new(TokenMeter::default());
+    // Shared across sessions (like `meter`) so denials accumulate for the whole run and
+    // stay in scope at RunResult construction below.
+    let approval = Arc::new(SafeApproval {
+        denied: Mutex::new(Vec::new()),
+    });
 
     for session in &task.sessions {
         let mut cfg = RuntimeConfig::from_launch(
@@ -186,9 +201,7 @@ async fn eval_context_run() {
                     std::env::var("AGENT_API_KEY").ok(),
                 )),
                 sink: meter.clone(),
-                approval: Arc::new(SafeApproval {
-                    denied: Mutex::new(Vec::new()),
-                }),
+                approval: approval.clone(),
                 workspace: ws.clone(),
                 mcp_tools: vec![],
                 memory_tools: mem_tools,
@@ -236,10 +249,27 @@ async fn eval_context_run() {
         .status()
         .unwrap();
 
+    // Denials go to stderr only (prefixed `eval-denied:`); stdout stays exactly one JSON line.
+    let denied = approval.denied.lock().unwrap();
+    for d in denied.iter() {
+        eprintln!("eval-denied: {d}");
+    }
+    let trajectory = meter.trajectory.lock().unwrap().clone();
+    let gold_matched = if task.gold_trajectory.is_empty() {
+        None
+    } else {
+        Some(agent_runtime_config::eval::trajectory_matches_gold(
+            &trajectory,
+            &task.gold_trajectory,
+        ))
+    };
     let result = RunResult {
         passed: status.success(),
         tokens: meter.total.load(Ordering::Relaxed),
         turns: meter.turns.load(Ordering::Relaxed) as usize,
+        trajectory,
+        denials: denied.len(),
+        gold_matched,
     };
     println!("{}", serde_json::to_string(&result).unwrap());
 }

@@ -56,6 +56,9 @@ mod tests {
                     passed,
                     tokens,
                     turns: 1,
+                    trajectory: Vec::new(),
+                    denials: 0,
+                    gold_matched: None,
                 })
                 .collect(),
         }

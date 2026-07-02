@@ -11,5 +11,5 @@ pub mod task;
 pub use admissibility::{admit, Admissibility};
 pub use config::CandidateConfig;
 pub use gate::{gate, heldout_ok, Verdict};
-pub use result::{BatchResult, RunResult};
+pub use result::{trajectory_matches_gold, BatchResult, RunResult, TrajectoryStep};
 pub use task::{SeedFile, SessionSpec, TaskSpec};

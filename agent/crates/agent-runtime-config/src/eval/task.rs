@@ -31,6 +31,10 @@ pub struct TaskSpec {
     /// copied in. Exit code 0 == pass.
     pub test_cmd: String,
     pub sessions: Vec<SessionSpec>,
+    /// Ordered tool-name subsequence a correct run is expected to contain;
+    /// empty = no process expectation.
+    #[serde(default)]
+    pub gold_trajectory: Vec<String>,
 }
 
 impl TaskSpec {
@@ -71,5 +75,26 @@ mod tests {
             prompts: vec!["recall it".into()],
         });
         assert!(t.is_cross_session());
+    }
+    #[test]
+    fn gold_trajectory_defaults_empty_when_absent() {
+        let t = TaskSpec::from_json(JSON).unwrap();
+        assert!(t.gold_trajectory.is_empty());
+    }
+    #[test]
+    fn gold_trajectory_parses_when_present() {
+        let json = r#"{
+          "id": "drift-ledger",
+          "mode": "drift",
+          "realistic_window": 16000,
+          "favorable_window": 196608,
+          "memory_enabled": false,
+          "seed_files": [],
+          "test_cmd": "true",
+          "sessions": [{ "prompts": ["step 1"] }],
+          "gold_trajectory": ["read_file"]
+        }"#;
+        let t = TaskSpec::from_json(json).unwrap();
+        assert_eq!(t.gold_trajectory, vec!["read_file".to_string()]);
     }
 }
