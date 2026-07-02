@@ -200,7 +200,13 @@ impl Tool for DispatchAgentTool {
     }
     fn intent(&self, args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
         let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-        let head: String = prompt.chars().take(80).collect();
+        // Sanitize to a single line so the approval/trace summary can't be
+        // corrupted by embedded newlines before truncating to 80 chars.
+        let head: String = prompt
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .take(80)
+            .collect();
         // Read: spawning computation is not an effect — every effectful child
         // action is gated by the same policy + approval as the parent (spec D3).
         Ok(ToolIntent {
@@ -256,6 +262,11 @@ impl Tool for DispatchAgentTool {
         // dispatch_agent is structurally absent (spec D4: no recursion).
         let mut reg = ToolRegistry::new();
         for t in &self.deps.base_tools {
+            // Defense in depth for D4: dispatch_agent is never child-visible,
+            // even if a caller leaks it into the base snapshot. No recursion.
+            if t.name() == "dispatch_agent" {
+                continue;
+            }
             if allow
                 .as_ref()
                 .is_none_or(|names| names.iter().any(|n| n == t.name()))
@@ -318,10 +329,18 @@ impl Tool for DispatchAgentTool {
             content = format!("[sub-agent hit its turn budget before finishing]\n{content}");
         }
         let stop = s.stop.unwrap_or(StopReason::Stop);
-        content.push_str(&format!(
-            "\n\n[sub-agent: {} turns, {} tool calls, stop: {stop:?}]",
+        let footer = format!(
+            "[sub-agent: {} turns, {} tool calls, stop: {stop:?}]",
             s.turns, s.tool_calls
-        ));
+        );
+        // Spec: when there's no assembled content, the result is the footer alone
+        // (no leading blank lines).
+        if content.is_empty() {
+            content = footer;
+        } else {
+            content.push_str("\n\n");
+            content.push_str(&footer);
+        }
         Ok(ToolOutput {
             content,
             display: None,

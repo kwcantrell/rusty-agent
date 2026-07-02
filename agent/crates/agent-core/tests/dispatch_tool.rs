@@ -226,3 +226,167 @@ fn schema_describes_required_prompt() {
     assert!(agent_tools::required_params_missing_description(&s).is_empty());
     assert!(tool.when_not_to_call().is_some());
 }
+
+#[test]
+fn intent_summary_is_single_line_for_a_multiline_prompt() {
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![]),
+        Arc::new(FullSink::default()),
+        vec![],
+    ));
+    let intent = tool
+        .intent(&serde_json::json!({"prompt": "line one\nline two\r\nline three"}))
+        .unwrap();
+    assert!(!intent.summary.contains('\n'), "{}", intent.summary);
+    assert!(!intent.summary.contains('\r'), "{}", intent.summary);
+    assert!(intent.summary.contains("line one line two"), "{}", intent.summary);
+}
+
+/// Records approval requests; replies with a fixed response.
+struct RecordingApproval {
+    seen: Mutex<Vec<String>>,
+    reply: agent_policy::ApprovalResponse,
+}
+#[async_trait::async_trait]
+impl agent_policy::ApprovalChannel for RecordingApproval {
+    async fn request(&self, req: agent_policy::ApprovalRequest) -> agent_policy::ApprovalResponse {
+        self.seen.lock().unwrap().push(req.intent.summary.clone());
+        self.reply
+    }
+}
+
+/// A Write-access tool: policy says Ask, so the shared approval channel decides.
+struct Writey;
+#[async_trait::async_trait]
+impl Tool for Writey {
+    fn name(&self) -> &str { "writey" }
+    fn description(&self) -> &str { "writes" }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema { name: "writey".into(), description: "writes".into(), parameters: serde_json::json!({"type":"object"}) }
+    }
+    fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+        Ok(ToolIntent { tool: "writey".into(), access: Access::Write, paths: vec![], command: None, summary: "write something".into() })
+    }
+    async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput { content: "wrote".into(), display: None })
+    }
+}
+
+#[tokio::test]
+async fn child_ask_routes_to_the_shared_approval_channel_and_deny_sticks() {
+    let sink = Arc::new(FullSink::default());
+    let approval = Arc::new(RecordingApproval { seen: Mutex::new(vec![]), reply: agent_policy::ApprovalResponse::Deny });
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "writey".into(), "{}".into()),
+            Scripted::Text("done".into()),
+        ]),
+        sink.clone(),
+        vec![Arc::new(Writey)],
+    );
+    d.approval = approval.clone();
+    let tool = DispatchAgentTool::new(d);
+    let out = tool.execute(serde_json::json!({"prompt": "p"}), &tool_ctx()).await.unwrap();
+    // The Ask reached the PARENT's channel (spec Invariant / D2)...
+    assert_eq!(approval.seen.lock().unwrap().as_slice(), &["write something".to_string()]);
+    // ...and the denial reached the child (forwarded as a denied tool_result).
+    let events = sink.events.lock().unwrap().clone();
+    assert!(events.iter().any(|(k, _, n)| k == "tool_result:denied" && n == "sub:writey"), "{events:?}");
+    assert!(out.content.starts_with("done"));
+}
+
+#[tokio::test]
+async fn child_ask_approve_executes() {
+    let sink = Arc::new(FullSink::default());
+    let approval = Arc::new(RecordingApproval { seen: Mutex::new(vec![]), reply: agent_policy::ApprovalResponse::Approve });
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "writey".into(), "{}".into()),
+            Scripted::Text("done".into()),
+        ]),
+        sink.clone(),
+        vec![Arc::new(Writey)],
+    );
+    d.approval = approval;
+    let tool = DispatchAgentTool::new(d);
+    tool.execute(serde_json::json!({"prompt": "p"}), &tool_ctx()).await.unwrap();
+    let events = sink.events.lock().unwrap().clone();
+    assert!(events.iter().any(|(k, _, n)| k == "tool_result:ok" && n == "sub:writey"), "{events:?}");
+}
+
+#[tokio::test]
+async fn child_cannot_recurse_into_dispatch_agent() {
+    let sink = Arc::new(FullSink::default());
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "dispatch_agent".into(), r#"{"prompt":"nested"}"#.into()),
+            Scripted::Text("done".into()),
+        ]),
+        sink.clone(),
+        vec![Arc::new(Echo)],
+    ));
+    let out = tool.execute(serde_json::json!({"prompt": "p"}), &tool_ctx()).await.unwrap();
+    assert!(out.content.starts_with("done"));
+    // The child's gate rejected the unknown tool (Denied, "not found").
+    let events = sink.events.lock().unwrap().clone();
+    assert!(events.iter().any(|(k, _, n)| k == "tool_result:denied" && n == "sub:dispatch_agent"), "{events:?}");
+}
+
+#[tokio::test]
+async fn pre_cancelled_parent_token_cancels_the_child() {
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![Scripted::Text("never returned".into())]),
+        Arc::new(FullSink::default()),
+        vec![],
+    ));
+    let ctx = tool_ctx();
+    ctx.cancel.cancel();
+    let err = tool.execute(serde_json::json!({"prompt": "p"}), &ctx).await.unwrap_err();
+    assert!(matches!(err, ToolError::Failed { ref message, .. } if message.contains("cancelled")), "{err:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn wall_clock_timeout_cancels_the_child_and_reports_timeout() {
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![Scripted::HangOpen]),
+        Arc::new(FullSink::default()),
+        vec![],
+    ));
+    let mut ctx = tool_ctx();
+    ctx.timeout = Duration::from_secs(1);
+    let started = tokio::time::Instant::now();
+    let err = tool.execute(serde_json::json!({"prompt": "p"}), &ctx).await.unwrap_err();
+    assert!(matches!(err, ToolError::Timeout), "{err:?}");
+    assert_eq!(started.elapsed(), Duration::from_secs(1)); // virtual time: exactly the budget
+}
+
+#[tokio::test]
+async fn parallel_dispatches_get_distinct_ordinals_and_both_complete() {
+    let sink = Arc::new(FullSink::default());
+    let mk = |sink: Arc<FullSink>| {
+        DispatchAgentTool::new(deps(
+            ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "echo".into(), "{}".into()),
+                Scripted::Text("done".into()),
+            ]),
+            sink,
+            vec![Arc::new(Echo)],
+        ))
+    };
+    let (a, b) = (mk(sink.clone()), mk(sink.clone()));
+    let (ca, cb) = (tool_ctx(), tool_ctx());
+    let (ra, rb) = tokio::join!(
+        a.execute(serde_json::json!({"prompt": "a"}), &ca),
+        b.execute(serde_json::json!({"prompt": "b"}), &cb),
+    );
+    ra.unwrap();
+    rb.unwrap();
+    // Two children each made one echo call; the two forwarded start ids carry
+    // distinct sub{n} prefixes even though both children used child-id c1.
+    let ids: Vec<String> = sink.events.lock().unwrap().iter()
+        .filter(|(k, _, _)| k == "tool_start")
+        .map(|(_, id, _)| id.clone())
+        .collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[0], ids[1], "{ids:?}");
+}
