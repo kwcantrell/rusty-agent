@@ -10,6 +10,44 @@ use std::path::Path;
 /// the forkbomb signature live here as substring backstop literals.
 pub const HARD_FLOOR_DENYLIST: &[&str] = &["rm -rf /", ":(){", "dd if="];
 
+/// Partial model override (spec 2026-07-02 sub-spec #3, G1): every `None`
+/// inherits the primary config's value, so `{"model": "haiku"}` just works.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ModelRef {
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub claude_binary: Option<String>,
+    /// Tool-call protocol for routed CHILD LOOPS ("native" | "prompted");
+    /// compaction ignores it (plain completion).
+    #[serde(default)]
+    pub protocol: Option<String>,
+}
+
+impl ModelRef {
+    /// Merge with the primary config: (backend, base_url, model, claude_binary).
+    /// `primary_claude_binary` is a parameter because it lives on the frontends,
+    /// not RuntimeConfig.
+    pub fn resolve(
+        &self,
+        cfg: &RuntimeConfig,
+        primary_claude_binary: &str,
+    ) -> (String, String, String, String) {
+        (
+            self.backend.clone().unwrap_or_else(|| cfg.backend.clone()),
+            self.base_url.clone().unwrap_or_else(|| cfg.base_url.clone()),
+            self.model.clone().unwrap_or_else(|| cfg.model.clone()),
+            self.claude_binary
+                .clone()
+                .unwrap_or_else(|| primary_claude_binary.to_string()),
+        )
+    }
+}
+
 /// The editable runtime surface, persisted to disk and mirrored on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeConfig {
@@ -34,6 +72,16 @@ pub struct RuntimeConfig {
     pub subagent_max_turns: usize,
     #[serde(default = "default_subagent_timeout_secs")]
     pub subagent_timeout_secs: u64,
+    /// Model serving sub-agent (dispatch_agent) children; None = the session model.
+    #[serde(default)]
+    pub subagent_model: Option<ModelRef>,
+    /// Model serving context compaction; None = the session model.
+    #[serde(default)]
+    pub compaction_model: Option<ModelRef>,
+    /// Max sub-agent nesting depth (1 = children cannot dispatch). Read sites
+    /// clamp to >= 1; "no sub-agents at all" is `subagents: false`.
+    #[serde(default = "default_subagent_max_depth")]
+    pub subagent_max_depth: usize,
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -99,6 +147,9 @@ struct PartialRuntimeConfig {
     subagents: Option<bool>,
     subagent_max_turns: Option<usize>,
     subagent_timeout_secs: Option<u64>,
+    subagent_model: Option<ModelRef>,
+    compaction_model: Option<ModelRef>,
+    subagent_max_depth: Option<usize>,
     top_p: Option<f32>,
     top_k: Option<u32>,
     min_p: Option<f32>,
@@ -134,6 +185,9 @@ fn default_subagent_max_turns() -> usize {
 }
 fn default_subagent_timeout_secs() -> u64 {
     600
+}
+fn default_subagent_max_depth() -> usize {
+    1
 }
 fn default_sandbox_mode() -> String {
     "auto".into()
@@ -186,6 +240,9 @@ impl RuntimeConfig {
             subagents: true,
             subagent_max_turns: default_subagent_max_turns(),
             subagent_timeout_secs: default_subagent_timeout_secs(),
+            subagent_model: None,
+            compaction_model: None,
+            subagent_max_depth: default_subagent_max_depth(),
             top_p: None,
             top_k: None,
             min_p: None,
@@ -342,6 +399,15 @@ impl RuntimeConfig {
         }
         if let Some(v) = p.subagent_timeout_secs {
             self.subagent_timeout_secs = v;
+        }
+        if let Some(v) = p.subagent_model {
+            self.subagent_model = Some(v);
+        }
+        if let Some(v) = p.compaction_model {
+            self.compaction_model = Some(v);
+        }
+        if let Some(v) = p.subagent_max_depth {
+            self.subagent_max_depth = v;
         }
         if let Some(v) = p.top_p {
             self.top_p = Some(v);
@@ -538,6 +604,42 @@ mod tests {
         assert_eq!(loaded.subagent_max_turns, 4);
         assert_eq!(loaded.subagent_timeout_secs, 30);
         assert_eq!(loaded.model, b.model); // absent fields fall back to base
+    }
+
+    #[test]
+    fn model_routing_fields_default_none_and_depth_one() {
+        let c = base();
+        assert!(c.subagent_model.is_none());
+        assert!(c.compaction_model.is_none());
+        assert_eq!(c.subagent_max_depth, 1);
+        // Old on-disk file without the fields -> defaults.
+        let mut v = serde_json::to_value(&c).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("subagent_model");
+        o.remove("compaction_model");
+        o.remove("subagent_max_depth");
+        let parsed: RuntimeConfig = serde_json::from_value(v).unwrap();
+        assert!(parsed.subagent_model.is_none());
+        assert_eq!(parsed.subagent_max_depth, 1);
+    }
+
+    #[test]
+    fn model_routing_fields_partial_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.json");
+        std::fs::write(
+            &path,
+            r#"{"subagent_model": {"model": "haiku"}, "subagent_max_depth": 2}"#,
+        )
+        .unwrap();
+        let b = base();
+        let loaded = RuntimeConfig::load_over(b.clone(), &path);
+        let r = loaded.subagent_model.expect("merged");
+        assert_eq!(r.model.as_deref(), Some("haiku"));
+        assert!(r.backend.is_none()); // partial ModelRef: unset fields stay None
+        assert_eq!(loaded.subagent_max_depth, 2);
+        assert!(loaded.compaction_model.is_none()); // untouched
+        assert_eq!(loaded.model, b.model);
     }
 
     #[test]
