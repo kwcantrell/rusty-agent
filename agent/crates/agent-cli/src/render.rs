@@ -43,6 +43,12 @@ pub fn format_stats_line(s: &agent_core::SessionStats) -> String {
     if s.cost_usd > 0.0 {
         line.push_str(&format!(" · ${:.2}", s.cost_usd));
     }
+    if s.subagent_tool_calls > 0 || s.subagent_turns > 0 {
+        line.push_str(&format!(
+            " · sub-agent: {} calls/{} turns",
+            s.subagent_tool_calls, s.subagent_turns
+        ));
+    }
     line
 }
 
@@ -185,5 +191,15 @@ mod tests {
     fn stats_line_omits_zero_cost() {
         let s = agent_core::SessionStats::default();
         assert!(!format_stats_line(&s).contains('$'));
+    }
+
+    #[test]
+    fn stats_line_mentions_subagents_only_when_present() {
+        let mut s = agent_core::SessionStats::default();
+        assert!(!format_stats_line(&s).contains("sub-agent"));
+        s.subagent_tool_calls = 3;
+        s.subagent_turns = 2;
+        let line = format_stats_line(&s);
+        assert!(line.contains("sub-agent: 3 calls/2 turns"), "{line}");
     }
 }
