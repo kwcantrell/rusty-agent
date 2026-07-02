@@ -20,3 +20,18 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: bash scripts/ci.sh
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agent
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage summary
+        working-directory: agent
+        run: cargo llvm-cov --workspace --summary-only
