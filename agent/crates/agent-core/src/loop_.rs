@@ -396,6 +396,7 @@ impl AgentLoop {
                          settings and try again"
                             .into(),
                     ));
+                    self.sink.emit(AgentEvent::Done(StopReason::Length));
                     return Ok(());
                 }
                 Err(e) if protocol_repairs < 1 => {
@@ -408,6 +409,7 @@ impl AgentLoop {
                 }
                 Err(e) => {
                     self.sink.emit(AgentEvent::Error(e.to_string()));
+                    self.sink.emit(AgentEvent::Done(StopReason::Error));
                     return Ok(());
                 }
             };
@@ -1393,6 +1395,57 @@ mod tests {
         assert!(
             !err.contains("EOF while parsing"),
             "must not surface the raw JSON EOF parse error: {err}"
+        );
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("done"),
+            "the truncation abort must still terminate with Done; events were: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_repair_exhausted_emits_done() {
+        let ws = std::env::temp_dir();
+        // Two consecutive unparseable tool calls (malformed JSON args, stop is
+        // ToolCalls not Length): the first triggers a re-emit repair, the second
+        // exhausts the single repair budget and the turn aborts.
+        let bad = r#"{"path": "a.txt", "#.to_string();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "read_file".into(), bad.clone()),
+            Scripted::Call("c2".into(), "read_file".into(), bad),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "read a.txt".into()).await.unwrap();
+
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e.starts_with("error:")),
+            "expected an error event for the exhausted repair; events were: {events:?}"
+        );
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("done"),
+            "the repair-exhausted abort must still terminate with Done; events were: {events:?}"
         );
     }
 

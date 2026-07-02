@@ -434,6 +434,11 @@ mod tests {
     }
 
     #[test]
+    fn stop_reason_error_maps_to_error() {
+        assert_eq!(stop_reason_str(&StopReason::Error), "error");
+    }
+
+    #[test]
     fn done_uses_stop_reason_string() {
         let ev = server_event_from(AgentEvent::Done(StopReason::Cancelled)).unwrap();
         assert_eq!(
