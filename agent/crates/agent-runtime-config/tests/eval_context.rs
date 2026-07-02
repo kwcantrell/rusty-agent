@@ -240,6 +240,10 @@ async fn eval_context_run() {
         passed: status.success(),
         tokens: meter.total.load(Ordering::Relaxed),
         turns: meter.turns.load(Ordering::Relaxed) as usize,
+        // Task 2 fills these from the sink; stopgap defaults for now.
+        trajectory: Vec::new(),
+        denials: 0,
+        gold_matched: None,
     };
     println!("{}", serde_json::to_string(&result).unwrap());
 }
