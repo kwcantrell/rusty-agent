@@ -1552,7 +1552,7 @@ mod tests {
         assert!(usage_idx < done_idx);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn transport_error_then_success_via_retry() {
         let ws = std::env::temp_dir();
         let model = Arc::new(ScriptedModel::new(vec![
@@ -1581,6 +1581,46 @@ mod tests {
         );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_backoff_sleeps_grow_exponentially_in_situ() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Error,
+            Scripted::Error,
+            Scripted::Error,
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 3,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        let start = tokio::time::Instant::now();
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        // Paused clock: virtual elapsed is EXACTLY the loop's backoff sleeps —
+        // three failures -> backoff_delay(1..=3) = 100 + 200 + 400 ms. This pins
+        // that the LOOP sleeps the schedule, which the pure backoff_delay unit
+        // test cannot.
+        assert_eq!(start.elapsed(), std::time::Duration::from_millis(700));
         assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
     }
 
@@ -1628,7 +1668,7 @@ mod tests {
         assert_eq!(model.remaining(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rate_limit_429_is_retried_then_succeeds() {
         let ws = std::env::temp_dir();
         let model = Arc::new(ScriptedModel::new(vec![
@@ -1666,7 +1706,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn exhaustion_emits_done_error() {
         let ws = std::env::temp_dir();
         // All-retryable failures burn max_retries then abort WITH a Done.
