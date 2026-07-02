@@ -24,9 +24,13 @@ headlessly, deterministically, with no compositor involved. The existing
 
 Pixel-driving the window is the **last resort** here (see §This machine for why).
 
+**Do not** use this skill for: generic Tauri v2 development (→ `tauri` skill);
+automating GUI apps outside this repo on Wayland (→ `wayland` skill); or
+pixel-driving when a WS-bridge rung is available — the bridge is the point.
+
 ## Prerequisites (check first)
 
-- **cargo / node on PATH** — they are; do NOT `source ~/.cargo/env`.
+- **cargo / node on PATH** — normally already true on this machine; only `source ~/.cargo/env` if a bare shell lacks `cargo`.
 - **llama-server on :8080** for any live/model run: `curl -s -m 2 localhost:8080/health`
   must return `{"status":"ok"}`. Model is `qwen3.6-35b-a3b`, launched `-np 1`
   (no `n>1`). Drive it manually with `agent/scripts/chat.sh`. Note: `:8080` is where the
@@ -148,7 +152,7 @@ present today.
   prompt; a human must click Approve once per session before input flows.
 - Running L1/e2e without `llama-server` on :8080 → hang/timeout. Check
   `curl localhost:8080/health` first.
-- `source ~/.cargo/env` → unnecessary; cargo is on PATH.
+- `source ~/.cargo/env` → only needed when `cargo` is missing from PATH (normally it isn't here).
 - Hardcoding a bridge port → it's ephemeral; read `bridge.ws_url()`.
 - Asserting on screenshots for L0/L1 → assert on `event` frames
   (`done`/`error`/`token`); screenshots are only for L2 GUI rendering checks.

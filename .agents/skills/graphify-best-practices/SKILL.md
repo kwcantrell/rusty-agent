@@ -19,6 +19,11 @@ work faster. The single highest-leverage idea: **when a graph already exists, a
 question about how the code or corpus fits together is a graph query, not a
 grep.**
 
+**Do not** use this skill in place of the `/graphify` runbook (mechanics —
+commands, flags, builds — live there), and don't reach for the graph when the
+answer is one known file: a direct read beats a graph query for single-fact
+lookups.
+
 ## Non-negotiables
 
 Discipline to not rationalize away:

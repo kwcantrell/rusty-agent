@@ -20,13 +20,17 @@ Optimize the context manager so the running model solves hard, long-horizon task
 - `train.md` — the per-iteration loop: hypothesize → edit → eval N× → gate → record.
 - `program.md` — accumulated learnings + the current champion config (append-only).
 
+**Do not** use this skill for one-off context tuning or manual config edits
+(→ `context-management` skill), nor for any change that would skip the eval
+gate — it exists only for the full hypothesize → eval → gate campaign loop.
+
 ## Prerequisites
 
 - A live server (see the `llama-server` skill). Export `AGENT_E2E_URL` (e.g.
   `http://localhost:8080`) and `AGENT_E2E_MODEL` (e.g. `qwen3.6-35b-a3b`).
 - Build the harness + CLI once:
-  `source ~/.cargo/env && cd agent && cargo build -p agent-runtime-config --tests --bins`
-- `cargo` is not on PATH by default — always `source ~/.cargo/env` first.
+  `cd agent && cargo build -p agent-runtime-config --tests --bins`
+- If `cargo` isn't on PATH, `source ~/.cargo/env` first (CLAUDE.md's conditional form).
 
 ## The objective (never violate)
 

@@ -27,6 +27,11 @@ The two are linked: how you write the app determines how easily it can be
 driven. An app that labels its widgets for the accessibility bus is trivial to
 test; one that doesn't forces brittle pixel-coordinate scripts.
 
+**Do not** use this skill for THIS repo's own desktop app — load
+`auto-drive-tauri` instead and drive its WebSocket bridge, not the GUI. Also
+not for X11-only automation (there `xdotool` still works; this skill exists
+for Wayland's constraints).
+
 This file is the hub. Depth lives in `references/` — pull in only the file the
 current task needs (decision table in §5).
 
