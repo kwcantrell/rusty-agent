@@ -22,6 +22,9 @@ jobs:
       - run: bash scripts/ci.sh
   coverage:
     runs-on: ubuntu-latest
+    # Tracked number, not a gate (spec 2026-07-02 eval-flywheel §5): a red
+    # coverage job must never block a merge.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
