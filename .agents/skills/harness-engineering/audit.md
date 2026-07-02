@@ -297,6 +297,32 @@ drift); `lift` callers double-clone content (peak-memory nicety: clone only ~cap
 double-count when a preview is later age-offloaded); offload store growth is still the
 pre-existing RAM-only backlog item.
 
+Re-stamp note (2026-07-01, retry cluster): the deep audit's "cluster 8" — the **Orchestration**
+MED (unclassified retries; Top-10 fix #8) plus three folds (the Spine-B "compact-and-rebuild
+on context overflow" MED half deferred from cluster 7, the terminal-`Done`-parity MED, the
+backoff LOW part) — is now **fixed and merged to `main`** (7 commits, `b0d2de5..c2abcc1`,
+merge commit): `ModelError::class() -> ErrorClass {Retryable, Fatal, ContextOverflow}` lives
+on the type in `agent-model` — Fatal (non-408/429 4xx, initial-response Decode) aborts on
+first sight, Retryable (transport/stream/process/timeout/5xx/408/429) retries with
+exponential backoff (100ms·2^(attempt−1), 5 s cap), and overflow (`Status{400|413|422}` or
+`Stream` body matching five conservative signatures, checked before the 4xx rule) defers to
+turn level: `ctx.request_compaction()` (new provided `ContextManager` method; `CuratedContext`
+sets the same flag the `context_compact` tool uses) + mid-turn `maintain()` + rebuild via a
+shared `completion_request` helper, retried ONCE per turn without consuming retry budget.
+`ModelError::Cancelled` replaces the spoofable `Stream("cancelled")` encoding. All eight
+`run_with_cancel` terminal paths now emit `Done` (new `StopReason::Error`, additive on
+wire/trace; web reads reason opaquely). Testkit gained `Scripted::Fail(ModelError)`. See
+`docs/superpowers/specs/2026-07-01-retry-classification-design.md` and its plan. Accepted
+residuals (final whole-branch review — merge-clean, follow-up candidates): overflow recovery
+does NOT fire on the claude-cli backend (`Process` bodies aren't signature-checked — one-arm
+fix + spec edge-case correction, the highest-value follow-up); `AgentError::Cancelled` is now
+dead code; the turn's `Usage` event is stale after a mid-turn rebuild; recovery is visible
+only via tracing (no frontend event); retry tests use real ~400 ms sleeps and no in-situ
+backoff-growth pin (spec's paused-clock test deviation); Retry-After/jitter deferred. Design
+interaction worth remembering: overflow recovery is now the runtime safety net for the known
+token-estimate undercount, raising the value of the deferred server-usage-calibrated
+budgeting item.
+
 ---
 
 **Finding 1 — Instructions: duplicated system prompt + skill files lack negative constraints**
@@ -322,10 +348,12 @@ cluster (per-call terminal events + durations, JSONL session traces, usage/cost 
 SessionStats + web panel, ContextEvent forwarding, CI gate), the sandbox cluster
 (fail-closed degraded exec, env scrub, required `LoopConfig.sandbox`, MCP workspace cwd,
 nobody uid fallback), the context cluster (turn-atomic eviction/compaction + visible
-eviction), and the tools cluster (16 KiB ingestion cap + eager offload, recall/read_file
-pagination) are **done** — for the full current backlog see
+eviction), the tools cluster (16 KiB ingestion cap + eager offload, recall/read_file
+pagination), and the retry cluster (classified retries, overflow compact-and-rebuild,
+full Done parity) are **done** — for the full current backlog see
 `docs/superpowers/audits/2026-07-01-harness-deep-audit.md` (its Top-10 table; items
-1, 2, 3, 4, 5, 6, and 7 are now complete). Of this file's inline findings, one remains:
+1 through 8 are now complete; #9/#10 — the 2-state permission model — remain). Of this
+file's inline findings, one remains:
 
 1. **[Component 1 — Instructions] De-duplicate the system prompt + add negative constraints** (Finding 1)
    `agent/crates/agent-server/src/daemon.rs:23` + `agent/crates/agent-cli/src/main.rs:15`; `.agents/skills/`
