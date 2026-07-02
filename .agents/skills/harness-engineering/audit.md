@@ -500,6 +500,38 @@ file quoting the full identity sentence in a doc comment fails intentionally); s
 `_facts.md`, prompt-eval gate, and catalog inlining remain unbuilt (recorded spec residuals /
 product decisions). **No inline finding remains open in this file.**
 
+Re-stamp note (2026-07-02, loop-robustness cluster — backlog drain 2/6): the deep audit's
+never-clustered **Orchestration** MEDs/LOWs are now **fixed and merged to `main`** (6 commits
++ fix wave, `4bb31a2..431416c`, merge `f419188`; spec
+`docs/superpowers/specs/2026-07-02-loop-robustness-design.md`). (1) Approval waits race
+cancellation (`tokio::select!` in `gate_tool`'s Ask arm + gate-entry short-circuit after the
+ToolStart emit) — Ctrl-C no longer wedges on a pending prompt; deny-on-cancel, content
+distinguishes "run cancelled" from "user declined"; sub-agent children unwedge via the shared
+gate path. (2) Mid-stream retry no longer duplicates output: additive
+`AgentEvent::StreamRetry {discarded_text_chars, discarded_reasoning_chars}` (wire kind
+`"stream_retry"`, old-SPA-safe) emitted only when a failed attempt leaked chunks AND another
+attempt follows (Retryable-with-budget + first-overflow arms; never Fatal/Cancelled/
+second-overflow); CLI prints a dim retraction line, web trims the in-flight item tail
+(code-point exact), traces record it, and the dispatch child-capture trims
+`segments.last_mut()` so the parent model never reads abandoned partial child text.
+(3) One malformed tool call no longer discards the turn: `ParsedTurn.invalid`
+(`InvalidToolCall{id,name,error}`) — native protocol isolates per call; invalid calls become
+per-call `ToolResult{Error}` "re-emit only this call" results while good calls execute;
+assistant history carries all ids (invalid as `args {}`), `normalize_invalid_ids` keeps id
+uniqueness, and the max_tokens Length guard is preserved (prompted-protocol repair path
+untouched). (4) Stuck-model detection: identical call-set signature (sorted, id-independent,
+valid+invalid) → one nudge user message on the 3rd consecutive identical turn (appended
+AFTER the tool results — OpenAI-compat ordering), abort on the 5th with `Done(Error)` and a
+text-only assistant append (no dangling `tool_calls` in persistent history);
+`STUCK_NUDGE_AFTER=2`/`STUCK_ABORT_AFTER=4` consts by design. Accepted residuals (final
+whole-branch review — merge-clean): stranded IPC pending-approval entry on the cancel path
+(bounded, spec-sanctioned answerable-but-ignored posture); benign TOCTOU decline-labeled-
+cancelled; nudge/abort strings hardcode "3"/"5" apart from the consts; stuck signature relies
+on serde_json default key-sorting (false-negative-only if `preserve_order` ever lands);
+coverage gaps only: no Fatal/second-overflow-with-partial absence tests, no abort-after-reset
+composition test, no direct `normalize_invalid_ids` collision unit test; `Some(all_calls.clone())`
+allocation nit. Retry-After/jitter remains deferred to the small-residuals sweep.
+
 ---
 
 ## Top highest-leverage fixes
