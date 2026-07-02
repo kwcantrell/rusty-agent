@@ -24,6 +24,10 @@ pub struct ToolCall {
 pub enum Access {
     Read,
     Write,
+    /// Irreversible destruction (e.g. deleting a stored record). Never auto-allowed:
+    /// the policy floor for Destroy is Ask — no allowlist or workspace-boundary rule
+    /// may return Allow for it. The hard floor can still Deny it.
+    Destroy,
 }
 
 #[derive(Debug, Clone)]

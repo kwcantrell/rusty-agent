@@ -47,7 +47,11 @@ impl PolicyEngine for RulePolicy {
             {
                 return Decision::Deny(reason);
             }
-            if crate::command::is_auto_allowed(cmd, &self.command_allowlist) {
+            // Destroy-declared intents are never auto-allowed, even when the command
+            // itself is allowlisted — the tier's floor is Ask.
+            if intent.access != Access::Destroy
+                && crate::command::is_auto_allowed(cmd, &self.command_allowlist)
+            {
                 return Decision::Allow;
             }
             return Decision::Ask;
@@ -69,6 +73,8 @@ impl PolicyEngine for RulePolicy {
                 }
             }
             Access::Write => Decision::Ask,
+            // Destroy never participates in any auto-allow; its floor is Ask.
+            Access::Destroy => Decision::Ask,
         }
     }
 }
@@ -222,6 +228,42 @@ mod tests {
         assert!(matches!(
             policy().check(&intent(Access::Write, vec![], Some("git status"))),
             Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn destroy_inside_workspace_still_asks() {
+        // Destroy never participates in the Read-style inside-workspace auto-allow.
+        assert!(matches!(
+            policy().check(&intent(Access::Destroy, vec!["/work/a.txt"], None)),
+            Decision::Ask
+        ));
+    }
+
+    #[test]
+    fn destroy_pathless_commandless_asks() {
+        // Memory-shaped intent: a path-less, command-less `forget`.
+        assert!(matches!(
+            policy().check(&intent(Access::Destroy, vec![], None)),
+            Decision::Ask
+        ));
+    }
+
+    #[test]
+    fn destroy_command_never_auto_allowed() {
+        // "ls -la" is Allow for a Write intent (allowlisted); a Destroy intent skips the gate.
+        assert!(matches!(
+            policy().check(&intent(Access::Destroy, vec![], Some("ls -la"))),
+            Decision::Ask
+        ));
+    }
+
+    #[test]
+    fn destroy_command_still_hits_hard_floor() {
+        // Deny still beats Ask for Destroy-declared commands.
+        assert!(matches!(
+            policy().check(&intent(Access::Destroy, vec![], Some("sudo reboot"))),
+            Decision::Deny(_)
         ));
     }
 }

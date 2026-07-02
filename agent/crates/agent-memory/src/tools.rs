@@ -8,13 +8,14 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Memory ops touch only the private local store, so they declare a Read-access,
-/// path-less, command-less intent → `RulePolicy` auto-allows them. Approval-gating
-/// memory writes is deferred per spec §1; `summary` stays truthful for the audit log.
-fn read_intent(tool: &str, summary: String) -> ToolIntent {
+/// Memory intents are path-less and command-less, so `RulePolicy` judges them purely
+/// by access tier: `recall` (Read) stays frictionless, while `remember` (Write —
+/// upsert plus capacity eviction) and especially `forget` (Destroy — irreversible
+/// record deletion) require approval. `summary` stays truthful for the audit log.
+fn memory_intent(tool: &str, access: Access, summary: String) -> ToolIntent {
     ToolIntent {
         tool: tool.into(),
-        access: Access::Read,
+        access,
         paths: vec![],
         command: None,
         summary,
@@ -122,8 +123,9 @@ impl Tool for Remember {
         }
     }
     fn intent(&self, _args: &Value) -> Result<ToolIntent, ToolError> {
-        Ok(read_intent(
+        Ok(memory_intent(
             "remember",
+            Access::Write,
             "write to long-term memory store".into(),
         ))
     }
@@ -264,7 +266,11 @@ impl Tool for Recall {
         }
     }
     fn intent(&self, _args: &Value) -> Result<ToolIntent, ToolError> {
-        Ok(read_intent("recall", "search long-term memory".into()))
+        Ok(memory_intent(
+            "recall",
+            Access::Read,
+            "search long-term memory".into(),
+        ))
     }
     async fn execute(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let query = args
@@ -335,7 +341,11 @@ impl Tool for Forget {
         }
     }
     fn intent(&self, _args: &Value) -> Result<ToolIntent, ToolError> {
-        Ok(read_intent("forget", "remove from long-term memory".into()))
+        Ok(memory_intent(
+            "forget",
+            Access::Destroy,
+            "remove from long-term memory".into(),
+        ))
     }
     async fn execute(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         if let Some(id) = args.get("id").and_then(Value::as_str) {
@@ -797,5 +807,52 @@ mod tests {
         let (r, _s, _e, _c) = remember("A");
         let err = r.execute(json!({"text": "   "}), &ctx()).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
+    }
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+    use crate::config::MemoryConfig;
+    use crate::embedder::StubEmbedder;
+    use crate::store::InMemoryStore;
+
+    #[test]
+    fn memory_tools_declare_truthful_access_tiers() {
+        // Construct remember/recall/forget with the same fixture the surrounding
+        // tests use (in-memory store + test embedder + default MemoryConfig).
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::d384());
+        let cfg = Arc::new(MemoryConfig::default());
+        let remember = Remember {
+            embedder: embedder.clone(),
+            store: store.clone(),
+            cfg: cfg.clone(),
+            project_key: "A".into(),
+        };
+        let recall = Recall {
+            embedder: embedder.clone(),
+            store: store.clone(),
+            cfg: cfg.clone(),
+            project_key: "A".into(),
+        };
+        let forget = Forget {
+            embedder,
+            store,
+            cfg,
+            project_key: "A".into(),
+        };
+
+        let args = serde_json::json!({});
+        let r = remember.intent(&args).unwrap();
+        assert_eq!(r.access, Access::Write);
+        assert!(r.paths.is_empty() && r.command.is_none());
+
+        let q = recall.intent(&args).unwrap();
+        assert_eq!(q.access, Access::Read);
+
+        let f = forget.intent(&args).unwrap();
+        assert_eq!(f.access, Access::Destroy);
+        assert!(f.paths.is_empty() && f.command.is_none());
     }
 }
