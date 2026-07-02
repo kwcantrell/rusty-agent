@@ -55,10 +55,10 @@ impl Tool for ListSkills {
         }
         let mut content = String::from("Available skills (load one with use_skill):\n");
         for s in &skills {
-            let mark = if s.examples.is_empty() {
-                String::new()
-            } else {
-                format!(" [{} examples]", s.examples.len())
+            let mark = match s.examples.len() {
+                0 => String::new(),
+                1 => " [1 example]".to_string(),
+                n => format!(" [{n} examples]"),
             };
             content.push_str(&format!("- {}: {}{mark}\n", s.name, s.description));
         }
@@ -132,7 +132,10 @@ impl Tool for UseSkill {
                 .unwrap_or_else(|_| p.to_string_lossy().into_owned())
         };
         if !skill.examples.is_empty() {
-            content.push_str("\n## Examples (worked exemplars)\n");
+            content.push_str(&format!(
+                "\n## Examples (worked exemplars, dir: {})\n",
+                skill.dir.display()
+            ));
             for p in &skill.examples {
                 content.push_str(&format!("- {}\n", rel(p)));
             }
@@ -644,7 +647,7 @@ mod tests {
             .unwrap();
         let c = &out.content;
         // Examples section, relative path, contract line:
-        assert!(c.contains("## Examples (worked exemplars)"), "{c}");
+        assert!(c.contains("## Examples (worked exemplars"), "{c}");
         assert!(c.contains("- examples/a.md"), "{c}");
         assert!(c.contains("imitate its shape and conventions"), "{c}");
         assert!(c.contains("do not copy content verbatim"), "{c}");
@@ -673,12 +676,49 @@ mod tests {
             .execute(json!({"name": "demo"}), &ctx())
             .await
             .unwrap();
-        assert!(!out.content.contains("## Examples"), "{}", out.content);
-        assert!(
-            out.content.contains("## Bundled files (dir: "),
-            "{}",
-            out.content
-        );
+        let c = &out.content;
+        assert!(!c.contains("## Examples"), "{c}");
+        assert!(c.contains("## Bundled files (dir: "), "{c}");
+        // Bundled list uses relative form; no absolute-path leak in `- ` lines
+        // (the only absolute path is the dir header).
+        assert!(c.contains("- references/r.md"), "{c}");
+        let after_header = c.split("## Bundled files").nth(1).unwrap();
+        for line in after_header.lines().filter(|l| l.starts_with("- ")) {
+            assert!(
+                !line.contains(_tmp.path().to_str().unwrap()),
+                "absolute path leaked: {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn use_skill_examples_only_carries_dir_and_no_bundled_section() {
+        // Examples present, no other bundled files: the Examples header must carry
+        // the skill dir (so a script-shaped exemplar is runnable) and there must be
+        // no "## Bundled files" section at all.
+        let (reg, _tmp) = reg_with_nested_skill("demo", &[("examples/run.sh", "echo hi")]);
+        let out = UseSkill::new(reg)
+            .execute(json!({"name": "demo"}), &ctx())
+            .await
+            .unwrap();
+        let c = &out.content;
+        assert!(c.contains("## Examples (worked exemplars"), "{c}");
+        assert!(c.contains("dir: "), "{c}");
+        assert!(c.contains("- examples/run.sh"), "{c}");
+        assert!(!c.contains("## Bundled files"), "{c}");
+    }
+
+    #[tokio::test]
+    async fn use_skill_no_files_at_all_states_empty() {
+        let (reg, _tmp) = reg_with_nested_skill("demo", &[]);
+        let out = UseSkill::new(reg)
+            .execute(json!({"name": "demo"}), &ctx())
+            .await
+            .unwrap();
+        let c = &out.content;
+        assert!(c.contains("(No bundled files.)"), "{c}");
+        assert!(!c.contains("## Examples"), "{c}");
+        assert!(!c.contains("## Bundled files"), "{c}");
     }
 
     #[tokio::test]
@@ -706,7 +746,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out.content.contains("withex:") && out.content.contains("[1 examples]"),
+            out.content.contains("withex:") && out.content.contains("[1 example]"),
             "{}",
             out.content
         );
@@ -730,7 +770,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out.content.contains("## Examples (worked exemplars)"),
+            out.content.contains("## Examples (worked exemplars"),
             "{}",
             out.content
         );
@@ -750,7 +790,7 @@ mod tests {
             .execute(json!({}), &ctx())
             .await
             .unwrap();
-        assert!(l1.content.contains("[1 examples]"), "{}", l1.content);
+        assert!(l1.content.contains("[1 example]"), "{}", l1.content);
         // L2: use_skill Examples section with relative path.
         let l2 = UseSkill::new(reg.clone())
             .execute(json!({"name": "flow"}), &ctx())

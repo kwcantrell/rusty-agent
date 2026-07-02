@@ -144,7 +144,8 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         // guards against symlinked-dir cycles (unbounded recursion) and symlinks
         // that escape the skill dir. Symlinks in skill dirs are therefore not
         // traversed — a symlink to a dir is not descended and a symlink to a file
-        // is skipped, matching the guard.rs no-symlink posture.
+        // is skipped. Symlinks are never advertised in listings; note guard.rs's
+        // lexical resolve can still read through one at L3 (pre-existing limitation).
         let ft = match e.file_type() {
             Ok(ft) => ft,
             Err(_) => continue,
@@ -394,6 +395,32 @@ mod tests {
         fs::write(sd.join("SKILL.md"), "---\ndescription: d\n---\nbody").unwrap();
         fs::write(sd.join("real.txt"), "R").unwrap();
         std::os::unix::fs::symlink(&sd, sd.join("loop")).unwrap();
+        let reg = SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf());
+        let skill = reg.find("demo").expect("skill loads");
+        let rel: Vec<String> = skill
+            .files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&skill.dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(rel, vec!["real.txt".to_string()], "{rel:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_file_is_not_listed() {
+        // A symlink to a file must not be advertised in the bundled listing —
+        // only the real file appears.
+        let dir = tempdir().unwrap();
+        let sd = dir.path().join("demo");
+        fs::create_dir_all(&sd).unwrap();
+        fs::write(sd.join("SKILL.md"), "---\ndescription: d\n---\nbody").unwrap();
+        fs::write(sd.join("real.txt"), "R").unwrap();
+        std::os::unix::fs::symlink(sd.join("real.txt"), sd.join("link.txt")).unwrap();
         let reg = SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf());
         let skill = reg.find("demo").expect("skill loads");
         let rel: Vec<String> = skill
