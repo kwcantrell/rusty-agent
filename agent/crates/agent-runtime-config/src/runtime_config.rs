@@ -839,4 +839,56 @@ mod tests {
         assert!(agent_policy::hard_floor_violation("sudo reboot", &deny).is_some());
         assert!(agent_policy::hard_floor_violation("mkfs /dev/sda", &deny).is_some());
     }
+
+    #[test]
+    fn default_allowlist_is_subcommand_aware_for_exec_capable_programs() {
+        let al = crate::default_allowlist();
+        // Read-safe subcommands stay frictionless.
+        assert!(agent_policy::is_auto_allowed("git status --porcelain -b", &al));
+        // NOTE: `git diff HEAD~1` from the plan can't be auto-allowed — `~` is a
+        // SHELL_SIGNIFICANT char (pre-existing agent-policy behavior, out of scope
+        // here), so any command containing it goes to Ask. Use a shell-safe argument
+        // that exercises the same "read-safe `git diff` subcommand is frictionless" intent.
+        assert!(agent_policy::is_auto_allowed("git diff HEAD", &al));
+        assert!(agent_policy::is_auto_allowed("git log --oneline -5", &al));
+        assert!(agent_policy::is_auto_allowed("cargo test -p agent-core", &al));
+        assert!(agent_policy::is_auto_allowed("ls -la", &al));
+        // Destructive / unlisted forms are no longer auto-allowed (audit Top-10 #9).
+        assert!(!agent_policy::is_auto_allowed("git push --force", &al));
+        assert!(!agent_policy::is_auto_allowed("git reset --hard", &al));
+        assert!(!agent_policy::is_auto_allowed("git clean -fdx", &al));
+        assert!(!agent_policy::is_auto_allowed("git push", &al));
+        assert!(!agent_policy::is_auto_allowed("git commit -m x", &al));
+        assert!(!agent_policy::is_auto_allowed("cargo publish", &al));
+        assert!(!agent_policy::is_auto_allowed("cargo install evil", &al));
+    }
+
+    #[test]
+    fn execute_command_git_status_matches_git_status_tool_friction() {
+        use agent_policy::{Decision, PolicyEngine, RulePolicy};
+        let policy = RulePolicy {
+            workspace: std::path::PathBuf::from("/work"),
+            command_allowlist: crate::default_allowlist(),
+            command_denylist: crate::default_denylist(),
+        };
+        // execute_command("git status …") — judged by the command branch.
+        let via_shell = agent_tools::ToolIntent {
+            tool: "execute_command".into(),
+            access: agent_tools::Access::Write,
+            paths: vec![],
+            command: Some("git status --short --branch".into()),
+            summary: "run".into(),
+        };
+        // git_status tool — judged by the access branch (Read, no paths, no command).
+        let via_tool = agent_tools::ToolIntent {
+            tool: "git_status".into(),
+            access: agent_tools::Access::Read,
+            paths: vec![],
+            command: None,
+            summary: "status".into(),
+        };
+        // Same operation, same friction on both routes (audit Tools-component asymmetry).
+        assert!(matches!(policy.check(&via_shell), Decision::Allow));
+        assert!(matches!(policy.check(&via_tool), Decision::Allow));
+    }
 }

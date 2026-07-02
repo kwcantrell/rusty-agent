@@ -198,8 +198,17 @@ pub fn build_memory_full(
 }
 
 pub fn default_allowlist() -> Vec<String> {
+    // Exec-capable programs (`git`, `cargo`) are exposed as subcommand prefixes only —
+    // a bare entry would auto-allow destructive forms (`git push --force`,
+    // `git reset --hard`, `git clean -fdx`). Unknown subcommands fail safe to Ask.
+    // The cargo set still runs build scripts: the documented exec-vehicle residual.
+    // Users may add a bare "git"/"cargo" entry back in command_allowlist to opt out.
     [
-        "ls", "cat", "pwd", "echo", "git", "grep", "find", "rg", "cargo", "head", "tail", "wc",
+        "ls", "cat", "pwd", "echo", "grep", "find", "rg", "head", "tail", "wc",
+        "git status", "git log", "git diff", "git show", "git blame",
+        "git rev-parse", "git ls-files",
+        "cargo build", "cargo check", "cargo test", "cargo fmt", "cargo clippy",
+        "cargo metadata", "cargo tree",
     ]
     .into_iter()
     .map(String::from)
