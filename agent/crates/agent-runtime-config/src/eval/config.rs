@@ -55,7 +55,15 @@ impl CandidateConfig {
             output_min_bytes: self.output_min_bytes,
             keep_recent: self.keep_recent,
             exclude_tools: Vec::new(),
-            ..Default::default()
+            // The eager ingestion cap (`max_result_bytes`, size-based and
+            // age-agnostic via `select_oversized`) is intentionally NOT part
+            // of the candidate genome — eval semantics predate it, and an
+            // active context-evolve campaign validated its champion without
+            // it. Neutralize it for the whole harness so `favorable` and every
+            // candidate share the "no ingestion cap" baseline; `Default`'s
+            // 16 KiB cap would otherwise silently apply regardless of the
+            // `usize::MAX` age thresholds above.
+            max_result_bytes: usize::MAX,
         }
     }
 }
@@ -70,6 +78,9 @@ mod tests {
         assert!(f.high_water_pct >= 1.0);
         assert_eq!(f.offload_config().output_min_bytes, usize::MAX);
         assert_eq!(f.offload_config().error_min_bytes, usize::MAX);
+        // Ingestion cap is neutralized for the whole eval harness (not part of
+        // the candidate genome) — otherwise a size-based cap would apply.
+        assert_eq!(f.offload_config().max_result_bytes, usize::MAX);
         assert!(f.auto_recall && f.relevance_threshold <= 0.001);
     }
     #[test]

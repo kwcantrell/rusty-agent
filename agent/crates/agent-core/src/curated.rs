@@ -698,6 +698,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capped_result_survives_build_under_a_small_model_limit() {
+        // A fresh oversized tool result (50 000 B) would blow any small window
+        // and, as its own turn unit, force an over-limit request. After the
+        // ingestion cap replaces it with a bounded preview, the turn unit is
+        // small enough to survive `build` under a limit far below what the
+        // uncapped result needs — without orphaning the tool message.
+        let store = Arc::new(InMemoryOffloadStore::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut ctx = CuratedContext::new(Message::system("s"), store.clone(), flag)
+            .with_offload_config(OffloadConfig {
+                max_result_bytes: 1024,
+                ..Default::default()
+            });
+        ctx.append(parent("c1")); // parent must precede the Role::Tool result
+        ctx.append(Message::tool("c1", "shell", "x".repeat(50_000)));
+
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
+        let sink_dyn: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let mut deps = maint_deps(&model, &sink_dyn, &cancel);
+        deps.model_limit = 1_000_000; // no compaction/eviction interference
+        ctx.maintain(&deps).await;
+
+        // Small model_limit: larger than pinned + capped unit (~a few hundred
+        // tokens) but far below the ~12 500 tokens the uncapped 50 KB needs.
+        let small_limit = 2 * 1024 / 4;
+        let built = ctx.build(small_limit);
+        // `build` has a debug_assert against orphaned tool messages; reaching
+        // here means integrity held. The capped preview must be present.
+        let preview = built
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("capped tool message survives build");
+        assert!(preview.content.len() <= 1024, "preview within cap");
+        assert!(preview.content.contains("truncated: showing first"));
+    }
+
+    #[tokio::test]
     async fn capped_preview_is_age_offloaded_to_a_placeholder_later() {
         // keep_recent 0 lets the age pass run on the same maintain call: the
         // eager pass stores the full content (#1), then the age pass lifts the

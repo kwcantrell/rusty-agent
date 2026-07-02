@@ -137,6 +137,10 @@ pub(crate) fn recall_block(lines: &[String], budget: usize) -> Option<Message> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintReport {
     pub offloaded: usize,
+    /// Total bytes WRITTEN to the offload store this pass — not "bytes removed
+    /// from the window". A result capped eagerly (full content stored) whose
+    /// preview is then age-offloaded in the same pass (preview stored) counts
+    /// twice: once for the full content, once for the preview.
     pub offloaded_bytes: usize,
     pub compacted_turns: usize,
 }

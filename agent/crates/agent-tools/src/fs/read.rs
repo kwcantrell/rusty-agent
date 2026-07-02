@@ -65,6 +65,9 @@ impl Tool for ReadFile {
             .get("limit")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        if limit == Some(0) {
+            return Err(ToolError::InvalidArgs("limit must be >= 1".into()));
+        }
         let content = match (offset, limit) {
             (None, None) => content, // whole-file fast path, byte-identical
             (o, l) => {
@@ -76,7 +79,10 @@ impl Tool for ReadFile {
                         "offset {first} is past the end of {path} ({n} lines)"
                     )));
                 }
-                let last = l.map_or(n, |l| (first + l - 1).min(n));
+                // Saturating: l >= 1 is guaranteed by the limit==0 guard above,
+                // and first.saturating_add avoids overflow when limit is huge
+                // (e.g. u64::MAX) so we never wrap into a bad slice range.
+                let last = l.map_or(n, |l| first.saturating_add(l - 1).min(n));
                 if first == 1 && last == n {
                     content // limit covers the whole file: unchanged
                 } else {
@@ -215,6 +221,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.content, "l1\nl2\n"); // byte-identical, incl. trailing newline
+    }
+
+    #[tokio::test]
+    async fn read_file_limit_zero_is_invalid_args() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "l1\nl2\n").unwrap();
+        let err = ReadFile
+            .execute(
+                json!({"path": "f.txt", "limit": 0}),
+                &ctx(dir.path().into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+    }
+
+    #[tokio::test]
+    async fn read_file_offset_with_u64_max_limit_does_not_panic() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        // limit == u64::MAX would overflow `first + limit - 1` without
+        // saturating arithmetic; offset 2 must still return lines 2..n.
+        let out = ReadFile
+            .execute(
+                json!({"path": "f.txt", "offset": 2, "limit": u64::MAX}),
+                &ctx(dir.path().into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content, "[lines 2–5 of 5]\nl2\nl3\nl4\nl5");
     }
 
     #[tokio::test]
