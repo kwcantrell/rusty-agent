@@ -183,8 +183,10 @@ const SHELL_SIGNIFICANT: &[char] = &[
 ];
 
 /// A command is auto-allowed only if it is a single simple command, free of shell-
-/// significant characters, invokes an unqualified (no `/`) program name, and that name is
-/// on the allowlist.
+/// significant characters, invokes an unqualified (no `/`) program name, and matches an
+/// allowlist entry. Entries are whitespace-token prefixes: `"ls"` matches any `ls`
+/// invocation, while `"git status"` matches only that subcommand — `git push` et al.
+/// fall through to Ask. Unknown subcommands of exec-capable programs fail safe to Ask.
 pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
     let tokens = match shell_words::split(cmd) {
         Ok(t) => t,
@@ -219,6 +221,11 @@ pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
     // RESIDUAL: the hard floor covers DIRECT catastrophe invocation, not catastrophes smuggled
     // through allowlisted exec vehicles. Mitigations: don't allowlist exec-capable programs if the
     // floor must hold, and rely on the execution sandbox (agent-sandbox).
+    //
+    // With prefix entries the DEFAULT allowlist no longer exposes bare `git`/`cargo`
+    // (see agent-runtime-config::default_allowlist); the residual narrows to the
+    // enumerated subcommands (`cargo build` still runs build scripts) and re-widens
+    // only if a user adds a bare exec-capable entry back.
     if tokens
         .iter()
         .any(|t| program_name_is_catastrophic(basename(t)).is_some())
@@ -229,7 +236,17 @@ pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
     if prog.contains('/') {
         return false;
     }
-    allowlist.iter().any(|a| a == prog)
+    // Allowlist entries are whitespace-split token prefixes: a one-word entry matches
+    // the program name alone (legacy behavior); a multi-word entry ("git status") also
+    // pins the leading arguments, so exec-capable programs can expose only read-safe
+    // subcommands. Unknown subcommands fail safe to Ask. Degenerate (empty) entries
+    // never match.
+    allowlist.iter().any(|entry| {
+        let want: Vec<&str> = entry.split_whitespace().collect();
+        !want.is_empty()
+            && want.len() <= tokens.len()
+            && want.iter().zip(tokens.iter()).all(|(w, t)| *w == t.as_str())
+    })
 }
 
 #[cfg(test)]
@@ -484,5 +501,47 @@ mod tests {
             r#"git -c core.pager="sudo reboot" log"#,
             &al
         ));
+    }
+
+    #[test]
+    fn prefix_entries_gate_subcommands() {
+        let al = vec![
+            "git status".to_string(),
+            "git log".to_string(),
+            "cargo build".to_string(),
+        ];
+        assert!(is_auto_allowed("git status", &al));
+        assert!(is_auto_allowed("git status --porcelain -b", &al));
+        assert!(is_auto_allowed("git log --oneline -5", &al));
+        assert!(is_auto_allowed("cargo build --release", &al));
+        // Destructive / unlisted subcommands are not auto-allowed (audit Top-10 #9).
+        assert!(!is_auto_allowed("git push --force", &al));
+        assert!(!is_auto_allowed("git reset --hard", &al));
+        assert!(!is_auto_allowed("git clean -fdx", &al));
+        assert!(!is_auto_allowed("cargo publish", &al));
+        // Bare program does not match when only prefix entries exist.
+        assert!(!is_auto_allowed("git", &al));
+        // A flag before the subcommand breaks the prefix — accepted over-ask.
+        assert!(!is_auto_allowed("git -C /tmp status", &al));
+    }
+
+    #[test]
+    fn prefix_entry_longer_than_command_does_not_match() {
+        let al = vec!["git status --short".to_string()];
+        assert!(!is_auto_allowed("git status", &al));
+        assert!(is_auto_allowed("git status --short", &al));
+    }
+
+    #[test]
+    fn one_word_entries_keep_legacy_program_match() {
+        let al = vec!["ls".to_string()];
+        assert!(is_auto_allowed("ls -la", &al));
+        assert!(!is_auto_allowed("lsblk", &al)); // token equality, not substring
+    }
+
+    #[test]
+    fn degenerate_entries_never_match() {
+        let al = vec!["".to_string(), "   ".to_string()];
+        assert!(!is_auto_allowed("ls", &al));
     }
 }
