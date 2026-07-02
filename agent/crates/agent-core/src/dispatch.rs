@@ -105,9 +105,7 @@ impl SubagentSink {
 impl EventSink for SubagentSink {
     fn emit(&self, event: AgentEvent) {
         match event {
-            AgentEvent::ToolStart {
-                id, name, args, ..
-            } => {
+            AgentEvent::ToolStart { id, name, args, .. } => {
                 self.cap.lock().unwrap().tool_calls += 1;
                 self.parent.emit(AgentEvent::ToolStart {
                     id: format!("sub{}:{}", self.n, id),
@@ -438,12 +436,7 @@ mod tests {
                     name,
                     parent_id,
                     ..
-                } => (
-                    "tool_start".into(),
-                    id,
-                    name,
-                    parent_id.unwrap_or_default(),
-                ),
+                } => ("tool_start".into(), id, name, parent_id.unwrap_or_default()),
                 AgentEvent::ToolResult {
                     id,
                     name,
@@ -617,7 +610,7 @@ mod tests {
         );
         assert_eq!(got[1].3, "d1");
         assert_eq!(got[2].3, "d1"); // server_usage
-        // Tap saw exactly the non-forwarded kinds, attributed to ordinal 7:
+                                    // Tap saw exactly the non-forwarded kinds, attributed to ordinal 7:
         assert_eq!(
             tap.seen.lock().unwrap().clone(),
             vec![(7, "token"), (7, "error"), (7, "done")]

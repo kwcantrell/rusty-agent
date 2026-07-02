@@ -188,7 +188,9 @@ async fn child_tool_calls_are_forwarded_rewritten_and_tokens_suppressed() {
         "{events:?}"
     );
     assert!(
-        !events.iter().any(|(k, _, _, _)| k == "token" || k == "done"),
+        !events
+            .iter()
+            .any(|(k, _, _, _)| k == "token" || k == "done"),
         "{events:?}"
     );
 }

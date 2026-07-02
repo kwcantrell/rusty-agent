@@ -286,8 +286,12 @@ mod tests {
             parent_id,
         };
         let none = serde_json::to_string(&server_event_from(mk(None)).unwrap()).unwrap();
-        assert!(!none.contains("parent_id"), "old-SPA byte-compat broken: {none}");
-        let some = serde_json::to_string(&server_event_from(mk(Some("d1".into()))).unwrap()).unwrap();
+        assert!(
+            !none.contains("parent_id"),
+            "old-SPA byte-compat broken: {none}"
+        );
+        let some =
+            serde_json::to_string(&server_event_from(mk(Some("d1".into()))).unwrap()).unwrap();
         assert!(some.contains(r#""parent_id":"d1""#), "{some}");
     }
 
