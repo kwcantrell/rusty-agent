@@ -187,6 +187,8 @@ const SHELL_SIGNIFICANT: &[char] = &[
 /// allowlist entry. Entries are whitespace-token prefixes: `"ls"` matches any `ls`
 /// invocation, while `"git status"` matches only that subcommand — `git push` et al.
 /// fall through to Ask. Unknown subcommands of exec-capable programs fail safe to Ask.
+/// Matched git `log`/`diff`/`show` invocations are additionally screened for
+/// `--output`/`-o` (an arbitrary-file write) and fall to Ask.
 pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
     let tokens = match shell_words::split(cmd) {
         Ok(t) => t,
@@ -241,7 +243,7 @@ pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
     // pins the leading arguments, so exec-capable programs can expose only read-safe
     // subcommands. Unknown subcommands fail safe to Ask. Degenerate (empty) entries
     // never match.
-    allowlist.iter().any(|entry| {
+    let matched = allowlist.iter().any(|entry| {
         let want: Vec<&str> = entry.split_whitespace().collect();
         !want.is_empty()
             && want.len() <= tokens.len()
@@ -249,7 +251,27 @@ pub fn is_auto_allowed(cmd: &str, allowlist: &[String]) -> bool {
                 .iter()
                 .zip(tokens.iter())
                 .all(|(w, t)| *w == t.as_str())
-    })
+    });
+    if !matched {
+        return false;
+    }
+    // `git {log,diff,show} --output[=]<path>` truncates an arbitrary file — a write
+    // hiding under read-safe prefixes. Scoped to those subcommands so read flags
+    // stay allowed elsewhere (`git ls-files -o` = --others). `-o` has no meaning on
+    // log/diff/show; scanning it too is belt-and-braces. `--output-indicator-*`
+    // must not trip (rendering flags). Hit → Ask, never Deny.
+    if tokens[0] == "git"
+        && matches!(
+            tokens.get(1).map(String::as_str),
+            Some("log" | "diff" | "show")
+        )
+        && tokens[2..]
+            .iter()
+            .any(|t| t == "-o" || t == "--output" || t.starts_with("--output="))
+    {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -546,5 +568,47 @@ mod tests {
     fn degenerate_entries_never_match() {
         let al = vec!["".to_string(), "   ".to_string()];
         assert!(!is_auto_allowed("ls", &al));
+    }
+
+    // Mirrors default_allowlist()'s read-safe git prefixes plus grep.
+    fn git_scan_fixture() -> Vec<String> {
+        [
+            "git log",
+            "git diff",
+            "git show",
+            "git ls-files",
+            "git status",
+            "grep",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
+    #[test]
+    fn git_output_flag_is_not_auto_allowed() {
+        let al = git_scan_fixture();
+        for cmd in [
+            "git log --output=/tmp/x",
+            "git diff --output /tmp/x",
+            "git show --output=x HEAD",
+            "git log -o x",
+        ] {
+            assert!(!is_auto_allowed(cmd, &al), "{cmd} must fall to Ask");
+        }
+    }
+
+    #[test]
+    fn git_output_scan_has_no_false_positives() {
+        let al = git_scan_fixture();
+        for cmd in [
+            "git diff --output-indicator-new=+",
+            "git log --oneline",
+            "git ls-files -o",
+            "git status",
+            "grep -o pat file",
+        ] {
+            assert!(is_auto_allowed(cmd, &al), "{cmd} must stay auto-allowed");
+        }
     }
 }
