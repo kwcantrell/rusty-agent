@@ -53,6 +53,12 @@ is pinned in-situ without real sleeps. `AgentError` carries no dead variants.
   most once per turn and then classification falls back to the plain class —
   the same exposure `Stream` bodies already have, accepted by the original
   spec's "conservative by design" stance.
+  *[Correction 2026-07-01, final whole-branch review: `class()` is stateless —
+  there is no "fall back to the plain class." A SECOND overflow-classified
+  error in the same turn is FATAL (`Error` + `Done(StopReason::Error)`),
+  pinned by the pre-existing `second_overflow_in_a_turn_is_fatal` test. Still
+  bounded — the turn fails fast instead of burning retry budget — and still
+  the same exposure profile `Stream` already had.]*
 - **Correct the original spec in place, dated.** The retry spec's claude-cli
   edge case gets a bracketed correction note rather than silent rewriting —
   the audit trail convention (specs are marked implemented; corrections are
@@ -154,10 +160,13 @@ non-exhaustive). `cargo build` across the workspace is the proof.
 ## Error handling & edge cases
 
 - Process body that merely *mentions* an overflow phrase (false positive):
-  classified ContextOverflow → one forced compaction + rebuild for that turn,
-  then subsequent identical errors fall back to Retryable for the rest of the
-  turn (`overflow_recovered` flag) — bounded, no retry storm. Same exposure
-  profile as Stream today.
+  classified ContextOverflow → one forced compaction + rebuild for that turn.
+  *[Correction 2026-07-01, final whole-branch review: a second
+  overflow-classified error in the same turn does NOT demote to Retryable —
+  the loop's second-overflow arm is fatal (turn ends with `Done(Error)`,
+  pinned by `second_overflow_in_a_turn_is_fatal`). Bounded either way: one
+  recovery attempt, then fail-fast, no retry storm. Same exposure profile as
+  Stream today.]*
 - Spawn-failure Process bodies ("spawn <bin>: ...") never contain overflow
   phrases in practice; if one did, the bounded path above applies.
 - `OverflowRecovery` before `maintain()`: guarantees visibility even when
