@@ -405,10 +405,10 @@ impl AgentLoop {
         }
 
         if let Some(retriever) = &self.retriever {
-            let lines = retriever.retrieve(&user_input).await;
-            if !lines.is_empty() {
-                ctx.set_recall(lines);
-            }
+            // Unconditional: an empty retrieval clears the prior run's recall
+            // block (contexts persist across runs). set_recall(vec![]) renders
+            // no block. (spec §2, audit Spine B #4)
+            ctx.set_recall(retriever.retrieve(&user_input).await);
         }
         ctx.set_goal(user_input.clone());
         ctx.append(Message::user(user_input));
@@ -1789,6 +1789,73 @@ mod tests {
             .iter()
             .any(|m| m.content.contains("Relevant memories")));
         assert!(sink.events.lock().unwrap().last().unwrap() == "done");
+    }
+
+    /// A run that retrieves nothing must CLEAR the previous run's recall block —
+    /// contexts persist across runs (spec §2, audit Spine B #4).
+    #[tokio::test]
+    async fn empty_retrieval_clears_stale_recall() {
+        // Retriever stub: first call returns ["fact A"], every later call [].
+        struct TogglingRetriever(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl crate::Retriever for TogglingRetriever {
+            async fn retrieve(&self, _q: &str) -> Vec<String> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    vec!["fact A".into()]
+                } else {
+                    vec![]
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Text("ok".into()),
+            Scripted::Text("ok".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .with_retriever(Arc::new(TogglingRetriever(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
+
+        // Shared real context across two runs (persists like a REPL/server session).
+        let mut ctx = WindowContext::new(Message::system("sys"));
+
+        agent.run(&mut ctx, "hello".into()).await.unwrap();
+        assert!(
+            ctx.build(100_000)
+                .iter()
+                .any(|m| m.content.contains("fact A")),
+            "run 1 (non-empty retrieval) should inject the recall block"
+        );
+
+        agent.run(&mut ctx, "again".into()).await.unwrap();
+        assert!(
+            !ctx.build(100_000)
+                .iter()
+                .any(|m| m.content.contains("fact A")),
+            "run 2 (empty retrieval) must clear the stale recall block"
+        );
     }
 
     #[tokio::test]
