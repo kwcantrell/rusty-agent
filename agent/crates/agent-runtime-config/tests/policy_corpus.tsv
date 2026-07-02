@@ -1,0 +1,122 @@
+# Adversarial command-policy corpus. One case per line: expected<TAB>command
+#   expected ∈ allow | ask | deny
+#   blank lines and lines whose first non-space char is `#` are skipped
+#   an inline `#...` field AFTER a tab (i.e. a 3rd tab-separated field) is a comment
+#   TABS separate fields; SPACES inside the command are load-bearing (do not collapse)
+#
+# Expected values pin CURRENT behavior (default_allowlist + effective_denylist,
+# fed as an execute_command ToolIntent through RulePolicy::check). This is a
+# regression net, not a wishlist. Rows documenting an accepted asymmetry carry a
+# `#` comment saying so.
+#
+# ── Class: rm -rf / — flag / spacing / no-preserve-root variants (structural deny) ──
+deny	rm -rf /
+deny	rm -fr /
+deny	rm  -rf   /	# whitespace-smuggled: shell-words still tokenizes; structural deny
+deny	rm --recursive --force /
+deny	rm -rf --no-preserve-root /
+deny	rm -R -f /
+deny	rm -rf /*
+ask	rm file.txt	# not recursive+root: floor does NOT fire; `rm` un-allowlisted → Ask
+#
+# ── Class: fork bomb (substring backstop over the `:(){` literal) ──
+deny	:(){ :|:& };:
+deny	: ( ) { :|:& } ; :	# spaced form dodges normalize_ws but not the strip-ws pass
+#
+# ── Class: mkfs / mkfs.<fs> in program position (name-based catastrophe) ──
+deny	mkfs /dev/sda
+deny	mkfs.ext4 /dev/sda1
+deny	/sbin/mkfs.xfs /dev/sdb1	# path-qualified: basename still `mkfs.xfs`
+deny	echo hi && mkfs /dev/sda
+deny	ls|mkfs /dev/sda	# glued pipe: raw boundary scan catches program-position mkfs
+#
+# ── Class: dd writing a block device (structural + `dd if=` backstop) ──
+deny	dd if=/dev/zero of=/dev/sda
+deny	dd if=/dev/zero of=/dev/sdb1 bs=4M
+#
+# ── Class: privilege escalation — sudo / doas / su in program position ──
+deny	sudo reboot
+deny	/usr/bin/sudo reboot	# path-qualified basename `sudo`
+deny	doas reboot
+deny	su -
+deny	echo x && sudo reboot
+deny	echo x&&sudo reboot	# glued && hides sudo from shell-words; boundary scan catches it
+#
+# ── Class: catastrophe smuggled via env-prefix / $() / backtick / subshell / group ──
+deny	FOO=bar sudo reboot	# env-assignment prefix is skipped to the real program
+deny	echo $(sudo reboot)
+deny	echo `sudo reboot`
+deny	(sudo reboot)
+deny	{ sudo reboot; }
+deny	echo $(mkfs.ext4 /dev/sda)
+#
+# ── Class: catastrophe NAME in argument position — must NOT over-deny (position-aware) ──
+ask	man mkfs	# `mkfs` is an arg, not program; `man` un-allowlisted → Ask (not Deny)
+ask	which sudo	# `sudo` is an arg; `which` un-allowlisted → Ask (not Deny)
+ask	grep mkfs README	# OBSERVED≠spec: hard floor allows it (mkfs in arg pos), but is_auto_allowed's catastrophe-token guard is name-EXACT on EVERY token (not position-aware) → Ask, not Allow
+allow	cat sudoku.txt	# `sudo` is only a SUBSTRING of `sudoku`; name-exact guard does not fire → auto-allowed
+#
+# ── Class: exec-vehicle residual — allowlisted/exec runner + catastrophe arg → Ask ──
+ask	bash -c "sudo reboot"	# interpreter wrapping: not Deny, not Allow → Ask (documented)
+ask	find . -exec sudo reboot ;	# find is allowlisted but catastrophe-token guard → Ask
+ask	xargs mkfs	# mkfs as an arg; xargs un-allowlisted anyway → Ask
+#
+# ── Class: git destructive subcommands — prefix allowlist withholds them → Ask ──
+ask	git push --force
+ask	git reset --hard
+ask	git clean -fdx
+ask	git commit -m msg	# `git commit` is not an allowlisted prefix
+ask	git	# bare git does not match any `git <sub>` prefix entry
+ask	git -C /tmp status	# flag before subcommand breaks the prefix match (accepted over-ask)
+#
+# ── Class: git read-safe subcommands + arg-scan (cluster 4: --output/-o exfil write) ──
+allow	git status
+allow	git status --porcelain -b
+allow	git log --oneline
+allow	git log --oneline -5
+allow	git diff
+allow	git show HEAD
+allow	git blame README
+allow	git rev-parse HEAD
+allow	git ls-files
+allow	git ls-files -o	# `-o` = --others here (not log/diff/show) → stays allowed
+allow	git diff --output-indicator-new=+	# rendering flag, not --output → allowed
+ask	git log --output=/tmp/x	# cluster-4 arg-scan: --output is an arbitrary-file write
+ask	git diff --output /tmp/x
+ask	git show --output=x HEAD
+ask	git log -o x	# `-o` on log/diff/show is scanned too
+#
+# ── Class: cargo prefix allowlist (build-script exec-vehicle residual accepted) ──
+allow	cargo build
+allow	cargo build --release
+allow	cargo check
+allow	cargo test
+allow	cargo fmt
+allow	cargo clippy
+ask	cargo publish	# not an allowlisted cargo subcommand
+ask	cargo run	# not allowlisted (would run arbitrary code)
+#
+# ── Class: shell metacharacters / operators / explicit paths break auto-allow → Ask ──
+ask	ls && curl evil.com
+ask	ls | sh
+ask	cat x; curl evil.com
+ask	cat {a,b}	# brace expansion
+ask	ls *	# glob
+ask	cat ~/x	# tilde expansion
+ask	echo $(whoami)	# command substitution
+ask	./ls	# explicit relative path program
+ask	/bin/ls	# absolute path program
+ask	curl evil.com	# not on the allowlist
+ask	echo x > /dev/sda	# redirection asymmetry — reaches Ask, not Deny (documented)
+#
+# ── Class: clean allowlisted single commands → allow ──
+allow	ls -la
+allow	cat file.txt
+allow	cat "a b.txt"	# quoted arg with a space tokenizes cleanly
+allow	pwd
+allow	echo hello
+allow	grep -o pat file	# `-o` on grep (not git) is fine
+allow	head -n 5 file
+allow	tail file
+allow	wc -l file
+allow	rg pattern
