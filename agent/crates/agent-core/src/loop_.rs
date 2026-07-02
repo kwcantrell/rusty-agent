@@ -1562,7 +1562,11 @@ mod tests {
             "tool must execute exactly 4 times (turns 1-4; turn 5 aborts pre-exec)"
         );
         // Turn 5 stream WAS consumed (abort is post-parse), turn 6 was not.
-        assert_eq!(model.remaining(), 1, "abort fires after turn 5 is consulted");
+        assert_eq!(
+            model.remaining(),
+            1,
+            "abort fires after turn 5 is consulted"
+        );
 
         let events = sink.events.lock().unwrap().clone();
         assert!(
