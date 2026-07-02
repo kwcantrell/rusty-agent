@@ -691,6 +691,17 @@ impl AgentLoop {
             args: call.args.clone(),
             parent_id: None,
         });
+        // Gate entry: if the run was already cancelled (e.g. Ctrl-C during an
+        // earlier prompt in this Phase-1 batch), short-circuit the rest of the
+        // batch without touching policy/approval. Placed AFTER the ToolStart emit
+        // so every call still gets a start/terminal event pair.
+        if cancel.is_cancelled() {
+            return GateOutcome::Rejected {
+                id: call.id,
+                name: call.name,
+                content: format!("ERROR: {}", ToolError::Denied("run cancelled".into())),
+            };
+        }
         let tool = match self.tools.get(&call.name) {
             Some(t) => t,
             None => {
@@ -744,17 +755,30 @@ impl AgentLoop {
                     display: None,
                 };
                 self.sink.emit(AgentEvent::Approval(req.clone()));
-                matches!(
-                    self.approval.request(req).await,
-                    ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
-                )
+                // Race the approval wait against cancellation: Ctrl-C during a
+                // pending prompt must end the run promptly rather than wedge until
+                // the prompt is answered. Cancel-during-prompt counts as a deny.
+                tokio::select! {
+                    _ = cancel.cancelled() => false,
+                    resp = self.approval.request(req) => matches!(
+                        resp,
+                        ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
+                    ),
+                }
             }
         };
         if !allowed {
+            // Distinguish a cancel-driven denial (the run is ending) from an
+            // explicit user "no" so the tool result reads correctly downstream.
+            let reason = if cancel.is_cancelled() {
+                "run cancelled"
+            } else {
+                "user declined"
+            };
             return GateOutcome::Rejected {
                 id: call.id,
                 name: call.name,
-                content: format!("ERROR: {}", ToolError::Denied("user declined".into())),
+                content: format!("ERROR: {}", ToolError::Denied(reason.into())),
             };
         }
         // The live run token: a tool that honors `ctx.cancel` (shell/git/fetch_url)
@@ -1611,6 +1635,101 @@ mod tests {
             "a denied call must still emit a terminal ToolResult: {events:?}"
         );
         assert_eq!(events.last().unwrap(), "done");
+    }
+
+    /// Ctrl-C during a pending approval prompt must end the run promptly as
+    /// Cancelled — not wedge until the prompt is answered (audit Component 4).
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_pending_approval_ends_run() {
+        use std::sync::Mutex;
+
+        // Approval channel that never answers — models a prompt left hanging.
+        struct NeverApprove;
+        #[async_trait::async_trait]
+        impl ApprovalChannel for NeverApprove {
+            async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+                std::future::pending().await
+            }
+        }
+
+        // Captures the fields the string-label CollectingSink can't: the Done
+        // reason, the terminal ToolResult content, and an Approval-emitted signal.
+        #[derive(Default)]
+        struct CancelRaceSink {
+            approval_seen: tokio::sync::Notify,
+            done: Mutex<Option<StopReason>>,
+            results: Mutex<Vec<(ToolStatus, String)>>,
+        }
+        impl EventSink for CancelRaceSink {
+            fn emit(&self, event: AgentEvent) {
+                match event {
+                    AgentEvent::Approval(_) => self.approval_seen.notify_one(),
+                    AgentEvent::ToolResult { status, output, .. } => {
+                        self.results.lock().unwrap().push((status, output.content));
+                    }
+                    AgentEvent::Done(r) => *self.done.lock().unwrap() = Some(r),
+                    _ => {}
+                }
+            }
+        }
+
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "read_file".into(), r#"{"path":"a.txt"}"#.into()),
+            Scripted::Text("should not run".into()),
+        ]));
+        let sink = Arc::new(CancelRaceSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            Arc::new(AskAll),
+            Arc::new(NeverApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        let run = tokio::spawn(async move {
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run_with_cancel(&mut ctx, "go".into(), cancel).await
+        });
+
+        // Cancel only once the approval prompt is actually pending.
+        sink.approval_seen.notified().await;
+        c2.cancel();
+
+        // The run must return promptly; on today's code it would wedge on the
+        // never-resolving prompt and this timeout would fire.
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run must finish promptly after cancel, not wedge on the prompt")
+            .expect("run task must not panic")
+            .expect("run returns Ok");
+
+        assert_eq!(
+            *sink.done.lock().unwrap(),
+            Some(StopReason::Cancelled),
+            "cancel during a prompt must end the run as Cancelled"
+        );
+        let results = sink.results.lock().unwrap();
+        let (status, content) = results.last().expect("the gated call gets a terminal result");
+        assert_eq!(*status, ToolStatus::Denied);
+        assert!(
+            content.contains("run cancelled"),
+            "cancel-driven denial must say 'run cancelled', got: {content}"
+        );
     }
 
     #[tokio::test]
