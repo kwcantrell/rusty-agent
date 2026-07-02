@@ -24,6 +24,10 @@ raised score **+13.7 points** by tweaking only system prompt, tools, and
 middleware around a fixed model. This skill makes that work systematic for
 `rust-agent-runtime`.
 
+**Do not** use this skill for ordinary feature work in this repo — only for
+the harness layer itself. And never let `audit.md` edit code: it REPORTS ONLY;
+the human holds the judgment gate.
+
 ## Which playbook
 
 | If the ask is… | Load |

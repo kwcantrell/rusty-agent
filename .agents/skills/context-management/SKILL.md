@@ -15,6 +15,10 @@ errors and large tool outputs into a retrievable table, compacts old history int
 a summary when the window fills, and pins a re-grounding block restating the
 original goal. This skill is judgment: how to work *with* that machinery.
 
+**Do not** use this skill to run the optimization campaign (→ `context-evolve`)
+or as internals documentation for the runtime's Rust context code — it is
+generic judgment for working with the curating context manager at run time.
+
 ## The one big idea
 
 **The live window is a working set, not a transcript.** The offload table is the

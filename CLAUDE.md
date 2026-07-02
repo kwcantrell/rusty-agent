@@ -96,3 +96,7 @@ See `agent/docs/RUNNING.md` for the full model-server setup (llama.cpp / SGLang 
 
 - **Two separate Cargo workspaces** — `agent/` and `src-tauri/`. `-p <crate>` must target the right one.
 - **The graph reflects the last build and can be stale.** Read live source before editing; `--update` after doc/image changes (code changes re-extract for free).
+- **Two skill trees** — `.agents/skills/` is Claude-facing (skills for working *on*
+  this repo). The runtime's own agent loads skills from `<workspace>/.agent/skills`
+  and `~/.agent/skills` (`agent-skills/src/registry.rs`). Don't author into the
+  wrong tree.
