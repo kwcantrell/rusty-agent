@@ -324,9 +324,20 @@ mod tests {
         let rel: Vec<String> = skill
             .examples
             .iter()
-            .map(|p| p.strip_prefix(&skill.dir).unwrap().to_string_lossy().into_owned())
+            .map(|p| {
+                p.strip_prefix(&skill.dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
-        assert_eq!(rel, vec!["examples/a.md".to_string(), "examples/nested/b.md".to_string()]);
+        assert_eq!(
+            rel,
+            vec![
+                "examples/a.md".to_string(),
+                "examples/nested/b.md".to_string()
+            ]
+        );
         // Superset pin: files still contains every bundled file incl. examples.
         assert!(skill.files.len() >= 4, "{:?}", skill.files);
         for e in &skill.examples {
@@ -361,7 +372,12 @@ mod tests {
         let rel: Vec<String> = skill
             .files
             .iter()
-            .map(|p| p.strip_prefix(&skill.dir).unwrap().to_string_lossy().into_owned())
+            .map(|p| {
+                p.strip_prefix(&skill.dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         assert_eq!(rel, vec!["examples/SKILL.md".to_string()], "{rel:?}");
     }
@@ -383,7 +399,12 @@ mod tests {
         let rel: Vec<String> = skill
             .files
             .iter()
-            .map(|p| p.strip_prefix(&skill.dir).unwrap().to_string_lossy().into_owned())
+            .map(|p| {
+                p.strip_prefix(&skill.dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         assert_eq!(rel, vec!["real.txt".to_string()], "{rel:?}");
     }
