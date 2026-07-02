@@ -8,6 +8,7 @@ export type Item =
   | { kind: "assistant"; text: string; done?: string }
   | { kind: "reasoning"; text: string }
   | { kind: "tool"; name: string; args: unknown; status: "running" | "done";
+      id?: string; parentId?: string;
       content?: string; display?: Display; resultStatus?: string; durationMs?: number }
   | { kind: "context"; text: string }
   | { kind: "error"; message: string };
@@ -115,6 +116,9 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
     // The breakdown only needs the prompt total, so we intentionally keep only
     // promptTokens here and drop completion_tokens. Revisit if a chart needs it.
     case "server_usage":
+      // A sub-agent's usage frame must not flicker the parent turn readout;
+      // its tokens still land in session_stats (spec E5/E6c).
+      if (p.parent_id) return s;
       return { ...s, serverUsage: { promptTokens: p.prompt_tokens, turn: p.turn } };
     case "token": {
       const items = [...s.items];
@@ -137,12 +141,16 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
       return { ...s, items };
     }
     case "tool_start":
-      return { ...s, items: [...s.items, { kind: "tool", name: p.name, args: p.args, status: "running" }] };
+      return { ...s, items: [...s.items, { kind: "tool", id: p.id, parentId: p.parent_id,
+        name: p.name, args: p.args, status: "running" }] };
     case "tool_result": {
       const items = [...s.items];
       for (let i = items.length - 1; i >= 0; i--) {
         const it = items[i];
-        if (it.kind === "tool" && it.status === "running" && it.name === p.name) {
+        // id-first correlation (parallel same-named child tools); name-fallback
+        // only for pre-id items restored from old persisted state.
+        if (it.kind === "tool" && it.status === "running" &&
+            (it.id !== undefined ? it.id === p.id : it.name === p.name)) {
           items[i] = { ...it, status: "done", content: p.content, display: p.display,
             resultStatus: p.status, durationMs: p.duration_ms };
           break;

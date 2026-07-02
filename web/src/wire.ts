@@ -43,6 +43,8 @@ export interface SessionStats {
   tool_calls: number; tools_ok: number; tools_denied: number; tools_error: number;
   tools_timeout: number; tools_panic: number; tool_time_ms: number;
   turn_time_ms: number; context_events: number; errors: number;
+  // optional: old servers omit these sub-agent subset counters.
+  subagent_tool_calls?: number; subagent_turns?: number;
 }
 
 export interface DiscoveredSkill { name: string; description: string }
@@ -52,10 +54,11 @@ export type WireEvent =
   | { type: "reasoning"; text: string }
   | { type: "usage"; prompt_tokens: number; context_limit: number; turn: number; max_turns: number }
   | { type: "server_usage"; prompt_tokens: number; completion_tokens: number; turn: number;
-      reasoning_tokens?: number; cached_tokens?: number; cost_usd?: number; turn_duration_ms?: number }
-  | { type: "tool_start"; id: string; name: string; args: unknown }
+      reasoning_tokens?: number; cached_tokens?: number; cost_usd?: number; turn_duration_ms?: number;
+      parent_id?: string }
+  | { type: "tool_start"; id: string; name: string; args: unknown; parent_id?: string }
   | { type: "tool_result"; id: string; name: string; status: string; duration_ms: number;
-      content: string; display?: Display }
+      content: string; display?: Display; parent_id?: string }
   | { type: "context"; kind: string; detail: Record<string, unknown> }
   | { type: "session_stats"; stats: SessionStats }
   | { type: "error"; message: string }
