@@ -1,7 +1,7 @@
 # Retry Classification + Overflow Recovery — Design
 
 **Date:** 2026-07-01
-**Status:** Approved (plan: docs/superpowers/plans/2026-07-01-retry-classification.md)
+**Status:** Implemented (this plan: docs/superpowers/plans/2026-07-01-retry-classification.md)
 **Source:** Cluster 8 of the harness deep audit
 (`docs/superpowers/audits/2026-07-01-harness-deep-audit.md`, Component 4 —
 Orchestration, MED at `loop_.rs:132-152`; Top-10 fix #8), plus three folds:
