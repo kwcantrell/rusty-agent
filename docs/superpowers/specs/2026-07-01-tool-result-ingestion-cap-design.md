@@ -1,7 +1,7 @@
 # Tool-Result Ingestion Cap — Design
 
 **Date:** 2026-07-01
-**Status:** Approved (plan: docs/superpowers/plans/2026-07-01-tool-result-ingestion-cap.md)
+**Status:** Implemented (this plan: docs/superpowers/plans/2026-07-01-tool-result-ingestion-cap.md)
 **Source:** Cluster 7 of the harness deep audit
 (`docs/superpowers/audits/2026-07-01-harness-deep-audit.md`, Component 2 —
 Tools, HIGH at `shell.rs:74; fs/read.rs:36-38; git.rs:85; mcp/tool.rs:91-125;
