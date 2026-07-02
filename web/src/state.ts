@@ -148,7 +148,8 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
       for (let i = items.length - 1; i >= 0; i--) {
         const it = items[i];
         // id-first correlation (parallel same-named child tools); name-fallback
-        // only for pre-id items restored from old persisted state.
+        // only for tool items from an old SERVER that omitted `id` on tool_start
+        // frames (restored history never contains tool items, so it's not that).
         if (it.kind === "tool" && it.status === "running" &&
             (it.id !== undefined ? it.id === p.id : it.name === p.name)) {
           items[i] = { ...it, status: "done", content: p.content, display: p.display,

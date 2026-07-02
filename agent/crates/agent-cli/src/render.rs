@@ -60,6 +60,47 @@ fn format_tool_start(name: &str, args: &serde_json::Value, parent_id: Option<&st
     format!("{indent}\x1b[36m⚙ {name}\x1b[0m {args}")
 }
 
+/// The ToolResult display block (pure for testability); child (attributed)
+/// results get the same two-space `↳` indent as their ToolStart so the row
+/// reads as nested (spec E7). Mirrors `format_tool_start`; the caller writes
+/// this via a single `writeln!`.
+fn format_tool_result(
+    name: &str,
+    status: ToolStatus,
+    output: &agent_tools::ToolOutput,
+    duration_ms: u64,
+    parent_id: Option<&str>,
+) -> String {
+    let indent = if parent_id.is_some() { "  ↳ " } else { "" };
+    if status != ToolStatus::Ok {
+        format!(
+            "{indent}\x1b[31m✗ {name} ({}, {duration_ms}ms)\x1b[0m {}",
+            status.as_str(),
+            output.content
+        )
+    } else if let Some(Display::Diff {
+        path,
+        before,
+        after,
+    }) = &output.display
+    {
+        format!(
+            "{indent}\x1b[33m✎ {path}\x1b[0m\n{}",
+            render_diff(before, after)
+        )
+    } else if let Some(Display::Terminal {
+        exit_code,
+        stdout,
+        stderr,
+        ..
+    }) = &output.display
+    {
+        format!("{indent}\x1b[90m$ exit={exit_code}\x1b[0m\n{stdout}{stderr}")
+    } else {
+        format!("{indent}\x1b[32m✓ {name}\x1b[0m")
+    }
+}
+
 /// Renders agent events to stdout/stderr. Buffers streamed tokens inline.
 #[allow(dead_code)]
 pub struct TerminalSink {
@@ -106,41 +147,11 @@ impl EventSink for TerminalSink {
                 parent_id,
                 ..
             } => {
-                // Attributed (sub-agent) results get the same `↳` indent as their
-                // ToolStart so the child row reads as nested (spec E7).
-                let indent = if parent_id.is_some() { "  ↳ " } else { "" };
-                if status != ToolStatus::Ok {
-                    let _ = writeln!(
-                        out,
-                        "{indent}\x1b[31m✗ {name} ({}, {duration_ms}ms)\x1b[0m {}",
-                        status.as_str(),
-                        output.content
-                    );
-                } else if let Some(Display::Diff {
-                    path,
-                    before,
-                    after,
-                }) = &output.display
-                {
-                    let _ = writeln!(
-                        out,
-                        "{indent}\x1b[33m✎ {path}\x1b[0m\n{}",
-                        render_diff(before, after)
-                    );
-                } else if let Some(Display::Terminal {
-                    exit_code,
-                    stdout,
-                    stderr,
-                    ..
-                }) = &output.display
-                {
-                    let _ = writeln!(
-                        out,
-                        "{indent}\x1b[90m$ exit={exit_code}\x1b[0m\n{stdout}{stderr}"
-                    );
-                } else {
-                    let _ = writeln!(out, "{indent}\x1b[32m✓ {name}\x1b[0m");
-                }
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    format_tool_result(&name, status, &output, duration_ms, parent_id.as_deref())
+                );
             }
             AgentEvent::Usage { .. } => {} // telemetry for the web context dashboard; not shown in the CLI
             AgentEvent::ServerUsage { .. } => {} // server-reported usage telemetry; not shown in the CLI
@@ -209,6 +220,33 @@ mod tests {
         assert!(line.contains("7 tools"));
         assert!(line.contains("2 failed"));
         assert!(line.contains("$0.05"));
+    }
+
+    #[test]
+    fn tool_result_helper_pins_ok_and_error_literals_and_indent() {
+        let ok = agent_tools::ToolOutput {
+            content: "unused".into(),
+            display: None,
+        };
+        let err = agent_tools::ToolOutput {
+            content: "ERROR: nope".into(),
+            display: None,
+        };
+        // Unattributed lines are byte-identical to the pre-helper literals.
+        assert_eq!(
+            format_tool_result("read_file", ToolStatus::Ok, &ok, 5, None),
+            "\x1b[32m✓ read_file\x1b[0m"
+        );
+        assert_eq!(
+            format_tool_result("read_file", ToolStatus::Denied, &err, 5, None),
+            "\x1b[31m✗ read_file (denied, 5ms)\x1b[0m ERROR: nope"
+        );
+        // Attributed (sub-agent) lines gain the two-space `↳` indent.
+        let ok_child = format_tool_result("sub:read_file", ToolStatus::Ok, &ok, 5, Some("d1"));
+        let err_child =
+            format_tool_result("sub:read_file", ToolStatus::Denied, &err, 5, Some("d1"));
+        assert!(ok_child.starts_with("  ↳ "), "{ok_child:?}");
+        assert!(err_child.starts_with("  ↳ "), "{err_child:?}");
     }
 
     #[test]

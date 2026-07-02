@@ -101,6 +101,13 @@ starts reaching any frontend.
   the v1 turns distortion is gone. ToolResult status counters stay unified.
   Surfaces: `format_stats_line` appends `sub-agent: {calls} calls/{turns}
   turns` and StatsPanel adds a `Sub-agent` row — both only when nonzero.
+  - *(corrected 2026-07-02, final review)* The `session_stats` frame **always**
+    carries the two subagent counters (zero-valued when unused), not only when
+    nonzero — they are plain struct fields, not skipped optionals. This is an
+    E5-sanctioned additive exception to the Invariant's byte-identical wording:
+    old-SPA safety is unaffected because the SPA duck-types the parse and simply
+    ignores unknown fields. (The "only when nonzero" gating is a render-surface
+    concern — `format_stats_line` / StatsPanel — not a wire-schema one.)
 - **E6 — Web: id-correlation + flat nesting.** (a) `tool_result` correlates by
   **id first** (fall back to name-match only for items that predate ids in
   state) — closes the observability backlog item and is required now that

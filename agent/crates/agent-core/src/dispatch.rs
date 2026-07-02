@@ -45,8 +45,10 @@ pub struct CaptureSummary {
 /// Sink-shaped hook for tracing the child's non-forwarded transcript
 /// (implemented over TraceWriter in agent-runtime-config — dep direction).
 pub trait SubagentTrace: Send + Sync {
-    /// Record one non-forwarded child event, attributed to dispatch ordinal `n`.
-    fn record(&self, n: u64, event: &AgentEvent);
+    /// Record one non-forwarded child event, attributed to dispatch ordinal `n`
+    /// and the dispatching model call's id `parent_id` (lineage join: a child
+    /// that makes zero tool calls still ties to its dispatch row via this id).
+    fn record(&self, n: u64, parent_id: &str, event: &AgentEvent);
 }
 
 /// The child loop's sink: captures the transcript for the tool result and
@@ -157,7 +159,7 @@ impl EventSink for SubagentSink {
             // the child-trace tap so a failed child turn is replayable (E4).
             other => {
                 if let Some(t) = &self.child_trace {
-                    t.record(self.n, &other);
+                    t.record(self.n, &self.parent_call_id, &other);
                 }
                 let mut cap = self.cap.lock().unwrap();
                 match other {
@@ -472,13 +474,13 @@ mod tests {
         }
     }
 
-    /// Records (ordinal, kind-name) for every tapped event.
+    /// Records (ordinal, parent_id, kind-name) for every tapped event.
     #[derive(Default)]
     struct TapSpy {
-        seen: Mutex<Vec<(u64, &'static str)>>,
+        seen: Mutex<Vec<(u64, String, &'static str)>>,
     }
     impl SubagentTrace for TapSpy {
-        fn record(&self, n: u64, event: &AgentEvent) {
+        fn record(&self, n: u64, parent_id: &str, event: &AgentEvent) {
             let kind = match event {
                 AgentEvent::Token(_) => "token",
                 AgentEvent::Reasoning(_) => "reasoning",
@@ -492,7 +494,10 @@ mod tests {
                 | AgentEvent::ToolResult { .. }
                 | AgentEvent::ServerUsage { .. } => "FORWARDED-KIND-MUST-NOT-BE-TAPPED",
             };
-            self.seen.lock().unwrap().push((n, kind));
+            self.seen
+                .lock()
+                .unwrap()
+                .push((n, parent_id.to_string(), kind));
         }
     }
 
@@ -610,10 +615,15 @@ mod tests {
         );
         assert_eq!(got[1].3, "d1");
         assert_eq!(got[2].3, "d1"); // server_usage
-                                    // Tap saw exactly the non-forwarded kinds, attributed to ordinal 7:
+                                    // Tap saw exactly the non-forwarded kinds, attributed to ordinal 7 and
+                                    // stamped with the dispatch call id "d1" (the zero-tool-call join key):
         assert_eq!(
             tap.seen.lock().unwrap().clone(),
-            vec![(7, "token"), (7, "error"), (7, "done")]
+            vec![
+                (7, "d1".to_string(), "token"),
+                (7, "d1".to_string(), "error"),
+                (7, "d1".to_string(), "done"),
+            ]
         );
     }
 

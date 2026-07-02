@@ -64,16 +64,18 @@ impl TraceWriter {
     /// Append one event. Infallible; disables itself on error or cap breach.
     /// (Borrow order matters: read `seq`/`written` before taking `w` mutably.)
     pub fn record(&self, event: &AgentEvent) {
-        self.write_record(None, event);
+        self.write_record(None, None, event);
     }
 
-    /// Record a sub-agent child event, attributed to dispatch ordinal `n`
-    /// (spec 2026-07-02 E4). Same file, same seq counter, same size cap.
-    pub fn record_child(&self, n: u64, event: &AgentEvent) {
-        self.write_record(Some(n), event);
+    /// Record a sub-agent child event, attributed to dispatch ordinal `n` and
+    /// the dispatching call's id `parent_id` (spec 2026-07-02 E4). The record's
+    /// `parent_id` joins a zero-tool-call child's transcript to its dispatch row
+    /// under parallel dispatch. Same file, same seq counter, same size cap.
+    pub fn record_child(&self, n: u64, parent_id: &str, event: &AgentEvent) {
+        self.write_record(Some(n), Some(parent_id), event);
     }
 
-    fn write_record(&self, sub: Option<u64>, event: &AgentEvent) {
+    fn write_record(&self, sub: Option<u64>, parent_id: Option<&str>, event: &AgentEvent) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -84,6 +86,7 @@ impl TraceWriter {
             seq: inner.seq,
             ts_ms: epoch_ms(),
             sub,
+            parent_id,
             event: trace_event(event),
         };
         let line = match serde_json::to_string(&rec) {
@@ -153,6 +156,10 @@ struct TraceRecord<'a> {
     ts_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     sub: Option<u64>,
+    /// Dispatching call's id on child lines (record-level lineage join); None on
+    /// parent lines. A zero-tool-call child still ties to its dispatch row here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_id: Option<&'a str>,
     event: TraceEvent<'a>,
 }
 
@@ -339,8 +346,8 @@ fn stop_reason_str(r: &StopReason) -> &'static str {
 /// the same JSONL with a `sub` ordinal (spec E4).
 pub struct ChildTraceTap(pub Arc<TraceWriter>);
 impl agent_core::SubagentTrace for ChildTraceTap {
-    fn record(&self, n: u64, event: &agent_core::AgentEvent) {
-        self.0.record_child(n, event);
+    fn record(&self, n: u64, parent_id: &str, event: &agent_core::AgentEvent) {
+        self.0.record_child(n, parent_id, event);
     }
 }
 
@@ -425,13 +432,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let w = TraceWriter::create(dir.path(), 1024 * 1024).unwrap();
         w.record(&agent_core::AgentEvent::Token("parent".into()));
-        w.record_child(3, &agent_core::AgentEvent::Token("child".into()));
+        w.record_child(3, "d1", &agent_core::AgentEvent::Token("child".into()));
         w.record(&AgentEvent::Done(agent_model::StopReason::Stop)); // flushes the BufWriter
         let path = dir.path().join(format!("{}.jsonl", w.session_id()));
         let content = std::fs::read_to_string(path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
+        // Parent line: neither the `sub` ordinal nor the record-level parent_id.
         assert!(!lines[1].contains(r#""sub""#), "{}", lines[1]);
+        assert!(!lines[1].contains(r#""parent_id""#), "{}", lines[1]);
+        // Child line: both — `sub` ordinal AND the dispatch-call join key.
         assert!(lines[2].contains(r#""sub":3"#), "{}", lines[2]);
+        assert!(lines[2].contains(r#""parent_id":"d1""#), "{}", lines[2]);
         // seq stays monotonic across both write paths:
         assert!(lines[2].contains(r#""seq":1"#), "{}", lines[2]);
     }

@@ -279,20 +279,50 @@ mod tests {
 
     #[test]
     fn parent_id_absent_from_json_when_none_and_present_when_some() {
-        let mk = |parent_id: Option<String>| agent_core::AgentEvent::ToolStart {
+        // The None-omission / Some-presence pin covers every parent_id-bearing
+        // frame — ToolStart, ToolResult, and ServerUsage — so old-SPA byte-compat
+        // can't regress on one while another is checked (spec T2-a).
+        let tool_start = |parent_id: Option<String>| agent_core::AgentEvent::ToolStart {
             id: "c1".into(),
             name: "echo".into(),
             args: serde_json::json!({}),
             parent_id,
         };
-        let none = serde_json::to_string(&server_event_from(mk(None)).unwrap()).unwrap();
-        assert!(
-            !none.contains("parent_id"),
-            "old-SPA byte-compat broken: {none}"
-        );
-        let some =
-            serde_json::to_string(&server_event_from(mk(Some("d1".into()))).unwrap()).unwrap();
-        assert!(some.contains(r#""parent_id":"d1""#), "{some}");
+        let tool_result = |parent_id: Option<String>| agent_core::AgentEvent::ToolResult {
+            id: "c1".into(),
+            name: "echo".into(),
+            status: agent_core::ToolStatus::Ok,
+            output: agent_tools::ToolOutput {
+                content: "r".into(),
+                display: None,
+            },
+            duration_ms: 1,
+            parent_id,
+        };
+        let server_usage = |parent_id: Option<String>| agent_core::AgentEvent::ServerUsage {
+            prompt_tokens: 42,
+            completion_tokens: 1,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            cost_usd: None,
+            turn_duration_ms: 1,
+            turn: 1,
+            parent_id,
+        };
+        for mk in [
+            &tool_start as &dyn Fn(Option<String>) -> AgentEvent,
+            &tool_result,
+            &server_usage,
+        ] {
+            let none = serde_json::to_string(&server_event_from(mk(None)).unwrap()).unwrap();
+            assert!(
+                !none.contains("parent_id"),
+                "old-SPA byte-compat broken: {none}"
+            );
+            let some =
+                serde_json::to_string(&server_event_from(mk(Some("d1".into()))).unwrap()).unwrap();
+            assert!(some.contains(r#""parent_id":"d1""#), "{some}");
+        }
     }
 
     #[test]
