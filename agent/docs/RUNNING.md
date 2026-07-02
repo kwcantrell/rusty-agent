@@ -255,6 +255,14 @@ The agent gets four tools:
 
 Bundled scripts are run with the ordinary `execute_command` tool, gated by the command allow/deny policy + approval — the skills subsystem never executes anything itself.
 
+### Skill examples
+
+Put worked exemplars under a skill's `examples/` directory. They surface as a
+distinct "Examples" section when the skill is loaded (with guidance to imitate
+their shape, not copy content), get an `[N examples]` marker in `list_skills`,
+and are read on demand with `read_skill_file` — nothing is injected into the
+prompt until the model asks.
+
 Preload a skill as a **preset** (its body injected into the system prompt from the first turn):
 
     cargo run -p agent-cli -- ... --skill code-review --skill changelog
