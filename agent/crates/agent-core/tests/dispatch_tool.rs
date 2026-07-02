@@ -98,6 +98,40 @@ impl Tool for Echo {
     }
 }
 
+/// A second child-visible tool, used to pin transitive allowlist scoping.
+struct Echo2;
+#[async_trait::async_trait]
+impl Tool for Echo2 {
+    fn name(&self) -> &str {
+        "echo2"
+    }
+    fn description(&self) -> &str {
+        "echo2"
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "echo2".into(),
+            description: "echo2".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+    fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+        Ok(ToolIntent {
+            tool: "echo2".into(),
+            access: Access::Read,
+            paths: vec![],
+            command: None,
+            summary: "echo2".into(),
+        })
+    }
+    async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            content: "echoed2".into(),
+            display: None,
+        })
+    }
+}
+
 fn workspace() -> PathBuf {
     std::env::temp_dir()
 }
@@ -859,13 +893,14 @@ async fn depth_two_child_can_dispatch_and_grandchild_attribution_chains() {
     // ...and the grandchild's ServerUsage carries parent_id == the child's VISIBLE id.
     let child_visible_id = child_dispatch_start.1.clone(); // "sub{n}:c1"
     assert!(child_visible_id.ends_with(":c1"), "{child_visible_id}");
-    // Concrete grandchild pin: at least one forwarded event carries the child's
-    // visible id as its parent_id (the grandchild's ServerUsage does).
+    // Concrete grandchild pin: the grandchild's ServerUsage specifically carries
+    // the child's visible id as its parent_id (kind-constrained so a stray
+    // forward can't satisfy the pin).
     assert!(
         events
             .iter()
-            .any(|(_, _, _, parent)| parent == &child_visible_id),
-        "no event chained to the child's visible id {child_visible_id}: {events:?}"
+            .any(|(kind, _, _, parent)| kind == "server_usage" && parent == &child_visible_id),
+        "no server_usage chained to the child's visible id {child_visible_id}: {events:?}"
     );
     // Tap pin (spec Testing): grandchild suppressed events reach the tap with
     // the prefixed parent id.
@@ -919,15 +954,19 @@ async fn depth_two_is_the_floor_for_the_grandchild() {
     );
     d.max_depth = 2;
     let tool = DispatchAgentTool::new(d);
-    tool.execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
         .await
         .unwrap();
+    assert!(out.content.starts_with("child done"), "{}", out.content);
     let events = sink.events.lock().unwrap().clone();
-    // The grandchild's dispatch attempt is a denied tool_result at depth 3.
+    // The grandchild's dispatch attempt is a denied tool_result at depth 3, and
+    // the denied row is specifically the grandchild's own g1 call (its visible id
+    // ends with the grandchild's child-side call id ":g1").
     assert!(
-        events
-            .iter()
-            .any(|(k, _, n, _)| k == "tool_result:denied" && n == "sub:dispatch_agent"),
+        events.iter().any(|(k, id, n, _)| k == "tool_result:denied"
+            && n == "sub:dispatch_agent"
+            && id.ends_with(":g1")),
         "{events:?}"
     );
 }
@@ -942,6 +981,126 @@ async fn default_depth_one_matches_v1_no_recursion() {
         vec![],
     );
     assert_eq!((d.depth, d.max_depth), (1, 1));
+}
+
+#[tokio::test]
+async fn allowlist_without_dispatch_agent_denies_child_dispatch_at_depth_two() {
+    // I-1 (i): depth allows nesting (max_depth 2), but the allowlist does NOT
+    // name dispatch_agent → the nested tool is not registered, so the child's
+    // dispatch attempt is denied as an unknown tool.
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"nested"}"#.into(),
+            ),
+            Scripted::Text("child done".into()),
+        ]),
+        sink.clone(),
+        vec![Arc::new(Echo)],
+    );
+    d.max_depth = 2;
+    let tool = DispatchAgentTool::new(d);
+    let out = tool
+        .execute(
+            serde_json::json!({"prompt": "p", "tools": ["echo"]}),
+            &tool_ctx(),
+        )
+        .await
+        .unwrap();
+    assert!(out.content.starts_with("child done"), "{}", out.content);
+    let events = sink.events.lock().unwrap().clone();
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n, _)| k == "tool_result:denied" && n == "sub:dispatch_agent"),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn allowlist_with_dispatch_agent_nests_and_scopes_grandchild_transitively() {
+    // I-1 (ii): allowlist ["echo","dispatch_agent"] at max_depth 2 → the child
+    // dispatches a grandchild successfully, and the grandchild inherits the
+    // FILTERED base (echo only): calling echo works, calling the non-allowlisted
+    // echo2 is denied (transitive scope pin).
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            // child turn1: dispatch a grandchild
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"nested"}"#.into(),
+            ),
+            // grandchild turn1: echo (allowlisted → ok)
+            Scripted::Call("g1".into(), "echo".into(), "{}".into()),
+            // grandchild turn2: echo2 (NOT in the filtered base → denied)
+            Scripted::Call("g2".into(), "echo2".into(), "{}".into()),
+            // grandchild turn3: answer
+            Scripted::Text("gc done".into()),
+            // child turn2: answer
+            Scripted::Text("child done".into()),
+        ]),
+        sink.clone(),
+        vec![Arc::new(Echo), Arc::new(Echo2)],
+    );
+    d.max_depth = 2;
+    let tool = DispatchAgentTool::new(d);
+    let out = tool
+        .execute(
+            serde_json::json!({"prompt": "p", "tools": ["echo", "dispatch_agent"]}),
+            &tool_ctx(),
+        )
+        .await
+        .unwrap();
+    assert!(out.content.starts_with("child done"), "{}", out.content);
+    let events = sink.events.lock().unwrap().clone();
+    // Child dispatched the grandchild successfully.
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n, _)| k == "tool_result:ok" && n == "sub:dispatch_agent"),
+        "{events:?}"
+    );
+    // Grandchild's echo (allowlisted) worked.
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n, _)| k == "tool_result:ok" && n == "sub:echo"),
+        "{events:?}"
+    );
+    // Grandchild's echo2 (NOT in the transitively-filtered base) was denied.
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n, _)| k == "tool_result:denied" && n == "sub:echo2"),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn allowlist_naming_dispatch_agent_at_depth_floor_is_invalid_args() {
+    // I-1 (iii): at the depth floor (deps() default max_depth 1 == depth 1)
+    // dispatch_agent is unknown, so naming it in the allowlist is InvalidArgs.
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![Scripted::Text("x".into())]),
+        Arc::new(FullSink::default()),
+        vec![Arc::new(Echo)],
+    ));
+    let err = tool
+        .execute(
+            serde_json::json!({"prompt": "p", "tools": ["dispatch_agent"]}),
+            &tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ToolError::InvalidArgs(ref m) if m.contains("dispatch_agent")),
+        "{err:?}"
+    );
 }
 
 #[test]

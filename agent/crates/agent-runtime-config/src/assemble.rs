@@ -1,7 +1,7 @@
 //! The single place a `RuntimeConfig` + per-frontend pieces become an `AgentLoop`.
 //! Used by both the CLI (`agent-cli`) and the server (`agent-server`) so loop
 //! assembly cannot diverge between front-ends.
-use crate::{build_registry, build_sandbox, build_skills, pick_protocol, RuntimeConfig};
+use crate::{build_registry, build_sandbox, build_skills, pick_protocol, ModelRef, RuntimeConfig};
 use agent_core::{AgentLoop, EventSink, LoopConfig, Retriever};
 use agent_model::ModelClient;
 use agent_policy::{ApprovalChannel, RulePolicy};
@@ -65,6 +65,22 @@ pub struct BuiltLoop {
     /// Did a dedicated compaction model get built and applied?
     #[cfg(test)]
     pub compaction_model_routed: bool,
+}
+
+/// Resolve the tool-call protocol name for a routed child loop (spec G5).
+/// Precedence: an explicit `ModelRef::protocol` wins; otherwise, if the ModelRef
+/// SWITCHED the child backend to `claude-cli` from a non-claude-cli session
+/// default, force `"prompted"` (claude-cli is text-only — a native-protocol child
+/// would silently break); otherwise inherit `cfg.protocol`.
+pub(crate) fn child_protocol_name(cfg: &RuntimeConfig, r: Option<&ModelRef>) -> String {
+    if let Some(p) = r.and_then(|r| r.protocol.as_deref()) {
+        return p.to_string();
+    }
+    let child_backend = r.and_then(|r| r.backend.as_deref()).unwrap_or(&cfg.backend);
+    if child_backend == "claude-cli" && cfg.backend != "claude-cli" {
+        return "prompted".to_string();
+    }
+    cfg.protocol.clone()
 }
 
 /// The single RuntimeConfig → LoopConfig mapping. Constants that are identical on
@@ -184,12 +200,15 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     #[cfg(test)]
     let mut subagent_model_routed: Option<bool> = None;
     if let Some(child_base) = child_base {
-        let (child_model, child_protocol) = match &cfg.subagent_model {
-            Some(r) => (
-                crate::build_routed_model(cfg, r, &parts.claude_binary, parts.api_key.clone()),
-                pick_protocol(r.protocol.as_deref().unwrap_or(&cfg.protocol)),
-            ),
-            None => (parts.model.clone(), pick_protocol(&cfg.protocol)),
+        // Child protocol resolves through child_protocol_name (spec G5/M-1): a
+        // ModelRef that switches the child backend to claude-cli defaults to
+        // "prompted" unless it names a protocol explicitly.
+        let child_protocol = pick_protocol(&child_protocol_name(cfg, cfg.subagent_model.as_ref()));
+        let child_model = match &cfg.subagent_model {
+            Some(r) => {
+                crate::build_routed_model(cfg, r, &parts.claude_binary, parts.api_key.clone())
+            }
+            None => parts.model.clone(),
         };
         #[cfg(test)]
         {
@@ -487,6 +506,60 @@ mod tests {
         let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
         assert_eq!(built.subagent_model_routed, Some(true));
         assert!(built.compaction_model_routed);
+    }
+
+    #[test]
+    fn routed_models_mix_subagent_set_compaction_none() {
+        // M-2: subagent routed, compaction inherits primary.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.subagent_model = Some(crate::ModelRef {
+            model: Some("mini".into()),
+            ..Default::default()
+        });
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        assert_eq!(built.subagent_model_routed, Some(true));
+        assert!(!built.compaction_model_routed);
+    }
+
+    #[test]
+    fn routed_models_mix_compaction_set_subagent_none() {
+        // M-2 (reverse): compaction routed, subagent inherits the primary client.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.compaction_model = Some(crate::ModelRef {
+            model: Some("tiny".into()),
+            ..Default::default()
+        });
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        assert_eq!(built.subagent_model_routed, Some(false));
+        assert!(built.compaction_model_routed);
+    }
+
+    #[test]
+    fn child_protocol_defaults_and_overrides() {
+        // M-1: child protocol precedence — explicit wins, claude-cli backend
+        // switch defaults to prompted, claude-cli primary inherits unchanged.
+        let mut c = cfg(); // backend "openai", protocol "native"
+        assert_eq!(child_protocol_name(&c, None), "native"); // default passthrough
+                                                             // Explicit protocol wins even against a backend switch.
+        let r = crate::ModelRef {
+            backend: Some("claude-cli".into()),
+            protocol: Some("native".into()),
+            ..Default::default()
+        };
+        assert_eq!(child_protocol_name(&c, Some(&r)), "native");
+        // claude-cli backend switch (no explicit protocol) → prompted.
+        let r = crate::ModelRef {
+            backend: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        assert_eq!(child_protocol_name(&c, Some(&r)), "prompted");
+        // claude-cli PRIMARY: no switch, inherit cfg.protocol unchanged (even
+        // when a ModelRef restates the same claude-cli backend).
+        c.backend = "claude-cli".into();
+        assert_eq!(child_protocol_name(&c, None), "native");
+        assert_eq!(child_protocol_name(&c, Some(&r)), "native");
     }
 
     #[test]

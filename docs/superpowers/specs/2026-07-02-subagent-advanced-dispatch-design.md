@@ -105,6 +105,13 @@ budgets, attribution, and the no-recursion floor at max depth are untouched.
   (else the session protocol). Retries/overflow-recovery inside the child ride
   the routed client automatically (it IS the child's model). Cost attribution
   needs nothing new — child `ServerUsage` already carries `parent_id`.
+  - _(amended 2026-07-02, final review)_ Child-protocol resolution is factored
+    into `child_protocol_name(cfg, subagent_model)`: an explicit
+    `ModelRef::protocol` still wins, but a `ModelRef` that SWITCHES the child
+    backend to `claude-cli` from a non-claude-cli session default now defaults
+    the child protocol to `"prompted"` (claude-cli is text-only — a
+    native-protocol child would silently break). A claude-cli primary inherits
+    `cfg.protocol` unchanged (no switch).
 - **G6 — `role` arg (minimal role prompts).** `dispatch_agent(prompt, tools?,
   role?)`: optional string, max 2000 chars (`InvalidArgs` beyond), injected
   into the child's system prompt as a `Role: {role}` block appended after
@@ -119,6 +126,15 @@ budgets, attribution, and the no-recursion floor at max depth are untouched.
   nothing is registered — the no-recursion floor is unchanged in mechanism
   (absent tool → gate rejects), just configurable in depth. The existing
   in-tool "skip base tool named dispatch_agent" guard stays.
+  - _(amended 2026-07-02, final review)_ The `tools` allowlist gates and
+    transitively scopes nested dispatch (the I-1 resolution). `"dispatch_agent"`
+    is a VALID allowlist name only while `depth < max_depth` (at the depth floor
+    it is unknown → `InvalidArgs`); the nested tool is registered iff
+    `depth < max_depth` AND (`allow.is_none()` OR the allowlist names
+    `"dispatch_agent"`); and when an allowlist is present the nested tool's
+    `base_tools` become the FILTERED base set (the same tools the child sees,
+    minus the per-level-fresh context tools) so a grandchild's scope can never
+    exceed its parent's. Without an allowlist the full snapshot passes through.
 - **G8 — Depth-2 attribution: visible-id prefix threads down.**
   `DispatchDeps` gains `id_prefix: String` (top-level `""`). `execute()` mints
   `n = next_dispatch_n()` FIRST, then: `parent_id = format!("{}{}",

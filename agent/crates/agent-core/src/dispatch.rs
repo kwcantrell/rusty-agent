@@ -259,7 +259,7 @@ impl Tool for DispatchAgentTool {
                     "tools": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tools (context_recall, context_compact) are always available."
+                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tools (context_recall, context_compact) are always available. Include dispatch_agent to let the sub-agent dispatch its own (only meaningful when nesting depth allows); the restriction applies transitively to its children."
                     },
                     "role": {
                         "type": "string",
@@ -338,10 +338,19 @@ impl Tool for DispatchAgentTool {
             }
         };
         const IMPLICIT_CHILD_TOOLS: [&str; 2] = ["context_recall", "context_compact"];
+        // "dispatch_agent" is a valid allowlist name ONLY while the child could
+        // itself dispatch (depth < max_depth). At the depth floor it is unknown
+        // — naming it there is an error, keeping the allowlist contract coherent
+        // and transitive (spec G7, I-1 resolution).
+        let nested_allowed = self.deps.depth < self.deps.max_depth;
         if let Some(names) = &allow {
             let available: Vec<&str> = self.deps.base_tools.iter().map(|t| t.name()).collect();
             for n in names {
-                if !available.contains(&n.as_str()) && !IMPLICIT_CHILD_TOOLS.contains(&n.as_str()) {
+                let is_nested = n == "dispatch_agent" && nested_allowed;
+                if !available.contains(&n.as_str())
+                    && !IMPLICIT_CHILD_TOOLS.contains(&n.as_str())
+                    && !is_nested
+                {
                     return Err(ToolError::InvalidArgs(format!(
                         "unknown tool '{n}'; available: {}, plus always-available: {}",
                         available.join(", "),
@@ -359,6 +368,11 @@ impl Tool for DispatchAgentTool {
         // Child registry: (filtered) base snapshot + child-bound context tools.
         // dispatch_agent is structurally absent (spec D4: no recursion).
         let mut reg = ToolRegistry::new();
+        // The FILTERED base set: exactly the tools the child sees (minus the
+        // per-level-fresh context tools and dispatch_agent). Reused below as a
+        // nested tool's base so a grandchild cannot exceed the child's scope
+        // when an allowlist is in force (spec G7, transitive focus).
+        let mut filtered_base: Vec<Arc<dyn Tool>> = Vec::new();
         for t in &self.deps.base_tools {
             // Defense in depth for D4: dispatch_agent is never child-visible,
             // even if a caller leaks it into the base snapshot. No recursion.
@@ -369,16 +383,29 @@ impl Tool for DispatchAgentTool {
                 .as_ref()
                 .is_none_or(|names| names.iter().any(|n| n == t.name()))
             {
-                reg.register(t.clone());
+                filtered_base.push(t.clone());
             }
         }
+        for t in &filtered_base {
+            reg.register(t.clone());
+        }
         // Depth budget (spec G7/G8): a child may dispatch only while under the
-        // configured depth; the nested tool's id_prefix is THIS call's visible
-        // prefix so a grandchild's parent_id is the child row's on-wire id.
-        if self.deps.depth < self.deps.max_depth {
+        // configured depth AND (no allowlist, or the allowlist names it). The
+        // nested tool's id_prefix is THIS call's visible prefix so a grandchild's
+        // parent_id is the child row's on-wire id.
+        let nested_named = allow
+            .as_ref()
+            .is_none_or(|names| names.iter().any(|n| n == "dispatch_agent"));
+        if nested_allowed && nested_named {
             let mut nested = self.deps.clone();
             nested.depth = self.deps.depth + 1;
             nested.id_prefix = format!("sub{n}:");
+            // Transitive scope: when an allowlist filtered the base, the nested
+            // tool sees only that filtered set (grandchild ⊆ child). Without an
+            // allowlist, the full snapshot passes through unchanged.
+            if allow.is_some() {
+                nested.base_tools = filtered_base.clone();
+            }
             reg.register(Arc::new(DispatchAgentTool::new(nested)));
         }
         let store: Arc<dyn crate::OffloadStore> = Arc::new(InMemoryOffloadStore::new());
