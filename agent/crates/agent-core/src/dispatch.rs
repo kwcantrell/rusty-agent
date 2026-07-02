@@ -42,22 +42,42 @@ pub struct CaptureSummary {
     pub stop: Option<StopReason>,
 }
 
+/// Sink-shaped hook for tracing the child's non-forwarded transcript
+/// (implemented over TraceWriter in agent-runtime-config — dep direction).
+pub trait SubagentTrace: Send + Sync {
+    /// Record one non-forwarded child event, attributed to dispatch ordinal `n`.
+    fn record(&self, n: u64, event: &AgentEvent);
+}
+
 /// The child loop's sink: captures the transcript for the tool result and
 /// forwards ONLY ToolStart/ToolResult (ids `sub{n}:{id}`, names `sub:{name}`)
 /// plus ServerUsage (real cost) to the parent sink — all existing wire frames,
-/// so no wire/web/CLI changes (spec D9). Child Token/Done/Error/Context stay
-/// private: the parent's streamed transcript must not be corrupted.
+/// so no wire/web/CLI changes (spec D9). Forwards carry the dispatching call's
+/// id as `parent_id` (lineage). Child Token/Done/Error/Context stay off the
+/// parent's streamed transcript, but tee to the optional child-trace tap so a
+/// failed child turn is replayable (spec E4).
 pub struct SubagentSink {
     parent: Arc<dyn EventSink>,
     n: u64,
+    /// The dispatching model call's id, stamped as `parent_id` on every forward.
+    parent_call_id: String,
+    /// Tap for the child's non-forwarded events; None = tracing off.
+    child_trace: Option<Arc<dyn SubagentTrace>>,
     cap: Mutex<Capture>,
 }
 
 impl SubagentSink {
-    pub fn new(parent: Arc<dyn EventSink>, n: u64) -> Self {
+    pub fn new(
+        parent: Arc<dyn EventSink>,
+        n: u64,
+        parent_call_id: String,
+        child_trace: Option<Arc<dyn SubagentTrace>>,
+    ) -> Self {
         Self {
             parent,
             n,
+            parent_call_id,
+            child_trace,
             cap: Mutex::new(Capture {
                 segments: vec![String::new()],
                 ..Capture::default()
@@ -84,27 +104,16 @@ impl SubagentSink {
 
 impl EventSink for SubagentSink {
     fn emit(&self, event: AgentEvent) {
-        let mut cap = self.cap.lock().unwrap();
         match event {
-            AgentEvent::Token(t) => {
-                cap.segments
-                    .last_mut()
-                    .expect("segments never empty")
-                    .push_str(&t);
-            }
             AgentEvent::ToolStart {
-                id,
-                name,
-                args,
-                parent_id: _,
+                id, name, args, ..
             } => {
-                cap.tool_calls += 1;
-                drop(cap);
+                self.cap.lock().unwrap().tool_calls += 1;
                 self.parent.emit(AgentEvent::ToolStart {
                     id: format!("sub{}:{}", self.n, id),
                     name: format!("sub:{name}"),
                     args,
-                    parent_id: None,
+                    parent_id: Some(self.parent_call_id.clone()),
                 });
             }
             AgentEvent::ToolResult {
@@ -113,33 +122,58 @@ impl EventSink for SubagentSink {
                 status,
                 output,
                 duration_ms,
-                parent_id: _,
+                ..
             } => {
-                cap.segments.push(String::new());
-                drop(cap);
+                self.cap.lock().unwrap().segments.push(String::new());
                 self.parent.emit(AgentEvent::ToolResult {
                     id: format!("sub{}:{}", self.n, id),
                     name: format!("sub:{name}"),
                     status,
                     output,
                     duration_ms,
-                    parent_id: None,
+                    parent_id: Some(self.parent_call_id.clone()),
                 });
             }
-            e @ AgentEvent::ServerUsage { .. } => {
-                drop(cap);
-                self.parent.emit(e);
+            AgentEvent::ServerUsage {
+                prompt_tokens,
+                completion_tokens,
+                reasoning_tokens,
+                cached_tokens,
+                cost_usd,
+                turn_duration_ms,
+                turn,
+                ..
+            } => {
+                self.parent.emit(AgentEvent::ServerUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    reasoning_tokens,
+                    cached_tokens,
+                    cost_usd,
+                    turn_duration_ms,
+                    turn,
+                    parent_id: Some(self.parent_call_id.clone()),
+                });
             }
-            AgentEvent::Usage { turn, .. } => {
-                cap.turns = cap.turns.max(turn);
+            // Everything else stays off the frontends (spec D9/E9) but goes to
+            // the child-trace tap so a failed child turn is replayable (E4).
+            other => {
+                if let Some(t) = &self.child_trace {
+                    t.record(self.n, &other);
+                }
+                let mut cap = self.cap.lock().unwrap();
+                match other {
+                    AgentEvent::Token(t) => {
+                        cap.segments
+                            .last_mut()
+                            .expect("segments never empty")
+                            .push_str(&t);
+                    }
+                    AgentEvent::Usage { turn, .. } => cap.turns = cap.turns.max(turn),
+                    AgentEvent::Done(reason) => cap.stop = Some(reason),
+                    _ => {}
+                }
             }
-            AgentEvent::Done(reason) => {
-                cap.stop = Some(reason);
-            }
-            // Suppressed: Reasoning, Approval, Error, Context, SandboxDegraded
-            // (spec D9 — child terminal/context events are the tool result's
-            // business, not the parent transcript's).
-            _ => {}
         }
     }
 }
@@ -152,6 +186,8 @@ pub struct DispatchDeps {
     pub approval: Arc<dyn ApprovalChannel>,
     /// The parent's (Observed) sink — forwarded child events reach stats/trace/UI.
     pub sink: Arc<dyn EventSink>,
+    /// Trace tap for the child's non-forwarded events; None = tracing off.
+    pub child_trace: Option<Arc<dyn SubagentTrace>>,
     /// Snapshot of the parent's tools taken BEFORE dispatch_agent and the
     /// parent's context tools were registered (spec D4: structural depth-1).
     pub base_tools: Vec<Arc<dyn Tool>>,
@@ -208,7 +244,7 @@ impl Tool for DispatchAgentTool {
                     "tools": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way."
+                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tools (context_recall, context_compact) are always available."
                     }
                 },
                 "required": ["prompt"]
@@ -266,13 +302,15 @@ impl Tool for DispatchAgentTool {
                 ))
             }
         };
+        const IMPLICIT_CHILD_TOOLS: [&str; 2] = ["context_recall", "context_compact"];
         if let Some(names) = &allow {
             let available: Vec<&str> = self.deps.base_tools.iter().map(|t| t.name()).collect();
             for n in names {
-                if !available.contains(&n.as_str()) {
+                if !available.contains(&n.as_str()) && !IMPLICIT_CHILD_TOOLS.contains(&n.as_str()) {
                     return Err(ToolError::InvalidArgs(format!(
-                        "unknown tool '{n}'; available: {}",
-                        available.join(", ")
+                        "unknown tool '{n}'; available: {}, plus always-available: {}",
+                        available.join(", "),
+                        IMPLICIT_CHILD_TOOLS.join(", ")
                     )));
                 }
             }
@@ -309,7 +347,12 @@ impl Tool for DispatchAgentTool {
             ..OffloadConfig::default()
         });
 
-        let sink = Arc::new(SubagentSink::new(self.deps.sink.clone(), next_dispatch_n()));
+        let sink = Arc::new(SubagentSink::new(
+            self.deps.sink.clone(),
+            next_dispatch_n(),
+            ctx.call_id.clone(),
+            self.deps.child_trace.clone(),
+        ));
         let child = AgentLoop::new(
             self.deps.model.clone(),
             self.deps.protocol.clone(),
@@ -381,28 +424,82 @@ mod tests {
     use agent_tools::ToolOutput;
     use std::sync::{Arc, Mutex};
 
-    /// Captures full (kind, id, name) triples — testkit's CollectingSink drops ids.
+    /// Captures full (kind, id, name, parent) quads — testkit's CollectingSink
+    /// drops ids and the parent_id lineage field.
     #[derive(Default)]
     struct FullSink {
-        events: Mutex<Vec<(String, String, String)>>,
+        events: Mutex<Vec<(String, String, String, String)>>,
     }
     impl EventSink for FullSink {
         fn emit(&self, event: AgentEvent) {
-            let triple = match event {
-                AgentEvent::ToolStart { id, name, .. } => ("tool_start".into(), id, name),
+            let quad = match event {
+                AgentEvent::ToolStart {
+                    id,
+                    name,
+                    parent_id,
+                    ..
+                } => (
+                    "tool_start".into(),
+                    id,
+                    name,
+                    parent_id.unwrap_or_default(),
+                ),
                 AgentEvent::ToolResult {
-                    id, name, status, ..
-                } => (format!("tool_result:{}", status.as_str()), id, name),
-                AgentEvent::ServerUsage { prompt_tokens, .. } => (
+                    id,
+                    name,
+                    status,
+                    parent_id,
+                    ..
+                } => (
+                    format!("tool_result:{}", status.as_str()),
+                    id,
+                    name,
+                    parent_id.unwrap_or_default(),
+                ),
+                AgentEvent::ServerUsage {
+                    prompt_tokens,
+                    parent_id,
+                    ..
+                } => (
                     "server_usage".into(),
                     prompt_tokens.to_string(),
                     String::new(),
+                    parent_id.unwrap_or_default(),
                 ),
                 // Anything else reaching the parent is a forwarding-table bug —
                 // record it so the exact-equality assertion below catches the leak.
-                _ => ("unexpected".to_string(), String::new(), String::new()),
+                _ => (
+                    "unexpected".to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
             };
-            self.events.lock().unwrap().push(triple);
+            self.events.lock().unwrap().push(quad);
+        }
+    }
+
+    /// Records (ordinal, kind-name) for every tapped event.
+    #[derive(Default)]
+    struct TapSpy {
+        seen: Mutex<Vec<(u64, &'static str)>>,
+    }
+    impl SubagentTrace for TapSpy {
+        fn record(&self, n: u64, event: &AgentEvent) {
+            let kind = match event {
+                AgentEvent::Token(_) => "token",
+                AgentEvent::Reasoning(_) => "reasoning",
+                AgentEvent::Usage { .. } => "usage",
+                AgentEvent::Done(_) => "done",
+                AgentEvent::Error(_) => "error",
+                AgentEvent::Context(_) => "context",
+                AgentEvent::Approval(_) => "approval",
+                AgentEvent::SandboxDegraded { .. } => "sandbox_degraded",
+                AgentEvent::ToolStart { .. }
+                | AgentEvent::ToolResult { .. }
+                | AgentEvent::ServerUsage { .. } => "FORWARDED-KIND-MUST-NOT-BE-TAPPED",
+            };
+            self.seen.lock().unwrap().push((n, kind));
         }
     }
 
@@ -423,7 +520,7 @@ mod tests {
     #[test]
     fn forwards_tool_events_rewritten_and_suppresses_the_rest() {
         let parent = Arc::new(FullSink::default());
-        let sink = SubagentSink::new(parent.clone(), 7);
+        let sink = SubagentSink::new(parent.clone(), 7, "d1".into(), None);
         sink.emit(AgentEvent::Token("hi".into()));
         sink.emit(AgentEvent::Reasoning("r".into()));
         sink.emit(AgentEvent::Usage {
@@ -454,28 +551,90 @@ mod tests {
         sink.emit(AgentEvent::Done(StopReason::Stop));
 
         let got = parent.events.lock().unwrap().clone();
-        // ONLY ToolStart/ToolResult (rewritten) + ServerUsage (verbatim) forwarded.
+        // ONLY ToolStart/ToolResult (rewritten) + ServerUsage forwarded, each
+        // stamped with the dispatching call's id ("d1") as parent_id.
         assert_eq!(
             got,
             vec![
                 (
                     "tool_start".to_string(),
                     "sub7:c1".to_string(),
-                    "sub:echo".to_string()
+                    "sub:echo".to_string(),
+                    "d1".to_string()
                 ),
                 (
                     "tool_result:ok".to_string(),
                     "sub7:c1".to_string(),
-                    "sub:echo".to_string()
+                    "sub:echo".to_string(),
+                    "d1".to_string()
                 ),
-                ("server_usage".to_string(), "42".to_string(), String::new()),
+                (
+                    "server_usage".to_string(),
+                    "42".to_string(),
+                    String::new(),
+                    "d1".to_string()
+                ),
             ]
         );
     }
 
     #[test]
+    fn forwards_carry_parent_id_and_tap_gets_exactly_the_suppressed_kinds() {
+        let parent = Arc::new(FullSink::default());
+        let tap = Arc::new(TapSpy::default());
+        let sink = SubagentSink::new(parent.clone(), 7, "d1".into(), Some(tap.clone()));
+        sink.emit(AgentEvent::Token("hi".into()));
+        sink.emit(AgentEvent::ToolStart {
+            id: "c1".into(),
+            name: "echo".into(),
+            args: serde_json::json!({}),
+            parent_id: None,
+        });
+        sink.emit(tool_result("c1", "echo"));
+        sink.emit(AgentEvent::ServerUsage {
+            prompt_tokens: 42,
+            completion_tokens: 1,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            cost_usd: None,
+            turn_duration_ms: 1,
+            turn: 1,
+            parent_id: None,
+        });
+        sink.emit(AgentEvent::Error("boom".into()));
+        sink.emit(AgentEvent::Done(StopReason::Stop));
+
+        // Forwards stamped with the dispatch call id (even though the child emitted None):
+        let got = parent.events.lock().unwrap().clone();
+        assert_eq!(
+            got[0],
+            (
+                "tool_start".to_string(),
+                "sub7:c1".to_string(),
+                "sub:echo".to_string(),
+                "d1".to_string()
+            )
+        );
+        assert_eq!(got[1].3, "d1");
+        assert_eq!(got[2].3, "d1"); // server_usage
+        // Tap saw exactly the non-forwarded kinds, attributed to ordinal 7:
+        assert_eq!(
+            tap.seen.lock().unwrap().clone(),
+            vec![(7, "token"), (7, "error"), (7, "done")]
+        );
+    }
+
+    #[test]
+    fn no_tap_means_no_panic_and_capture_still_works() {
+        let sink = SubagentSink::new(Arc::new(FullSink::default()), 1, "d1".into(), None);
+        sink.emit(AgentEvent::Token("t".into()));
+        sink.emit(AgentEvent::Done(StopReason::Stop));
+        assert_eq!(sink.summary().final_text, "t");
+    }
+
+    #[test]
     fn summary_final_text_is_tail_after_last_tool_result() {
-        let sink = SubagentSink::new(Arc::new(FullSink::default()), 1);
+        let sink = SubagentSink::new(Arc::new(FullSink::default()), 1, "d1".into(), None);
         sink.emit(AgentEvent::Token("thinking...".into()));
         sink.emit(tool_result("c1", "echo"));
         sink.emit(AgentEvent::Token("final ".into()));
@@ -489,7 +648,7 @@ mod tests {
 
     #[test]
     fn summary_falls_back_to_all_text_when_tail_is_blank() {
-        let sink = SubagentSink::new(Arc::new(FullSink::default()), 1);
+        let sink = SubagentSink::new(Arc::new(FullSink::default()), 1, "d1".into(), None);
         sink.emit(AgentEvent::Token("early words".into()));
         sink.emit(tool_result("c1", "echo"));
         // no tokens after the last tool result
@@ -499,7 +658,7 @@ mod tests {
 
     #[test]
     fn summary_counts_tool_calls_and_turns() {
-        let sink = SubagentSink::new(Arc::new(FullSink::default()), 1);
+        let sink = SubagentSink::new(Arc::new(FullSink::default()), 1, "d1".into(), None);
         sink.emit(AgentEvent::Usage {
             prompt_tokens: 1,
             context_limit: 10,
@@ -555,6 +714,7 @@ mod tests {
             }),
             approval: Arc::new(AlwaysApprove),
             sink: Arc::new(FullSink::default()),
+            child_trace: None,
             base_tools: vec![],
             child_system_prompt: "SYS".into(),
             loop_config: LoopConfig {

@@ -13,17 +13,41 @@ use tokio_util::sync::CancellationToken;
 /// Full-fidelity parent sink (testkit CollectingSink drops ids).
 #[derive(Default)]
 struct FullSink {
-    events: Mutex<Vec<(String, String, String)>>, // (kind, id, name)
+    events: Mutex<Vec<(String, String, String, String)>>, // (kind, id, name, parent)
 }
 impl EventSink for FullSink {
     fn emit(&self, event: AgentEvent) {
         let t = match event {
-            AgentEvent::ToolStart { id, name, .. } => ("tool_start".to_string(), id, name),
+            AgentEvent::ToolStart {
+                id,
+                name,
+                parent_id,
+                ..
+            } => (
+                "tool_start".to_string(),
+                id,
+                name,
+                parent_id.unwrap_or_default(),
+            ),
             AgentEvent::ToolResult {
-                id, name, status, ..
-            } => (format!("tool_result:{}", status.as_str()), id, name),
-            AgentEvent::Token(t) => ("token".to_string(), String::new(), t),
-            AgentEvent::Done(_) => ("done".to_string(), String::new(), String::new()),
+                id,
+                name,
+                status,
+                parent_id,
+                ..
+            } => (
+                format!("tool_result:{}", status.as_str()),
+                id,
+                name,
+                parent_id.unwrap_or_default(),
+            ),
+            AgentEvent::Token(t) => ("token".to_string(), String::new(), t, String::new()),
+            AgentEvent::Done(_) => (
+                "done".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
             _ => return,
         };
         self.events.lock().unwrap().push(t);
@@ -92,6 +116,7 @@ fn deps(model: ScriptedModel, sink: Arc<dyn EventSink>, base: Vec<Arc<dyn Tool>>
         }),
         approval: Arc::new(AlwaysApprove),
         sink,
+        child_trace: None,
         base_tools: base,
         child_system_prompt: format!("SYS\n\n{SUBAGENT_PREAMBLE}"),
         loop_config: child_config(ws),
@@ -150,7 +175,7 @@ async fn child_tool_calls_are_forwarded_rewritten_and_tokens_suppressed() {
     let events = sink.events.lock().unwrap().clone();
     // Child echo call forwarded with rewritten id/name; NO child token/done leaked.
     assert!(
-        events.iter().any(|(k, i, n)| k == "tool_start"
+        events.iter().any(|(k, i, n, _)| k == "tool_start"
             && i.contains(":c1")
             && i.starts_with("sub")
             && n == "sub:echo"),
@@ -159,12 +184,66 @@ async fn child_tool_calls_are_forwarded_rewritten_and_tokens_suppressed() {
     assert!(
         events
             .iter()
-            .any(|(k, _, n)| k == "tool_result:ok" && n == "sub:echo"),
+            .any(|(k, _, n, _)| k == "tool_result:ok" && n == "sub:echo"),
         "{events:?}"
     );
     assert!(
-        !events.iter().any(|(k, _, _)| k == "token" || k == "done"),
+        !events.iter().any(|(k, _, _, _)| k == "token" || k == "done"),
         "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn forwarded_child_events_carry_the_dispatch_call_id() {
+    let sink = Arc::new(FullSink::default());
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "echo".into(), "{}".into()),
+            Scripted::Text("done".into()),
+        ]),
+        sink.clone(),
+        vec![Arc::new(Echo)],
+    ));
+    tool.execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+    let events = sink.events.lock().unwrap().clone();
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.0.starts_with("tool_"))
+            .all(|e| e.3 == "d1"),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn allowlist_accepts_always_available_context_tools() {
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![Scripted::Text("x".into())]),
+        Arc::new(FullSink::default()),
+        vec![Arc::new(Echo)],
+    ));
+    // context_recall is not in base_tools but IS always registered for the child.
+    let out = tool
+        .execute(
+            serde_json::json!({"prompt": "p", "tools": ["context_recall"]}),
+            &tool_ctx(),
+        )
+        .await;
+    assert!(out.is_ok(), "{out:?}");
+    // Genuinely unknown names still error, and the message names the implicit tools.
+    let err = tool
+        .execute(
+            serde_json::json!({"prompt": "p", "tools": ["nope"]}),
+            &tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ToolError::InvalidArgs(ref m)
+        if m.contains("nope") && m.contains("context_recall")),
+        "{err:?}"
     );
 }
 
@@ -232,7 +311,7 @@ async fn tools_allowlist_filters_and_rejects_unknown_names() {
     assert!(
         events
             .iter()
-            .any(|(k, _, n)| k == "tool_result:denied" && n == "sub:echo"),
+            .any(|(k, _, n, _)| k == "tool_result:denied" && n == "sub:echo"),
         "{events:?}"
     );
 }
@@ -393,7 +472,7 @@ async fn child_ask_routes_to_the_shared_approval_channel_and_deny_sticks() {
     assert!(
         events
             .iter()
-            .any(|(k, _, n)| k == "tool_result:denied" && n == "sub:writey"),
+            .any(|(k, _, n, _)| k == "tool_result:denied" && n == "sub:writey"),
         "{events:?}"
     );
     assert!(out.content.starts_with("done"));
@@ -423,7 +502,7 @@ async fn child_ask_approve_executes() {
     assert!(
         events
             .iter()
-            .any(|(k, _, n)| k == "tool_result:ok" && n == "sub:writey"),
+            .any(|(k, _, n, _)| k == "tool_result:ok" && n == "sub:writey"),
         "{events:?}"
     );
 }
@@ -453,7 +532,7 @@ async fn child_cannot_recurse_into_dispatch_agent() {
     assert!(
         events
             .iter()
-            .any(|(k, _, n)| k == "tool_result:denied" && n == "sub:dispatch_agent"),
+            .any(|(k, _, n, _)| k == "tool_result:denied" && n == "sub:dispatch_agent"),
         "{events:?}"
     );
 }
@@ -527,7 +606,7 @@ async fn dispatch_agent_in_base_tools_is_still_excluded_from_child() {
     assert!(
         events
             .iter()
-            .any(|(k, _, n)| k == "tool_result:denied" && n == "sub:dispatch_agent"),
+            .any(|(k, _, n, _)| k == "tool_result:denied" && n == "sub:dispatch_agent"),
         "{events:?}"
     );
 }
@@ -628,8 +707,8 @@ async fn parallel_dispatches_get_distinct_ordinals_and_both_complete() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|(k, _, _)| k == "tool_start")
-        .map(|(_, id, _)| id.clone())
+        .filter(|(k, _, _, _)| k == "tool_start")
+        .map(|(_, id, _, _)| id.clone())
         .collect();
     assert_eq!(ids.len(), 2, "{ids:?}");
     assert_ne!(ids[0], ids[1], "{ids:?}");

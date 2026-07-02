@@ -171,6 +171,7 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 policy: policy.clone(),
                 approval: parts.approval.clone(),
                 sink: sink.clone(),
+                child_trace: None, // Task 4 wires the real tap
                 base_tools: child_base,
                 child_system_prompt: format!(
                     "{system_prompt}\n\n{}",
