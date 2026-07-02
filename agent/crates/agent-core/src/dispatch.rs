@@ -92,13 +92,19 @@ impl EventSink for SubagentSink {
                     .expect("segments never empty")
                     .push_str(&t);
             }
-            AgentEvent::ToolStart { id, name, args } => {
+            AgentEvent::ToolStart {
+                id,
+                name,
+                args,
+                parent_id: _,
+            } => {
                 cap.tool_calls += 1;
                 drop(cap);
                 self.parent.emit(AgentEvent::ToolStart {
                     id: format!("sub{}:{}", self.n, id),
                     name: format!("sub:{name}"),
                     args,
+                    parent_id: None,
                 });
             }
             AgentEvent::ToolResult {
@@ -107,6 +113,7 @@ impl EventSink for SubagentSink {
                 status,
                 output,
                 duration_ms,
+                parent_id: _,
             } => {
                 cap.segments.push(String::new());
                 drop(cap);
@@ -116,6 +123,7 @@ impl EventSink for SubagentSink {
                     status,
                     output,
                     duration_ms,
+                    parent_id: None,
                 });
             }
             e @ AgentEvent::ServerUsage { .. } => {
@@ -408,6 +416,7 @@ mod tests {
                 display: None,
             },
             duration_ms: 1,
+            parent_id: None,
         }
     }
 
@@ -427,6 +436,7 @@ mod tests {
             id: "c1".into(),
             name: "echo".into(),
             args: serde_json::json!({}),
+            parent_id: None,
         });
         sink.emit(tool_result("c1", "echo"));
         sink.emit(AgentEvent::ServerUsage {
@@ -437,6 +447,7 @@ mod tests {
             cost_usd: None,
             turn_duration_ms: 1,
             turn: 1,
+            parent_id: None,
         });
         sink.emit(AgentEvent::Error("boom".into()));
         sink.emit(AgentEvent::Context(ContextEvent::OverflowRecovery));
@@ -499,11 +510,13 @@ mod tests {
             id: "c1".into(),
             name: "a".into(),
             args: serde_json::json!({}),
+            parent_id: None,
         });
         sink.emit(AgentEvent::ToolStart {
             id: "c2".into(),
             name: "b".into(),
             args: serde_json::json!({}),
+            parent_id: None,
         });
         sink.emit(AgentEvent::Usage {
             prompt_tokens: 2,

@@ -168,11 +168,15 @@ enum TraceEvent<'a> {
         cost_usd: Option<f64>,
         turn_duration_ms: u64,
         turn: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_id: Option<&'a str>,
     },
     ToolStart {
         id: &'a str,
         name: &'a str,
         args: &'a serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_id: Option<&'a str>,
     },
     ToolResult {
         id: &'a str,
@@ -180,6 +184,8 @@ enum TraceEvent<'a> {
         status: &'static str,
         duration_ms: u64,
         content: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_id: Option<&'a str>,
     },
     Approval {
         summary: &'a str,
@@ -224,6 +230,7 @@ fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
             cost_usd,
             turn_duration_ms,
             turn,
+            parent_id,
         } => TraceEvent::ServerUsage {
             prompt_tokens: *prompt_tokens,
             completion_tokens: *completion_tokens,
@@ -232,20 +239,33 @@ fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
             cost_usd: *cost_usd,
             turn_duration_ms: *turn_duration_ms,
             turn: *turn,
+            parent_id: parent_id.as_deref(),
         },
-        AgentEvent::ToolStart { id, name, args } => TraceEvent::ToolStart { id, name, args },
+        AgentEvent::ToolStart {
+            id,
+            name,
+            args,
+            parent_id,
+        } => TraceEvent::ToolStart {
+            id,
+            name,
+            args,
+            parent_id: parent_id.as_deref(),
+        },
         AgentEvent::ToolResult {
             id,
             name,
             status,
             output,
             duration_ms,
+            parent_id,
         } => TraceEvent::ToolResult {
             id,
             name,
             status: status.as_str(),
             duration_ms: *duration_ms,
             content: &output.content,
+            parent_id: parent_id.as_deref(),
         },
         AgentEvent::Approval(req) => TraceEvent::Approval {
             summary: &req.intent.summary,
@@ -350,7 +370,32 @@ mod tests {
                 display: None,
             },
             duration_ms: 7,
+            parent_id: None,
         }
+    }
+
+    #[test]
+    fn trace_parent_id_skipped_when_none_present_when_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = TraceWriter::create(dir.path(), 64).unwrap();
+        w.record(&agent_core::AgentEvent::ToolStart {
+            id: "a".into(),
+            name: "t".into(),
+            args: serde_json::json!({}),
+            parent_id: None,
+        });
+        w.record(&agent_core::AgentEvent::ToolStart {
+            id: "b".into(),
+            name: "t".into(),
+            args: serde_json::json!({}),
+            parent_id: Some("d1".into()),
+        });
+        w.record(&AgentEvent::Done(agent_model::StopReason::Stop)); // flushes the BufWriter
+        let path = dir.path().join(format!("{}.jsonl", w.session_id()));
+        let content = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert!(!lines[1].contains("parent_id"), "{}", lines[1]); // [0] is the header
+        assert!(lines[2].contains(r#""parent_id":"d1""#), "{}", lines[2]);
     }
 
     #[test]

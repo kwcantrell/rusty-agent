@@ -36,6 +36,7 @@ impl SessionStats {
                 cost_usd,
                 turn_duration_ms,
                 turn,
+                parent_id: _,
             } => {
                 self.turns = self.turns.max(*turn);
                 self.prompt_tokens += *prompt_tokens as u64;
@@ -84,6 +85,7 @@ mod tests {
             cost_usd: Some(0.02),
             turn_duration_ms: 500,
             turn: 1,
+            parent_id: None,
         });
         s.fold(&AgentEvent::ServerUsage {
             prompt_tokens: 200,
@@ -93,11 +95,13 @@ mod tests {
             cost_usd: Some(0.03),
             turn_duration_ms: 700,
             turn: 2,
+            parent_id: None,
         });
         s.fold(&AgentEvent::ToolStart {
             id: "a".into(),
             name: "t".into(),
             args: serde_json::json!({}),
+            parent_id: None,
         });
         s.fold(&AgentEvent::ToolResult {
             id: "a".into(),
@@ -108,6 +112,7 @@ mod tests {
                 display: None,
             },
             duration_ms: 30,
+            parent_id: None,
         });
         s.fold(&AgentEvent::ToolResult {
             id: "b".into(),
@@ -118,6 +123,7 @@ mod tests {
                 display: None,
             },
             duration_ms: 60000,
+            parent_id: None,
         });
         s.fold(&AgentEvent::Context(ContextEvent::CompactionFailed {
             reason: "r".into(),

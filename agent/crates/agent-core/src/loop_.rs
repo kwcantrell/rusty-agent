@@ -386,6 +386,7 @@ impl AgentLoop {
                 cost_usd: assistant.cost_usd,
                 turn_duration_ms: turn_started.elapsed().as_millis() as u64,
                 turn: turn + 1,
+                parent_id: None,
             });
 
             let mut parsed = match self.protocol.parse(&assistant) {
@@ -564,6 +565,7 @@ impl AgentLoop {
                             status: ToolStatus::Ok,
                             output: output.clone(),
                             duration_ms,
+                            parent_id: None,
                         });
                         output.content
                     }
@@ -581,6 +583,7 @@ impl AgentLoop {
                                 display: None,
                             },
                             duration_ms,
+                            parent_id: None,
                         });
                         content
                     }
@@ -616,6 +619,7 @@ impl AgentLoop {
             id: call.id.clone(),
             name: call.name.clone(),
             args: call.args.clone(),
+            parent_id: None,
         });
         let tool = match self.tools.get(&call.name) {
             Some(t) => t,
