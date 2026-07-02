@@ -20,6 +20,11 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    /// Every registered tool (arbitrary order). Cheap: Arc clones.
+    pub fn all(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.values().cloned().collect()
+    }
+
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools
             .values()
@@ -176,6 +181,58 @@ mod tests {
                 required_params_missing_description(&s)
             );
         }
+    }
+
+    fn fake(name: &'static str) -> Arc<dyn Tool> {
+        use crate::{Access, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolSchema};
+        struct F(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for F {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "fake"
+            }
+            fn schema(&self) -> ToolSchema {
+                ToolSchema {
+                    name: self.0.into(),
+                    description: "fake".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }
+            }
+            fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+                Ok(ToolIntent {
+                    tool: self.0.into(),
+                    access: Access::Read,
+                    paths: vec![],
+                    command: None,
+                    summary: "x".into(),
+                })
+            }
+            async fn execute(
+                &self,
+                _a: serde_json::Value,
+                _c: &ToolCtx,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput {
+                    content: "ok".into(),
+                    display: None,
+                })
+            }
+        }
+        Arc::new(F(name))
+    }
+
+    #[test]
+    fn all_returns_every_registered_tool() {
+        let mut r = ToolRegistry::new();
+        assert!(r.all().is_empty());
+        r.register(fake("a"));
+        r.register(fake("b"));
+        let mut names: Vec<String> = r.all().iter().map(|t| t.name().to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

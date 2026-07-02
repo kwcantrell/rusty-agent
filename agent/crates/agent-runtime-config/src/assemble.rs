@@ -50,6 +50,10 @@ pub struct BuiltLoop {
     /// Assembled, folded tool schemas — retained so tests can assert the tool contract.
     #[cfg(test)]
     pub schemas: Vec<agent_tools::ToolSchema>,
+    /// Child-base snapshot names when subagents are enabled — pins the "snapshot
+    /// excludes context tools + dispatch itself" invariant.
+    #[cfg(test)]
+    pub dispatch_base_names: Option<Vec<String>>,
 }
 
 /// The single RuntimeConfig → LoopConfig mapping. Constants that are identical on
@@ -97,6 +101,11 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         registry.register(t);
     }
 
+    // Snapshot for sub-agent children BEFORE context tools (child gets its own,
+    // bound to a per-dispatch store/flag) and before dispatch itself (spec D4:
+    // structural no-recursion). The POSITION of this line is the invariant.
+    let child_base = cfg.subagents.then(|| registry.all());
+
     // Context-management tools share the caller-owned offload store + compact flag
     // with the frontend's CuratedContext (passed in via LoopParts).
     for t in agent_core::context_tools(
@@ -130,11 +139,6 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         }
     };
 
-    #[cfg(test)]
-    let schemas = registry.schemas();
-    #[cfg(test)]
-    let registered_names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
-
     let policy = Arc::new(RulePolicy {
         workspace: parts.workspace.clone(),
         command_allowlist: cfg.command_allowlist.clone(),
@@ -149,6 +153,41 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         trace: parts.trace.clone(),
     });
 
+    let loop_config = loop_config_from(cfg, parts.workspace.clone(), parts.stream_idle_timeout);
+
+    // Sub-agent dispatch: capture the child-base names before the snapshot is moved
+    // into the tool, then register `dispatch_agent` iff subagents are enabled.
+    #[cfg(test)]
+    let dispatch_base_names: Option<Vec<String>> = child_base
+        .as_ref()
+        .map(|b| b.iter().map(|t| t.name().to_string()).collect());
+    if let Some(child_base) = child_base {
+        let mut child_config = loop_config.clone();
+        child_config.max_turns = cfg.subagent_max_turns;
+        registry.register(Arc::new(agent_core::DispatchAgentTool::new(
+            agent_core::DispatchDeps {
+                model: parts.model.clone(),
+                protocol: pick_protocol(&cfg.protocol),
+                policy: policy.clone(),
+                approval: parts.approval.clone(),
+                sink: sink.clone(),
+                base_tools: child_base,
+                child_system_prompt: format!(
+                    "{system_prompt}\n\n{}",
+                    agent_core::SUBAGENT_PREAMBLE
+                ),
+                loop_config: child_config,
+                max_result_bytes: cfg.max_tool_result_bytes,
+                subagent_timeout: Duration::from_secs(cfg.subagent_timeout_secs),
+            },
+        )));
+    }
+
+    #[cfg(test)]
+    let schemas = registry.schemas();
+    #[cfg(test)]
+    let registered_names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
+
     let agent = AgentLoop::new(
         parts.model,
         pick_protocol(&cfg.protocol),
@@ -156,7 +195,7 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         policy,
         parts.approval,
         sink,
-        loop_config_from(cfg, parts.workspace.clone(), parts.stream_idle_timeout),
+        loop_config,
     );
     let agent = match (cfg.memory, &parts.memory_retriever) {
         (true, Some(r)) => agent.with_retriever(r.clone()),
@@ -171,6 +210,8 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         registered_names,
         #[cfg(test)]
         schemas,
+        #[cfg(test)]
+        dispatch_base_names,
     }
 }
 
@@ -359,6 +400,37 @@ mod tests {
         assert!(lc.preserve_thinking);
         assert!((lc.temperature - 0.7).abs() < 1e-6);
         assert!(!lc.sandbox.describe().mechanism.is_empty());
+    }
+
+    #[test]
+    fn registers_dispatch_agent_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        assert!(built.registered_names.iter().any(|n| n == "dispatch_agent"));
+    }
+
+    #[test]
+    fn omits_dispatch_agent_when_subagents_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.subagents = false;
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        assert!(!built.registered_names.iter().any(|n| n == "dispatch_agent"));
+        assert!(built.dispatch_base_names.is_none());
+    }
+
+    #[test]
+    fn child_base_snapshot_excludes_context_tools_and_dispatch_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        let base = built.dispatch_base_names.expect("subagents on by default");
+        assert!(!base.iter().any(|n| n == "dispatch_agent"), "{base:?}");
+        assert!(
+            !base.iter().any(|n| n == "context_recall" || n == "context_compact"),
+            "{base:?}"
+        );
+        // Sanity: real tools are in the snapshot.
+        assert!(base.iter().any(|n| n == "read_file"), "{base:?}");
     }
 
     #[test]
