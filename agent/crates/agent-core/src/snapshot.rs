@@ -1,4 +1,4 @@
-use crate::context::{estimate_tokens, message_tokens};
+use crate::context::{estimate_tokens, message_tokens, recall_block, recall_prefix_len};
 use agent_model::Message;
 use serde::{Deserialize, Serialize};
 
@@ -26,12 +26,16 @@ pub(crate) fn preview(s: &str, n: usize) -> String {
 
 /// Build a snapshot from already-separated context blocks. Pure so it is unit
 /// testable without a full CuratedContext.
+// One positional param per pinned context block plus the recall cap — a flat
+// fan-in of already-separated pieces, not state worth bundling into a struct.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_snapshot(
     turn: usize,
     model_limit: usize,
     system: &Message,
     goal: Option<&Message>,
     recall: &[String],
+    recall_budget: usize,
     compaction_summary: Option<&Message>,
     history: &[Message],
 ) -> ContextSnapshot {
@@ -54,13 +58,17 @@ pub(crate) fn build_snapshot(
         });
     }
 
-    if !recall.is_empty() {
-        let est = recall.iter().map(|l| estimate_tokens(l)).sum();
+    // The context injects only the capped `recall_block(recall, budget)` — a
+    // greedy prefix under the token cap — so the snapshot sizes the memory
+    // segment from that SAME block, never the raw line sum, or the dashboard
+    // over-reports memory pressure.
+    if let Some(block) = recall_block(recall, recall_budget) {
+        let kept = recall_prefix_len(recall, recall_budget);
         segments.push(ContextSegment {
             category: "memory".into(),
-            est_tokens: est,
-            items: recall.iter().map(|l| preview(l, 100)).collect(),
-            count: recall.len(),
+            est_tokens: estimate_tokens(&block.content),
+            items: recall[..kept].iter().map(|l| preview(l, 100)).collect(),
+            count: kept,
         });
     }
 
@@ -95,6 +103,7 @@ pub(crate) fn build_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::DEFAULT_RECALL_TOKEN_BUDGET;
     use agent_model::Message;
 
     #[test]
@@ -105,6 +114,7 @@ mod tests {
             &Message::system("SYSTEM PROMPT"),
             None,
             &[],
+            DEFAULT_RECALL_TOKEN_BUDGET,
             None,
             &[Message::user("hello"), Message::assistant("hi", None)],
         );
@@ -142,6 +152,7 @@ mod tests {
                 "user likes rust".to_string(),
                 "deploys on friday".to_string(),
             ],
+            DEFAULT_RECALL_TOKEN_BUDGET,
             None,
             &[],
         );
@@ -152,5 +163,46 @@ mod tests {
             .unwrap();
         assert_eq!(mem.count, 2);
         assert!(mem.items[0].contains("rust"));
+    }
+
+    #[test]
+    fn memory_segment_uses_capped_recall_block_not_raw_sum() {
+        // Many long recall lines vastly exceed a tiny budget. The context only
+        // injects the capped `recall_block` (a short prefix), so the snapshot's
+        // memory segment must be sized from that block — est ≤ the block's own
+        // estimate — never the raw sum of all lines.
+        let budget = 32;
+        let lines: Vec<String> = (0..40)
+            .map(|i| format!("memory fact number {i} with a fair amount of padding text here"))
+            .collect();
+        let raw_sum: usize = lines.iter().map(|l| estimate_tokens(l)).sum();
+        let snap = build_snapshot(
+            1,
+            100_000,
+            &Message::system("S"),
+            None,
+            &lines,
+            budget,
+            None,
+            &[],
+        );
+        let mem = snap
+            .segments
+            .iter()
+            .find(|s| s.category == "memory")
+            .unwrap();
+        // The capped block, not all 40 lines.
+        let kept = recall_prefix_len(&lines, budget);
+        assert!(kept < lines.len(), "block must be capped below all lines");
+        assert_eq!(mem.count, kept);
+        assert_eq!(mem.items.len(), kept);
+        let block_est = estimate_tokens(&recall_block(&lines, budget).unwrap().content);
+        assert_eq!(mem.est_tokens, block_est);
+        assert!(
+            mem.est_tokens < raw_sum,
+            "capped est {} must be far below raw sum {}",
+            mem.est_tokens,
+            raw_sum
+        );
     }
 }

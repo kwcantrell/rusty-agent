@@ -114,21 +114,39 @@ pub(crate) fn orphaned_tool_positions(messages: &[Message]) -> Vec<usize> {
 /// `WindowContext::with_recall_budget`.
 pub const DEFAULT_RECALL_TOKEN_BUDGET: usize = 512;
 
+const RECALL_HEADER: &str = "Relevant memories from past sessions:";
+
+/// Number of leading `lines` that fit within `budget` tokens — the greedy
+/// prefix `recall_block` renders. Always ≥1 when any lines are present (soft
+/// cap: the first line is kept even if it alone exceeds `budget`). The included
+/// set is always a prefix, so a count fully describes it. Shared so the snapshot
+/// can size the memory segment from the SAME capped block the context injects.
+pub(crate) fn recall_prefix_len(lines: &[String], budget: usize) -> usize {
+    let mut body = String::from(RECALL_HEADER);
+    let mut n = 0;
+    for line in lines {
+        let candidate = format!("{body}\n- {line}");
+        if estimate_tokens(&candidate) > budget && n > 0 {
+            break;
+        }
+        body = candidate;
+        n += 1;
+    }
+    n
+}
+
 /// Build a capped recall/notes block: greedily keep lines under `budget` tokens,
 /// always including at least the first line if any are present (soft cap).
 /// Shared by `WindowContext` and `CuratedContext`.
 pub(crate) fn recall_block(lines: &[String], budget: usize) -> Option<Message> {
-    if lines.is_empty() {
+    let n = recall_prefix_len(lines, budget);
+    if n == 0 {
         return None;
     }
-    const HEADER: &str = "Relevant memories from past sessions:";
-    let mut body = String::from(HEADER);
-    for line in lines {
-        let candidate = format!("{body}\n- {line}");
-        if estimate_tokens(&candidate) > budget && body != HEADER {
-            break;
-        }
-        body = candidate;
+    let mut body = String::from(RECALL_HEADER);
+    for line in &lines[..n] {
+        body.push_str("\n- ");
+        body.push_str(line);
     }
     Some(Message::system(body))
 }
