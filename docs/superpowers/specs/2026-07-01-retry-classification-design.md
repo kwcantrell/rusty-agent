@@ -255,6 +255,9 @@ that scripted turn. `Scripted::Error` stays as-is (`Http("scripted error")`).
 - **claude-cli backend**: overflow surfaces as `Process(..)`/`Stream(..)`
   without a status code — only the `Stream` body signature check can catch
   it; a miss retries as today (no regression).
+  *[Correction 2026-07-01, retry follow-up batch: `Process` bodies carry the CLI's stderr
+  text and are now signature-checked exactly like `Stream` — see
+  `2026-07-01-retry-followup-batch-design.md`.]*
 - **In-band `Stream` server errors that aren't overflow** stay `Retryable`
   (today's behavior — e.g. llama.cpp slot exhaustion is genuinely transient).
 - **`Decode` mid-stream** is already skipped inside the stream reader

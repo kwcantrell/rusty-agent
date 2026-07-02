@@ -3548,4 +3548,48 @@ mod tests {
         assert_eq!(events.last().map(String::as_str), Some("done"));
         assert!(events.iter().any(|k| k.starts_with("error")));
     }
+
+    #[tokio::test]
+    async fn process_overflow_recovers_like_status_overflow() {
+        // claude-cli surfaces overflow as Process stderr text (no status code);
+        // recovery must fire exactly as it does for Status{400}.
+        let ws = std::env::temp_dir();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Process(
+                "claude exited (1): maximum context length exceeded".into(),
+            )),
+            Scripted::Text("recovered after compaction".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 0, // recovery must not consume retry budget
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = OverflowCtx {
+            history: vec![],
+            compaction_requests: 0,
+            maintains: 0,
+        };
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(ctx.compaction_requests, 1);
+        assert_eq!(
+            sink.events.lock().unwrap().last().map(String::as_str),
+            Some("done")
+        );
+    }
 }
