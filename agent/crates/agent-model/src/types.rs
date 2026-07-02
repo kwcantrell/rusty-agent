@@ -93,6 +93,9 @@ pub enum StopReason {
     Length,
     BudgetExhausted,
     Cancelled,
+    /// The run aborted on an unrecoverable model error (fatal or retries
+    /// exhausted). Emitted alongside the returned `AgentError`.
+    Error,
 }
 
 #[derive(Debug, Clone, Default)]
