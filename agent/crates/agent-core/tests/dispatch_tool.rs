@@ -48,6 +48,16 @@ impl EventSink for FullSink {
                 String::new(),
                 String::new(),
             ),
+            AgentEvent::ServerUsage {
+                prompt_tokens,
+                parent_id,
+                ..
+            } => (
+                "server_usage".to_string(),
+                prompt_tokens.to_string(),
+                String::new(),
+                parent_id.unwrap_or_default(),
+            ),
             _ => return,
         };
         self.events.lock().unwrap().push(t);
@@ -122,6 +132,10 @@ fn deps(model: ScriptedModel, sink: Arc<dyn EventSink>, base: Vec<Arc<dyn Tool>>
         loop_config: child_config(ws),
         max_result_bytes: 16 * 1024,
         subagent_timeout: Duration::from_secs(600),
+        compaction_model: None,
+        depth: 1,
+        max_depth: 1,
+        id_prefix: String::new(),
     }
 }
 
@@ -802,4 +816,144 @@ async fn parallel_dispatches_get_distinct_ordinals_and_both_complete() {
         .collect();
     assert_eq!(ids.len(), 2, "{ids:?}");
     assert_ne!(ids[0], ids[1], "{ids:?}");
+}
+
+#[tokio::test]
+async fn depth_two_child_can_dispatch_and_grandchild_attribution_chains() {
+    let sink = Arc::new(FullSink::default());
+    // Child model: dispatches a grandchild, then answers.
+    // Grandchild model comes from the SAME deps.model (scripted queue): its turn
+    // is the "gc done" text. Order: child turn1 -> grandchild turn -> child turn2.
+    let tap = Arc::new(TapSpy::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"nested task"}"#.into(),
+            ),
+            Scripted::Text("gc done".into()), // consumed by the GRANDCHILD loop
+            Scripted::Text("child done".into()), // child's final answer
+        ]),
+        sink.clone(),
+        vec![],
+    );
+    d.max_depth = 2;
+    d.child_trace = Some(tap.clone());
+    let tool = DispatchAgentTool::new(d);
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+    assert!(out.content.starts_with("child done"), "{}", out.content);
+
+    let events = sink.events.lock().unwrap().clone();
+    // The child's dispatch call is visible as sub{n}:c1 with parent "d1";
+    // the grandchild's? there are no grandchild TOOL calls here, so the pin is:
+    // the child-level dispatch_agent tool_start row itself chains to d1...
+    let child_dispatch_start = events
+        .iter()
+        .find(|(k, _, name, _)| k == "tool_start" && name == "sub:dispatch_agent")
+        .expect("child dispatch row forwarded");
+    assert_eq!(child_dispatch_start.3, "d1");
+    // ...and the grandchild's ServerUsage carries parent_id == the child's VISIBLE id.
+    let child_visible_id = child_dispatch_start.1.clone(); // "sub{n}:c1"
+    assert!(child_visible_id.ends_with(":c1"), "{child_visible_id}");
+    // Concrete grandchild pin: at least one forwarded event carries the child's
+    // visible id as its parent_id (the grandchild's ServerUsage does).
+    assert!(
+        events
+            .iter()
+            .any(|(_, _, _, parent)| parent == &child_visible_id),
+        "no event chained to the child's visible id {child_visible_id}: {events:?}"
+    );
+    // Tap pin (spec Testing): grandchild suppressed events reach the tap with
+    // the prefixed parent id.
+    let tap_parents = tap.seen.lock().unwrap().clone();
+    assert!(
+        tap_parents.iter().any(|(_, p, _)| p == &child_visible_id),
+        "no tap record chained to {child_visible_id}: {tap_parents:?}"
+    );
+}
+
+/// Local tap spy (SubagentTrace is pub): records (ordinal, parent_id, kind).
+#[derive(Default)]
+struct TapSpy {
+    seen: Mutex<Vec<(u64, String, &'static str)>>,
+}
+impl agent_core::SubagentTrace for TapSpy {
+    fn record(&self, n: u64, parent_id: &str, event: &agent_core::AgentEvent) {
+        let kind = match event {
+            agent_core::AgentEvent::Token(_) => "token",
+            agent_core::AgentEvent::Done(_) => "done",
+            _ => "other",
+        };
+        self.seen
+            .lock()
+            .unwrap()
+            .push((n, parent_id.to_string(), kind));
+    }
+}
+
+#[tokio::test]
+async fn depth_two_is_the_floor_for_the_grandchild() {
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            // Child dispatches grandchild; grandchild TRIES to dispatch (rejected: unknown tool).
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"nested"}"#.into(),
+            ),
+            Scripted::Call(
+                "g1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"三"}"#.into(),
+            ),
+            Scripted::Text("gc done".into()),
+            Scripted::Text("child done".into()),
+        ]),
+        sink.clone(),
+        vec![],
+    );
+    d.max_depth = 2;
+    let tool = DispatchAgentTool::new(d);
+    tool.execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+    let events = sink.events.lock().unwrap().clone();
+    // The grandchild's dispatch attempt is a denied tool_result at depth 3.
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n, _)| k == "tool_result:denied" && n == "sub:dispatch_agent"),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn default_depth_one_matches_v1_no_recursion() {
+    // deps() defaults max_depth = 1: the existing child_cannot_recurse_into_dispatch_agent
+    // test already pins this; this test pins the DEFAULT deps value explicitly.
+    let d = deps(
+        ScriptedModel::new(vec![]),
+        Arc::new(FullSink::default()),
+        vec![],
+    );
+    assert_eq!((d.depth, d.max_depth), (1, 1));
+}
+
+#[test]
+fn description_mentions_concurrent_fanout() {
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![]),
+        Arc::new(FullSink::default()),
+        vec![],
+    ));
+    assert!(
+        tool.description().contains("concurrently"),
+        "{}",
+        tool.description()
+    );
 }

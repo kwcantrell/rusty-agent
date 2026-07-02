@@ -39,7 +39,9 @@ impl ModelRef {
     ) -> (String, String, String, String) {
         (
             self.backend.clone().unwrap_or_else(|| cfg.backend.clone()),
-            self.base_url.clone().unwrap_or_else(|| cfg.base_url.clone()),
+            self.base_url
+                .clone()
+                .unwrap_or_else(|| cfg.base_url.clone()),
             self.model.clone().unwrap_or_else(|| cfg.model.clone()),
             self.claude_binary
                 .clone()

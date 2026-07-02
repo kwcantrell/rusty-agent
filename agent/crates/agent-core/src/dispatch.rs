@@ -182,6 +182,7 @@ impl EventSink for SubagentSink {
 }
 
 /// Everything `DispatchAgentTool` needs to spawn a child `AgentLoop`.
+#[derive(Clone)]
 pub struct DispatchDeps {
     pub model: Arc<dyn ModelClient>,
     pub protocol: Arc<dyn ToolCallProtocol>,
@@ -200,6 +201,16 @@ pub struct DispatchDeps {
     pub loop_config: LoopConfig,
     pub max_result_bytes: usize,
     pub subagent_timeout: std::time::Duration,
+    /// Dedicated compaction model routed into child loops too; None = use `model`.
+    pub compaction_model: Option<Arc<dyn ModelClient>>,
+    /// This tool's depth; top-level = 1 (spec G7).
+    pub depth: usize,
+    /// From `cfg.subagent_max_depth` (assembly clamps >= 1); a child may dispatch
+    /// only while `depth < max_depth` (spec G7).
+    pub max_depth: usize,
+    /// "" at top level; "sub{n}:" for a nested tool so a grandchild's parent_id
+    /// is the child row's on-wire visible id (spec G8).
+    pub id_prefix: String,
 }
 
 pub struct DispatchAgentTool {
@@ -223,7 +234,8 @@ impl Tool for DispatchAgentTool {
          tools as you (minus dispatch_agent itself), works autonomously on the \
          prompt you give it, and its final answer is returned as this tool's \
          result. Make the prompt self-contained: the sub-agent cannot see this \
-         conversation."
+         conversation. You may dispatch several sub-agents in one message by \
+         issuing multiple dispatch_agent calls — they run concurrently."
     }
     fn when_not_to_call(&self) -> Option<&str> {
         Some(
@@ -339,6 +351,11 @@ impl Tool for DispatchAgentTool {
             }
         }
 
+        // Mint the dispatch ordinal FIRST: it both stamps forwarded child event
+        // ids (`sub{n}:`) and, when depth allows, names the nested tool's prefix
+        // so a grandchild's parent_id is this call's visible row id (spec G8).
+        let n = next_dispatch_n();
+
         // Child registry: (filtered) base snapshot + child-bound context tools.
         // dispatch_agent is structurally absent (spec D4: no recursion).
         let mut reg = ToolRegistry::new();
@@ -355,6 +372,15 @@ impl Tool for DispatchAgentTool {
                 reg.register(t.clone());
             }
         }
+        // Depth budget (spec G7/G8): a child may dispatch only while under the
+        // configured depth; the nested tool's id_prefix is THIS call's visible
+        // prefix so a grandchild's parent_id is the child row's on-wire id.
+        if self.deps.depth < self.deps.max_depth {
+            let mut nested = self.deps.clone();
+            nested.depth = self.deps.depth + 1;
+            nested.id_prefix = format!("sub{n}:");
+            reg.register(Arc::new(DispatchAgentTool::new(nested)));
+        }
         let store: Arc<dyn crate::OffloadStore> = Arc::new(InMemoryOffloadStore::new());
         let flag = Arc::new(AtomicBool::new(false));
         for t in crate::context_tools(store.clone(), flag.clone(), self.deps.max_result_bytes) {
@@ -370,10 +396,13 @@ impl Tool for DispatchAgentTool {
                 ..OffloadConfig::default()
             });
 
+        // Visible parent id: at top level this is the raw call id; nested, the
+        // prefix makes it the child row's on-wire id (spec G8 attribution).
+        let parent_id = format!("{}{}", self.deps.id_prefix, ctx.call_id);
         let sink = Arc::new(SubagentSink::new(
             self.deps.sink.clone(),
-            next_dispatch_n(),
-            ctx.call_id.clone(),
+            n,
+            parent_id,
             self.deps.child_trace.clone(),
         ));
         let child = AgentLoop::new(
@@ -385,6 +414,11 @@ impl Tool for DispatchAgentTool {
             sink.clone(),
             self.deps.loop_config.clone(),
         );
+        // Route child-loop compaction through the dedicated model when set.
+        let child = match &self.deps.compaction_model {
+            Some(m) => child.with_compaction_model(m.clone()),
+            None => child,
+        };
 
         // Parent cancel propagates down; child self-cancel never travels up (D8).
         let child_cancel = ctx.cancel.child_token();
@@ -754,6 +788,10 @@ mod tests {
             },
             max_result_bytes: 16 * 1024,
             subagent_timeout: Duration::from_secs(600),
+            compaction_model: None,
+            depth: 1,
+            max_depth: 1,
+            id_prefix: String::new(),
         }
     }
 

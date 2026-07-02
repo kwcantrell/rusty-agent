@@ -182,6 +182,11 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 loop_config: child_config,
                 max_result_bytes: cfg.max_tool_result_bytes,
                 subagent_timeout: Duration::from_secs(cfg.subagent_timeout_secs),
+                // Task 5 wires cfg values (compaction_model / subagent_max_depth).
+                compaction_model: None,
+                depth: 1,
+                max_depth: 1,
+                id_prefix: String::new(),
             },
         )));
     }
