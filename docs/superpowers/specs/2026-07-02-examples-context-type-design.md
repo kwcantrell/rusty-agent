@@ -23,6 +23,15 @@ byte-identically to today.
   file in the skill dir, absolute paths, sorted (`agent-skills/src/skill.rs:4-11`,
   `registry.rs:112-124`). Nested dirs (`references/`, `tasks/`) already exist as
   informal conventions; nothing collides with `examples/` (grep-verified absent).
+  - *(corrected 2026-07-02, implementation)* This fact was WRONG in one respect:
+    `list_bundled_files` was **non-recursive** — files in nested dirs
+    (`references/…`, `tasks/…`) were readable at L3 but never listed in `files`
+    or advertised at L2. The feature's own contract (`examples/` members ⊆
+    `files`) requires recursion, so collection is now recursive for the whole
+    skill dir. Consequence: the Invariant's "byte-identical without examples/"
+    is amended — a skill with OTHER nested dirs now also lists those files at
+    L2 (a fix of the discovered gap, adjudicated in-session; L3 behavior was
+    always reachable for these paths, so no new access is granted).
 - L1 = `list_skills` (re-scans per call; emits `- name: description`,
   `tools.rs:58`). L2 = `use_skill` (body + "## Bundled files" section listing
   **absolute** paths + read/run guidance, `tools.rs:123-134`). L3 =
