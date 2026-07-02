@@ -187,6 +187,10 @@ impl ContextManager for CuratedContext {
         self.emit_eviction(deps);
         report
     }
+
+    fn request_compaction(&mut self) {
+        self.compact_flag.store(true, Ordering::SeqCst);
+    }
 }
 
 impl CuratedContext {
@@ -798,6 +802,29 @@ mod tests {
 
         assert!(ctx.history()[1].content.len() <= 1024);
         assert!(matches!(store.get(1).unwrap().kind, OffloadKind::Error));
+    }
+
+    #[tokio::test]
+    async fn request_compaction_takes_the_compaction_path_on_next_maintain() {
+        // History stays below the high-water mark, so ONLY the requested flag
+        // can trigger compaction — proving request_compaction() wires through.
+        let mut c = ctx();
+        c.high_water_pct = 2.0; // disable size-triggered compaction
+        c.config.keep_recent = 1;
+        for i in 0..6 {
+            c.append(Message::assistant(
+                format!("turn {i} with a fair bit of padding text here"),
+                None,
+            ));
+        }
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "compact summary".into(),
+        )]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        c.request_compaction();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        assert!(report.compacted_turns > 0);
     }
 
     #[tokio::test]

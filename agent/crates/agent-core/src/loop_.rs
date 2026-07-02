@@ -254,6 +254,28 @@ impl AgentLoop {
         }
     }
 
+    /// One place a built message list becomes a CompletionRequest (the turn
+    /// prologue and the overflow-recovery rebuild must not drift apart).
+    fn completion_request(
+        &self,
+        messages: Vec<Message>,
+        preserve_thinking: bool,
+    ) -> CompletionRequest {
+        CompletionRequest {
+            messages,
+            tools: self.tools.schemas(),
+            temperature: self.config.temperature,
+            max_tokens: self.config.max_tokens,
+            top_p: self.config.top_p,
+            top_k: self.config.top_k,
+            min_p: self.config.min_p,
+            presence_penalty: self.config.presence_penalty,
+            repeat_penalty: self.config.repeat_penalty,
+            enable_thinking: self.config.enable_thinking,
+            preserve_thinking,
+        }
+    }
+
     /// Convenience entry point with no external cancel source (server + tests).
     /// Live cancellation goes through [`Self::run_with_cancel`].
     pub async fn run(
@@ -312,31 +334,39 @@ impl AgentLoop {
                 turn: turn + 1,
                 max_turns: self.config.max_turns,
             });
-            let base = CompletionRequest {
-                messages,
-                tools: self.tools.schemas(),
-                temperature: self.config.temperature,
-                max_tokens: self.config.max_tokens,
-                top_p: self.config.top_p,
-                top_k: self.config.top_k,
-                min_p: self.config.min_p,
-                presence_penalty: self.config.presence_penalty,
-                repeat_penalty: self.config.repeat_penalty,
-                enable_thinking: self.config.enable_thinking,
-                preserve_thinking,
-            };
+            let mut base = self.completion_request(messages, preserve_thinking);
             let turn_started = std::time::Instant::now();
-            let assistant = match self.completion_with_retry(&base, &cancel).await {
-                Ok(t) => t,
-                Err(RetryFailure::Cancelled) => {
-                    self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
-                    return Ok(());
-                }
-                // Overflow degrades to fatal-with-Done here; Task 3 replaces
-                // this arm with compact-rebuild-retry recovery.
-                Err(RetryFailure::Fatal(msg) | RetryFailure::Overflow(msg)) => {
-                    self.sink.emit(AgentEvent::Done(StopReason::Error));
-                    return Err(AgentError::Model(msg));
+            let mut overflow_recovered = false;
+            let assistant = loop {
+                match self.completion_with_retry(&base, &cancel).await {
+                    Ok(t) => break t,
+                    Err(RetryFailure::Cancelled) => {
+                        self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
+                        return Ok(());
+                    }
+                    Err(RetryFailure::Overflow(_)) if !overflow_recovered => {
+                        overflow_recovered = true;
+                        tracing::warn!("context overflow: forcing compaction and rebuilding once");
+                        ctx.request_compaction();
+                        let deps = crate::MaintCtx {
+                            model_limit: self.config.model_limit,
+                            model: &self.model,
+                            sink: &self.sink,
+                            cancel: &cancel,
+                        };
+                        ctx.maintain(&deps).await;
+                        let messages = ctx.build(self.config.model_limit);
+                        base = self.completion_request(messages, preserve_thinking);
+                    }
+                    Err(RetryFailure::Overflow(msg)) => {
+                        self.sink.emit(AgentEvent::Error(msg.clone()));
+                        self.sink.emit(AgentEvent::Done(StopReason::Error));
+                        return Err(AgentError::Model(msg));
+                    }
+                    Err(RetryFailure::Fatal(msg)) => {
+                        self.sink.emit(AgentEvent::Done(StopReason::Error));
+                        return Err(AgentError::Model(msg));
+                    }
                 }
             };
             self.sink.emit(AgentEvent::ServerUsage {
@@ -3343,5 +3373,126 @@ mod tests {
             capture.turn_duration_ms.lock().unwrap().is_some(),
             "ServerUsage must carry a measured turn_duration_ms"
         );
+    }
+
+    /// Context stub for overflow recovery: counts request_compaction calls,
+    /// and after the first one build() returns a shrunk history.
+    struct OverflowCtx {
+        history: Vec<Message>,
+        compaction_requests: usize,
+        maintains: usize,
+    }
+    #[async_trait::async_trait]
+    impl ContextManager for OverflowCtx {
+        fn append(&mut self, m: Message) {
+            self.history.push(m);
+        }
+        fn set_system(&mut self, _: Message) {}
+        fn set_recall(&mut self, _: Vec<String>) {}
+        fn set_goal(&mut self, _: String) {}
+        fn build(&self, _limit: usize) -> Vec<Message> {
+            if self.compaction_requests > 0 {
+                self.history.iter().take(1).cloned().collect() // "shrunk"
+            } else {
+                self.history.clone()
+            }
+        }
+        async fn maintain(&mut self, _deps: &crate::MaintCtx<'_>) -> crate::MaintReport {
+            self.maintains += 1;
+            crate::MaintReport::default()
+        }
+        fn request_compaction(&mut self) {
+            self.compaction_requests += 1;
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_compacts_rebuilds_and_recovers_once() {
+        let ws = std::env::temp_dir();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Status {
+                code: 400,
+                body: "maximum context length exceeded".into(),
+            }),
+            Scripted::Text("recovered after compaction".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 0, // proving overflow recovery does NOT consume retry budget
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = OverflowCtx {
+            history: vec![],
+            compaction_requests: 0,
+            maintains: 0,
+        };
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(ctx.compaction_requests, 1);
+        assert!(ctx.maintains >= 1);
+        assert_eq!(
+            sink.events.lock().unwrap().last().map(String::as_str),
+            Some("done")
+        );
+    }
+
+    #[tokio::test]
+    async fn second_overflow_in_a_turn_is_fatal() {
+        let ws = std::env::temp_dir();
+        let overflow = || {
+            Scripted::Fail(ModelError::Status {
+                code: 400,
+                body: "maximum context length exceeded".into(),
+            })
+        };
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![overflow(), overflow()]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 3, // unused — overflow skips budget
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = OverflowCtx {
+            history: vec![],
+            compaction_requests: 0,
+            maintains: 0,
+        };
+        let err = agent.run(&mut ctx, "go".into()).await.unwrap_err();
+        assert!(matches!(err, AgentError::Model(_)));
+        assert_eq!(
+            ctx.compaction_requests, 1,
+            "recovery attempted exactly once"
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+        assert!(events.iter().any(|k| k.starts_with("error")));
     }
 }

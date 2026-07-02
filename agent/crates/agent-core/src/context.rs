@@ -169,6 +169,10 @@ pub trait ContextManager: Send + Sync {
     async fn maintain(&mut self, _deps: &MaintCtx<'_>) -> MaintReport {
         MaintReport::default()
     }
+    /// Ask the manager to compact on its next maintenance pass. Default: no-op
+    /// (managers without a compaction concept ignore it). `CuratedContext`
+    /// sets the same flag the `context_compact` tool uses.
+    fn request_compaction(&mut self) {}
 }
 
 /// Sliding-window context: always keeps the system prompt; evicts oldest
