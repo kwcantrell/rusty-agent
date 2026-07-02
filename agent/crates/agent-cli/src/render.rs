@@ -52,6 +52,14 @@ pub fn format_stats_line(s: &agent_core::SessionStats) -> String {
     line
 }
 
+/// The ToolStart display line (pure for testability); child (attributed)
+/// calls get a two-space `↳` indent so nested activity reads as nested
+/// (spec E7). The caller prepends the leading blank line via `writeln!`.
+fn format_tool_start(name: &str, args: &serde_json::Value, parent_id: Option<&str>) -> String {
+    let indent = if parent_id.is_some() { "  ↳ " } else { "" };
+    format!("{indent}\x1b[36m⚙ {name}\x1b[0m {args}")
+}
+
 /// Renders agent events to stdout/stderr. Buffers streamed tokens inline.
 #[allow(dead_code)]
 pub struct TerminalSink {
@@ -78,20 +86,33 @@ impl EventSink for TerminalSink {
                 let _ = write!(out, "\x1b[2m{r}\x1b[0m");
                 let _ = out.flush();
             }
-            AgentEvent::ToolStart { name, args, .. } => {
-                let _ = writeln!(out, "\n\x1b[36m⚙ {name}\x1b[0m {args}");
+            AgentEvent::ToolStart {
+                name,
+                args,
+                parent_id,
+                ..
+            } => {
+                let _ = writeln!(
+                    out,
+                    "\n{}",
+                    format_tool_start(&name, &args, parent_id.as_deref())
+                );
             }
             AgentEvent::ToolResult {
                 name,
                 status,
                 output,
                 duration_ms,
+                parent_id,
                 ..
             } => {
+                // Attributed (sub-agent) results get the same `↳` indent as their
+                // ToolStart so the child row reads as nested (spec E7).
+                let indent = if parent_id.is_some() { "  ↳ " } else { "" };
                 if status != ToolStatus::Ok {
                     let _ = writeln!(
                         out,
-                        "\x1b[31m✗ {name} ({}, {duration_ms}ms)\x1b[0m {}",
+                        "{indent}\x1b[31m✗ {name} ({}, {duration_ms}ms)\x1b[0m {}",
                         status.as_str(),
                         output.content
                     );
@@ -103,7 +124,7 @@ impl EventSink for TerminalSink {
                 {
                     let _ = writeln!(
                         out,
-                        "\x1b[33m✎ {path}\x1b[0m\n{}",
+                        "{indent}\x1b[33m✎ {path}\x1b[0m\n{}",
                         render_diff(before, after)
                     );
                 } else if let Some(Display::Terminal {
@@ -113,9 +134,12 @@ impl EventSink for TerminalSink {
                     ..
                 }) = &output.display
                 {
-                    let _ = writeln!(out, "\x1b[90m$ exit={exit_code}\x1b[0m\n{stdout}{stderr}");
+                    let _ = writeln!(
+                        out,
+                        "{indent}\x1b[90m$ exit={exit_code}\x1b[0m\n{stdout}{stderr}"
+                    );
                 } else {
-                    let _ = writeln!(out, "\x1b[32m✓ {name}\x1b[0m");
+                    let _ = writeln!(out, "{indent}\x1b[32m✓ {name}\x1b[0m");
                 }
             }
             AgentEvent::Usage { .. } => {} // telemetry for the web context dashboard; not shown in the CLI
@@ -185,6 +209,16 @@ mod tests {
         assert!(line.contains("7 tools"));
         assert!(line.contains("2 failed"));
         assert!(line.contains("$0.05"));
+    }
+
+    #[test]
+    fn child_tool_rows_are_indented() {
+        let args = serde_json::json!({});
+        let top = format_tool_start("read_file", &args, None);
+        let child = format_tool_start("sub:read_file", &args, Some("d1"));
+        assert!(!top.contains('↳'));
+        assert!(child.starts_with("  ↳"), "{child:?}");
+        assert!(child.contains("sub:read_file"));
     }
 
     #[test]
