@@ -16,8 +16,6 @@ use tokio_util::sync::CancellationToken;
 pub enum AgentError {
     #[error("model error after retries: {0}")]
     Model(String),
-    #[error("cancelled")]
-    Cancelled,
 }
 
 /// Default idle timeout for model-stream consumption. Generous enough to cover
