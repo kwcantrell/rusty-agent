@@ -117,6 +117,13 @@ mod tests {
         )); // order violated
         assert!(!trajectory_matches_gold(&traj, &gold(&["write_file"]))); // missing tool
         assert!(!trajectory_matches_gold(&[], &gold(&["read_file"]))); // empty traj, non-empty gold
+
+        // Duplicate gold names each need a distinct trajectory step (subsequence, not set).
+        assert!(!trajectory_matches_gold(&[step("a")], &gold(&["a", "a"]))); // one "a" can't cover two
+        assert!(trajectory_matches_gold(
+            &[step("a"), step("b"), step("a")],
+            &gold(&["a", "a"])
+        )); // two "a"s, order preserved
     }
 
     #[test]
