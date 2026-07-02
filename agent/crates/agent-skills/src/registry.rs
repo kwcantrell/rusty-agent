@@ -100,27 +100,53 @@ fn load_skill(dir: &Path, dir_name: &str) -> Result<Skill, String> {
             ));
         }
     }
+    let files = list_bundled_files(dir);
+    // Component-wise filter (separator-safe): first component under the
+    // skill dir must be the DIRECTORY `examples`.
+    let examples: Vec<PathBuf> = files
+        .iter()
+        .filter(|p| {
+            p.strip_prefix(dir)
+                .ok()
+                .and_then(|rel| rel.components().next())
+                .map(|c| c.as_os_str() == "examples" && p.parent() != Some(dir))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
     Ok(Skill {
         name: dir_name.to_string(),
         description: parsed.description,
         body: parsed.body,
         dir: dir.to_path_buf(),
-        files: list_bundled_files(dir),
+        files,
+        examples,
     })
 }
 
+/// Collect bundled files (absolute paths) beneath a skill dir, recursively, so
+/// nested subtrees like `examples/` are part of the superset. Excludes the
+/// top-level `SKILL.md`. Sorted for stable rendering and ordered `examples`.
 fn list_bundled_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    if let Ok(read) = std::fs::read_dir(dir) {
-        for e in read.flatten() {
-            let p = e.path();
-            if p.is_file() && p.file_name().and_then(|n| n.to_str()) != Some("SKILL.md") {
-                files.push(p);
-            }
-        }
-    }
+    collect_files(dir, dir, &mut files);
     files.sort();
     files
+}
+
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    let read = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for e in read.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_files(root, &p, out);
+        } else if p.is_file() && p != root.join("SKILL.md") {
+            out.push(p);
+        }
+    }
 }
 
 /// Validate + slugify a skill name: ASCII alphanumerics kept, anything else
@@ -269,6 +295,47 @@ mod tests {
         // it falls through to the workspace default.
         let reg = SkillRegistry::from_config(&["".to_string()], Path::new("/ws"));
         assert_eq!(reg.writable_root(), Path::new("/ws/.agent/skills"));
+    }
+
+    #[test]
+    fn examples_are_the_examples_dir_subset_of_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path().join("demo");
+        std::fs::create_dir_all(sd.join("examples/nested")).unwrap();
+        std::fs::create_dir_all(sd.join("references")).unwrap();
+        std::fs::write(sd.join("SKILL.md"), "---\ndescription: d\n---\nbody").unwrap();
+        std::fs::write(sd.join("examples/a.md"), "A").unwrap();
+        std::fs::write(sd.join("examples/nested/b.md"), "B").unwrap();
+        std::fs::write(sd.join("references/r.md"), "R").unwrap();
+        // A plain FILE named "examples" elsewhere must not confuse the filter:
+        std::fs::write(sd.join("notes.md"), "N").unwrap();
+
+        let reg = SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf());
+        let skill = reg.find("demo").expect("skill loads");
+        let rel: Vec<String> = skill
+            .examples
+            .iter()
+            .map(|p| p.strip_prefix(&skill.dir).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(rel, vec!["examples/a.md".to_string(), "examples/nested/b.md".to_string()]);
+        // Superset pin: files still contains every bundled file incl. examples.
+        assert!(skill.files.len() >= 4, "{:?}", skill.files);
+        for e in &skill.examples {
+            assert!(skill.files.contains(e));
+        }
+    }
+
+    #[test]
+    fn no_examples_dir_means_empty_examples_and_a_plain_file_named_examples_does_not_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path().join("plain");
+        std::fs::create_dir_all(&sd).unwrap();
+        std::fs::write(sd.join("SKILL.md"), "---\ndescription: d\n---\nbody").unwrap();
+        std::fs::write(sd.join("examples"), "just a file named examples").unwrap();
+        let reg = SkillRegistry::new(vec![dir.path().to_path_buf()], dir.path().to_path_buf());
+        let skill = reg.find("plain").expect("skill loads");
+        assert!(skill.examples.is_empty(), "{:?}", skill.examples);
+        assert_eq!(skill.files.len(), 1); // the odd file is still bundled
     }
 
     #[test]

@@ -8,6 +8,10 @@ pub struct Skill {
     pub body: String,
     pub dir: PathBuf,
     pub files: Vec<PathBuf>,
+    /// Worked exemplars: the subset of `files` under the skill's `examples/`
+    /// directory (spec 2026-07-02 Examples context type, H1). Absolute paths,
+    /// sorted; `files` remains the superset so L3 reading is unchanged.
+    pub examples: Vec<PathBuf>,
 }
 
 /// The result of parsing a SKILL.md's text (before a directory/name is attached).
