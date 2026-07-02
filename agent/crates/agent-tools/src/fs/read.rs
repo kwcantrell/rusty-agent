@@ -31,7 +31,9 @@ impl Tool for ReadFile {
             name: self.name().into(),
             description: self.description().into(),
             parameters: json!({"type":"object","properties":{
-                "path":{"type":"string","description":"Workspace-relative path of the file to read."}},
+                "path":{"type":"string","description":"Workspace-relative path of the file to read."},
+                "offset":{"type":"integer","description":"1-based line number to start reading from (default 1)."},
+                "limit":{"type":"integer","description":"Maximum number of lines to return (default: all lines)."}},
                 "required":["path"]}),
         }
     }
@@ -55,6 +57,42 @@ impl Tool for ReadFile {
         let content = tokio::fs::read_to_string(&full)
             .await
             .map_err(|e| ToolError::NotFound(format!("{path}: {e}")))?;
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|v| (v as usize).max(1));
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        if limit == Some(0) {
+            return Err(ToolError::InvalidArgs("limit must be >= 1".into()));
+        }
+        let content = match (offset, limit) {
+            (None, None) => content, // whole-file fast path, byte-identical
+            (o, l) => {
+                let first = o.unwrap_or(1);
+                let lines: Vec<&str> = content.lines().collect();
+                let n = lines.len();
+                if first > n {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "offset {first} is past the end of {path} ({n} lines)"
+                    )));
+                }
+                // Saturating: l >= 1 is guaranteed by the limit==0 guard above,
+                // and first.saturating_add avoids overflow when limit is huge
+                // (e.g. u64::MAX) so we never wrap into a bad slice range.
+                let last = l.map_or(n, |l| first.saturating_add(l - 1).min(n));
+                if first == 1 && last == n {
+                    content // limit covers the whole file: unchanged
+                } else {
+                    format!(
+                        "[lines {first}–{last} of {n}]\n{}",
+                        lines[first - 1..last].join("\n")
+                    )
+                }
+            }
+        };
         Ok(ToolOutput {
             content,
             display: None,
@@ -144,6 +182,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.content, "hello");
+    }
+
+    #[tokio::test]
+    async fn read_file_slices_with_offset_and_limit() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        let out = ReadFile
+            .execute(
+                json!({"path": "f.txt", "offset": 2, "limit": 2}),
+                &ctx(dir.path().into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content, "[lines 2–3 of 5]\nl2\nl3");
+    }
+
+    #[tokio::test]
+    async fn read_file_limit_clamps_to_eof() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "l1\nl2\nl3\n").unwrap();
+        let out = ReadFile
+            .execute(
+                json!({"path": "f.txt", "offset": 3, "limit": 99}),
+                &ctx(dir.path().into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content, "[lines 3–3 of 3]\nl3");
+    }
+
+    #[tokio::test]
+    async fn read_file_default_is_whole_file_unchanged() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "l1\nl2\n").unwrap();
+        let out = ReadFile
+            .execute(json!({"path": "f.txt"}), &ctx(dir.path().into()))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "l1\nl2\n"); // byte-identical, incl. trailing newline
+    }
+
+    #[tokio::test]
+    async fn read_file_limit_zero_is_invalid_args() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "l1\nl2\n").unwrap();
+        let err = ReadFile
+            .execute(
+                json!({"path": "f.txt", "limit": 0}),
+                &ctx(dir.path().into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+    }
+
+    #[tokio::test]
+    async fn read_file_offset_with_u64_max_limit_does_not_panic() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        // limit == u64::MAX would overflow `first + limit - 1` without
+        // saturating arithmetic; offset 2 must still return lines 2..n.
+        let out = ReadFile
+            .execute(
+                json!({"path": "f.txt", "offset": 2, "limit": u64::MAX}),
+                &ctx(dir.path().into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content, "[lines 2–5 of 5]\nl2\nl3\nl4\nl5");
+    }
+
+    #[tokio::test]
+    async fn read_file_offset_past_eof_is_invalid_args() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "l1\n").unwrap();
+        let err = ReadFile
+            .execute(
+                json!({"path": "f.txt", "offset": 5}),
+                &ctx(dir.path().into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+    }
+
+    #[tokio::test]
+    async fn read_file_offset_limit_params_are_described() {
+        let schema = ReadFile.schema();
+        for p in ["offset", "limit"] {
+            let d = schema.parameters["properties"][p]["description"]
+                .as_str()
+                .unwrap_or("");
+            assert!(!d.is_empty(), "{p} must be described");
+        }
     }
 
     #[test]

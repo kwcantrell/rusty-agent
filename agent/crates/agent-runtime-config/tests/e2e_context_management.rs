@@ -149,7 +149,10 @@ async fn offload_then_recall_round_trips_through_the_loop() {
     reg.register(Arc::new(BoomTool {
         message: big_message.clone(),
     }));
-    reg.register(Arc::new(ContextRecallTool::new(store.clone())));
+    reg.register(Arc::new(ContextRecallTool::new(
+        store.clone(),
+        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
+    )));
 
     let model = ScriptedModel::new(vec![
         Scripted::Call("c1".into(), "boom".into(), "{}".into()),
@@ -204,7 +207,10 @@ async fn recall_unknown_id_feeds_error_back_and_continues() {
     let flag = Arc::new(AtomicBool::new(false));
 
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(ContextRecallTool::new(store.clone())));
+    reg.register(Arc::new(ContextRecallTool::new(
+        store.clone(),
+        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
+    )));
 
     let model = ScriptedModel::new(vec![
         Scripted::Call("c1".into(), "context_recall".into(), r#"{"id":999}"#.into()),

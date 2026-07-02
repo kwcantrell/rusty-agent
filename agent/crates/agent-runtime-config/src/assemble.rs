@@ -99,7 +99,11 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
 
     // Context-management tools share the caller-owned offload store + compact flag
     // with the frontend's CuratedContext (passed in via LoopParts).
-    for t in agent_core::context_tools(parts.offload_store.clone(), parts.compact_flag.clone()) {
+    for t in agent_core::context_tools(
+        parts.offload_store.clone(),
+        parts.compact_flag.clone(),
+        cfg.max_tool_result_bytes,
+    ) {
         registry.register(t);
     }
 

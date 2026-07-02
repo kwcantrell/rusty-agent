@@ -6,7 +6,9 @@ use crate::context::{
 };
 use crate::event::{AgentEvent, ContextEvent};
 use crate::offload::OffloadStore;
-use crate::offload_policy::{placeholder_for, select_offloads, OffloadConfig};
+use crate::offload_policy::{
+    capped_preview, placeholder_for, select_offloads, select_oversized, OffloadConfig,
+};
 use agent_model::{Message, Role};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,22 +150,26 @@ impl ContextManager for CuratedContext {
     async fn maintain(&mut self, deps: &MaintCtx<'_>) -> MaintReport {
         let mut report = MaintReport::default();
 
-        // (a) Deterministic offload — sync, cheap, every turn.
-        let hits = select_offloads(&self.history, &self.config);
-        for hit in hits {
-            let idx = hit.history_index;
+        // (0) Ingestion cap — an oversized fresh result is offloaded whole
+        // before it can reach a model call; the window keeps a bounded
+        // preview + recall marker. Age is irrelevant here, only size.
+        let cap = self.config.max_result_bytes;
+        for hit in select_oversized(&self.history, &self.config) {
+            let content = hit.entry.content.clone();
+            let tool = hit.entry.tool_name.clone();
+            self.lift(hit, &mut report, deps, |id| {
+                capped_preview(&content, cap, id, &tool)
+            });
+        }
+
+        // (a) Deterministic age-based offload — sync, cheap, every turn.
+        for hit in select_offloads(&self.history, &self.config) {
             let tool = hit.entry.tool_name.clone();
             let kind = hit.entry.kind.clone();
             let bytes = hit.entry.bytes;
-            let id = self.store.put(hit.entry);
-            self.history[idx].content = placeholder_for(id, &tool, &kind, bytes);
-            report.offloaded += 1;
-            report.offloaded_bytes += bytes;
-            deps.sink.emit(AgentEvent::Context(ContextEvent::Offloaded {
-                id,
-                bytes,
-                tool,
-            }));
+            self.lift(hit, &mut report, deps, |id| {
+                placeholder_for(id, &tool, &kind, bytes)
+            });
         }
 
         // (b) Compaction — async, gated by the high-water mark or an explicit request.
@@ -184,6 +190,30 @@ impl ContextManager for CuratedContext {
 }
 
 impl CuratedContext {
+    /// Store a hit's full content in the offload table and replace the window
+    /// copy with whatever `replacement` renders for the assigned id. Shared by
+    /// the ingestion-cap and age-based offload passes.
+    fn lift(
+        &mut self,
+        hit: crate::offload_policy::OffloadHit,
+        report: &mut MaintReport,
+        deps: &MaintCtx<'_>,
+        replacement: impl FnOnce(crate::OffloadId) -> String,
+    ) {
+        let idx = hit.history_index;
+        let tool = hit.entry.tool_name.clone();
+        let bytes = hit.entry.bytes;
+        let id = self.store.put(hit.entry);
+        self.history[idx].content = replacement(id);
+        report.offloaded += 1;
+        report.offloaded_bytes += bytes;
+        deps.sink.emit(AgentEvent::Context(ContextEvent::Offloaded {
+            id,
+            bytes,
+            tool,
+        }));
+    }
+
     /// Compact the old span into the pinned summary. Extracted from `maintain`
     /// so its early exits cannot skip the eviction check that follows.
     async fn compact_old_span(&mut self, deps: &MaintCtx<'_>, report: &mut MaintReport) {
@@ -265,7 +295,7 @@ mod tests {
     use super::*;
     use crate::context::MaintCtx;
     use crate::event::EventSink;
-    use crate::offload::InMemoryOffloadStore;
+    use crate::offload::{InMemoryOffloadStore, OffloadKind};
     use crate::testkit::{CollectingSink, Scripted, ScriptedModel};
     use agent_model::{ModelClient, Role};
     use tokio_util::sync::CancellationToken;
@@ -620,6 +650,154 @@ mod tests {
             !events.iter().any(|e| e.starts_with("evicted:")),
             "no Evicted under budget: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ingestion_cap_offloads_fresh_oversized_result_before_next_build() {
+        let store = Arc::new(InMemoryOffloadStore::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut ctx = CuratedContext::new(Message::system("s"), store.clone(), flag)
+            .with_offload_config(OffloadConfig {
+                max_result_bytes: 1024,
+                ..Default::default()
+            });
+        let big = "x".repeat(50_000);
+        ctx.append(parent("c1")); // tool results always follow a tool_calls parent
+        ctx.append(Message::tool("c1", "shell", &big));
+
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
+        let sink = Arc::new(CollectingSink::default());
+        let sink_dyn: Arc<dyn EventSink> = sink.clone();
+        let cancel = CancellationToken::new();
+        let mut deps = maint_deps(&model, &sink_dyn, &cancel);
+        deps.model_limit = 1_000_000; // no compaction/eviction interference
+
+        let report = ctx.maintain(&deps).await;
+
+        assert_eq!(report.offloaded, 1);
+        assert_eq!(report.offloaded_bytes, 50_000);
+        let msg = &ctx.history()[1];
+        assert!(msg.content.len() <= 1024, "window copy exceeds cap");
+        assert!(msg.content.contains("truncated: showing first"));
+        assert_eq!(msg.tool_call_id.as_deref(), Some("c1"), "id must survive");
+        // Full content stored, recallable.
+        let entry = store.get(1).expect("entry stored");
+        assert_eq!(entry.content.len(), 50_000);
+        // Offloaded event emitted.
+        assert!(
+            sink.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e == "offloaded:1"),
+            "Offloaded event must be emitted"
+        );
+        // Second pass is a no-op (idempotent).
+        let report2 = ctx.maintain(&deps).await;
+        assert_eq!(report2.offloaded, 0);
+    }
+
+    #[tokio::test]
+    async fn capped_result_survives_build_under_a_small_model_limit() {
+        // A fresh oversized tool result (50 000 B) would blow any small window
+        // and, as its own turn unit, force an over-limit request. After the
+        // ingestion cap replaces it with a bounded preview, the turn unit is
+        // small enough to survive `build` under a limit far below what the
+        // uncapped result needs — without orphaning the tool message.
+        let store = Arc::new(InMemoryOffloadStore::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut ctx = CuratedContext::new(Message::system("s"), store.clone(), flag)
+            .with_offload_config(OffloadConfig {
+                max_result_bytes: 1024,
+                ..Default::default()
+            });
+        ctx.append(parent("c1")); // parent must precede the Role::Tool result
+        ctx.append(Message::tool("c1", "shell", "x".repeat(50_000)));
+
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
+        let sink_dyn: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let mut deps = maint_deps(&model, &sink_dyn, &cancel);
+        deps.model_limit = 1_000_000; // no compaction/eviction interference
+        ctx.maintain(&deps).await;
+
+        // Small model_limit: larger than pinned + capped unit (~a few hundred
+        // tokens) but far below the ~12 500 tokens the uncapped 50 KB needs.
+        let small_limit = 2 * 1024 / 4;
+        let built = ctx.build(small_limit);
+        // `build` has a debug_assert against orphaned tool messages; reaching
+        // here means integrity held. The capped preview must be present.
+        let preview = built
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("capped tool message survives build");
+        assert!(preview.content.len() <= 1024, "preview within cap");
+        assert!(preview.content.contains("truncated: showing first"));
+    }
+
+    #[tokio::test]
+    async fn capped_preview_is_age_offloaded_to_a_placeholder_later() {
+        // keep_recent 0 lets the age pass run on the same maintain call: the
+        // eager pass stores the full content (#1), then the age pass lifts the
+        // preview into a second small entry (#2) whose content still carries
+        // the marker to #1 — the recall chain stays intact.
+        let store = Arc::new(InMemoryOffloadStore::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut ctx = CuratedContext::new(Message::system("s"), store.clone(), flag)
+            .with_offload_config(OffloadConfig {
+                max_result_bytes: 1024,
+                output_min_bytes: 100,
+                keep_recent: 0,
+                ..Default::default()
+            });
+        ctx.append(parent("c1")); // tool results always follow a tool_calls parent
+        ctx.append(Message::tool("c1", "shell", "x".repeat(50_000)));
+
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
+        let sink_dyn: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let mut deps = maint_deps(&model, &sink_dyn, &cancel);
+        deps.model_limit = 1_000_000;
+
+        let report = ctx.maintain(&deps).await;
+
+        assert_eq!(report.offloaded, 2, "eager + age in one pass");
+        let msg = &ctx.history()[1];
+        assert!(msg.content.starts_with("[tool_result#2 offloaded:"));
+        assert!(store
+            .get(2)
+            .unwrap()
+            .content
+            .contains("context_recall(id: 1"));
+        assert_eq!(store.get(1).unwrap().content.len(), 50_000);
+    }
+
+    #[tokio::test]
+    async fn oversized_error_result_is_capped_too() {
+        let store = Arc::new(InMemoryOffloadStore::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut ctx = CuratedContext::new(Message::system("s"), store.clone(), flag)
+            .with_offload_config(OffloadConfig {
+                max_result_bytes: 1024,
+                ..Default::default()
+            });
+        ctx.append(parent("c1")); // tool results always follow a tool_calls parent
+        ctx.append(Message::tool(
+            "c1",
+            "shell",
+            format!("ERROR: {}", "e".repeat(50_000)),
+        ));
+
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
+        let sink_dyn: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let mut deps = maint_deps(&model, &sink_dyn, &cancel);
+        deps.model_limit = 1_000_000;
+
+        ctx.maintain(&deps).await;
+
+        assert!(ctx.history()[1].content.len() <= 1024);
+        assert!(matches!(store.get(1).unwrap().kind, OffloadKind::Error));
     }
 
     #[tokio::test]
