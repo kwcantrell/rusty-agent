@@ -157,6 +157,63 @@ pub enum ModelError {
     Process(String),
     #[error("stream idle timeout after {0:?}")]
     Timeout(std::time::Duration),
+    /// The caller's cancel token fired mid-call. Never retried; the loop's
+    /// token check is authoritative, this variant exists so cancellation is
+    /// not spoofable as a plain stream-error string.
+    #[error("cancelled")]
+    Cancelled,
+}
+
+/// How the agent loop should react to a model error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// Transient: transport, stream, timeout, 5xx, 408/429. Retry with backoff.
+    Retryable,
+    /// Permanent request problem: other 4xx, decode. Abort on first sight.
+    Fatal,
+    /// The request exceeds the model's context. Retrying verbatim cannot
+    /// succeed; the caller should shrink the context and rebuild once.
+    ContextOverflow,
+}
+
+/// Case-insensitive overflow signature check. Conservative by design: a miss
+/// degrades to the code's plain class, never to a wrong retry storm.
+fn body_is_overflow(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    [
+        "context length",
+        "context window",
+        "context size",
+        "too many tokens",
+        "prompt is too long",
+    ]
+    .iter()
+    .any(|sig| b.contains(sig))
+}
+
+impl ModelError {
+    /// Classify for the retry loop. Overflow is checked before the 4xx-fatal
+    /// rule (overflow usually arrives as a 400).
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            ModelError::Status {
+                code: 400 | 413 | 422,
+                body,
+            } if body_is_overflow(body) => ErrorClass::ContextOverflow,
+            ModelError::Stream(body) if body_is_overflow(body) => ErrorClass::ContextOverflow,
+            ModelError::Status {
+                code: 408 | 429 | 500..=599,
+                ..
+            } => ErrorClass::Retryable,
+            ModelError::Status { .. } | ModelError::Decode(_) | ModelError::Cancelled => {
+                ErrorClass::Fatal
+            }
+            ModelError::Http(_)
+            | ModelError::Stream(_)
+            | ModelError::Process(_)
+            | ModelError::Timeout(_) => ErrorClass::Retryable,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -192,5 +249,127 @@ mod tests {
     fn timeout_error_displays_duration() {
         let e = ModelError::Timeout(std::time::Duration::from_secs(120));
         assert_eq!(e.to_string(), "stream idle timeout after 120s");
+    }
+
+    #[test]
+    fn class_table() {
+        use ErrorClass::*;
+        let cases: Vec<(ModelError, ErrorClass)> = vec![
+            (ModelError::Http("connect refused".into()), Retryable),
+            (ModelError::Stream("byte stream cut".into()), Retryable),
+            (ModelError::Process("claude exited (1)".into()), Retryable),
+            (
+                ModelError::Timeout(std::time::Duration::from_secs(120)),
+                Retryable,
+            ),
+            (
+                ModelError::Status {
+                    code: 500,
+                    body: "oops".into(),
+                },
+                Retryable,
+            ),
+            (
+                ModelError::Status {
+                    code: 503,
+                    body: "busy".into(),
+                },
+                Retryable,
+            ),
+            (
+                ModelError::Status {
+                    code: 408,
+                    body: "timeout".into(),
+                },
+                Retryable,
+            ),
+            (
+                ModelError::Status {
+                    code: 429,
+                    body: "rate limited".into(),
+                },
+                Retryable,
+            ),
+            (
+                ModelError::Status {
+                    code: 400,
+                    body: "invalid request".into(),
+                },
+                Fatal,
+            ),
+            (
+                ModelError::Status {
+                    code: 401,
+                    body: "bad key".into(),
+                },
+                Fatal,
+            ),
+            (
+                ModelError::Status {
+                    code: 403,
+                    body: "forbidden".into(),
+                },
+                Fatal,
+            ),
+            (
+                ModelError::Status {
+                    code: 404,
+                    body: "no such model".into(),
+                },
+                Fatal,
+            ),
+            (ModelError::Decode("not json".into()), Fatal),
+            (ModelError::Cancelled, Fatal), // defensive: must never reach a retry arm
+        ];
+        for (e, want) in cases {
+            assert_eq!(e.class(), want, "wrong class for {e}");
+        }
+    }
+
+    #[test]
+    fn overflow_is_detected_on_status_and_stream_bodies() {
+        use ErrorClass::*;
+        let overflowing = [
+            "This model's maximum CONTEXT LENGTH is 8192 tokens",
+            "the request exceeds the available context size",
+            "context window exceeded",
+            "too many tokens in prompt",
+            "your prompt is too long",
+        ];
+        for body in overflowing {
+            for code in [400u16, 413, 422] {
+                let e = ModelError::Status {
+                    code,
+                    body: body.into(),
+                };
+                assert_eq!(e.class(), ContextOverflow, "code {code}, body {body}");
+            }
+            let e = ModelError::Stream(format!("server error in stream: {body}"));
+            assert_eq!(e.class(), ContextOverflow, "stream body {body}");
+        }
+    }
+
+    #[test]
+    fn overflow_signatures_are_conservative() {
+        use ErrorClass::*;
+        // Near-misses must NOT match: degrade to the plain class.
+        let e = ModelError::Status {
+            code: 400,
+            body: "context deadline exceeded".into(),
+        };
+        assert_eq!(e.class(), Fatal);
+        let e = ModelError::Stream("context deadline exceeded".into());
+        assert_eq!(e.class(), Retryable);
+        // Overflow bodies on non-overflow codes keep their code's class.
+        let e = ModelError::Status {
+            code: 500,
+            body: "context length exceeded".into(),
+        };
+        assert_eq!(e.class(), Retryable);
+        let e = ModelError::Status {
+            code: 404,
+            body: "context length exceeded".into(),
+        };
+        assert_eq!(e.class(), Fatal);
     }
 }
