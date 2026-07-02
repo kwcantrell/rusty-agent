@@ -38,6 +38,9 @@ pub enum Scripted {
     Reasoning(String, String),
     /// Final text plus a server usage chunk: (answer, prompt_tokens, completion_tokens).
     TextWithUsage(String, u32, u32),
+    /// Emit an arbitrary chunk sequence verbatim, then succeed. Lets a test drive
+    /// exact tool-call + `Usage` shapes across multiple turns (calibration tests).
+    Chunks(Vec<Chunk>),
 }
 
 pub struct ScriptedModel {
@@ -135,6 +138,9 @@ impl ModelClient for ScriptedModel {
                     Ok(Chunk::Done(StopReason::Stop)),
                 ])
                 .boxed())
+            }
+            Scripted::Chunks(chunks) => {
+                Ok(stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>()).boxed())
             }
             Scripted::Hang => Ok(stream::pending().boxed()),
             Scripted::HangOpen => {
