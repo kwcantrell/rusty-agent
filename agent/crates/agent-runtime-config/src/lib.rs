@@ -203,6 +203,11 @@ pub fn default_allowlist() -> Vec<String> {
     // `git reset --hard`, `git clean -fdx`). Unknown subcommands fail safe to Ask.
     // The cargo set still runs build scripts: the documented exec-vehicle residual.
     // Users may add a bare "git"/"cargo" entry back in command_allowlist to opt out.
+    //
+    // ACCEPTED RESIDUAL: the git prefixes are read-safe in the common case but NOT
+    // pure-read — `git {log,diff,show} --output=<path>` truncates/overwrites an
+    // arbitrary file and still auto-allows (pre-existing under the old bare `git`
+    // entry; mitigated by the execution sandbox, not the policy gate).
     [
         "ls",
         "cat",

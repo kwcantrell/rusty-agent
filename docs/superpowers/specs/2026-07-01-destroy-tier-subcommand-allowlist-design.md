@@ -98,8 +98,12 @@ token-prefix matching:
 - `cargo build`, `cargo check`, `cargo test`, `cargo fmt`, `cargo clippy`,
   `cargo metadata`, `cargo tree`
 
-Rationale: the git set is pure-read; the cargo set preserves dev UX and is
-already covered by the documented exec-vehicle residual (build scripts). Every
+Rationale: the git set is read-safe in the common case but NOT pure-read —
+`git {log,diff,show} --output=<path>` truncates/overwrites an arbitrary file
+and still auto-allows (accepted residual, recorded at `default_allowlist()`;
+pre-existing under the old bare `git` entry and mitigated by the execution
+sandbox). The cargo set preserves dev UX and is already covered by the
+documented exec-vehicle residual (build scripts). Every
 other subcommand (`git push`, `git reset`, `git clean`, `git commit`,
 `git branch`, `cargo publish`, `cargo install`, `cargo run`, …) demotes to Ask.
 Flag-before-subcommand forms (`git -C x status`) also reach Ask — accepted
@@ -193,4 +197,7 @@ drives `remember`/`forget` through the policy gate must gain an approval stub
 - Write-vs-Destroy granularity for FS tools (tracked-file overwrite vs scratch
   write) and `git_commit`'s tier.
 - Surfacing Access/severity over the approval wire; `ApproveAlways` persistence.
+- `git {log,diff,show} --output=<path>`: auto-allowed arbitrary-file write under
+  the default git prefixes (pre-existing under bare `git`; candidate for
+  `--output`/`-o` arg-scanning if FS-write granularity is ever tightened).
 - Cluster-8 follow-up batch (separate cleanup).
