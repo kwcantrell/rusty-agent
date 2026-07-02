@@ -198,6 +198,7 @@ impl EventSink for CollectingSink {
             AgentEvent::Context(ContextEvent::Evicted { messages, .. }) => {
                 format!("evicted:{messages}")
             }
+            AgentEvent::Context(ContextEvent::OverflowRecovery) => "overflow_recovery".into(),
             AgentEvent::SandboxDegraded { mechanism, .. } => {
                 format!("sandbox_degraded:{mechanism}")
             }

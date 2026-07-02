@@ -58,6 +58,8 @@ function describeContext(kind: string, detail: Record<string, unknown>): string 
       return `compacted ${detail.turns_replaced} turns: ${detail.tokens_before} → ${detail.tokens_after} tokens`;
     case "compaction_failed": return `compaction failed: ${detail.reason}`;
     case "evicted": return `evicted ${detail.messages} messages (~${detail.est_tokens} tokens)`;
+    case "overflow_recovery":
+      return "context overflow: compacted and retried";
     default: return kind;
   }
 }

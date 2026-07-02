@@ -196,7 +196,9 @@ fn body_is_overflow(body: &str) -> bool {
 
 impl ModelError {
     /// Classify for the retry loop. Overflow is checked before the 4xx-fatal
-    /// rule (overflow usually arrives as a 400).
+    /// rule (overflow usually arrives as a 400); `Status{400|413|422}`,
+    /// `Stream`, and `Process` bodies are all signature-checked — the
+    /// claude-cli backend surfaces overflow as `Process` stderr text.
     pub fn class(&self) -> ErrorClass {
         match self {
             ModelError::Status {
@@ -204,6 +206,7 @@ impl ModelError {
                 body,
             } if body_is_overflow(body) => ErrorClass::ContextOverflow,
             ModelError::Stream(body) if body_is_overflow(body) => ErrorClass::ContextOverflow,
+            ModelError::Process(body) if body_is_overflow(body) => ErrorClass::ContextOverflow,
             ModelError::Status {
                 code: 408 | 429 | 500..=599,
                 ..
@@ -374,5 +377,30 @@ mod tests {
             body: "context length exceeded".into(),
         };
         assert_eq!(e.class(), Fatal);
+    }
+
+    #[test]
+    fn overflow_is_detected_on_process_bodies() {
+        // claude-cli surfaces model errors as Process("claude exited (1): <stderr>").
+        for body in [
+            "claude exited (1): This model's maximum CONTEXT LENGTH is 8192 tokens",
+            "claude exited (1): your prompt is too long",
+        ] {
+            assert_eq!(
+                ModelError::Process(body.into()).class(),
+                ErrorClass::ContextOverflow,
+                "expected overflow for {body:?}"
+            );
+        }
+        // Conservative: near-miss stays Retryable.
+        assert_eq!(
+            ModelError::Process("claude exited (1): context deadline exceeded".into()).class(),
+            ErrorClass::Retryable
+        );
+        // Spawn-style bodies without signatures stay Retryable.
+        assert_eq!(
+            ModelError::Process("spawn claude: No such file or directory".into()).class(),
+            ErrorClass::Retryable
+        );
     }
 }

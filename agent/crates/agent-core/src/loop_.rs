@@ -16,8 +16,6 @@ use tokio_util::sync::CancellationToken;
 pub enum AgentError {
     #[error("model error after retries: {0}")]
     Model(String),
-    #[error("cancelled")]
-    Cancelled,
 }
 
 /// Default idle timeout for model-stream consumption. Generous enough to cover
@@ -347,6 +345,8 @@ impl AgentLoop {
                     Err(RetryFailure::Overflow(_)) if !overflow_recovered => {
                         overflow_recovered = true;
                         tracing::warn!("context overflow: forcing compaction and rebuilding once");
+                        self.sink
+                            .emit(AgentEvent::Context(crate::ContextEvent::OverflowRecovery));
                         ctx.request_compaction();
                         let deps = crate::MaintCtx {
                             model_limit: self.config.model_limit,
@@ -356,6 +356,14 @@ impl AgentLoop {
                         };
                         ctx.maintain(&deps).await;
                         let messages = ctx.build(self.config.model_limit);
+                        // The pre-request Usage is stale after compaction; re-emit so
+                        // every surface sees the rebuilt request's estimate (latest wins).
+                        self.sink.emit(AgentEvent::Usage {
+                            prompt_tokens: built_tokens(&messages),
+                            context_limit: self.config.model_limit,
+                            turn: turn + 1,
+                            max_turns: self.config.max_turns,
+                        });
                         base = self.completion_request(messages, preserve_thinking);
                     }
                     Err(RetryFailure::Overflow(msg)) => {
@@ -1544,7 +1552,7 @@ mod tests {
         assert!(usage_idx < done_idx);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn transport_error_then_success_via_retry() {
         let ws = std::env::temp_dir();
         let model = Arc::new(ScriptedModel::new(vec![
@@ -1573,6 +1581,46 @@ mod tests {
         );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_backoff_sleeps_grow_exponentially_in_situ() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Error,
+            Scripted::Error,
+            Scripted::Error,
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 3,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        let start = tokio::time::Instant::now();
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        // Paused clock: virtual elapsed is EXACTLY the loop's backoff sleeps —
+        // three failures -> backoff_delay(1..=3) = 100 + 200 + 400 ms. This pins
+        // that the LOOP sleeps the schedule, which the pure backoff_delay unit
+        // test cannot.
+        assert_eq!(start.elapsed(), std::time::Duration::from_millis(700));
         assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
     }
 
@@ -1620,7 +1668,7 @@ mod tests {
         assert_eq!(model.remaining(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rate_limit_429_is_retried_then_succeeds() {
         let ws = std::env::temp_dir();
         let model = Arc::new(ScriptedModel::new(vec![
@@ -1658,7 +1706,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn exhaustion_emits_done_error() {
         let ws = std::env::temp_dir();
         // All-retryable failures burn max_retries then abort WITH a Done.
@@ -3497,10 +3545,17 @@ mod tests {
         agent.run(&mut ctx, "go".into()).await.unwrap();
         assert_eq!(ctx.compaction_requests, 1);
         assert!(ctx.maintains >= 1);
-        assert_eq!(
-            sink.events.lock().unwrap().last().map(String::as_str),
-            Some("done")
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e == "overflow_recovery"),
+            "recovery must be observable as a context event: {events:?}"
         );
+        let usages: Vec<&String> = events.iter().filter(|e| e.starts_with("usage:")).collect();
+        assert!(
+            usages.len() >= 2,
+            "expected pre-request + post-rebuild Usage events: {events:?}"
+        );
+        assert_eq!(events.last().map(String::as_str), Some("done"));
     }
 
     #[tokio::test]
@@ -3547,5 +3602,49 @@ mod tests {
         let events = sink.events.lock().unwrap().clone();
         assert_eq!(events.last().map(String::as_str), Some("done"));
         assert!(events.iter().any(|k| k.starts_with("error")));
+    }
+
+    #[tokio::test]
+    async fn process_overflow_recovers_like_status_overflow() {
+        // claude-cli surfaces overflow as Process stderr text (no status code);
+        // recovery must fire exactly as it does for Status{400}.
+        let ws = std::env::temp_dir();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Process(
+                "claude exited (1): maximum context length exceeded".into(),
+            )),
+            Scripted::Text("recovered after compaction".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 0, // recovery must not consume retry budget
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = OverflowCtx {
+            history: vec![],
+            compaction_requests: 0,
+            maintains: 0,
+        };
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(ctx.compaction_requests, 1);
+        assert_eq!(
+            sink.events.lock().unwrap().last().map(String::as_str),
+            Some("done")
+        );
     }
 }
