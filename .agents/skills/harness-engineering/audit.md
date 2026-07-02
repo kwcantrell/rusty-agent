@@ -373,6 +373,35 @@ Usage assertion is `>= 2` without turn-parity pin; signatures scan the whole Pro
 (anchor to the CLI error prefix only if a real transient ever echoes an overflow phrase);
 Retry-After/jitter and server-usage-calibrated budgeting stay deferred.
 
+Re-stamp note (2026-07-01, sub-agent dispatch build): the deep audit's **missing capability #1**
+— sub-agent / decompose-and-delegate orchestration (Component 4's top build opportunity) — is now
+**BUILT and merged to `main`** (10 commits, `84050d9..0ab9b1c`, merge `af4dd14`; spec
+`docs/superpowers/specs/2026-07-01-subagent-dispatch-core-design.md`, sub-spec #1 of 3). A
+`dispatch_agent` tool (sub-agents-as-tools, per `build.md`'s patterns) in
+`agent-core/src/dispatch.rs` runs a nested `AgentLoop` per call: fresh `CuratedContext` with its
+own offload store/compact flag + child-bound context tools; child registry = a snapshot of the
+parent's tools taken **before** context-tool/dispatch registration (structural depth-1 no-recursion,
+plus an in-tool defense-in-depth skip); the child holds the parent's **exact**
+policy/approval/sandbox Arcs — a sub-agent is never more privileged than its parent, Ask prompts
+route to the parent's channel on both surfaces (pinned by tests). Guards: additive
+`Tool::timeout_override()` (dispatch runs under `subagent_timeout_secs`, default 600 s; the
+`execute_isolated` 2× backstop scales with it), child-token cancellation (parent cancel propagates;
+child self-cancel never travels up), child `max_turns = subagent_max_turns` (default 10),
+`subagents: false` disables registration. Observability v1 rides existing frames (old-SPA
+compatible, zero wire/web changes): `SubagentSink` forwards child ToolStart/ToolResult with
+`sub{n}:` ids + `sub:` name prefix and ServerUsage verbatim (cost truth), captures token text for
+the tool result (final-turn tail + `[sub-agent: N turns, M tool calls, stop: …]` footer), suppresses
+the rest. `TerminalApproval` prompts now serialize via an internal gate (parallel children).
+Accepted residuals (final whole-branch review, merge-clean): child tool calls/turns fold into
+session stats by design (D9-documented distortion); a dispatch wall-clock timeout drops a child
+mid-approval → bounded stale IPC prompt (joins the pre-existing approval-wait-vs-cancel residual);
+the `tools` allowlist arg rejects context-tool names the child implicitly has (model-facing error
+clarity, sub-spec #2); a timed-out `TerminalApproval` orphan thread can still race the next
+prompt's stdin read (documented in `approval.rs`). Sub-spec #2 (nested wire hierarchy, trace
+linkage, UI attribution, `ToolCtx.call_id`) and #3 (per-child model routing — first customer
+`run_compaction` — role prompts, depth>1, fan-out ergonomics) remain open backlog. **Missing
+capability #1 is closed; #2 (Examples context type) is the remaining absent capability.**
+
 ---
 
 **Finding 1 — Instructions: duplicated system prompt + skill files lack negative constraints**
