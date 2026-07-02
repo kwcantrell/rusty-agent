@@ -1,5 +1,5 @@
 use crate::EventSink;
-use agent_model::{Message, ModelClient};
+use agent_model::{Message, ModelClient, Role};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +27,90 @@ pub(crate) fn message_tokens(m: &Message) -> usize {
 /// using the same per-message estimate the window manager evicts against.
 pub fn built_tokens(messages: &[Message]) -> usize {
     messages.iter().map(message_tokens).sum()
+}
+
+/// Chronological turn-unit grouping: a message with non-empty `tool_calls`
+/// absorbs the consecutive `Role::Tool` messages that follow it; every other
+/// message is a singleton unit. Curation (eviction, compaction splits) must
+/// keep or drop a unit whole — a `Role::Tool` result serialized without its
+/// parent `tool_calls` message 400s on OpenAI-compatible servers.
+#[allow(dead_code)] // wired in by the next task
+pub(crate) fn turn_unit_ranges(history: &[Message]) -> Vec<std::ops::Range<usize>> {
+    let mut units = Vec::new();
+    let mut i = 0;
+    while i < history.len() {
+        let start = i;
+        let is_parent = history[i]
+            .tool_calls
+            .as_ref()
+            .is_some_and(|c| !c.is_empty());
+        i += 1;
+        if is_parent {
+            while i < history.len() && matches!(history[i].role, Role::Tool) {
+                i += 1;
+            }
+        }
+        units.push(start..i);
+    }
+    units
+}
+
+/// Index into `history` where the kept window begins for `budget`: walk turn
+/// units newest-first, keep whole units while they fit, always keeping at
+/// least the newest unit (even if it alone exceeds budget — the keep-≥1
+/// floor, unit-shaped).
+#[allow(dead_code)] // wired in by the next task
+pub(crate) fn evict_start(history: &[Message], budget: usize) -> usize {
+    let units = turn_unit_ranges(history);
+    let mut start = history.len();
+    let mut used = 0usize;
+    for r in units.iter().rev() {
+        let t: usize = history[r.clone()].iter().map(message_tokens).sum();
+        if used + t > budget && start < history.len() {
+            break;
+        }
+        used += t;
+        start = r.start;
+    }
+    start
+}
+
+/// Largest unit boundary `<= split`. Snapping only moves left (keeps more in
+/// the recent window), never right.
+#[allow(dead_code)] // wired in by the next task
+pub(crate) fn snap_split_to_unit_boundary(history: &[Message], split: usize) -> usize {
+    let mut boundary = 0;
+    for r in turn_unit_ranges(history) {
+        if r.end <= split {
+            boundary = r.end;
+        } else {
+            break;
+        }
+    }
+    boundary
+}
+
+/// Positions of `Role::Tool` messages whose `tool_call_id` is not covered by
+/// the nearest preceding assistant `tool_calls` block with only `Role::Tool`
+/// messages in between — the exact shape OpenAI-compatible servers reject.
+#[allow(dead_code)] // wired in by the next task
+pub(crate) fn orphaned_tool_positions(messages: &[Message]) -> Vec<usize> {
+    let mut orphans = Vec::new();
+    let mut live_ids: std::collections::HashSet<&str> = Default::default();
+    for (i, m) in messages.iter().enumerate() {
+        if matches!(m.role, Role::Tool) {
+            match m.tool_call_id.as_deref() {
+                Some(id) if live_ids.contains(id) => {}
+                _ => orphans.push(i),
+            }
+        } else {
+            live_ids.clear();
+            if let Some(calls) = &m.tool_calls {
+                live_ids.extend(calls.iter().map(|c| c.id.as_str()));
+            }
+        }
+    }
+    orphans
 }
 
 /// Default cap on the auto-retrieval recall block, in estimated tokens. Keeps
@@ -287,6 +371,121 @@ mod tests {
         assert!(matches!(built[0].role, Role::System));
         assert!(built[1].content.contains("pinned memory")); // recall survives
         assert!(built.len() < 51); // history evicted
+    }
+
+    fn parent(id: &str) -> Message {
+        Message::assistant(
+            "calling",
+            Some(vec![agent_tools::ToolCall {
+                id: id.into(),
+                name: "shell".into(),
+                args: serde_json::json!({}),
+            }]),
+        )
+    }
+    fn parent2(id1: &str, id2: &str) -> Message {
+        Message::assistant(
+            "calling two",
+            Some(vec![
+                agent_tools::ToolCall {
+                    id: id1.into(),
+                    name: "shell".into(),
+                    args: serde_json::json!({}),
+                },
+                agent_tools::ToolCall {
+                    id: id2.into(),
+                    name: "shell".into(),
+                    args: serde_json::json!({}),
+                },
+            ]),
+        )
+    }
+
+    #[test]
+    fn turn_units_group_parent_with_consecutive_tool_results() {
+        let h = vec![
+            Message::user("u0"), // unit 0..1
+            parent("c1"),        // unit 1..3
+            Message::tool("c1", "shell", "r1"),
+            Message::user("u1"), // unit 3..4
+        ];
+        assert_eq!(turn_unit_ranges(&h), vec![0..1, 1..3, 3..4]);
+    }
+
+    #[test]
+    fn turn_units_parallel_calls_are_one_unit() {
+        let h = vec![
+            parent2("c1", "c2"), // unit 0..3
+            Message::tool("c1", "shell", "r1"),
+            Message::tool("c2", "shell", "r2"),
+        ];
+        assert_eq!(turn_unit_ranges(&h), vec![0..3]);
+    }
+
+    #[test]
+    fn turn_units_stray_tool_is_a_singleton() {
+        // Defensive: a Role::Tool with no preceding parent must not panic or
+        // mis-attach; it stays a singleton unit.
+        let h = vec![Message::tool("cX", "shell", "stray"), Message::user("u")];
+        assert_eq!(turn_unit_ranges(&h), vec![0..1, 1..2]);
+        assert_eq!(turn_unit_ranges(&[]), Vec::<std::ops::Range<usize>>::new());
+    }
+
+    #[test]
+    fn evict_start_drops_whole_units_and_keeps_newest_even_over_budget() {
+        let h = vec![
+            Message::user("old message with padding padding padding"),
+            parent("c1"),
+            Message::tool("c1", "shell", &"x".repeat(200)),
+            Message::user("newest"),
+        ];
+        // Budget 0: only the newest unit survives (keep-≥1-unit floor).
+        assert_eq!(evict_start(&h, 0), 3);
+        // Huge budget: everything kept.
+        assert_eq!(evict_start(&h, 1_000_000), 0);
+        // Budget that fits "newest" + the tool unit but not the old user msg:
+        let tool_unit: usize = h[1..3].iter().map(message_tokens).sum();
+        let newest = message_tokens(&h[3]);
+        assert_eq!(evict_start(&h, tool_unit + newest), 1);
+        // One token short of the tool unit: the cut moves to the unit start,
+        // never inside it.
+        assert_eq!(evict_start(&h, tool_unit + newest - 1), 3);
+    }
+
+    #[test]
+    fn snap_split_moves_left_to_a_unit_boundary() {
+        let h = vec![
+            Message::user("u0"), // boundary at 1
+            parent("c1"),        // unit 1..4
+            Message::tool("c1", "shell", "r1"),
+            Message::tool("c1", "shell", "r2"),
+            Message::user("u1"), // boundary at 4, 5
+        ];
+        assert_eq!(snap_split_to_unit_boundary(&h, 4), 4); // exact boundary unchanged
+        assert_eq!(snap_split_to_unit_boundary(&h, 3), 1); // mid-unit snaps left
+        assert_eq!(snap_split_to_unit_boundary(&h, 2), 1);
+        assert_eq!(snap_split_to_unit_boundary(&h, 0), 0); // snap to zero
+        assert_eq!(snap_split_to_unit_boundary(&h, 5), 5);
+    }
+
+    #[test]
+    fn orphan_checker_flags_tool_without_live_parent() {
+        let clean = vec![parent("c1"), Message::tool("c1", "shell", "r")];
+        assert!(orphaned_tool_positions(&clean).is_empty());
+        // Parent evicted → orphan.
+        let torn = vec![Message::tool("c1", "shell", "r"), Message::user("u")];
+        assert_eq!(orphaned_tool_positions(&torn), vec![0]);
+        // A non-tool interloper breaks adjacency → later result is orphaned.
+        let interloped = vec![
+            parent("c1"),
+            Message::tool("c1", "shell", "r1"),
+            Message::user("interloper"),
+            Message::tool("c1", "shell", "r2"),
+        ];
+        assert_eq!(orphaned_tool_positions(&interloped), vec![3]);
+        // Wrong id → orphaned.
+        let wrong = vec![parent("c1"), Message::tool("c9", "shell", "r")];
+        assert_eq!(orphaned_tool_positions(&wrong), vec![1]);
     }
 
     #[test]
