@@ -280,6 +280,10 @@ fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
                 kind: "evicted",
                 detail: serde_json::json!({"messages": messages, "est_tokens": est_tokens}),
             },
+            ContextEvent::OverflowRecovery => TraceEvent::Context {
+                kind: "overflow_recovery",
+                detail: serde_json::json!({}),
+            },
         },
         AgentEvent::SandboxDegraded { mechanism, reason } => {
             TraceEvent::SandboxDegraded { mechanism, reason }

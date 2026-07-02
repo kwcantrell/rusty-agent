@@ -221,6 +221,7 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
                     "evicted",
                     serde_json::json!({"messages": messages, "est_tokens": est_tokens}),
                 ),
+                CE::OverflowRecovery => ("overflow_recovery", serde_json::json!({})),
             };
             ServerEvent::Context {
                 kind: kind.into(),
@@ -392,6 +393,7 @@ mod tests {
                 },
                 "compaction_failed",
             ),
+            (ContextEvent::OverflowRecovery, "overflow_recovery"),
         ] {
             let out = server_event_from(AgentEvent::Context(ev)).expect("must forward");
             let j = serde_json::to_value(&out).unwrap();

@@ -347,6 +347,8 @@ impl AgentLoop {
                     Err(RetryFailure::Overflow(_)) if !overflow_recovered => {
                         overflow_recovered = true;
                         tracing::warn!("context overflow: forcing compaction and rebuilding once");
+                        self.sink
+                            .emit(AgentEvent::Context(crate::ContextEvent::OverflowRecovery));
                         ctx.request_compaction();
                         let deps = crate::MaintCtx {
                             model_limit: self.config.model_limit,
@@ -356,6 +358,14 @@ impl AgentLoop {
                         };
                         ctx.maintain(&deps).await;
                         let messages = ctx.build(self.config.model_limit);
+                        // The pre-request Usage is stale after compaction; re-emit so
+                        // every surface sees the rebuilt request's estimate (latest wins).
+                        self.sink.emit(AgentEvent::Usage {
+                            prompt_tokens: built_tokens(&messages),
+                            context_limit: self.config.model_limit,
+                            turn: turn + 1,
+                            max_turns: self.config.max_turns,
+                        });
                         base = self.completion_request(messages, preserve_thinking);
                     }
                     Err(RetryFailure::Overflow(msg)) => {
@@ -3497,10 +3507,17 @@ mod tests {
         agent.run(&mut ctx, "go".into()).await.unwrap();
         assert_eq!(ctx.compaction_requests, 1);
         assert!(ctx.maintains >= 1);
-        assert_eq!(
-            sink.events.lock().unwrap().last().map(String::as_str),
-            Some("done")
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e == "overflow_recovery"),
+            "recovery must be observable as a context event: {events:?}"
         );
+        let usages: Vec<&String> = events.iter().filter(|e| e.starts_with("usage:")).collect();
+        assert!(
+            usages.len() >= 2,
+            "expected pre-request + post-rebuild Usage events: {events:?}"
+        );
+        assert_eq!(events.last().map(String::as_str), Some("done"));
     }
 
     #[tokio::test]

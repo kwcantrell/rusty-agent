@@ -124,6 +124,8 @@ impl EventSink for TerminalSink {
                     CE::CompactionFailed { reason } => format!("⚠ compaction failed: {reason}"),
                     CE::Evicted { messages, est_tokens } =>
                         format!("⟲ evicted {messages} messages (~{est_tokens} tokens)"),
+                    CE::OverflowRecovery =>
+                        "⟲ context overflow: compacted and retried".to_string(),
                 };
                 let _ = writeln!(out, "\x1b[2m{note}\x1b[0m");
             }

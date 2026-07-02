@@ -25,6 +25,11 @@ pub enum ContextEvent {
         messages: usize,
         est_tokens: usize,
     },
+    /// The model reported context overflow; the loop forced compaction and
+    /// rebuilt the request. Emitted BEFORE maintenance runs, so it fires even
+    /// when compaction no-ops (`Compacted`/`CompactionFailed` then narrate the
+    /// maintenance outcome).
+    OverflowRecovery,
 }
 
 /// Terminal status of one tool call — carried on every ToolResult so
