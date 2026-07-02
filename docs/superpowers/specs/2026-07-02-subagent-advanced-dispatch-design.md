@@ -74,15 +74,19 @@ budgets, attribution, and the no-recursion floor at max depth are untouched.
   Every `None` inherits the primary config's value, so `{"model": "haiku"}` on
   a claude-cli session or `{"base_url": "http://…:8081", "model": "qwen-mini"}`
   on an openai session both just work. Resolution + construction live in ONE
-  helper: `build_routed_model(cfg, &ModelRef, api_key) -> Arc<dyn ModelClient>`
-  (agent-runtime-config), delegating to `build_model` with merged values.
+  helper: `build_routed_model(cfg, &ModelRef, claude_binary, api_key) ->
+  Arc<dyn ModelClient>` (agent-runtime-config; `claude_binary` is a parameter
+  because it lives on the frontends, not `RuntimeConfig`), delegating to
+  `build_model` with merged values.
   Rejected: model-name-only override (can't reach a second local server);
   full second config block (duplicates unrelated knobs).
 - **G2 — Two config slots.** `RuntimeConfig.subagent_model: Option<ModelRef>`
   and `compaction_model: Option<ModelRef>` (serde default `None`, PartialConfig
   + merge arms, tests). `None` = primary model (today).
-- **G3 — api_key reaches assembly once.** `LoopParts` gains `api_key:
-  Option<String>` (doc: used only to construct routed clients; the primary
+- **G3 — routed-construction inputs reach assembly once.** `LoopParts` gains
+  `api_key: Option<String>` and `claude_binary: String` (both are
+  frontend-held today — the CLI flag / server state — and `RuntimeConfig`
+  carries neither; doc: used only to construct routed clients; the primary
   model stays caller-built). Both frontends already hold the key for their own
   `build_model` call. `assemble_loop` builds routed clients centrally — no
   per-frontend duplication. Rejected: frontends building routed clients
