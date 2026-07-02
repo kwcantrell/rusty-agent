@@ -20,6 +20,6 @@ pub struct DaemonParams {
     pub memory_parts: Option<agent_memory::MemoryParts>,
 }
 
-pub const SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided tools to inspect \
-and modify the workspace. Think step by step. When the task is complete, reply with a summary \
-and no tool call.";
+/// Re-export of the shared role prompt — single source of truth lives in
+/// `agent_runtime_config::prompts`.
+pub use agent_runtime_config::BASE_SYSTEM_PROMPT as SYSTEM_PROMPT;

@@ -5,7 +5,7 @@ use agent_core::CuratedContext;
 use agent_model::Message;
 use agent_runtime_config::{
     assemble_loop, backend_name_is_valid, build_memory_full, build_model, build_sandbox,
-    default_allowlist, default_denylist, LoopParts, RuntimeConfig,
+    default_allowlist, default_denylist, LoopParts, RuntimeConfig, BASE_SYSTEM_PROMPT,
 };
 use approval::TerminalApproval;
 use clap::Parser;
@@ -13,10 +13,6 @@ use render::TerminalSink;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::time::Duration;
-
-const BASE_SYSTEM_PROMPT: &str = "You are a local coding agent. Use the provided tools to \
-inspect and modify the workspace. Think step by step. When the task is complete, reply with a \
-summary and no tool call.";
 
 /// Map CLI flags to a complete `RuntimeConfig` so the loop is assembled the same
 /// way as the server (via `agent_runtime_config::assemble_loop`).

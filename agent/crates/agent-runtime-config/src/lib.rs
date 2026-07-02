@@ -7,6 +7,9 @@ pub use runtime_config::{ModelRef, RuntimeConfig, HARD_FLOOR_DENYLIST};
 mod assemble;
 pub use assemble::{assemble_loop, loop_config_from, BuiltLoop, LoopParts};
 
+pub mod prompts;
+pub use prompts::BASE_SYSTEM_PROMPT;
+
 pub mod trace;
 pub use trace::{build_trace, ObservedSink, TraceWriter};
 
