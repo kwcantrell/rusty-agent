@@ -28,6 +28,12 @@ pub struct RuntimeConfig {
     pub max_tool_result_bytes: usize,
     #[serde(default = "default_true")]
     pub memory: bool,
+    #[serde(default = "default_true")]
+    pub subagents: bool,
+    #[serde(default = "default_subagent_max_turns")]
+    pub subagent_max_turns: usize,
+    #[serde(default = "default_subagent_timeout_secs")]
+    pub subagent_timeout_secs: u64,
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -90,6 +96,9 @@ struct PartialRuntimeConfig {
     max_turns: Option<usize>,
     context_limit: Option<usize>,
     max_tool_result_bytes: Option<usize>,
+    subagents: Option<bool>,
+    subagent_max_turns: Option<usize>,
+    subagent_timeout_secs: Option<u64>,
     top_p: Option<f32>,
     top_k: Option<u32>,
     min_p: Option<f32>,
@@ -119,6 +128,12 @@ fn default_true() -> bool {
 }
 fn default_max_tool_result_bytes() -> usize {
     agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES
+}
+fn default_subagent_max_turns() -> usize {
+    10
+}
+fn default_subagent_timeout_secs() -> u64 {
+    600
 }
 fn default_sandbox_mode() -> String {
     "auto".into()
@@ -168,6 +183,9 @@ impl RuntimeConfig {
             context_limit,
             max_tool_result_bytes: default_max_tool_result_bytes(),
             memory: true,
+            subagents: true,
+            subagent_max_turns: default_subagent_max_turns(),
+            subagent_timeout_secs: default_subagent_timeout_secs(),
             top_p: None,
             top_k: None,
             min_p: None,
@@ -315,6 +333,15 @@ impl RuntimeConfig {
         }
         if let Some(v) = p.max_tool_result_bytes {
             self.max_tool_result_bytes = v;
+        }
+        if let Some(v) = p.subagents {
+            self.subagents = v;
+        }
+        if let Some(v) = p.subagent_max_turns {
+            self.subagent_max_turns = v;
+        }
+        if let Some(v) = p.subagent_timeout_secs {
+            self.subagent_timeout_secs = v;
         }
         if let Some(v) = p.top_p {
             self.top_p = Some(v);
@@ -474,6 +501,43 @@ mod tests {
         assert_eq!(loaded.max_tool_result_bytes, 4096); // file wins
         assert_eq!(loaded.model, b.model); // absent fields fall back to base
         assert_eq!(loaded.max_tokens, b.max_tokens);
+    }
+
+    #[test]
+    fn subagent_fields_default_and_survive_old_files() {
+        // from_launch defaults.
+        let c = base();
+        assert!(c.subagents);
+        assert_eq!(c.subagent_max_turns, 10);
+        assert_eq!(c.subagent_timeout_secs, 600);
+
+        // Old on-disk file without the fields -> defaults.
+        let mut v = serde_json::to_value(&c).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("subagents");
+        o.remove("subagent_max_turns");
+        o.remove("subagent_timeout_secs");
+        let parsed: RuntimeConfig = serde_json::from_value(v).unwrap();
+        assert!(parsed.subagents);
+        assert_eq!(parsed.subagent_max_turns, 10);
+        assert_eq!(parsed.subagent_timeout_secs, 600);
+    }
+
+    #[test]
+    fn subagent_fields_partial_file_overrides_only_those_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.json");
+        std::fs::write(
+            &path,
+            r#"{"subagents": false, "subagent_max_turns": 4, "subagent_timeout_secs": 30}"#,
+        )
+        .unwrap();
+        let b = base();
+        let loaded = RuntimeConfig::load_over(b.clone(), &path);
+        assert!(!loaded.subagents);
+        assert_eq!(loaded.subagent_max_turns, 4);
+        assert_eq!(loaded.subagent_timeout_secs, 30);
+        assert_eq!(loaded.model, b.model); // absent fields fall back to base
     }
 
     #[test]
