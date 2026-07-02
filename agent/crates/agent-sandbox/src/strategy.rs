@@ -4,9 +4,14 @@ use agent_tools::{
 };
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Hard deadline on the `docker version` probe: a wedged daemon (socket
+/// accepts, never responds) must not pin a worker indefinitely.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Availability {
@@ -20,6 +25,9 @@ pub struct DockerSandbox {
     /// Cached probe result. Written only by `resolve_availability` (auto-mode
     /// re-probe); read by `describe()` and `launch()`.
     available: RwLock<Availability>,
+    /// Single-flights the auto-mode re-probe: concurrent launches during a
+    /// degraded burst contend here instead of each probing independently.
+    probe_lock: Mutex<()>,
     /// Injectable so tests never need a Docker daemon. Defaults to `Self::probe`.
     prober: Box<dyn Fn() -> Availability + Send + Sync>,
 }
@@ -30,6 +38,7 @@ impl DockerSandbox {
             policy,
             uid_gid,
             available: RwLock::new(available),
+            probe_lock: Mutex::new(()),
             prober: Box::new(Self::probe),
         }
     }
@@ -48,6 +57,14 @@ impl DockerSandbox {
         let cached = self.available.read().unwrap().clone();
         match (&cached, self.policy.mode) {
             (Availability::Unavailable(_), Mode::Auto) => {
+                // Single-flight: only one launch probes at a time. Losers of
+                // the race block here briefly (bounded by PROBE_TIMEOUT), then
+                // the double-check below reads the winner's fresh result.
+                let _guard = self.probe_lock.lock().unwrap();
+                let recheck = self.available.read().unwrap().clone();
+                if recheck == Availability::Available {
+                    return recheck;
+                }
                 let fresh = (self.prober)();
                 *self.available.write().unwrap() = fresh.clone();
                 fresh
@@ -57,16 +74,43 @@ impl DockerSandbox {
     }
 
     /// Blocking availability probe; run once at startup before `new`.
+    /// Bounded by [`PROBE_TIMEOUT`] so a wedged daemon cannot hang the caller.
     pub fn probe() -> Availability {
-        match std::process::Command::new("docker")
-            .args(["version", "--format", "{{.Server.Version}}"])
+        let mut cmd = std::process::Command::new("docker");
+        cmd.args(["version", "--format", "{{.Server.Version}}"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(s) if s.success() => Availability::Available,
-            Ok(s) => Availability::Unavailable(format!("docker version exited {s}")),
-            Err(e) => Availability::Unavailable(e.to_string()),
+            .stderr(Stdio::null());
+        Self::wait_bounded(cmd, PROBE_TIMEOUT)
+    }
+
+    /// Run `cmd` to completion with a hard deadline: poll `try_wait` in a
+    /// short sleep loop; on deadline, kill + reap the child and report the
+    /// timeout as `Unavailable`. Std-only so the probe stays runnable outside
+    /// a tokio context.
+    fn wait_bounded(mut cmd: std::process::Command, timeout: Duration) -> Availability {
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return Availability::Unavailable(e.to_string()),
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(s)) if s.success() => return Availability::Available,
+                Ok(Some(s)) => {
+                    return Availability::Unavailable(format!("docker version exited {s}"))
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Availability::Unavailable(format!(
+                            "docker probe timed out after {timeout:?}"
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Availability::Unavailable(e.to_string()),
+            }
         }
     }
 
@@ -260,6 +304,76 @@ mod tests {
             count.load(AtomicOrdering::SeqCst),
             0,
             "enforce must not re-probe"
+        );
+    }
+
+    #[test]
+    fn wait_bounded_kills_a_wedged_probe_at_the_deadline() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 10"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let start = Instant::now();
+        let got = DockerSandbox::wait_bounded(cmd, Duration::from_millis(500));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "bounded wait must not ride out the child; took {elapsed:?}"
+        );
+        let Availability::Unavailable(msg) = got else {
+            panic!("a timed-out probe must report Unavailable");
+        };
+        assert!(msg.contains("timed out"), "must name the timeout: {msg}");
+    }
+
+    #[test]
+    fn wait_bounded_reports_fast_exits() {
+        let mut ok = std::process::Command::new("sh");
+        ok.args(["-c", "true"]);
+        assert_eq!(
+            DockerSandbox::wait_bounded(ok, Duration::from_secs(2)),
+            Availability::Available
+        );
+        let mut bad = std::process::Command::new("sh");
+        bad.args(["-c", "exit 3"]);
+        assert!(matches!(
+            DockerSandbox::wait_bounded(bad, Duration::from_secs(2)),
+            Availability::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn concurrent_launches_single_flight_the_reprobe() {
+        // Four threads race resolve_availability() against a cached-unavailable
+        // state. The prober flips the cache to Available (after a short sleep so
+        // the others are very likely in-flight). Whatever the interleaving, the
+        // structure guarantees exactly one probe: latecomers see Available at the
+        // top-of-function read, and race losers see it at the double-check under
+        // the probe lock. count == 1 is therefore a deterministic assertion.
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let sb = DockerSandbox::new(
+            policy(Mode::Auto),
+            "1000:1000".into(),
+            Availability::Unavailable("no daemon".into()),
+        )
+        .with_prober(move || {
+            c.fetch_add(1, AtomicOrdering::SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            Availability::Available
+        });
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| s.spawn(|| sb.resolve_availability()))
+                .collect();
+            for h in handles {
+                assert_eq!(h.join().unwrap(), Availability::Available);
+            }
+        });
+        assert_eq!(
+            count.load(AtomicOrdering::SeqCst),
+            1,
+            "exactly one caller may probe; the rest must read the fresh cache"
         );
     }
 
