@@ -127,6 +127,8 @@ async fn auto_retrieval_feeds_a_seeded_fact_to_the_real_model() {
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
             trace: None,
+            api_key: None,
+            claude_binary: "claude".into(),
         },
     );
     let mut ctx =
@@ -190,6 +192,8 @@ async fn memory_off_suppresses_recall() {
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
             trace: None,
+            api_key: None,
+            claude_binary: "claude".into(),
         },
     );
     let mut ctx =
@@ -250,6 +254,8 @@ async fn assemble_loop_drives_a_real_tool_call() {
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
             trace: None,
+            api_key: None,
+            claude_binary: "claude".into(),
         },
     );
     let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()));

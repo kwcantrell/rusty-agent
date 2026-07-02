@@ -191,7 +191,7 @@ async fn main() {
         &cli.base_url,
         &cli.model,
         &cli.claude_binary,
-        api_key,
+        api_key.clone(),
     );
     // claude-cli is a pure text generator; tool calls must come via the prompted protocol.
     let protocol_name = if cli.backend == "claude-cli" {
@@ -254,6 +254,8 @@ async fn main() {
             compact_flag: compact_flag.clone(),
             stats: stats.clone(),
             trace,
+            api_key: api_key.clone(),
+            claude_binary: cli.claude_binary.clone(),
         },
     );
     if !built.unknown_presets.is_empty() {

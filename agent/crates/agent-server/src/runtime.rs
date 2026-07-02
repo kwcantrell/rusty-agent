@@ -228,6 +228,8 @@ fn build_loop(
             compact_flag: compact_flag.clone(),
             stats: stats.clone(),
             trace: trace.clone(),
+            api_key: api_key.clone(),
+            claude_binary: claude_binary.to_string(),
         },
     )
 }

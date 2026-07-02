@@ -36,6 +36,10 @@ pub struct LoopParts {
     /// ONCE per frontend lifetime (`TraceWriter::create` mints a `{epoch}-{pid}`
     /// session id, so per-assemble writers would interleave into one file).
     pub trace: Option<Arc<crate::trace::TraceWriter>>,
+    /// Inputs for constructing ROUTED model clients (spec G3). The primary
+    /// model stays caller-built; both values are frontend-held today.
+    pub api_key: Option<String>,
+    pub claude_binary: String,
 }
 
 /// Result of assembling a loop: the loop itself, the composed system prompt, and
@@ -54,6 +58,13 @@ pub struct BuiltLoop {
     /// excludes context tools + dispatch itself" invariant.
     #[cfg(test)]
     pub dispatch_base_names: Option<Vec<String>>,
+    /// Did the subagent model route to a distinct client from the primary?
+    /// `None` when subagents are disabled (mirrors `dispatch_base_names`).
+    #[cfg(test)]
+    pub subagent_model_routed: Option<bool>,
+    /// Did a dedicated compaction model get built and applied?
+    #[cfg(test)]
+    pub compaction_model_routed: bool,
 }
 
 /// The single RuntimeConfig → LoopConfig mapping. Constants that are identical on
@@ -155,19 +166,41 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
 
     let loop_config = loop_config_from(cfg, parts.workspace.clone(), parts.stream_idle_timeout);
 
+    // Dedicated compaction model (spec G3): routed into both the parent loop and
+    // child loops. None inherits the primary model at every read-site.
+    let compaction_model = cfg
+        .compaction_model
+        .as_ref()
+        .map(|r| crate::build_routed_model(cfg, r, &parts.claude_binary, parts.api_key.clone()));
+    #[cfg(test)]
+    let compaction_model_routed = compaction_model.is_some();
+
     // Sub-agent dispatch: capture the child-base names before the snapshot is moved
     // into the tool, then register `dispatch_agent` iff subagents are enabled.
     #[cfg(test)]
     let dispatch_base_names: Option<Vec<String>> = child_base
         .as_ref()
         .map(|b| b.iter().map(|t| t.name().to_string()).collect());
+    #[cfg(test)]
+    let mut subagent_model_routed: Option<bool> = None;
     if let Some(child_base) = child_base {
+        let (child_model, child_protocol) = match &cfg.subagent_model {
+            Some(r) => (
+                crate::build_routed_model(cfg, r, &parts.claude_binary, parts.api_key.clone()),
+                pick_protocol(r.protocol.as_deref().unwrap_or(&cfg.protocol)),
+            ),
+            None => (parts.model.clone(), pick_protocol(&cfg.protocol)),
+        };
+        #[cfg(test)]
+        {
+            subagent_model_routed = Some(!Arc::ptr_eq(&child_model, &parts.model));
+        }
         let mut child_config = loop_config.clone();
         child_config.max_turns = cfg.subagent_max_turns;
         registry.register(Arc::new(agent_core::DispatchAgentTool::new(
             agent_core::DispatchDeps {
-                model: parts.model.clone(),
-                protocol: pick_protocol(&cfg.protocol),
+                model: child_model,
+                protocol: child_protocol,
                 policy: policy.clone(),
                 approval: parts.approval.clone(),
                 sink: sink.clone(),
@@ -182,10 +215,9 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 loop_config: child_config,
                 max_result_bytes: cfg.max_tool_result_bytes,
                 subagent_timeout: Duration::from_secs(cfg.subagent_timeout_secs),
-                // Task 5 wires cfg values (compaction_model / subagent_max_depth).
-                compaction_model: None,
+                compaction_model: compaction_model.clone(),
                 depth: 1,
-                max_depth: 1,
+                max_depth: cfg.subagent_max_depth.max(1),
                 id_prefix: String::new(),
             },
         )));
@@ -209,6 +241,10 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         (true, Some(r)) => agent.with_retriever(r.clone()),
         _ => agent,
     };
+    let agent = match &compaction_model {
+        Some(m) => agent.with_compaction_model(m.clone()),
+        None => agent,
+    };
 
     BuiltLoop {
         loop_: Arc::new(agent),
@@ -220,6 +256,10 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         schemas,
         #[cfg(test)]
         dispatch_base_names,
+        #[cfg(test)]
+        subagent_model_routed,
+        #[cfg(test)]
+        compaction_model_routed,
     }
 }
 
@@ -303,6 +343,8 @@ mod tests {
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
             trace: None,
+            api_key: None,
+            claude_binary: "claude".into(),
         }
     }
 
@@ -420,6 +462,41 @@ mod tests {
         assert!(lc.preserve_thinking);
         assert!((lc.temperature - 0.7).abs() < 1e-6);
         assert!(!lc.sandbox.describe().mechanism.is_empty());
+    }
+
+    #[test]
+    fn routed_models_default_to_the_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        assert_eq!(built.subagent_model_routed, Some(false));
+        assert!(!built.compaction_model_routed);
+    }
+
+    #[test]
+    fn routed_models_are_distinct_clients_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.subagent_model = Some(crate::ModelRef {
+            model: Some("mini".into()),
+            ..Default::default()
+        });
+        c.compaction_model = Some(crate::ModelRef {
+            model: Some("tiny".into()),
+            ..Default::default()
+        });
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        assert_eq!(built.subagent_model_routed, Some(true));
+        assert!(built.compaction_model_routed);
+    }
+
+    #[test]
+    fn depth_zero_is_clamped_to_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.subagent_max_depth = 0;
+        // Assembles fine; the clamp is a read-site rule (no panic, tool registered).
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        assert!(built.registered_names.iter().any(|n| n == "dispatch_agent"));
     }
 
     #[test]
