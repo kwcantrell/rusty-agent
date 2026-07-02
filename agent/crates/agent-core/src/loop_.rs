@@ -106,6 +106,7 @@ pub struct AgentLoop {
     sink: Arc<dyn EventSink>,
     config: LoopConfig,
     retriever: Option<Arc<dyn Retriever>>,
+    compaction_model: Option<Arc<dyn ModelClient>>,
 }
 
 impl AgentLoop {
@@ -128,6 +129,7 @@ impl AgentLoop {
             sink,
             config,
             retriever: None,
+            compaction_model: None,
         }
     }
 
@@ -141,6 +143,18 @@ impl AgentLoop {
     pub fn with_retriever(mut self, retriever: Arc<dyn Retriever>) -> Self {
         self.retriever = Some(retriever);
         self
+    }
+
+    /// Route context compaction to a (typically cheaper) dedicated model
+    /// (spec 2026-07-02 sub-spec #3, G4). None = the session model.
+    pub fn with_compaction_model(mut self, model: Arc<dyn ModelClient>) -> Self {
+        self.compaction_model = Some(model);
+        self
+    }
+
+    /// The model that serves maintenance (compaction) completions.
+    fn maint_model(&self) -> &Arc<dyn ModelClient> {
+        self.compaction_model.as_ref().unwrap_or(&self.model)
     }
 
     /// Drive one streamed completion to an `AssistantTurn`, emitting tokens as they arrive.
@@ -351,7 +365,7 @@ impl AgentLoop {
                         ctx.request_compaction();
                         let deps = crate::MaintCtx {
                             model_limit: self.config.model_limit,
-                            model: &self.model,
+                            model: self.maint_model(),
                             sink: &self.sink,
                             cancel: &cancel,
                         };
@@ -593,7 +607,7 @@ impl AgentLoop {
 
             let deps = crate::MaintCtx {
                 model_limit: self.config.model_limit,
-                model: &self.model,
+                model: self.maint_model(),
                 sink: &self.sink,
                 cancel: &cancel,
             };

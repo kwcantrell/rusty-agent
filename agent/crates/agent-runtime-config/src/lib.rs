@@ -2,7 +2,7 @@
 //! used by both the CLI (`agent-cli`) and the daemon (`agent-server`).
 
 mod runtime_config;
-pub use runtime_config::{RuntimeConfig, HARD_FLOOR_DENYLIST};
+pub use runtime_config::{ModelRef, RuntimeConfig, HARD_FLOOR_DENYLIST};
 
 mod assemble;
 pub use assemble::{assemble_loop, loop_config_from, BuiltLoop, LoopParts};
@@ -87,6 +87,18 @@ pub fn build_model(
             api_key,
         )),
     }
+}
+
+/// Build a routed model client from a partial `ModelRef`, inheriting every
+/// unset field from the primary config (spec G1).
+pub fn build_routed_model(
+    cfg: &RuntimeConfig,
+    r: &ModelRef,
+    claude_binary: &str,
+    api_key: Option<String>,
+) -> Arc<dyn ModelClient> {
+    let (backend, base_url, model, bin) = r.resolve(cfg, claude_binary);
+    build_model(&backend, &base_url, &model, &bin, api_key)
 }
 
 pub fn build_registry(http_allow_hosts: &[String]) -> ToolRegistry {
@@ -332,7 +344,40 @@ fn dirs_home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_config::RuntimeConfig;
+    use crate::runtime_config::{ModelRef, RuntimeConfig};
+
+    #[test]
+    fn build_routed_model_inherits_primary_for_none_fields() {
+        let cfg = RuntimeConfig::from_launch(
+            "claude-cli".into(),
+            "http://x".into(),
+            "opus".into(),
+            "native".into(),
+            8192,
+        );
+        // model-only override on the primary backend: constructs a claude-cli client.
+        let r = ModelRef {
+            model: Some("haiku".into()),
+            ..ModelRef::default()
+        };
+        let _m = build_routed_model(&cfg, &r, "claude", None);
+        // backend override to openai: constructs without touching claude_binary.
+        let r2 = ModelRef {
+            backend: Some("openai".into()),
+            base_url: Some("http://127.0.0.1:1".into()),
+            model: Some("qwen-mini".into()),
+            ..ModelRef::default()
+        };
+        let _m2 = build_routed_model(&cfg, &r2, "claude", None);
+        // Construction is the contract here (build_model is already the tested seam);
+        // resolution correctness is pinned by resolve() below.
+        let (be, url, model, bin) = r2.resolve(&cfg, "claude");
+        assert_eq!((be.as_str(), model.as_str()), ("openai", "qwen-mini"));
+        assert_eq!(url, "http://127.0.0.1:1");
+        assert_eq!(bin, "claude");
+        let (be1, _, model1, _) = r.resolve(&cfg, "claude");
+        assert_eq!((be1.as_str(), model1.as_str()), ("claude-cli", "haiku"));
+    }
 
     fn base_cfg() -> RuntimeConfig {
         RuntimeConfig::from_launch(

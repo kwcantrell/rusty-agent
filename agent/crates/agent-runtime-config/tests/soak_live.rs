@@ -249,6 +249,8 @@ async fn soak_all_components_live() {
             compact_flag: flag.clone(),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
             trace: None,
+            api_key: None,
+            claude_binary: "claude".into(),
         },
     );
     let agent = built.loop_;

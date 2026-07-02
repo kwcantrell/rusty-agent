@@ -48,6 +48,16 @@ impl EventSink for FullSink {
                 String::new(),
                 String::new(),
             ),
+            AgentEvent::ServerUsage {
+                prompt_tokens,
+                parent_id,
+                ..
+            } => (
+                "server_usage".to_string(),
+                prompt_tokens.to_string(),
+                String::new(),
+                parent_id.unwrap_or_default(),
+            ),
             _ => return,
         };
         self.events.lock().unwrap().push(t);
@@ -88,6 +98,40 @@ impl Tool for Echo {
     }
 }
 
+/// A second child-visible tool, used to pin transitive allowlist scoping.
+struct Echo2;
+#[async_trait::async_trait]
+impl Tool for Echo2 {
+    fn name(&self) -> &str {
+        "echo2"
+    }
+    fn description(&self) -> &str {
+        "echo2"
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "echo2".into(),
+            description: "echo2".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+    fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+        Ok(ToolIntent {
+            tool: "echo2".into(),
+            access: Access::Read,
+            paths: vec![],
+            command: None,
+            summary: "echo2".into(),
+        })
+    }
+    async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            content: "echoed2".into(),
+            display: None,
+        })
+    }
+}
+
 fn workspace() -> PathBuf {
     std::env::temp_dir()
 }
@@ -122,6 +166,10 @@ fn deps(model: ScriptedModel, sink: Arc<dyn EventSink>, base: Vec<Arc<dyn Tool>>
         loop_config: child_config(ws),
         max_result_bytes: 16 * 1024,
         subagent_timeout: Duration::from_secs(600),
+        compaction_model: None,
+        depth: 1,
+        max_depth: 1,
+        id_prefix: String::new(),
     }
 }
 
@@ -681,6 +729,94 @@ async fn parent_cancel_mid_run_resolves_to_cancelled_promptly() {
     );
 }
 
+/// Records every CompletionRequest's system message, then delegates to a script.
+struct CapturingModel {
+    inner: ScriptedModel,
+    systems: Mutex<Vec<String>>,
+}
+#[async_trait::async_trait]
+impl agent_model::ModelClient for CapturingModel {
+    async fn stream(
+        &self,
+        req: agent_model::CompletionRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<agent_model::Chunk, agent_model::ModelError>>,
+        agent_model::ModelError,
+    > {
+        if let Some(m) = req.messages.first() {
+            self.systems.lock().unwrap().push(m.content.clone());
+        }
+        self.inner.stream(req).await
+    }
+}
+
+#[tokio::test]
+async fn role_arg_lands_in_the_child_system_prompt() {
+    let model = Arc::new(CapturingModel {
+        inner: ScriptedModel::new(vec![Scripted::Text("ok".into())]),
+        systems: Mutex::new(vec![]),
+    });
+    let mut d = deps(
+        ScriptedModel::new(vec![]),
+        Arc::new(FullSink::default()),
+        vec![],
+    );
+    d.model = model.clone();
+    let tool = DispatchAgentTool::new(d);
+    tool.execute(
+        serde_json::json!({"prompt": "p", "role": "You are a meticulous code reviewer."}),
+        &tool_ctx(),
+    )
+    .await
+    .unwrap();
+    let systems = model.systems.lock().unwrap().clone();
+    assert!(
+        systems[0].contains("Role: You are a meticulous code reviewer."),
+        "{systems:?}"
+    );
+}
+
+#[tokio::test]
+async fn role_is_optional_and_bounded() {
+    let mk = || {
+        DispatchAgentTool::new(deps(
+            ScriptedModel::new(vec![Scripted::Text("ok".into())]),
+            Arc::new(FullSink::default()),
+            vec![],
+        ))
+    };
+    // Absent role: fine (no Role block asserted via the capturing test above).
+    mk().execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+    // Whitespace-only role: treated as absent (no error).
+    mk().execute(
+        serde_json::json!({"prompt": "p", "role": "   "}),
+        &tool_ctx(),
+    )
+    .await
+    .unwrap();
+    // Over 2000 chars: InvalidArgs.
+    let long = "r".repeat(2001);
+    let err = mk()
+        .execute(
+            serde_json::json!({"prompt": "p", "role": long}),
+            &tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ToolError::InvalidArgs(ref m) if m.contains("role")),
+        "{err:?}"
+    );
+    // Non-string role: InvalidArgs.
+    let err = mk()
+        .execute(serde_json::json!({"prompt": "p", "role": 7}), &tool_ctx())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+}
+
 #[tokio::test]
 async fn parallel_dispatches_get_distinct_ordinals_and_both_complete() {
     let sink = Arc::new(FullSink::default());
@@ -714,4 +850,269 @@ async fn parallel_dispatches_get_distinct_ordinals_and_both_complete() {
         .collect();
     assert_eq!(ids.len(), 2, "{ids:?}");
     assert_ne!(ids[0], ids[1], "{ids:?}");
+}
+
+#[tokio::test]
+async fn depth_two_child_can_dispatch_and_grandchild_attribution_chains() {
+    let sink = Arc::new(FullSink::default());
+    // Child model: dispatches a grandchild, then answers.
+    // Grandchild model comes from the SAME deps.model (scripted queue): its turn
+    // is the "gc done" text. Order: child turn1 -> grandchild turn -> child turn2.
+    let tap = Arc::new(TapSpy::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"nested task"}"#.into(),
+            ),
+            Scripted::Text("gc done".into()), // consumed by the GRANDCHILD loop
+            Scripted::Text("child done".into()), // child's final answer
+        ]),
+        sink.clone(),
+        vec![],
+    );
+    d.max_depth = 2;
+    d.child_trace = Some(tap.clone());
+    let tool = DispatchAgentTool::new(d);
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+    assert!(out.content.starts_with("child done"), "{}", out.content);
+
+    let events = sink.events.lock().unwrap().clone();
+    // The child's dispatch call is visible as sub{n}:c1 with parent "d1";
+    // the grandchild's? there are no grandchild TOOL calls here, so the pin is:
+    // the child-level dispatch_agent tool_start row itself chains to d1...
+    let child_dispatch_start = events
+        .iter()
+        .find(|(k, _, name, _)| k == "tool_start" && name == "sub:dispatch_agent")
+        .expect("child dispatch row forwarded");
+    assert_eq!(child_dispatch_start.3, "d1");
+    // ...and the grandchild's ServerUsage carries parent_id == the child's VISIBLE id.
+    let child_visible_id = child_dispatch_start.1.clone(); // "sub{n}:c1"
+    assert!(child_visible_id.ends_with(":c1"), "{child_visible_id}");
+    // Concrete grandchild pin: the grandchild's ServerUsage specifically carries
+    // the child's visible id as its parent_id (kind-constrained so a stray
+    // forward can't satisfy the pin).
+    assert!(
+        events
+            .iter()
+            .any(|(kind, _, _, parent)| kind == "server_usage" && parent == &child_visible_id),
+        "no server_usage chained to the child's visible id {child_visible_id}: {events:?}"
+    );
+    // Tap pin (spec Testing): grandchild suppressed events reach the tap with
+    // the prefixed parent id.
+    let tap_parents = tap.seen.lock().unwrap().clone();
+    assert!(
+        tap_parents.iter().any(|(_, p, _)| p == &child_visible_id),
+        "no tap record chained to {child_visible_id}: {tap_parents:?}"
+    );
+}
+
+/// Local tap spy (SubagentTrace is pub): records (ordinal, parent_id, kind).
+#[derive(Default)]
+struct TapSpy {
+    seen: Mutex<Vec<(u64, String, &'static str)>>,
+}
+impl agent_core::SubagentTrace for TapSpy {
+    fn record(&self, n: u64, parent_id: &str, event: &agent_core::AgentEvent) {
+        let kind = match event {
+            agent_core::AgentEvent::Token(_) => "token",
+            agent_core::AgentEvent::Done(_) => "done",
+            _ => "other",
+        };
+        self.seen
+            .lock()
+            .unwrap()
+            .push((n, parent_id.to_string(), kind));
+    }
+}
+
+#[tokio::test]
+async fn depth_two_is_the_floor_for_the_grandchild() {
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            // Child dispatches grandchild; grandchild TRIES to dispatch (rejected: unknown tool).
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"nested"}"#.into(),
+            ),
+            Scripted::Call(
+                "g1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"三"}"#.into(),
+            ),
+            Scripted::Text("gc done".into()),
+            Scripted::Text("child done".into()),
+        ]),
+        sink.clone(),
+        vec![],
+    );
+    d.max_depth = 2;
+    let tool = DispatchAgentTool::new(d);
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+    assert!(out.content.starts_with("child done"), "{}", out.content);
+    let events = sink.events.lock().unwrap().clone();
+    // The grandchild's dispatch attempt is a denied tool_result at depth 3, and
+    // the denied row is specifically the grandchild's own g1 call (its visible id
+    // ends with the grandchild's child-side call id ":g1").
+    assert!(
+        events.iter().any(|(k, id, n, _)| k == "tool_result:denied"
+            && n == "sub:dispatch_agent"
+            && id.ends_with(":g1")),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn default_depth_one_matches_v1_no_recursion() {
+    // deps() defaults max_depth = 1: the existing child_cannot_recurse_into_dispatch_agent
+    // test already pins this; this test pins the DEFAULT deps value explicitly.
+    let d = deps(
+        ScriptedModel::new(vec![]),
+        Arc::new(FullSink::default()),
+        vec![],
+    );
+    assert_eq!((d.depth, d.max_depth), (1, 1));
+}
+
+#[tokio::test]
+async fn allowlist_without_dispatch_agent_denies_child_dispatch_at_depth_two() {
+    // I-1 (i): depth allows nesting (max_depth 2), but the allowlist does NOT
+    // name dispatch_agent → the nested tool is not registered, so the child's
+    // dispatch attempt is denied as an unknown tool.
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"nested"}"#.into(),
+            ),
+            Scripted::Text("child done".into()),
+        ]),
+        sink.clone(),
+        vec![Arc::new(Echo)],
+    );
+    d.max_depth = 2;
+    let tool = DispatchAgentTool::new(d);
+    let out = tool
+        .execute(
+            serde_json::json!({"prompt": "p", "tools": ["echo"]}),
+            &tool_ctx(),
+        )
+        .await
+        .unwrap();
+    assert!(out.content.starts_with("child done"), "{}", out.content);
+    let events = sink.events.lock().unwrap().clone();
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n, _)| k == "tool_result:denied" && n == "sub:dispatch_agent"),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn allowlist_with_dispatch_agent_nests_and_scopes_grandchild_transitively() {
+    // I-1 (ii): allowlist ["echo","dispatch_agent"] at max_depth 2 → the child
+    // dispatches a grandchild successfully, and the grandchild inherits the
+    // FILTERED base (echo only): calling echo works, calling the non-allowlisted
+    // echo2 is denied (transitive scope pin).
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            // child turn1: dispatch a grandchild
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"nested"}"#.into(),
+            ),
+            // grandchild turn1: echo (allowlisted → ok)
+            Scripted::Call("g1".into(), "echo".into(), "{}".into()),
+            // grandchild turn2: echo2 (NOT in the filtered base → denied)
+            Scripted::Call("g2".into(), "echo2".into(), "{}".into()),
+            // grandchild turn3: answer
+            Scripted::Text("gc done".into()),
+            // child turn2: answer
+            Scripted::Text("child done".into()),
+        ]),
+        sink.clone(),
+        vec![Arc::new(Echo), Arc::new(Echo2)],
+    );
+    d.max_depth = 2;
+    let tool = DispatchAgentTool::new(d);
+    let out = tool
+        .execute(
+            serde_json::json!({"prompt": "p", "tools": ["echo", "dispatch_agent"]}),
+            &tool_ctx(),
+        )
+        .await
+        .unwrap();
+    assert!(out.content.starts_with("child done"), "{}", out.content);
+    let events = sink.events.lock().unwrap().clone();
+    // Child dispatched the grandchild successfully.
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n, _)| k == "tool_result:ok" && n == "sub:dispatch_agent"),
+        "{events:?}"
+    );
+    // Grandchild's echo (allowlisted) worked.
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n, _)| k == "tool_result:ok" && n == "sub:echo"),
+        "{events:?}"
+    );
+    // Grandchild's echo2 (NOT in the transitively-filtered base) was denied.
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n, _)| k == "tool_result:denied" && n == "sub:echo2"),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn allowlist_naming_dispatch_agent_at_depth_floor_is_invalid_args() {
+    // I-1 (iii): at the depth floor (deps() default max_depth 1 == depth 1)
+    // dispatch_agent is unknown, so naming it in the allowlist is InvalidArgs.
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![Scripted::Text("x".into())]),
+        Arc::new(FullSink::default()),
+        vec![Arc::new(Echo)],
+    ));
+    let err = tool
+        .execute(
+            serde_json::json!({"prompt": "p", "tools": ["dispatch_agent"]}),
+            &tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ToolError::InvalidArgs(ref m) if m.contains("dispatch_agent")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn description_mentions_concurrent_fanout() {
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![]),
+        Arc::new(FullSink::default()),
+        vec![],
+    ));
+    assert!(
+        tool.description().contains("concurrently"),
+        "{}",
+        tool.description()
+    );
 }

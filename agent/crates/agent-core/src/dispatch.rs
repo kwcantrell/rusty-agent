@@ -17,6 +17,9 @@ agent to complete one self-contained task. Work autonomously: no one can answer 
 questions. Your final message is returned verbatim to the parent as the task \
 result, so end with a complete, standalone answer.";
 
+/// Upper bound on the `role` arg (system-prompt injection; spec G6).
+pub const MAX_ROLE_CHARS: usize = 2000;
+
 static DISPATCH_ORDINAL: AtomicU64 = AtomicU64::new(1);
 
 /// Process-wide dispatch ordinal: keeps forwarded child event ids unique across
@@ -179,6 +182,7 @@ impl EventSink for SubagentSink {
 }
 
 /// Everything `DispatchAgentTool` needs to spawn a child `AgentLoop`.
+#[derive(Clone)]
 pub struct DispatchDeps {
     pub model: Arc<dyn ModelClient>,
     pub protocol: Arc<dyn ToolCallProtocol>,
@@ -197,6 +201,16 @@ pub struct DispatchDeps {
     pub loop_config: LoopConfig,
     pub max_result_bytes: usize,
     pub subagent_timeout: std::time::Duration,
+    /// Dedicated compaction model routed into child loops too; None = use `model`.
+    pub compaction_model: Option<Arc<dyn ModelClient>>,
+    /// This tool's depth; top-level = 1 (spec G7).
+    pub depth: usize,
+    /// From `cfg.subagent_max_depth` (assembly clamps >= 1); a child may dispatch
+    /// only while `depth < max_depth` (spec G7).
+    pub max_depth: usize,
+    /// "" at top level; "sub{n}:" for a nested tool so a grandchild's parent_id
+    /// is the child row's on-wire visible id (spec G8).
+    pub id_prefix: String,
 }
 
 pub struct DispatchAgentTool {
@@ -220,7 +234,8 @@ impl Tool for DispatchAgentTool {
          tools as you (minus dispatch_agent itself), works autonomously on the \
          prompt you give it, and its final answer is returned as this tool's \
          result. Make the prompt self-contained: the sub-agent cannot see this \
-         conversation."
+         conversation. You may dispatch several sub-agents in one message by \
+         issuing multiple dispatch_agent calls — they run concurrently."
     }
     fn when_not_to_call(&self) -> Option<&str> {
         Some(
@@ -244,7 +259,11 @@ impl Tool for DispatchAgentTool {
                     "tools": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tools (context_recall, context_compact) are always available."
+                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tools (context_recall, context_compact) are always available. Include dispatch_agent to let the sub-agent dispatch its own (only meaningful when nesting depth allows); the restriction applies transitively to its children."
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Optional persona/role instructions injected into the sub-agent's system prompt (stronger steering than putting them in the prompt). Max 2000 characters."
                     }
                 },
                 "required": ["prompt"]
@@ -285,6 +304,22 @@ impl Tool for DispatchAgentTool {
             .filter(|p| !p.trim().is_empty())
             .ok_or_else(|| ToolError::InvalidArgs("prompt (non-empty string) is required".into()))?
             .to_string();
+        let role: Option<String> = match args.get("role") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else if s.chars().count() > MAX_ROLE_CHARS {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "role must be at most {MAX_ROLE_CHARS} characters"
+                    )));
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Some(_) => return Err(ToolError::InvalidArgs("role must be a string".into())),
+        };
         let allow: Option<Vec<String>> = match args.get("tools") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::Array(a)) => Some(
@@ -303,10 +338,19 @@ impl Tool for DispatchAgentTool {
             }
         };
         const IMPLICIT_CHILD_TOOLS: [&str; 2] = ["context_recall", "context_compact"];
+        // "dispatch_agent" is a valid allowlist name ONLY while the child could
+        // itself dispatch (depth < max_depth). At the depth floor it is unknown
+        // — naming it there is an error, keeping the allowlist contract coherent
+        // and transitive (spec G7, I-1 resolution).
+        let nested_allowed = self.deps.depth < self.deps.max_depth;
         if let Some(names) = &allow {
             let available: Vec<&str> = self.deps.base_tools.iter().map(|t| t.name()).collect();
             for n in names {
-                if !available.contains(&n.as_str()) && !IMPLICIT_CHILD_TOOLS.contains(&n.as_str()) {
+                let is_nested = n == "dispatch_agent" && nested_allowed;
+                if !available.contains(&n.as_str())
+                    && !IMPLICIT_CHILD_TOOLS.contains(&n.as_str())
+                    && !is_nested
+                {
                     return Err(ToolError::InvalidArgs(format!(
                         "unknown tool '{n}'; available: {}, plus always-available: {}",
                         available.join(", "),
@@ -316,9 +360,19 @@ impl Tool for DispatchAgentTool {
             }
         }
 
+        // Mint the dispatch ordinal FIRST: it both stamps forwarded child event
+        // ids (`sub{n}:`) and, when depth allows, names the nested tool's prefix
+        // so a grandchild's parent_id is this call's visible row id (spec G8).
+        let n = next_dispatch_n();
+
         // Child registry: (filtered) base snapshot + child-bound context tools.
         // dispatch_agent is structurally absent (spec D4: no recursion).
         let mut reg = ToolRegistry::new();
+        // The FILTERED base set: exactly the tools the child sees (minus the
+        // per-level-fresh context tools and dispatch_agent). Reused below as a
+        // nested tool's base so a grandchild cannot exceed the child's scope
+        // when an allowlist is in force (spec G7, transitive focus).
+        let mut filtered_base: Vec<Arc<dyn Tool>> = Vec::new();
         for t in &self.deps.base_tools {
             // Defense in depth for D4: dispatch_agent is never child-visible,
             // even if a caller leaks it into the base snapshot. No recursion.
@@ -329,28 +383,53 @@ impl Tool for DispatchAgentTool {
                 .as_ref()
                 .is_none_or(|names| names.iter().any(|n| n == t.name()))
             {
-                reg.register(t.clone());
+                filtered_base.push(t.clone());
             }
+        }
+        for t in &filtered_base {
+            reg.register(t.clone());
+        }
+        // Depth budget (spec G7/G8): a child may dispatch only while under the
+        // configured depth AND (no allowlist, or the allowlist names it). The
+        // nested tool's id_prefix is THIS call's visible prefix so a grandchild's
+        // parent_id is the child row's on-wire id.
+        let nested_named = allow
+            .as_ref()
+            .is_none_or(|names| names.iter().any(|n| n == "dispatch_agent"));
+        if nested_allowed && nested_named {
+            let mut nested = self.deps.clone();
+            nested.depth = self.deps.depth + 1;
+            nested.id_prefix = format!("sub{n}:");
+            // Transitive scope: when an allowlist filtered the base, the nested
+            // tool sees only that filtered set (grandchild ⊆ child). Without an
+            // allowlist, the full snapshot passes through unchanged.
+            if allow.is_some() {
+                nested.base_tools = filtered_base.clone();
+            }
+            reg.register(Arc::new(DispatchAgentTool::new(nested)));
         }
         let store: Arc<dyn crate::OffloadStore> = Arc::new(InMemoryOffloadStore::new());
         let flag = Arc::new(AtomicBool::new(false));
         for t in crate::context_tools(store.clone(), flag.clone(), self.deps.max_result_bytes) {
             reg.register(t);
         }
-        let mut child_ctx = CuratedContext::new(
-            Message::system(self.deps.child_system_prompt.clone()),
-            store,
-            flag,
-        )
-        .with_offload_config(OffloadConfig {
-            max_result_bytes: self.deps.max_result_bytes,
-            ..OffloadConfig::default()
-        });
+        let system = match &role {
+            Some(r) => format!("{}\n\nRole: {r}", self.deps.child_system_prompt),
+            None => self.deps.child_system_prompt.clone(),
+        };
+        let mut child_ctx = CuratedContext::new(Message::system(system), store, flag)
+            .with_offload_config(OffloadConfig {
+                max_result_bytes: self.deps.max_result_bytes,
+                ..OffloadConfig::default()
+            });
 
+        // Visible parent id: at top level this is the raw call id; nested, the
+        // prefix makes it the child row's on-wire id (spec G8 attribution).
+        let parent_id = format!("{}{}", self.deps.id_prefix, ctx.call_id);
         let sink = Arc::new(SubagentSink::new(
             self.deps.sink.clone(),
-            next_dispatch_n(),
-            ctx.call_id.clone(),
+            n,
+            parent_id,
             self.deps.child_trace.clone(),
         ));
         let child = AgentLoop::new(
@@ -362,6 +441,11 @@ impl Tool for DispatchAgentTool {
             sink.clone(),
             self.deps.loop_config.clone(),
         );
+        // Route child-loop compaction through the dedicated model when set.
+        let child = match &self.deps.compaction_model {
+            Some(m) => child.with_compaction_model(m.clone()),
+            None => child,
+        };
 
         // Parent cancel propagates down; child self-cancel never travels up (D8).
         let child_cancel = ctx.cancel.child_token();
@@ -731,6 +815,10 @@ mod tests {
             },
             max_result_bytes: 16 * 1024,
             subagent_timeout: Duration::from_secs(600),
+            compaction_model: None,
+            depth: 1,
+            max_depth: 1,
+            id_prefix: String::new(),
         }
     }
 

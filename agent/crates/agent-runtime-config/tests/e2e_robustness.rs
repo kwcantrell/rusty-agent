@@ -85,6 +85,8 @@ fn assemble_test(
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
             trace: None,
+            api_key: None,
+            claude_binary: "claude".into(),
         },
     );
     (built, sink)
