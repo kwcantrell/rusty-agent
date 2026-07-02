@@ -402,6 +402,31 @@ linkage, UI attribution, `ToolCtx.call_id`) and #3 (per-child model routing — 
 `run_compaction` — role prompts, depth>1, fan-out ergonomics) remain open backlog. **Missing
 capability #1 is closed; #2 (Examples context type) is the remaining absent capability.**
 
+Re-stamp note (2026-07-02, sub-agent observability): sub-spec **#2 of the sub-agent capability —
+surfaces & observability — is BUILT and merged to `main`** (10 commits, `17eae71..2b86d13`, merge
+`0224383`; spec `docs/superpowers/specs/2026-07-02-subagent-observability-design.md`). Attribution
+rides existing frames as `skip_serializing_if` optional fields (old-SPA byte-compat verified —
+duck-typed parse ignores unknown fields): `ToolCtx.call_id` (filled by `gate_tool`) is the lineage
+root; `SubagentSink` stamps `parent_id` on forwarded ToolStart/ToolResult/ServerUsage across
+event/wire/trace schemas; suppressed child events (Token/Done/etc.) tee to a `SubagentTrace` tap →
+`TraceWriter::record_child` writes them into the same session JSONL with `sub` ordinal +
+`parent_id` (same seq counter — full interleaved child transcripts are now replayable, closing the
+"failed child turn can't be replayed" gap); `SessionStats` gained subset counters
+(`subagent_tool_calls ⊆ tool_calls`, `subagent_turns`) and child turns no longer distort
+`turns = max(turn)` (v1 D9 distortion killed); CLI indents attributed rows (`  ↳ `); the web
+reducer switched to **id-first tool correlation** (closing the observability cluster's old
+name-correlation backlog item), renders `parentId` rows nested with the `sub:` prefix stripped,
+guards the turn readout against child usage flicker, and StatsPanel shows a conditional Sub-agent
+row. The `tools` allowlist now accepts the always-available child context tools (the #1 residual
+assigned here). Accepted residuals (final whole-branch review, merge-clean): `session_stats`
+always carries the two zero-valued subagent fields (E5-sanctioned additive exception, spec has a
+dated correction); parallel-dispatch child rows interleave ambiguously under flat+indent (accepted
+design); `tool_time_ms` double-counts child tool time inside the dispatch call's duration
+(pre-existing v1); child approval wire prompts remain unattributed (v1 residual); dead
+`ToolCall.tsx` parity copy pending cleanup. **Sub-spec #3 (per-child model routing — first
+customer `run_compaction` — role prompts, depth>1, fan-out ergonomics) is the remaining open
+sub-agent work; Examples context type remains the last absent capability.**
+
 ---
 
 **Finding 1 — Instructions: duplicated system prompt + skill files lack negative constraints**
