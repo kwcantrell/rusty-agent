@@ -225,6 +225,10 @@ enum TraceEvent<'a> {
         mechanism: &'a str,
         reason: &'a str,
     },
+    StreamRetry {
+        discarded_text_chars: usize,
+        discarded_reasoning_chars: usize,
+    },
 }
 
 fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
@@ -328,6 +332,13 @@ fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
         AgentEvent::SandboxDegraded { mechanism, reason } => {
             TraceEvent::SandboxDegraded { mechanism, reason }
         }
+        AgentEvent::StreamRetry {
+            discarded_text_chars,
+            discarded_reasoning_chars,
+        } => TraceEvent::StreamRetry {
+            discarded_text_chars: *discarded_text_chars,
+            discarded_reasoning_chars: *discarded_reasoning_chars,
+        },
     }
 }
 

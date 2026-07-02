@@ -174,6 +174,21 @@ impl EventSink for SubagentSink {
                     }
                     AgentEvent::Usage { turn, .. } => cap.turns = cap.turns.max(turn),
                     AgentEvent::Done(reason) => cap.stop = Some(reason),
+                    // A child stream died mid-answer and retries: retract the
+                    // abandoned trailing text from the current segment so the
+                    // captured result the parent model reads holds only the
+                    // re-streamed text. Reasoning isn't captured, so only the
+                    // text count matters; trim char-boundary-safe (count chars,
+                    // not bytes). If the segment empties, leave it empty — don't
+                    // pop, or the ToolResult-boundary segment invariant breaks.
+                    AgentEvent::StreamRetry {
+                        discarded_text_chars,
+                        ..
+                    } => {
+                        let seg = cap.segments.last_mut().expect("segments never empty");
+                        let keep = seg.chars().count().saturating_sub(discarded_text_chars);
+                        *seg = seg.chars().take(keep).collect();
+                    }
                     _ => {}
                 }
             }
@@ -574,6 +589,7 @@ mod tests {
                 AgentEvent::Context(_) => "context",
                 AgentEvent::Approval(_) => "approval",
                 AgentEvent::SandboxDegraded { .. } => "sandbox_degraded",
+                AgentEvent::StreamRetry { .. } => "stream_retry",
                 AgentEvent::ToolStart { .. }
                 | AgentEvent::ToolResult { .. }
                 | AgentEvent::ServerUsage { .. } => "FORWARDED-KIND-MUST-NOT-BE-TAPPED",
@@ -731,6 +747,23 @@ mod tests {
         assert_eq!(s.final_text, "final answer");
         assert_eq!(s.tool_calls, 0); // no ToolStart was emitted
         assert_eq!(s.stop, Some(StopReason::Stop));
+    }
+
+    #[test]
+    fn stream_retry_retracts_abandoned_partial_text_from_capture() {
+        // A child stream dies mid-answer (StreamRetry retracts the partial),
+        // then re-streams: the captured result must hold only the post-retry
+        // text — the abandoned partial must not leak to the parent model.
+        let sink = SubagentSink::new(Arc::new(FullSink::default()), 1, "d1".into(), None);
+        sink.emit(AgentEvent::Token("partial ".into()));
+        sink.emit(AgentEvent::Token("junk".into())); // 12 chars streamed this attempt
+        sink.emit(AgentEvent::StreamRetry {
+            discarded_text_chars: 12,
+            discarded_reasoning_chars: 0,
+        });
+        sink.emit(AgentEvent::Token("real answer".into()));
+        sink.emit(AgentEvent::Done(StopReason::Stop));
+        assert_eq!(sink.summary().final_text, "real answer");
     }
 
     #[test]

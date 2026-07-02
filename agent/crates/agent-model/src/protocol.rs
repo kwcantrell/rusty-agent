@@ -1,4 +1,4 @@
-use crate::{AssistantTurn, CompletionRequest, ParsedTurn, ProtocolError};
+use crate::{AssistantTurn, CompletionRequest, InvalidToolCall, ParsedTurn, ProtocolError};
 use agent_tools::ToolCall;
 
 pub trait ToolCallProtocol: Send + Sync {
@@ -17,23 +17,38 @@ impl ToolCallProtocol for NativeProtocol {
     }
     fn parse(&self, raw: &AssistantTurn) -> Result<ParsedTurn, ProtocolError> {
         let mut tool_calls = Vec::new();
+        let mut invalid = Vec::new();
         for (i, rc) in raw.raw_tool_calls.iter().enumerate() {
-            let name = rc
-                .name
-                .clone()
-                .ok_or_else(|| ProtocolError(format!("tool call {i} missing name")))?;
+            let id = rc.id.clone().unwrap_or_else(|| format!("call_{i}"));
+            let Some(name) = rc.name.clone() else {
+                invalid.push(InvalidToolCall {
+                    id,
+                    name: "unknown".into(),
+                    error: format!("tool call {i} missing name"),
+                });
+                continue;
+            };
             let args: serde_json::Value = if rc.args_fragment.trim().is_empty() {
                 serde_json::json!({})
             } else {
-                serde_json::from_str(&rc.args_fragment)
-                    .map_err(|e| ProtocolError(format!("tool call {i} bad args: {e}")))?
+                match serde_json::from_str(&rc.args_fragment) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        invalid.push(InvalidToolCall {
+                            id,
+                            name,
+                            error: format!("tool call {i} bad args: {e}"),
+                        });
+                        continue;
+                    }
+                }
             };
-            let id = rc.id.clone().unwrap_or_else(|| format!("call_{i}"));
             tool_calls.push(ToolCall { id, name, args });
         }
         Ok(ParsedTurn {
             text: raw.text.clone(),
             tool_calls,
+            invalid,
         })
     }
 }
@@ -65,20 +80,56 @@ mod tests {
     }
 
     #[test]
-    fn native_rejects_malformed_args() {
+    fn native_isolates_malformed_args_per_call() {
+        let turn = AssistantTurn {
+            text: "".into(),
+            raw_tool_calls: vec![
+                RawToolCall {
+                    index: None,
+                    id: Some("c1".into()),
+                    name: Some("good".into()),
+                    args_fragment: r#"{"a":1}"#.into(),
+                },
+                RawToolCall {
+                    index: None,
+                    id: Some("c2".into()),
+                    name: Some("bad".into()),
+                    args_fragment: "{not json".into(),
+                },
+            ],
+            stop: StopReason::ToolCalls,
+            reasoning: String::new(),
+            ..Default::default()
+        };
+        let parsed = NativeProtocol.parse(&turn).unwrap();
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "good");
+        assert_eq!(parsed.invalid.len(), 1);
+        assert_eq!(parsed.invalid[0].id, "c2");
+        assert_eq!(parsed.invalid[0].name, "bad");
+        assert!(parsed.invalid[0].error.contains("bad args"));
+    }
+
+    #[test]
+    fn native_isolates_missing_name_per_call() {
         let turn = AssistantTurn {
             text: "".into(),
             raw_tool_calls: vec![RawToolCall {
                 index: None,
-                id: Some("c1".into()),
-                name: Some("x".into()),
-                args_fragment: "{not json".into(),
+                id: None,
+                name: None,
+                args_fragment: "{}".into(),
             }],
             stop: StopReason::ToolCalls,
             reasoning: String::new(),
             ..Default::default()
         };
-        assert!(NativeProtocol.parse(&turn).is_err());
+        let parsed = NativeProtocol.parse(&turn).unwrap();
+        assert!(parsed.tool_calls.is_empty());
+        assert_eq!(parsed.invalid.len(), 1);
+        assert_eq!(parsed.invalid[0].id, "call_0");
+        assert_eq!(parsed.invalid[0].name, "unknown");
+        assert!(parsed.invalid[0].error.contains("missing name"));
     }
 
     #[test]

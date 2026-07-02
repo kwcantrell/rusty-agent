@@ -178,6 +178,12 @@ impl EventSink for TerminalSink {
                      exec-capable tools are DISABLED until it is available\x1b[0m"
                 );
             }
+            AgentEvent::StreamRetry { .. } => {
+                let _ = writeln!(
+                    out,
+                    "\n\x1b[2m[stream interrupted — retrying; partial output above is discarded]\x1b[0m"
+                );
+            }
             AgentEvent::Error(e) => {
                 let _ = writeln!(out, "\n\x1b[31m✗ {e}\x1b[0m");
             }

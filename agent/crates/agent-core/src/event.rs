@@ -106,6 +106,16 @@ pub enum AgentEvent {
         mechanism: &'static str,
         reason: String,
     },
+    /// A model stream died mid-answer and another attempt follows: the
+    /// in-flight partial text/reasoning of this turn is abandoned — frontends
+    /// should discard those trailing chars before the retry re-streams. Emitted
+    /// only when the failed attempt had already streamed something and a fresh
+    /// attempt follows (retryable-with-budget or the once-per-turn overflow
+    /// rebuild); never on a fatal/cancelled/second-overflow terminal.
+    StreamRetry {
+        discarded_text_chars: usize,
+        discarded_reasoning_chars: usize,
+    },
 }
 
 pub trait EventSink: Send + Sync {

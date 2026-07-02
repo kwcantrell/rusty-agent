@@ -26,6 +26,20 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A `LoopConfig.max_parallel_tools` of 0 (the `Default`) resolves to this.
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
 
+/// Nudge after this many consecutive REPEATS of an identical call set
+/// (i.e. on the 3rd identical turn); abort after STUCK_ABORT_AFTER (the 5th).
+/// Not configurable until a real workload needs the knob (spec 2026-07-02 §4).
+pub const STUCK_NUDGE_AFTER: usize = 2;
+pub const STUCK_ABORT_AFTER: usize = 4;
+
+/// Surfaced when a tool call is cut off at `max_tokens` (args are incomplete
+/// JSON). Shared by the whole-turn `Err(Length)` repair arm and the per-call
+/// `Ok`-with-`invalid` + `Length` guard so a truncated call takes the
+/// truncation path, not a per-call "re-emit" that would truncate again.
+const LENGTH_TRUNCATION_MSG: &str = "the model reached the max_tokens limit before it \
+    finished a tool call (e.g. writing a large file); increase max_tokens in settings \
+    and try again";
+
 /// Exponential retry backoff: 100ms · 2^(attempt-1), capped at 5s.
 fn backoff_delay(attempt: usize) -> Duration {
     let exp = (attempt.saturating_sub(1)).min(16) as u32; // 100ms << 16 is already > cap
@@ -40,8 +54,12 @@ enum RetryFailure {
     /// Cancellation observed (token or `ModelError::Cancelled`).
     Cancelled,
     /// Context overflow: the same request can never succeed. Not counted
-    /// against max_retries; the turn loop may compact-rebuild-retry once.
-    Overflow(String),
+    /// against max_retries; the turn loop may compact-rebuild-retry once. The
+    /// tuple carries the (text, reasoning) chars this attempt streamed before
+    /// overflowing, so the turn loop can retract a partial answer before the
+    /// once-per-turn rebuild re-streams (spec §2); the second-overflow arm
+    /// ignores it (that path is terminal, no further attempt).
+    Overflow(String, (usize, usize)),
 }
 
 #[derive(Clone)]
@@ -158,10 +176,16 @@ impl AgentLoop {
     }
 
     /// Drive one streamed completion to an `AssistantTurn`, emitting tokens as they arrive.
+    ///
+    /// `emitted` accumulates (text chars, reasoning chars) actually pushed to the
+    /// sink this attempt, so on an error return the caller knows what partial
+    /// output leaked and can retract it before a retry re-streams (spec §2). The
+    /// caller resets it per attempt.
     async fn one_completion(
         &self,
         req: CompletionRequest,
         cancel: &CancellationToken,
+        emitted: &mut (usize, usize),
     ) -> Result<AssistantTurn, ModelError> {
         let idle = self.config.stream_idle_timeout;
         let mut stream = tokio::select! {
@@ -189,10 +213,12 @@ impl AgentLoop {
                 Ok(Some(item)) => match item? {
                     Chunk::Text(t) => {
                         self.sink.emit(AgentEvent::Token(t.clone()));
+                        emitted.0 += t.chars().count();
                         text.push_str(&t);
                     }
                     Chunk::Reasoning(r) => {
                         self.sink.emit(AgentEvent::Reasoning(r.clone()));
+                        emitted.1 += r.chars().count();
                         reasoning.push_str(&r);
                     }
                     Chunk::ToolCallDelta(rc) => merge_tool_call(&mut raw_tool_calls, rc),
@@ -235,7 +261,10 @@ impl AgentLoop {
         loop {
             let mut req = base.clone();
             self.protocol.prepare(&mut req);
-            match self.one_completion(req, cancel).await {
+            // Chars this attempt streamed to the sink; feeds the StreamRetry
+            // retraction when another attempt follows a partial (spec §2).
+            let mut emitted = (0usize, 0usize);
+            match self.one_completion(req, cancel, &mut emitted).await {
                 Ok(turn) => return Ok(turn),
                 Err(ModelError::Cancelled) => return Err(RetryFailure::Cancelled),
                 Err(e) => {
@@ -246,7 +275,9 @@ impl AgentLoop {
                         ErrorClass::ContextOverflow => {
                             tracing::warn!(error = %e,
                                 "context overflow; deferring to turn-level recovery");
-                            return Err(RetryFailure::Overflow(e.to_string()));
+                            // Defer retraction to the turn loop: only its FIRST
+                            // overflow arm re-attempts; a second overflow is terminal.
+                            return Err(RetryFailure::Overflow(e.to_string(), emitted));
                         }
                         ErrorClass::Fatal => {
                             self.sink.emit(AgentEvent::Error(e.to_string()));
@@ -257,6 +288,15 @@ impl AgentLoop {
                             if attempt > self.config.max_retries {
                                 self.sink.emit(AgentEvent::Error(e.to_string()));
                                 return Err(RetryFailure::Fatal(e.to_string()));
+                            }
+                            // Another attempt follows: retract any partial output this
+                            // attempt already streamed, before the backoff sleep and
+                            // the fresh stream (spec §2). Skip when nothing leaked.
+                            if emitted != (0, 0) {
+                                self.sink.emit(AgentEvent::StreamRetry {
+                                    discarded_text_chars: emitted.0,
+                                    discarded_reasoning_chars: emitted.1,
+                                });
                             }
                             tracing::warn!(attempt, error = %e, "model error, retrying");
                             tokio::time::sleep(backoff_delay(attempt)).await;
@@ -329,6 +369,14 @@ impl AgentLoop {
         ctx.append(Message::user(user_input));
         let mut protocol_repairs = 0;
 
+        // Repeated-identical-call detection (spec §4): a model re-emitting the
+        // byte-identical call set every turn burns all max_turns. Track the last
+        // turn's signature and how many consecutive turns have repeated it; nudge
+        // at STUCK_NUDGE_AFTER, abort at STUCK_ABORT_AFTER.
+        let mut last_sig: Option<String> = None;
+        let mut repeats = 0usize;
+        let mut nudged = false;
+
         // Agentic (tool-bearing) runs auto-preserve reasoning so the model keeps
         // its chain-of-thought across the within-turn tool loop; each backend then
         // decides how to surface it (Qwen3.6 via reasoning_content + the kwarg;
@@ -357,8 +405,17 @@ impl AgentLoop {
                         self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
                         return Ok(());
                     }
-                    Err(RetryFailure::Overflow(_)) if !overflow_recovered => {
+                    Err(RetryFailure::Overflow(_, emitted)) if !overflow_recovered => {
                         overflow_recovered = true;
+                        // A partial answer streamed before the overflow is abandoned
+                        // by the compaction rebuild; retract it before the rebuilt
+                        // attempt re-streams (spec §2). Skip when nothing leaked.
+                        if emitted != (0, 0) {
+                            self.sink.emit(AgentEvent::StreamRetry {
+                                discarded_text_chars: emitted.0,
+                                discarded_reasoning_chars: emitted.1,
+                            });
+                        }
                         tracing::warn!("context overflow: forcing compaction and rebuilding once");
                         self.sink
                             .emit(AgentEvent::Context(crate::ContextEvent::OverflowRecovery));
@@ -381,7 +438,9 @@ impl AgentLoop {
                         });
                         base = self.completion_request(messages, preserve_thinking);
                     }
-                    Err(RetryFailure::Overflow(msg)) => {
+                    Err(RetryFailure::Overflow(msg, _)) => {
+                        // Second overflow in the turn — terminal, no further attempt,
+                        // so no StreamRetry (the partial stays; Done explains).
                         self.sink.emit(AgentEvent::Error(msg.clone()));
                         self.sink.emit(AgentEvent::Done(StopReason::Error));
                         return Err(AgentError::Model(msg));
@@ -414,12 +473,8 @@ impl AgentLoop {
                 // the same limit — so surface the real cause instead of a cryptic
                 // JSON parse error.
                 Err(_) if assistant.stop == StopReason::Length => {
-                    self.sink.emit(AgentEvent::Error(
-                        "the model reached the max_tokens limit before it finished a \
-                         tool call (e.g. writing a large file); increase max_tokens in \
-                         settings and try again"
-                            .into(),
-                    ));
+                    self.sink
+                        .emit(AgentEvent::Error(LENGTH_TRUNCATION_MSG.into()));
                     self.sink.emit(AgentEvent::Done(StopReason::Length));
                     return Ok(());
                 }
@@ -438,16 +493,90 @@ impl AgentLoop {
                 }
             };
 
+            // A call truncated by max_tokens must take the truncation path, not a
+            // per-call "re-emit" error that would truncate again (spec §3). The
+            // native protocol yields Ok-with-`invalid` here (not `Err`), so this
+            // guard mirrors the `Err(_) if Length` arm above for that shape.
+            if !parsed.invalid.is_empty() && assistant.stop == StopReason::Length {
+                self.sink
+                    .emit(AgentEvent::Error(LENGTH_TRUNCATION_MSG.into()));
+                self.sink.emit(AgentEvent::Done(StopReason::Length));
+                return Ok(());
+            }
+
             // Enforce the per-call id invariant for EVERY protocol before the ids
-            // feed the assistant message and the Phase-3 tool-result drain.
+            // feed the assistant message and the Phase-3 tool-result drain. Invalid
+            // (unparseable) calls participate in uniqueness too — each becomes its
+            // own tool message and needs a distinct id against the valid calls.
             normalize_tool_call_ids(&mut parsed.tool_calls);
+            normalize_invalid_ids(&parsed.tool_calls, &mut parsed.invalid);
+
+            // The assistant message must carry ALL ids (valid + invalid) so every
+            // tool message keeps a matching parent call; invalid calls carry `{}`
+            // args since their real args could not be parsed.
+            let mut all_calls = parsed.tool_calls.clone();
+            all_calls.extend(parsed.invalid.iter().map(|inv| ToolCall {
+                id: inv.id.clone(),
+                name: inv.name.clone(),
+                args: serde_json::json!({}),
+            }));
+
+            // Repeated-identical-call detection (spec §4). Signature is the sorted
+            // set of (name, args) for valid calls plus (name, error) for invalid
+            // ones — id-independent, so an id normalization can't mask a repeat.
+            // `\u{1}`/`\u{2}` are field/record separators that won't appear in JSON.
+            let mut nudge_pending = false;
+            if !all_calls.is_empty() {
+                let mut parts: Vec<String> = parsed
+                    .tool_calls
+                    .iter()
+                    .map(|c| format!("{}\u{1}{}", c.name, c.args))
+                    .chain(
+                        parsed
+                            .invalid
+                            .iter()
+                            .map(|i| format!("{}\u{1}{}", i.name, i.error)),
+                    )
+                    .collect();
+                parts.sort();
+                let sig = parts.join("\u{2}");
+                if last_sig.as_deref() == Some(&sig) {
+                    repeats += 1;
+                } else {
+                    repeats = 0;
+                    nudged = false;
+                }
+                last_sig = Some(sig);
+
+                // Constraint (a): abort BEFORE the assistant tool_calls message is
+                // appended. Append the turn as text only — a dangling assistant
+                // tool_calls message with no answering tool results would 400 an
+                // OpenAI-compat server on the next run (contexts survive across runs).
+                if repeats >= STUCK_ABORT_AFTER {
+                    ctx.append(Message::assistant(parsed.text.clone(), None));
+                    self.sink.emit(AgentEvent::Error(
+                        "model repeated the identical tool call(s) 5 turns in a row; \
+                         aborting the run"
+                            .into(),
+                    ));
+                    self.sink.emit(AgentEvent::Done(StopReason::Error));
+                    return Ok(());
+                }
+                // Constraint (b): defer the nudge until after this turn's tool
+                // results land (a user message between the assistant tool_calls
+                // message and its Role::Tool results is invalid for OpenAI-compat).
+                if repeats >= STUCK_NUDGE_AFTER && !nudged {
+                    nudged = true;
+                    nudge_pending = true;
+                }
+            }
 
             let mut msg = Message::assistant(
                 parsed.text.clone(),
-                if parsed.tool_calls.is_empty() {
+                if all_calls.is_empty() {
                     None
                 } else {
-                    Some(parsed.tool_calls.clone())
+                    Some(all_calls.clone())
                 },
             );
             // Preserve reasoning as data, not inline text — the model backend
@@ -458,15 +587,43 @@ impl AgentLoop {
             }
             ctx.append(msg);
 
-            if parsed.tool_calls.is_empty() {
+            if all_calls.is_empty() {
                 self.sink.emit(AgentEvent::Done(assistant.stop));
                 return Ok(());
             }
 
             // Phase 1 — gate every call sequentially (one approval prompt at a time).
-            let mut order: Vec<String> = Vec::with_capacity(parsed.tool_calls.len());
+            let mut order: Vec<String> = Vec::with_capacity(all_calls.len());
             let mut results: HashMap<String, (String, Resolved)> = HashMap::new();
             let mut ready: Vec<ReadyCall> = Vec::new();
+            // Seed the unparseable calls first: each emits a ToolStart and joins the
+            // Phase-3 drain as a per-call ERROR result (the "re-emit only this call"
+            // prompt). N-1 good calls still gate + execute normally below.
+            for inv in &parsed.invalid {
+                self.sink.emit(AgentEvent::ToolStart {
+                    id: inv.id.clone(),
+                    name: inv.name.clone(),
+                    args: serde_json::json!({}),
+                    parent_id: None,
+                });
+                order.push(inv.id.clone());
+                results.insert(
+                    inv.id.clone(),
+                    (
+                        inv.name.clone(),
+                        Resolved::Err {
+                            status: ToolStatus::Error,
+                            content: format!(
+                                "ERROR: this tool call could not be parsed ({}); the other \
+                                 calls in this turn ran normally — re-emit only this call, \
+                                 with valid JSON arguments",
+                                inv.error
+                            ),
+                            duration_ms: 0,
+                        },
+                    ),
+                );
+            }
             for call in parsed.tool_calls {
                 match self.gate_tool(call, &cancel).await {
                     GateOutcome::Rejected { id, name, content } => {
@@ -558,8 +715,9 @@ impl AgentLoop {
                 // violated, drop the result rather than crash on untrusted input.
                 let (name, resolved) = match results.remove(&id) {
                     Some(v) => v,
-                    // Unreachable while normalize_tool_call_ids holds. If a future
-                    // change ever breaks the one-slot-per-id invariant, emit an error
+                    // Unreachable while normalize_tool_call_ids and
+                    // normalize_invalid_ids hold. If a future change ever breaks
+                    // the one-slot-per-id invariant, emit an error
                     // rather than silently drop the result and desync the transcript
                     // (an assistant tool_call with no matching tool message).
                     None => (
@@ -605,6 +763,17 @@ impl AgentLoop {
                 ctx.append(Message::tool(id, name, content));
             }
 
+            // Constraint (b): the nudge goes in AFTER the turn's tool-result
+            // messages, never between the assistant tool_calls message and its
+            // Role::Tool results.
+            if nudge_pending {
+                ctx.append(Message::user(
+                    "You have now issued the identical tool call(s) 3 turns in a row; \
+                     repeating them will not change the result. Change your approach, or \
+                     reply with a summary and no tool call if you are done.",
+                ));
+            }
+
             let deps = crate::MaintCtx {
                 model_limit: self.config.model_limit,
                 model: self.maint_model(),
@@ -635,6 +804,17 @@ impl AgentLoop {
             args: call.args.clone(),
             parent_id: None,
         });
+        // Gate entry: if the run was already cancelled (e.g. Ctrl-C during an
+        // earlier prompt in this Phase-1 batch), short-circuit the rest of the
+        // batch without touching policy/approval. Placed AFTER the ToolStart emit
+        // so every call still gets a start/terminal event pair.
+        if cancel.is_cancelled() {
+            return GateOutcome::Rejected {
+                id: call.id,
+                name: call.name,
+                content: format!("ERROR: {}", ToolError::Denied("run cancelled".into())),
+            };
+        }
         let tool = match self.tools.get(&call.name) {
             Some(t) => t,
             None => {
@@ -688,17 +868,30 @@ impl AgentLoop {
                     display: None,
                 };
                 self.sink.emit(AgentEvent::Approval(req.clone()));
-                matches!(
-                    self.approval.request(req).await,
-                    ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
-                )
+                // Race the approval wait against cancellation: Ctrl-C during a
+                // pending prompt must end the run promptly rather than wedge until
+                // the prompt is answered. Cancel-during-prompt counts as a deny.
+                tokio::select! {
+                    _ = cancel.cancelled() => false,
+                    resp = self.approval.request(req) => matches!(
+                        resp,
+                        ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
+                    ),
+                }
             }
         };
         if !allowed {
+            // Distinguish a cancel-driven denial (the run is ending) from an
+            // explicit user "no" so the tool result reads correctly downstream.
+            let reason = if cancel.is_cancelled() {
+                "run cancelled"
+            } else {
+                "user declined"
+            };
             return GateOutcome::Rejected {
                 id: call.id,
                 name: call.name,
-                content: format!("ERROR: {}", ToolError::Denied("user declined".into())),
+                content: format!("ERROR: {}", ToolError::Denied(reason.into())),
             };
         }
         // The live run token: a tool that honors `ctx.cancel` (shell/git/fetch_url)
@@ -815,6 +1008,27 @@ fn normalize_tool_call_ids(calls: &mut [ToolCall]) {
                 n += 1;
             }
             c.id = candidate;
+        }
+    }
+}
+
+/// Make each invalid (unparseable) call's id unique against the already-normalized
+/// valid calls AND against the other invalid entries. Invalid calls each become
+/// their own tool message, so a collision with a valid call — or an empty/duplicate
+/// invalid id — would desync the transcript. Rewrites only offending ids,
+/// order-stable and deterministically. `valid` is treated as read-only (already
+/// normalized by [`normalize_tool_call_ids`]).
+fn normalize_invalid_ids(valid: &[ToolCall], invalid: &mut [agent_model::InvalidToolCall]) {
+    let mut seen: std::collections::HashSet<String> = valid.iter().map(|c| c.id.clone()).collect();
+    for (k, inv) in invalid.iter_mut().enumerate() {
+        if inv.id.is_empty() || !seen.insert(inv.id.clone()) {
+            let mut candidate = format!("{}_inv{k}", inv.id);
+            let mut n = 1;
+            while !seen.insert(candidate.clone()) {
+                candidate = format!("{}_inv{k}_{n}", inv.id);
+                n += 1;
+            }
+            inv.id = candidate;
         }
     }
 }
@@ -1251,6 +1465,195 @@ mod tests {
         );
     }
 
+    /// Counts how many times it executes — lets a stuck-detection test assert the
+    /// aborting turn's call never ran.
+    struct Counter(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for Counter {
+        fn name(&self) -> &str {
+            "counter"
+        }
+        fn description(&self) -> &str {
+            "records each execution"
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: "counter".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<agent_tools::ToolIntent, ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: "counter".into(),
+                access: agent_tools::Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "count".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, ToolError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(agent_tools::ToolOutput {
+                content: "ok".into(),
+                display: None,
+            })
+        }
+    }
+
+    fn counter_agent(
+        model: Arc<ScriptedModel>,
+        sink: Arc<CollectingSink>,
+        max_turns: usize,
+    ) -> (AgentLoop, Arc<std::sync::atomic::AtomicUsize>) {
+        let ws = std::env::temp_dir();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Counter(count.clone())));
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(reg),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        (agent, count)
+    }
+
+    /// The 3rd consecutive identical call-set gets a nudge; the 5th aborts the
+    /// run without executing (spec §4) — a stuck model burns 4 turns, not 25.
+    #[tokio::test]
+    async fn stuck_identical_calls_nudged_then_aborted() {
+        // 6 identical single-call turns; only turns 1-4 should execute, turn 5 aborts.
+        let one = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into());
+        let model = Arc::new(ScriptedModel::new(vec![
+            one(),
+            one(),
+            one(),
+            one(),
+            one(),
+            one(),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        // max_turns=25 (prod default): proves the abort caps burn at 4, not 25.
+        let (agent, count) = counter_agent(model.clone(), sink.clone(), 25);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        // Turns 1-4 executed; turn 5 was consulted (parsed) then aborted BEFORE exec.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "tool must execute exactly 4 times (turns 1-4; turn 5 aborts pre-exec)"
+        );
+        // Turn 5 stream WAS consumed (abort is post-parse), turn 6 was not.
+        assert_eq!(
+            model.remaining(),
+            1,
+            "abort fires after turn 5 is consulted"
+        );
+
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("error:") && e.contains("5 turns in a row")),
+            "expected abort Error mentioning '5 turns in a row'; got {events:?}"
+        );
+        assert_eq!(events.last().unwrap(), "done", "run ends Done after Error");
+
+        let built = ctx.build(100_000);
+        // Exactly one nudge user message.
+        let nudge_idx: Vec<usize> = built
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                matches!(m.role, agent_model::Role::User)
+                    && m.content.contains("identical tool call")
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            nudge_idx.len(),
+            1,
+            "exactly one nudge user message expected; got {nudge_idx:?}"
+        );
+        // Constraint (b): the nudge lands AFTER the turn's tool results, never
+        // between the assistant tool_calls message and its Role::Tool results.
+        assert!(
+            matches!(built[nudge_idx[0] - 1].role, agent_model::Role::Tool),
+            "nudge must follow tool results (message before it is Role::Tool)"
+        );
+        // Constraint (a): the aborted turn's assistant message carries NO tool_calls
+        // (no dangling tool_calls with no answering tool messages in persistent history).
+        let last_assistant = built
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, agent_model::Role::Assistant))
+            .expect("an assistant message exists");
+        assert!(
+            last_assistant.tool_calls.is_none(),
+            "aborted turn's assistant message must not carry tool_calls"
+        );
+    }
+
+    /// A differing call-set resets the stuck counter, so an interleaved workload
+    /// never trips the abort within its turn budget.
+    #[tokio::test]
+    async fn stuck_counter_resets_on_different_call() {
+        // A A B A A B A A — a differing turn (B) resets before any 5-in-a-row of
+        // an identical set can accumulate; run ends by budget, all 8 turns execute.
+        let a = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into());
+        let b = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"b"}"#.into());
+        let model = Arc::new(ScriptedModel::new(vec![
+            a(),
+            a(),
+            b(),
+            a(),
+            a(),
+            b(),
+            a(),
+            a(),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, count) = counter_agent(model.clone(), sink.clone(), 8);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            8,
+            "all 8 turns execute — no abort"
+        );
+        assert_eq!(
+            model.remaining(),
+            0,
+            "all scripted turns consumed (budget end)"
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e.contains("aborting")),
+            "no abort should fire; got {events:?}"
+        );
+        assert_eq!(events.last().unwrap(), "done");
+    }
+
     struct FakeRetriever(Vec<String>);
     #[async_trait::async_trait]
     impl crate::Retriever for FakeRetriever {
@@ -1534,6 +1937,107 @@ mod tests {
             "a denied call must still emit a terminal ToolResult: {events:?}"
         );
         assert_eq!(events.last().unwrap(), "done");
+    }
+
+    /// Ctrl-C during a pending approval prompt must end the run promptly as
+    /// Cancelled — not wedge until the prompt is answered (audit Component 4).
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_pending_approval_ends_run() {
+        use std::sync::Mutex;
+
+        // Approval channel that never answers — models a prompt left hanging.
+        struct NeverApprove;
+        #[async_trait::async_trait]
+        impl ApprovalChannel for NeverApprove {
+            async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+                std::future::pending().await
+            }
+        }
+
+        // Captures the fields the string-label CollectingSink can't: the Done
+        // reason, the terminal ToolResult content, and an Approval-emitted signal.
+        #[derive(Default)]
+        struct CancelRaceSink {
+            approval_seen: tokio::sync::Notify,
+            done: Mutex<Option<StopReason>>,
+            results: Mutex<Vec<(ToolStatus, String)>>,
+        }
+        impl EventSink for CancelRaceSink {
+            fn emit(&self, event: AgentEvent) {
+                match event {
+                    AgentEvent::Approval(_) => self.approval_seen.notify_one(),
+                    AgentEvent::ToolResult { status, output, .. } => {
+                        self.results.lock().unwrap().push((status, output.content));
+                    }
+                    AgentEvent::Done(r) => *self.done.lock().unwrap() = Some(r),
+                    _ => {}
+                }
+            }
+        }
+
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
+            Scripted::Text("should not run".into()),
+        ]));
+        let sink = Arc::new(CancelRaceSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            Arc::new(AskAll),
+            Arc::new(NeverApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        let run = tokio::spawn(async move {
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run_with_cancel(&mut ctx, "go".into(), cancel).await
+        });
+
+        // Cancel only once the approval prompt is actually pending.
+        sink.approval_seen.notified().await;
+        c2.cancel();
+
+        // The run must return promptly; on today's code it would wedge on the
+        // never-resolving prompt and this timeout would fire.
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run must finish promptly after cancel, not wedge on the prompt")
+            .expect("run task must not panic")
+            .expect("run returns Ok");
+
+        assert_eq!(
+            *sink.done.lock().unwrap(),
+            Some(StopReason::Cancelled),
+            "cancel during a prompt must end the run as Cancelled"
+        );
+        let results = sink.results.lock().unwrap();
+        let (status, content) = results
+            .last()
+            .expect("the gated call gets a terminal result");
+        assert_eq!(*status, ToolStatus::Denied);
+        assert!(
+            content.contains("run cancelled"),
+            "cancel-driven denial must say 'run cancelled', got: {content}"
+        );
     }
 
     #[tokio::test]
@@ -3669,6 +4173,354 @@ mod tests {
         assert_eq!(
             sink.events.lock().unwrap().last().map(String::as_str),
             Some("done")
+        );
+    }
+
+    /// A mid-stream failure that already emitted chunks must retract them before
+    /// the retry re-streams (spec §2); a clean or chunk-less failure must not.
+    #[tokio::test(start_paused = true)]
+    async fn stream_retry_retracts_partial_output() {
+        let ws = std::env::temp_dir();
+        // Attempt 1 streams "ab","cd" (4 chars) then the stream dies (retryable);
+        // attempt 2 succeeds with "xy".
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::ChunksThenFail(
+                vec![Chunk::Text("ab".into()), Chunk::Text("cd".into())],
+                ModelError::Http("mid-stream drop".into()),
+            ),
+            Scripted::Text("xy".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        // The retraction carries the exact char counts and sits between the
+        // abandoned partial and the re-streamed tokens.
+        let sr = events
+            .iter()
+            .position(|e| e == "stream_retry:4:0")
+            .unwrap_or_else(|| panic!("expected stream_retry:4:0; got {events:?}"));
+        let ab = events.iter().position(|e| e == "token:ab").unwrap();
+        let cd = events.iter().position(|e| e == "token:cd").unwrap();
+        let xy = events.iter().position(|e| e == "token:xy").unwrap();
+        assert!(
+            ab < sr && cd < sr,
+            "abandoned partial precedes the retraction: {events:?}"
+        );
+        assert!(sr < xy, "the re-stream follows the retraction: {events:?}");
+        // Exactly one retraction for one mid-stream failure.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.starts_with("stream_retry"))
+                .count(),
+            1
+        );
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_stream_retry_when_nothing_emitted() {
+        let ws = std::env::temp_dir();
+        // Attempt 1 fails before emitting any chunk; attempt 2 succeeds. Nothing
+        // streamed, so nothing to retract.
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Http("down".into())),
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e.starts_with("stream_retry")),
+            "no retraction when nothing was emitted: {events:?}"
+        );
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+    }
+
+    /// The once-per-turn overflow rebuild is also a "retry after a partial":
+    /// the partial answer is retracted before the rebuilt attempt re-streams,
+    /// and the retraction precedes the OverflowRecovery marker.
+    #[tokio::test]
+    async fn stream_retry_retracts_partial_before_overflow_rebuild() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::ChunksThenFail(
+                vec![Chunk::Text("part".into())], // 4 chars
+                ModelError::Status {
+                    code: 400,
+                    body: "maximum context length exceeded".into(),
+                },
+            ),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 0, // overflow recovery must not consume retry budget
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = OverflowCtx {
+            history: vec![],
+            compaction_requests: 0,
+            maintains: 0,
+        };
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        let sr = events
+            .iter()
+            .position(|e| e == "stream_retry:4:0")
+            .unwrap_or_else(|| panic!("expected stream_retry:4:0; got {events:?}"));
+        let or = events
+            .iter()
+            .position(|e| e == "overflow_recovery")
+            .unwrap_or_else(|| panic!("expected overflow_recovery; got {events:?}"));
+        assert!(
+            sr < or,
+            "retraction must precede the overflow rebuild: {events:?}"
+        );
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+    }
+
+    /// A sink that keeps full per-event detail (ids, status, content, done
+    /// reason) — the shared `CollectingSink` collapses events to
+    /// `name:status` strings, too lossy for the per-call isolation asserts.
+    #[derive(Default)]
+    struct DetailSink {
+        tool_starts: std::sync::Mutex<Vec<(String, String)>>, // (id, name)
+        tool_results: std::sync::Mutex<Vec<(String, ToolStatus, String)>>, // (id, status, content)
+        errors: std::sync::Mutex<Vec<String>>,
+        done: std::sync::Mutex<Option<StopReason>>,
+    }
+    impl EventSink for DetailSink {
+        fn emit(&self, event: AgentEvent) {
+            match event {
+                AgentEvent::ToolStart { id, name, .. } => {
+                    self.tool_starts.lock().unwrap().push((id, name));
+                }
+                AgentEvent::ToolResult {
+                    id, status, output, ..
+                } => {
+                    self.tool_results
+                        .lock()
+                        .unwrap()
+                        .push((id, status, output.content));
+                }
+                AgentEvent::Error(e) => self.errors.lock().unwrap().push(e),
+                AgentEvent::Done(r) => *self.done.lock().unwrap() = Some(r),
+                _ => {}
+            }
+        }
+    }
+
+    /// One malformed call must not discard the turn: good calls execute, the bad
+    /// one gets a per-call ERROR result, and the assistant message keeps all ids.
+    #[tokio::test]
+    async fn malformed_call_isolated_good_calls_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "BODY").unwrap();
+        let ws = dir.path().to_path_buf();
+        // Turn 1: one good read_file call + one bad-args call (unparseable JSON).
+        // Turn 2: plain text stop.
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                (
+                    "c_good".into(),
+                    "read_file".into(),
+                    r#"{"path":"a.txt"}"#.into(),
+                ),
+                ("c_bad".into(), "read_file".into(), "{not json".into()),
+            ]),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(DetailSink::default());
+        let agent = AgentLoop::new(
+            model,
+            // The native protocol is the one that fills `parsed.invalid`.
+            Arc::new(agent_model::NativeProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "read twice".into()).await.unwrap();
+
+        // Both ids emitted a ToolStart.
+        let starts = sink.tool_starts.lock().unwrap().clone();
+        let start_ids: std::collections::HashSet<&str> =
+            starts.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            start_ids.contains("c_good") && start_ids.contains("c_bad"),
+            "expected ToolStart for both ids, got {starts:?}"
+        );
+
+        // The good call actually executed (Ok result); the bad one is an Error
+        // result whose content is the per-call re-emit guidance.
+        let results = sink.tool_results.lock().unwrap().clone();
+        assert!(
+            results
+                .iter()
+                .any(|(id, st, _)| id == "c_good" && *st == ToolStatus::Ok),
+            "good call must run to an Ok ToolResult, got {results:?}"
+        );
+        let bad = results
+            .iter()
+            .find(|(id, _, _)| id == "c_bad")
+            .expect("bad call must produce a ToolResult");
+        assert_eq!(bad.1, ToolStatus::Error, "bad call result must be Error");
+        assert!(
+            bad.2.contains("could not be parsed") && bad.2.contains("re-emit only this call"),
+            "bad-call content must be the per-call re-emit guidance, got: {}",
+            bad.2
+        );
+
+        // Run ended normally, NOT via the whole-turn protocol-repair path.
+        assert_eq!(*sink.done.lock().unwrap(), Some(StopReason::Stop));
+
+        // The assistant message in history carries BOTH ids.
+        let built = ctx.build(100_000);
+        let assistant_ids: Vec<String> = built
+            .iter()
+            .filter(|m| matches!(m.role, agent_model::Role::Assistant))
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flat_map(|calls| calls.iter().map(|c| c.id.clone()))
+            .collect();
+        assert!(
+            assistant_ids.iter().any(|id| id == "c_good")
+                && assistant_ids.iter().any(|id| id == "c_bad"),
+            "assistant message must keep both tool-call ids, got {assistant_ids:?}"
+        );
+        // No whole-turn protocol-repair user message was appended.
+        assert!(
+            !built
+                .iter()
+                .any(|m| m.content.contains("Re-emit it correctly")),
+            "a malformed call must not trigger the whole-turn repair prompt"
+        );
+    }
+
+    /// A call truncated by max_tokens (Ok-parse with a non-empty `invalid` and
+    /// stop == Length) must take the max_tokens truncation path, not the
+    /// per-call re-emit error — and execute nothing.
+    #[tokio::test]
+    async fn malformed_call_length_stop_takes_truncation_path() {
+        let ws = std::env::temp_dir();
+        // A single tool call cut off mid-args with a `length` finish reason. The
+        // native protocol yields Ok-with-invalid (bad JSON) + stop == Length.
+        let truncated = r##"{"path":"big.py","content":"#!/usr/bin/env python3\nprint('hi"##;
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::TruncatedCall(
+            "write_file".into(),
+            truncated.into(),
+        )]));
+        let sink = Arc::new(DetailSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(agent_model::NativeProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: Some(2048),
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent
+            .run(&mut ctx, "write a big file".into())
+            .await
+            .unwrap();
+
+        // The terminal event is Done(Length), and the error explains truncation.
+        assert_eq!(*sink.done.lock().unwrap(), Some(StopReason::Length));
+        let errors = sink.errors.lock().unwrap().clone();
+        assert!(
+            errors.iter().any(|e| {
+                let low = e.to_lowercase();
+                low.contains("max_tokens") || low.contains("truncat")
+            }),
+            "expected a max_tokens/truncation error, got {errors:?}"
+        );
+        // No tool ran and no per-call re-emit error was emitted.
+        assert!(
+            sink.tool_starts.lock().unwrap().is_empty(),
+            "the Length-truncation path must not start any tool"
+        );
+        assert!(
+            sink.tool_results.lock().unwrap().is_empty(),
+            "the Length-truncation path must not emit a tool result"
         );
     }
 }

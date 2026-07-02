@@ -22,6 +22,10 @@ pub enum Scripted {
     Error,
     /// Force a specific model error this turn (classification-aware tests).
     Fail(ModelError),
+    /// Emit a sequence of chunks, THEN fail mid-stream with a `ModelError`.
+    /// Models a stream that dies after streaming partial output (spec §2:
+    /// the partial must be retracted before a retry re-streams).
+    ChunksThenFail(Vec<Chunk>, ModelError),
     /// `stream()` succeeds but the returned stream never yields (inter-chunk stall).
     Hang,
     /// The `stream()` call itself never resolves (stream-open stall).
@@ -67,6 +71,12 @@ impl ModelClient for ScriptedModel {
         match next {
             Scripted::Error => Err(ModelError::Http("scripted error".into())),
             Scripted::Fail(e) => Err(e),
+            Scripted::ChunksThenFail(chunks, err) => {
+                let mut items: Vec<Result<Chunk, ModelError>> =
+                    chunks.into_iter().map(Ok).collect();
+                items.push(Err(err));
+                Ok(stream::iter(items).boxed())
+            }
             Scripted::Text(t) => {
                 Ok(
                     stream::iter(vec![Ok(Chunk::Text(t)), Ok(Chunk::Done(StopReason::Stop))])
@@ -160,6 +170,7 @@ impl ToolCallProtocol for PassthroughProtocol {
         Ok(ParsedTurn {
             text: raw.text.clone(),
             tool_calls: calls,
+            invalid: vec![],
         })
     }
 }
@@ -202,6 +213,10 @@ impl EventSink for CollectingSink {
             AgentEvent::SandboxDegraded { mechanism, .. } => {
                 format!("sandbox_degraded:{mechanism}")
             }
+            AgentEvent::StreamRetry {
+                discarded_text_chars,
+                discarded_reasoning_chars,
+            } => format!("stream_retry:{discarded_text_chars}:{discarded_reasoning_chars}"),
         };
         self.events.lock().unwrap().push(label);
     }
