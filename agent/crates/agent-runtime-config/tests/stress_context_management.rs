@@ -125,7 +125,10 @@ async fn loop_stays_bounded_under_many_large_outputs_and_recalls() {
 
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(BlobTool));
-    reg.register(Arc::new(ContextRecallTool::new(store.clone())));
+    reg.register(Arc::new(ContextRecallTool::new(
+        store.clone(),
+        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
+    )));
 
     // Script: BLOBS turns each calling blob(n=i), then recall a spread of ids that
     // are guaranteed to have been offloaded, then finish.
@@ -515,7 +518,10 @@ async fn live_window_stays_bounded_under_model_driven_volume() {
 
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(BlobTool));
-    reg.register(Arc::new(ContextRecallTool::new(store.clone())));
+    reg.register(Arc::new(ContextRecallTool::new(
+        store.clone(),
+        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
+    )));
 
     let sink = Arc::new(StressSink::default());
     // keep_recent 2; compaction disabled so the live model only drives blob/recall
