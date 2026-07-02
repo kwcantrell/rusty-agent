@@ -34,7 +34,6 @@ pub fn built_tokens(messages: &[Message]) -> usize {
 /// message is a singleton unit. Curation (eviction, compaction splits) must
 /// keep or drop a unit whole — a `Role::Tool` result serialized without its
 /// parent `tool_calls` message 400s on OpenAI-compatible servers.
-#[allow(dead_code)] // wired in by the next task
 pub(crate) fn turn_unit_ranges(history: &[Message]) -> Vec<std::ops::Range<usize>> {
     let mut units = Vec::new();
     let mut i = 0;
@@ -59,7 +58,6 @@ pub(crate) fn turn_unit_ranges(history: &[Message]) -> Vec<std::ops::Range<usize
 /// units newest-first, keep whole units while they fit, always keeping at
 /// least the newest unit (even if it alone exceeds budget — the keep-≥1
 /// floor, unit-shaped).
-#[allow(dead_code)] // wired in by the next task
 pub(crate) fn evict_start(history: &[Message], budget: usize) -> usize {
     let units = turn_unit_ranges(history);
     let mut start = history.len();
@@ -93,7 +91,6 @@ pub(crate) fn snap_split_to_unit_boundary(history: &[Message], split: usize) -> 
 /// Positions of `Role::Tool` messages whose `tool_call_id` is not covered by
 /// the nearest preceding assistant `tool_calls` block with only `Role::Tool`
 /// messages in between — the exact shape OpenAI-compatible servers reject.
-#[allow(dead_code)] // wired in by the next task
 pub(crate) fn orphaned_tool_positions(messages: &[Message]) -> Vec<usize> {
     let mut orphans = Vec::new();
     let mut live_ids: std::collections::HashSet<&str> = Default::default();
@@ -225,24 +222,19 @@ impl ContextManager for WindowContext {
         let budget = model_limit
             .saturating_sub(sys_tokens)
             .saturating_sub(recall_tokens);
-        // Walk history newest-first, keep while it fits.
-        let mut kept_rev: Vec<Message> = Vec::new();
-        let mut used = 0usize;
-        for m in self.history.iter().rev() {
-            let t = message_tokens(m);
-            if used + t > budget && !kept_rev.is_empty() {
-                break;
-            }
-            used += t;
-            kept_rev.push(m.clone());
-        }
-        kept_rev.reverse();
-        let mut out = Vec::with_capacity(kept_rev.len() + 2);
+        // Walk history newest-first in turn units, keep whole units while they
+        // fit — never split a tool_calls parent from its Role::Tool results.
+        let start = evict_start(&self.history, budget);
+        let mut out = Vec::with_capacity(self.history.len() - start + 2);
         out.push(self.system.clone());
         if let Some(m) = recall_msg {
             out.push(m);
         }
-        out.extend(kept_rev);
+        out.extend(self.history[start..].iter().cloned());
+        debug_assert!(
+            orphaned_tool_positions(&out).is_empty(),
+            "WindowContext::build produced an orphaned tool message"
+        );
         out
     }
 }
@@ -486,6 +478,59 @@ mod tests {
         // Wrong id → orphaned.
         let wrong = vec![parent("c1"), Message::tool("c9", "shell", "r")];
         assert_eq!(orphaned_tool_positions(&wrong), vec![1]);
+    }
+
+    #[test]
+    fn build_never_orphans_tool_results() {
+        let mut ctx = WindowContext::new(Message::system("SYS"));
+        ctx.append(Message::user(
+            "old old old message with lots of padding text here",
+        ));
+        ctx.append(parent("c1"));
+        ctx.append(Message::tool("c1", "shell", &"y".repeat(120)));
+        ctx.append(Message::user("recent"));
+        // Budget forces the cut inside the tool turn under the old walk:
+        // recent fits, tool result fits, parent does not.
+        let tool_result_t = message_tokens(&Message::tool("c1", "shell", &"y".repeat(120)));
+        let recent_t = message_tokens(&Message::user("recent"));
+        let sys_t = message_tokens(&Message::system("SYS"));
+        let limit = sys_t + recent_t + tool_result_t + 2; // parent excluded
+        let built = ctx.build(limit);
+        assert!(
+            orphaned_tool_positions(&built).is_empty(),
+            "eviction must drop the torn tool turn whole, got: {:?}",
+            built
+                .iter()
+                .map(|m| (&m.role, &m.content))
+                .collect::<Vec<_>>()
+        );
+        // The torn turn was dropped whole: no c1 result without its parent.
+        let has_result = built
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("c1"));
+        let has_parent = built.iter().any(|m| m.tool_calls.is_some());
+        assert_eq!(has_result, has_parent);
+    }
+
+    #[test]
+    fn window_build_budget_sweep_never_orphans() {
+        let mut ctx = WindowContext::new(Message::system("SYS"));
+        ctx.append(Message::user("intro message with padding"));
+        ctx.append(parent("c1"));
+        ctx.append(Message::tool("c1", "shell", &"a".repeat(100)));
+        ctx.append(Message::user("middle instruction"));
+        ctx.append(parent2("c2", "c3"));
+        ctx.append(Message::tool("c2", "shell", &"b".repeat(80)));
+        ctx.append(Message::tool("c3", "shell", "tiny"));
+        ctx.append(Message::user("latest"));
+        let total = built_tokens(&ctx.build(usize::MAX)) + 16;
+        for limit in 1..=total {
+            let built = ctx.build(limit);
+            assert!(
+                orphaned_tool_positions(&built).is_empty(),
+                "orphan at model_limit={limit}"
+            );
+        }
     }
 
     #[test]
