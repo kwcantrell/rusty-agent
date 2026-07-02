@@ -482,21 +482,23 @@ capability built (3 sub-specs), Examples built. Only this file's inline Finding 
 prompt de-dup/negative-constraints polish) and per-cluster accepted residuals remain as backlog.
 The next audit run starts from a clean slate.**
 
----
-
-**Finding 1 — Instructions: duplicated system prompt + skill files lack negative constraints**
-
-```
-severity: low
-file:line: agent/crates/agent-server/src/daemon.rs:23 + agent/crates/agent-cli/src/main.rs:15;
-  .agents/skills/ (pattern)
-violated principle: "a single, versioned source of truth per agent role; no contradictory or stale
-  rule files" — SKILL.md Spine A component 1
-concrete proposed fix: The coding-agent system prompt is byte-identical but duplicated as two
-  constants in two crates — hoist to agent-runtime-config as one shared const. Separately, most skill
-  files describe capabilities only; add a "Forbidden"/negative-constraint section per skill (esp.
-  wayland), and disambiguate the auto-drive-tauri↔wayland description overlap.
-```
+Re-stamp note (2026-07-02, instructions cluster — backlog drain 1/6): this file's inline
+**Finding 1** — the last open finding — is now **fixed and merged to `main`** (4 commits,
+`db6fde6..2537f0f`, merge `bc8934e`; spec
+`docs/superpowers/specs/2026-07-02-instructions-single-source-design.md`). The coding-agent
+system prompt lives in exactly one place (`agent-runtime-config/src/prompts.rs::BASE_SYSTEM_PROMPT`,
+re-exported as `daemon::SYSTEM_PROMPT`; agent-cli imports it) guarded by a re-duplication
+ratchet test that scans both workspaces (incl. `src-tauri/tests`, repo-root self-check) for the
+identity sentence; the prompt gained a short negative-constraints clause (workspace confinement,
+no sandbox/policy bypass, no secrets in outputs — pinned by test); all 8 skills now carry a
+"**Do not**" block (6 added, house style); the context-evolve↔auto-drive-tauri cargo-PATH
+contradiction is eliminated both ways (both use CLAUDE.md's conditional form); the
+wayland→auto-drive-tauri deflection makes that cross-ref bidirectional; and CLAUDE.md's Gotchas
+distinguish `.agents/skills/` (Claude-facing) from the runtime's `.agent/skills` registry dirs.
+Accepted residuals (final whole-branch review — merge-clean): ratchet is needle-based (a future
+file quoting the full identity sentence in a doc comment fails intentionally); skill-lint script,
+`_facts.md`, prompt-eval gate, and catalog inlining remain unbuilt (recorded spec residuals /
+product decisions). **No inline finding remains open in this file.**
 
 ---
 
@@ -509,13 +511,11 @@ SessionStats + web panel, ContextEvent forwarding, CI gate), the sandbox cluster
 nobody uid fallback), the context cluster (turn-atomic eviction/compaction + visible
 eviction), the tools cluster (16 KiB ingestion cap + eager offload, recall/read_file
 pagination), the retry cluster (classified retries, overflow compact-and-rebuild,
-full Done parity), and the permissions cluster (Access::Destroy tier, token-prefix
-subcommand-aware allowlist, memory re-tiering) are **done** — for the full current
-backlog see `docs/superpowers/audits/2026-07-01-harness-deep-audit.md` (its Top-10
-table; **all ten items are now complete — the Top-10 is closed**). Of this
-file's inline findings, one remains:
-
-1. **[Component 1 — Instructions] De-duplicate the system prompt + add negative constraints** (Finding 1)
-   `agent/crates/agent-server/src/daemon.rs:23` + `agent/crates/agent-cli/src/main.rs:15`; `.agents/skills/`
-   — hoist the byte-identical coding-agent system prompt to one shared const, and add a
-   "Forbidden"/negative-constraint section to the skill files. `low` severity; polish.
+full Done parity), the permissions cluster (Access::Destroy tier, token-prefix
+subcommand-aware allowlist, memory re-tiering), and the instructions cluster
+(single-source ratchet-guarded prompt + negative constraints) are **done** — for
+the full current backlog see `docs/superpowers/audits/2026-07-01-harness-deep-audit.md`
+(its Top-10 table; **all ten items are now complete — the Top-10 is closed**).
+**No inline finding remains open.** The 2026-07 residual-backlog drain is in
+progress (see `.superpowers/sdd/progress.md` triage: orchestration robustness,
+context budgeting, git --output arg-scan, eval flywheel, small-residuals sweep).
