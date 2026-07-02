@@ -20,6 +20,11 @@ testkit = []
 e2e = []
 
 [dev-dependencies]
+# Self dev-dependency to enable the `testkit` feature for this crate's own
+# integration tests (ScriptedModel/PassthroughProtocol et al. live behind
+# `#[cfg(any(test, feature = "testkit"))]`, which integration tests — a separate
+# compilation unit — don't get from the `test` cfg alone).
+agent-core = { path = ".", features = ["testkit"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { version = "3" }
 agent-model = { path = "../agent-model" }

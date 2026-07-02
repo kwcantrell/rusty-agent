@@ -44,6 +44,7 @@ enum RetryFailure {
     Overflow(String),
 }
 
+#[derive(Clone)]
 pub struct LoopConfig {
     pub model_limit: usize,
     pub max_turns: usize,
@@ -683,7 +684,7 @@ impl AgentLoop {
         // aborts when the caller cancels the run (Ctrl-C / SIGINT via the CLI).
         let ctx = ToolCtx {
             workspace: self.config.workspace.clone(),
-            timeout: self.config.tool_timeout,
+            timeout: tool.timeout_override().unwrap_or(self.config.tool_timeout),
             cancel: cancel.clone(),
             sandbox: self.config.sandbox.clone(),
         };
