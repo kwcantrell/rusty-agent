@@ -1,6 +1,7 @@
 use crate::compactor::{compaction_is_worthwhile, run_compaction};
 use crate::context::{
-    message_tokens, recall_block, ContextManager, MaintCtx, MaintReport,
+    evict_start, message_tokens, orphaned_tool_positions, recall_block,
+    snap_split_to_unit_boundary, ContextManager, MaintCtx, MaintReport,
     DEFAULT_RECALL_TOKEN_BUDGET,
 };
 use crate::event::{AgentEvent, ContextEvent};
@@ -128,20 +129,15 @@ impl ContextManager for CuratedContext {
         let pinned = self.pinned();
         let pinned_tokens: usize = pinned.iter().map(message_tokens).sum();
         let budget = model_limit.saturating_sub(pinned_tokens);
-        // Walk history newest-first, keep while it fits.
-        let mut kept_rev: Vec<Message> = Vec::new();
-        let mut used = 0usize;
-        for m in self.history.iter().rev() {
-            let t = message_tokens(m);
-            if used + t > budget && !kept_rev.is_empty() {
-                break;
-            }
-            used += t;
-            kept_rev.push(m.clone());
-        }
-        kept_rev.reverse();
+        // Walk history newest-first in turn units, keep whole units while they
+        // fit — never split a tool_calls parent from its Role::Tool results.
+        let start = evict_start(&self.history, budget);
         let mut out = pinned;
-        out.extend(kept_rev);
+        out.extend(self.history[start..].iter().cloned());
+        debug_assert!(
+            orphaned_tool_positions(&out).is_empty(),
+            "CuratedContext::build produced an orphaned tool message"
+        );
         out
     }
 
@@ -174,7 +170,13 @@ impl ContextManager for CuratedContext {
             (used as f32) > (deps.model_limit as f32 * self.high_water_pct)
         };
         if (requested || over_high_water) && self.history.len() > self.config.keep_recent + 1 {
-            let split = self.history.len() - self.config.keep_recent;
+            // Snap left to a unit boundary so the cut never separates a
+            // tool_calls parent from its results; the torn turn lands wholly
+            // in the recent window (keep_recent temporarily keeps a bit more).
+            let split = snap_split_to_unit_boundary(
+                &self.history,
+                self.history.len() - self.config.keep_recent,
+            );
             let prior = self.compaction_summary.clone();
             // User turns are durable, author-authored instructions — the facts most
             // costly to lose. Keep them VERBATIM and never feed them to the lossy
@@ -245,6 +247,17 @@ mod tests {
         )
     }
 
+    fn parent(id: &str) -> Message {
+        Message::assistant(
+            "calling",
+            Some(vec![agent_tools::ToolCall {
+                id: id.into(),
+                name: "shell".into(),
+                args: serde_json::json!({}),
+            }]),
+        )
+    }
+
     fn maint_deps<'a>(
         model: &'a Arc<dyn ModelClient>,
         sink: &'a Arc<dyn EventSink>,
@@ -310,6 +323,7 @@ mod tests {
             ..Default::default()
         });
         let big_err = format!("ERROR: {}", "x".repeat(400));
+        c.append(parent("call-1")); // tool results always follow a tool_calls parent
         c.append(Message::tool("call-1", "shell", big_err.clone()));
 
         let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
@@ -332,6 +346,7 @@ mod tests {
             keep_recent: 0,
             ..Default::default()
         });
+        c.append(parent("call-1")); // tool results always follow a tool_calls parent
         c.append(Message::tool(
             "call-1",
             "shell",
@@ -431,6 +446,85 @@ mod tests {
             .find(|s| s.category == "messages")
             .unwrap();
         assert_eq!(msgs.count, 1);
+    }
+
+    #[test]
+    fn curated_build_never_orphans_tool_results() {
+        let mut c = ctx();
+        c.append(Message::user(
+            "old old old message with lots of padding text",
+        ));
+        c.append(parent("c1"));
+        c.append(Message::tool("c1", "shell", "y".repeat(120)));
+        c.append(Message::user("recent"));
+        use crate::context::{built_tokens, message_tokens, orphaned_tool_positions};
+        let tool_result_t = message_tokens(&Message::tool("c1", "shell", "y".repeat(120)));
+        let recent_t = message_tokens(&Message::user("recent"));
+        let sys_t = message_tokens(&Message::system("SYS"));
+        let limit = sys_t + recent_t + tool_result_t + 2;
+        let built = c.build(limit);
+        assert!(orphaned_tool_positions(&built).is_empty());
+        let _ = built_tokens(&built); // silence unused-import if optimized differently
+    }
+
+    #[tokio::test]
+    async fn compaction_split_snaps_to_turn_boundary() {
+        use crate::context::orphaned_tool_positions;
+        let mut c = ctx();
+        c.high_water_pct = 0.0; // force compaction
+                                // keep_recent = 2 lands the naive split between parent and result.
+        c.config.keep_recent = 2;
+        c.append(Message::assistant("chatter zero with padding", None));
+        c.append(Message::assistant("chatter one with padding", None));
+        c.append(parent("c1"));
+        c.append(Message::tool("c1", "shell", "result one")); // naive split cuts HERE
+        c.append(Message::user("newest instruction"));
+        let model: Arc<dyn ModelClient> =
+            Arc::new(ScriptedModel::new(vec![Scripted::Text("summary".into())]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        // History after compaction has no orphaned tool results...
+        assert!(
+            orphaned_tool_positions(c.history()).is_empty(),
+            "snapped split must keep parent+result together: {:?}",
+            c.history()
+                .iter()
+                .map(|m| (&m.role, &m.content))
+                .collect::<Vec<_>>()
+        );
+        // ...and the torn turn stayed whole in the recent window.
+        let has_result = c
+            .history()
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("c1"));
+        let has_parent = c.history().iter().any(|m| m.tool_calls.is_some());
+        assert!(
+            has_result && has_parent,
+            "torn turn must land wholly in recent"
+        );
+    }
+
+    #[test]
+    fn curated_build_budget_sweep_never_orphans() {
+        use crate::context::{built_tokens, orphaned_tool_positions};
+        let mut c = ctx();
+        c.set_goal("sweep goal".into());
+        c.append(Message::user("intro message with padding"));
+        c.append(parent("c1"));
+        c.append(Message::tool("c1", "shell", "a".repeat(100)));
+        c.append(Message::user("middle instruction"));
+        c.append(parent("c2"));
+        c.append(Message::tool("c2", "shell", "b".repeat(80)));
+        c.append(Message::user("latest"));
+        let total = built_tokens(&c.build(usize::MAX)) + 16;
+        for limit in 1..=total {
+            let built = c.build(limit);
+            assert!(
+                orphaned_tool_positions(&built).is_empty(),
+                "orphan at model_limit={limit}"
+            );
+        }
     }
 
     #[tokio::test]

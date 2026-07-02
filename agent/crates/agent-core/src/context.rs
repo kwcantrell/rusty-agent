@@ -75,7 +75,6 @@ pub(crate) fn evict_start(history: &[Message], budget: usize) -> usize {
 
 /// Largest unit boundary `<= split`. Snapping only moves left (keeps more in
 /// the recent window), never right.
-#[allow(dead_code)] // wired in by the next task
 pub(crate) fn snap_split_to_unit_boundary(history: &[Message], split: usize) -> usize {
     let mut boundary = 0;
     for r in turn_unit_ranges(history) {
@@ -428,7 +427,7 @@ mod tests {
         let h = vec![
             Message::user("old message with padding padding padding"),
             parent("c1"),
-            Message::tool("c1", "shell", &"x".repeat(200)),
+            Message::tool("c1", "shell", "x".repeat(200)),
             Message::user("newest"),
         ];
         // Budget 0: only the newest unit survives (keep-≥1-unit floor).
@@ -487,11 +486,11 @@ mod tests {
             "old old old message with lots of padding text here",
         ));
         ctx.append(parent("c1"));
-        ctx.append(Message::tool("c1", "shell", &"y".repeat(120)));
+        ctx.append(Message::tool("c1", "shell", "y".repeat(120)));
         ctx.append(Message::user("recent"));
         // Budget forces the cut inside the tool turn under the old walk:
         // recent fits, tool result fits, parent does not.
-        let tool_result_t = message_tokens(&Message::tool("c1", "shell", &"y".repeat(120)));
+        let tool_result_t = message_tokens(&Message::tool("c1", "shell", "y".repeat(120)));
         let recent_t = message_tokens(&Message::user("recent"));
         let sys_t = message_tokens(&Message::system("SYS"));
         let limit = sys_t + recent_t + tool_result_t + 2; // parent excluded
@@ -517,10 +516,10 @@ mod tests {
         let mut ctx = WindowContext::new(Message::system("SYS"));
         ctx.append(Message::user("intro message with padding"));
         ctx.append(parent("c1"));
-        ctx.append(Message::tool("c1", "shell", &"a".repeat(100)));
+        ctx.append(Message::tool("c1", "shell", "a".repeat(100)));
         ctx.append(Message::user("middle instruction"));
         ctx.append(parent2("c2", "c3"));
-        ctx.append(Message::tool("c2", "shell", &"b".repeat(80)));
+        ctx.append(Message::tool("c2", "shell", "b".repeat(80)));
         ctx.append(Message::tool("c3", "shell", "tiny"));
         ctx.append(Message::user("latest"));
         let total = built_tokens(&ctx.build(usize::MAX)) + 16;
