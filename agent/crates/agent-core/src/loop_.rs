@@ -567,7 +567,7 @@ impl AgentLoop {
                 }
             }
             Decision::Ask => {
-                let d = self.config.sandbox.describe();
+                let d = self.sandbox_descriptor();
                 let posture = if d.degraded.is_some() {
                     format!(" (sandbox: {} degraded; exec refused)", d.mechanism)
                 } else {

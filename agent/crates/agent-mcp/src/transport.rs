@@ -210,7 +210,10 @@ mod tests {
             trust: crate::config::Trust::Ask,
         };
         let t = StdioTransport::spawn(&spec, dir.path(), &sandbox).expect("spawn");
-        let got = t.recv().await.expect("one JSON line");
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), t.recv())
+            .await
+            .expect("recv must resolve within 5s, not hang")
+            .expect("one JSON line");
         let cwd = std::path::PathBuf::from(got["cwd"].as_str().unwrap());
         assert_eq!(
             cwd.canonicalize().unwrap(),

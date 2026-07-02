@@ -56,7 +56,12 @@ impl McpManager {
                     clients.push(client);
                 }
                 Err((name, e)) => {
-                    tracing::warn!(target: "mcp", server = %name, error = %e, "server failed to connect");
+                    if e.contains("sandbox unavailable") {
+                        tracing::warn!(target: "mcp", server = %name, error = %e,
+                            "server skipped: sandbox refused to launch it (exec degraded)");
+                    } else {
+                        tracing::warn!(target: "mcp", server = %name, error = %e, "server failed to connect");
+                    }
                     statuses.push(ServerStatus {
                         name,
                         connected: false,

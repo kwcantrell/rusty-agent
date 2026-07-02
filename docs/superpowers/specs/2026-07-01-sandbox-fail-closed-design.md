@@ -149,8 +149,9 @@ yields `degraded: None` and stays silent.)
 - **Refused exec:** `ToolError::Denied` (existing mapping); the turn
   continues, the model sees the actionable message.
 - **Docker starts mid-session:** next exec attempt re-probes, cache flips to
-  `Available`, command runs sandboxed. The next run's `SandboxDegraded`
-  emit reads the updated descriptor and stays silent.
+  `Available`, command runs sandboxed. The run-start `SandboxDegraded` emit
+  reads the cache, so the banner keeps warning until the first exec attempt
+  re-probes and refreshes it — safe over-warning that self-corrects on use.
 - **Docker dies mid-session:** `docker run` fails at spawn →
   `SandboxError::LaunchFailed` → `ToolError::Failed`. Unchanged from today;
   no silent host fallback exists anymore.
