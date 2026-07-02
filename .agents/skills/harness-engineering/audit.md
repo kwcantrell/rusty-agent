@@ -554,6 +554,21 @@ ratio is cross-session there (a backend property, desirable — recorded); `debu
 constant-est recorder (mechanism-level pin; no-oscillation is argued structurally); ratio
 resets on settings change / child loops / restart (converges in 1-2 turns).
 
+Re-stamp note (2026-07-02, git --output arg-scan — backlog drain 4/6): the permissions
+cluster's documented accepted residual — `git {log,diff,show} --output=<path>`/`-o` as an
+auto-allowed arbitrary-file write under the default read-safe prefixes — is now **fixed and
+merged to `main`** (1 commit, `789d514`, merge `669972d`; spec
+`docs/superpowers/specs/2026-07-02-git-output-argscan-design.md`). `is_auto_allowed` screens
+matched git `log`/`diff`/`show` invocations for exact `-o`/`--output` or `--output=…` in any
+argument position → Ask, never Deny. Precision pinned by test: `--output-indicator-*`,
+`git ls-files -o` (--others), `git log --oneline`, `grep -o` stay auto-allowed; abbreviation
+attack ruled out by parse-opt ambiguity against the `--output-indicator-*` siblings;
+adversarial review found no bypass (quoting, glued `=`, positional-arg placement, last-token
+flag all covered). The `default_allowlist()` ACCEPTED RESIDUAL comment is now a CLOSED note.
+Remaining out of scope: FS Write-vs-Destroy granularity (standing product decision);
+non-allowlisted git write-sinks (`format-patch -o`) already fail the prefix match; user-added
+bare `git` entries keep legacy semantics.
+
 ---
 
 ## Top highest-leverage fixes
