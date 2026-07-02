@@ -83,6 +83,13 @@ pub(crate) fn child_protocol_name(cfg: &RuntimeConfig, r: Option<&ModelRef>) -> 
     cfg.protocol.clone()
 }
 
+/// True when a composed static system prompt is large relative to the model's
+/// context window — over a quarter of it leaves little room for the conversation.
+/// Advisory only (the caller warns); pure so it can be unit-tested log-free.
+pub(crate) fn prompt_over_budget(est: usize, limit: usize) -> bool {
+    est > limit / 4
+}
+
 /// The single RuntimeConfig → LoopConfig mapping. Constants that are identical on
 /// both front-ends today stay literals here; `stream_idle_timeout` is frontend-supplied.
 pub fn loop_config_from(
@@ -165,6 +172,18 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
             parts.base_system_prompt.clone()
         }
     };
+
+    // Advisory: a static prompt over a quarter of the window crowds out the
+    // conversation. No behavior change — surface it so preset bloat is visible.
+    let prompt_est = agent_core::estimate_tokens(&system_prompt);
+    if prompt_over_budget(prompt_est, cfg.context_limit) {
+        tracing::warn!(
+            estimate = prompt_est,
+            context_limit = cfg.context_limit,
+            presets = ?presets,
+            "composed system prompt exceeds a quarter of the context window"
+        );
+    }
 
     let policy = Arc::new(RulePolicy {
         workspace: parts.workspace.clone(),
@@ -375,6 +394,13 @@ mod tests {
             "native".into(),
             8192,
         )
+    }
+
+    #[test]
+    fn prompt_over_budget_trips_above_a_quarter_of_the_window() {
+        assert!(!prompt_over_budget(0, 8192));
+        assert!(!prompt_over_budget(2048, 8192)); // exactly a quarter is not over
+        assert!(prompt_over_budget(2049, 8192)); // one past the quarter trips
     }
 
     #[test]
