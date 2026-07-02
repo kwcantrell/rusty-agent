@@ -26,6 +26,12 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A `LoopConfig.max_parallel_tools` of 0 (the `Default`) resolves to this.
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
 
+/// Nudge after this many consecutive REPEATS of an identical call set
+/// (i.e. on the 3rd identical turn); abort after STUCK_ABORT_AFTER (the 5th).
+/// Not configurable until a real workload needs the knob (spec 2026-07-02 §4).
+pub const STUCK_NUDGE_AFTER: usize = 2;
+pub const STUCK_ABORT_AFTER: usize = 4;
+
 /// Surfaced when a tool call is cut off at `max_tokens` (args are incomplete
 /// JSON). Shared by the whole-turn `Err(Length)` repair arm and the per-call
 /// `Ok`-with-`invalid` + `Length` guard so a truncated call takes the
@@ -363,6 +369,14 @@ impl AgentLoop {
         ctx.append(Message::user(user_input));
         let mut protocol_repairs = 0;
 
+        // Repeated-identical-call detection (spec §4): a model re-emitting the
+        // byte-identical call set every turn burns all max_turns. Track the last
+        // turn's signature and how many consecutive turns have repeated it; nudge
+        // at STUCK_NUDGE_AFTER, abort at STUCK_ABORT_AFTER.
+        let mut last_sig: Option<String> = None;
+        let mut repeats = 0usize;
+        let mut nudged = false;
+
         // Agentic (tool-bearing) runs auto-preserve reasoning so the model keeps
         // its chain-of-thought across the within-turn tool loop; each backend then
         // decides how to surface it (Qwen3.6 via reasoning_content + the kwarg;
@@ -506,6 +520,56 @@ impl AgentLoop {
                 name: inv.name.clone(),
                 args: serde_json::json!({}),
             }));
+
+            // Repeated-identical-call detection (spec §4). Signature is the sorted
+            // set of (name, args) for valid calls plus (name, error) for invalid
+            // ones — id-independent, so an id normalization can't mask a repeat.
+            // `\u{1}`/`\u{2}` are field/record separators that won't appear in JSON.
+            let mut nudge_pending = false;
+            if !all_calls.is_empty() {
+                let mut parts: Vec<String> = parsed
+                    .tool_calls
+                    .iter()
+                    .map(|c| format!("{}\u{1}{}", c.name, c.args))
+                    .chain(
+                        parsed
+                            .invalid
+                            .iter()
+                            .map(|i| format!("{}\u{1}{}", i.name, i.error)),
+                    )
+                    .collect();
+                parts.sort();
+                let sig = parts.join("\u{2}");
+                if last_sig.as_deref() == Some(&sig) {
+                    repeats += 1;
+                } else {
+                    repeats = 0;
+                    nudged = false;
+                }
+                last_sig = Some(sig);
+
+                // Constraint (a): abort BEFORE the assistant tool_calls message is
+                // appended. Append the turn as text only — a dangling assistant
+                // tool_calls message with no answering tool results would 400 an
+                // OpenAI-compat server on the next run (contexts survive across runs).
+                if repeats >= STUCK_ABORT_AFTER {
+                    ctx.append(Message::assistant(parsed.text.clone(), None));
+                    self.sink.emit(AgentEvent::Error(
+                        "model repeated the identical tool call(s) 5 turns in a row; \
+                         aborting the run"
+                            .into(),
+                    ));
+                    self.sink.emit(AgentEvent::Done(StopReason::Error));
+                    return Ok(());
+                }
+                // Constraint (b): defer the nudge until after this turn's tool
+                // results land (a user message between the assistant tool_calls
+                // message and its Role::Tool results is invalid for OpenAI-compat).
+                if repeats >= STUCK_NUDGE_AFTER && !nudged {
+                    nudged = true;
+                    nudge_pending = true;
+                }
+            }
 
             let mut msg = Message::assistant(
                 parsed.text.clone(),
@@ -696,6 +760,17 @@ impl AgentLoop {
                     }
                 };
                 ctx.append(Message::tool(id, name, content));
+            }
+
+            // Constraint (b): the nudge goes in AFTER the turn's tool-result
+            // messages, never between the assistant tool_calls message and its
+            // Role::Tool results.
+            if nudge_pending {
+                ctx.append(Message::user(
+                    "You have now issued the identical tool call(s) 3 turns in a row; \
+                     repeating them will not change the result. Change your approach, or \
+                     reply with a summary and no tool call if you are done.",
+                ));
             }
 
             let deps = crate::MaintCtx {
@@ -1387,6 +1462,191 @@ mod tests {
             tool_ids[0], tool_ids[1],
             "duplicate ids must normalize to distinct"
         );
+    }
+
+    /// Counts how many times it executes — lets a stuck-detection test assert the
+    /// aborting turn's call never ran.
+    struct Counter(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for Counter {
+        fn name(&self) -> &str {
+            "counter"
+        }
+        fn description(&self) -> &str {
+            "records each execution"
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: "counter".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<agent_tools::ToolIntent, ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: "counter".into(),
+                access: agent_tools::Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "count".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, ToolError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(agent_tools::ToolOutput {
+                content: "ok".into(),
+                display: None,
+            })
+        }
+    }
+
+    fn counter_agent(
+        model: Arc<ScriptedModel>,
+        sink: Arc<CollectingSink>,
+        max_turns: usize,
+    ) -> (AgentLoop, Arc<std::sync::atomic::AtomicUsize>) {
+        let ws = std::env::temp_dir();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Counter(count.clone())));
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(reg),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        (agent, count)
+    }
+
+    /// The 3rd consecutive identical call-set gets a nudge; the 5th aborts the
+    /// run without executing (spec §4) — a stuck model burns 4 turns, not 25.
+    #[tokio::test]
+    async fn stuck_identical_calls_nudged_then_aborted() {
+        // 6 identical single-call turns; only turns 1-4 should execute, turn 5 aborts.
+        let one = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into());
+        let model = Arc::new(ScriptedModel::new(vec![
+            one(),
+            one(),
+            one(),
+            one(),
+            one(),
+            one(),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        // max_turns=25 (prod default): proves the abort caps burn at 4, not 25.
+        let (agent, count) = counter_agent(model.clone(), sink.clone(), 25);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        // Turns 1-4 executed; turn 5 was consulted (parsed) then aborted BEFORE exec.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "tool must execute exactly 4 times (turns 1-4; turn 5 aborts pre-exec)"
+        );
+        // Turn 5 stream WAS consumed (abort is post-parse), turn 6 was not.
+        assert_eq!(model.remaining(), 1, "abort fires after turn 5 is consulted");
+
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("error:") && e.contains("5 turns in a row")),
+            "expected abort Error mentioning '5 turns in a row'; got {events:?}"
+        );
+        assert_eq!(events.last().unwrap(), "done", "run ends Done after Error");
+
+        let built = ctx.build(100_000);
+        // Exactly one nudge user message.
+        let nudge_idx: Vec<usize> = built
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                matches!(m.role, agent_model::Role::User)
+                    && m.content.contains("identical tool call")
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            nudge_idx.len(),
+            1,
+            "exactly one nudge user message expected; got {nudge_idx:?}"
+        );
+        // Constraint (b): the nudge lands AFTER the turn's tool results, never
+        // between the assistant tool_calls message and its Role::Tool results.
+        assert!(
+            matches!(built[nudge_idx[0] - 1].role, agent_model::Role::Tool),
+            "nudge must follow tool results (message before it is Role::Tool)"
+        );
+        // Constraint (a): the aborted turn's assistant message carries NO tool_calls
+        // (no dangling tool_calls with no answering tool messages in persistent history).
+        let last_assistant = built
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, agent_model::Role::Assistant))
+            .expect("an assistant message exists");
+        assert!(
+            last_assistant.tool_calls.is_none(),
+            "aborted turn's assistant message must not carry tool_calls"
+        );
+    }
+
+    /// A differing call-set resets the stuck counter, so an interleaved workload
+    /// never trips the abort within its turn budget.
+    #[tokio::test]
+    async fn stuck_counter_resets_on_different_call() {
+        // A A B A A B A A — a differing turn (B) resets before any 5-in-a-row of
+        // an identical set can accumulate; run ends by budget, all 8 turns execute.
+        let a = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into());
+        let b = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"b"}"#.into());
+        let model = Arc::new(ScriptedModel::new(vec![
+            a(),
+            a(),
+            b(),
+            a(),
+            a(),
+            b(),
+            a(),
+            a(),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, count) = counter_agent(model.clone(), sink.clone(), 8);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            8,
+            "all 8 turns execute — no abort"
+        );
+        assert_eq!(
+            model.remaining(),
+            0,
+            "all scripted turns consumed (budget end)"
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e.contains("aborting")),
+            "no abort should fire; got {events:?}"
+        );
+        assert_eq!(events.last().unwrap(), "done");
     }
 
     struct FakeRetriever(Vec<String>);
