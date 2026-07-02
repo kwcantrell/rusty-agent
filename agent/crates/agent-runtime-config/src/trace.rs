@@ -294,6 +294,7 @@ fn stop_reason_str(r: &StopReason) -> &'static str {
         StopReason::Length => "length",
         StopReason::BudgetExhausted => "budget_exhausted",
         StopReason::Cancelled => "cancelled",
+        StopReason::Error => "error",
     }
 }
 

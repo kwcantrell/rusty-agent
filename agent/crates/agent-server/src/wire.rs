@@ -154,6 +154,7 @@ fn stop_reason_str(r: &StopReason) -> &'static str {
         StopReason::Length => "length",
         StopReason::BudgetExhausted => "budget_exhausted",
         StopReason::Cancelled => "cancelled",
+        StopReason::Error => "error",
     }
 }
 
@@ -430,6 +431,11 @@ mod tests {
         assert_eq!(j["id"], "c1");
         assert_eq!(j["status"], "timeout");
         assert_eq!(j["duration_ms"], 60000);
+    }
+
+    #[test]
+    fn stop_reason_error_maps_to_error() {
+        assert_eq!(stop_reason_str(&StopReason::Error), "error");
     }
 
     #[test]

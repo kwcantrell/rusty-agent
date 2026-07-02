@@ -20,6 +20,8 @@ pub enum Scripted {
     Calls(Vec<(String, String, String)>),
     /// Force a transport error this turn.
     Error,
+    /// Force a specific model error this turn (classification-aware tests).
+    Fail(ModelError),
     /// `stream()` succeeds but the returned stream never yields (inter-chunk stall).
     Hang,
     /// The `stream()` call itself never resolves (stream-open stall).
@@ -43,6 +45,11 @@ impl ScriptedModel {
             turns: Mutex::new(turns.into()),
         }
     }
+    /// Scripted turns not yet consumed — lets tests assert the model was
+    /// consulted exactly N times (e.g. fail-fast leaves later turns queued).
+    pub fn remaining(&self) -> usize {
+        self.turns.lock().unwrap().len()
+    }
 }
 
 #[async_trait]
@@ -59,6 +66,7 @@ impl ModelClient for ScriptedModel {
             .unwrap_or(Scripted::Text(String::new()));
         match next {
             Scripted::Error => Err(ModelError::Http("scripted error".into())),
+            Scripted::Fail(e) => Err(e),
             Scripted::Text(t) => {
                 Ok(
                     stream::iter(vec![Ok(Chunk::Text(t)), Ok(Chunk::Done(StopReason::Stop))])

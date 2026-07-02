@@ -1,7 +1,7 @@
 use crate::{built_tokens, AgentEvent, ContextManager, EventSink, Retriever, ToolStatus};
 use agent_model::{
-    AssistantTurn, Chunk, CompletionRequest, Message, ModelClient, ModelError, RawToolCall,
-    StopReason, ToolCallProtocol,
+    AssistantTurn, Chunk, CompletionRequest, ErrorClass, Message, ModelClient, ModelError,
+    RawToolCall, StopReason, ToolCallProtocol,
 };
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse, Decision, PolicyEngine};
 use agent_tools::{Tool, ToolCall, ToolCtx, ToolError, ToolRegistry};
@@ -27,6 +27,24 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Default bound on how many of a turn's tool calls execute concurrently.
 /// A `LoopConfig.max_parallel_tools` of 0 (the `Default`) resolves to this.
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
+
+/// Exponential retry backoff: 100ms · 2^(attempt-1), capped at 5s.
+fn backoff_delay(attempt: usize) -> Duration {
+    let exp = (attempt.saturating_sub(1)).min(16) as u32; // 100ms << 16 is already > cap
+    Duration::from_millis((100u64 << exp).min(5_000))
+}
+
+/// Why `completion_with_retry` gave up. Loop-private: the turn loop maps
+/// these onto events + `AgentError`.
+enum RetryFailure {
+    /// Fatal on first sight, or retryable and retries exhausted.
+    Fatal(String),
+    /// Cancellation observed (token or `ModelError::Cancelled`).
+    Cancelled,
+    /// Context overflow: the same request can never succeed. Not counted
+    /// against max_retries; the turn loop may compact-rebuild-retry once.
+    Overflow(String),
+}
 
 pub struct LoopConfig {
     pub model_limit: usize,
@@ -134,7 +152,7 @@ impl AgentLoop {
     ) -> Result<AssistantTurn, ModelError> {
         let idle = self.config.stream_idle_timeout;
         let mut stream = tokio::select! {
-            _ = cancel.cancelled() => return Err(ModelError::Stream("cancelled".into())),
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
             opened = tokio::time::timeout(idle, self.model.stream(req)) => match opened {
                 Err(_) => return Err(ModelError::Timeout(idle)),
                 Ok(opened) => opened?,
@@ -148,7 +166,7 @@ impl AgentLoop {
         let mut usage_details: (Option<u32>, Option<u32>, Option<f64>) = (None, None, None);
         loop {
             let step = tokio::select! {
-                _ = cancel.cancelled() => return Err(ModelError::Stream("cancelled".into())),
+                _ = cancel.cancelled() => return Err(ModelError::Cancelled),
                 s = tokio::time::timeout(idle, stream.next()) => s,
             };
             match step {
@@ -192,31 +210,69 @@ impl AgentLoop {
         })
     }
 
-    /// Stream with retry/backoff on transport errors.
+    /// Stream with classified retry: transient errors retry with exponential
+    /// backoff; permanent request errors fail on first sight; context
+    /// overflow is deferred to the turn loop (retrying verbatim cannot help).
     async fn completion_with_retry(
         &self,
         base: &CompletionRequest,
         cancel: &CancellationToken,
-    ) -> Result<AssistantTurn, AgentError> {
+    ) -> Result<AssistantTurn, RetryFailure> {
         let mut attempt = 0;
         loop {
             let mut req = base.clone();
             self.protocol.prepare(&mut req);
             match self.one_completion(req, cancel).await {
                 Ok(turn) => return Ok(turn),
+                Err(ModelError::Cancelled) => return Err(RetryFailure::Cancelled),
                 Err(e) => {
                     if cancel.is_cancelled() {
-                        return Err(AgentError::Cancelled);
+                        return Err(RetryFailure::Cancelled);
                     }
-                    attempt += 1;
-                    if attempt > self.config.max_retries {
-                        self.sink.emit(AgentEvent::Error(e.to_string()));
-                        return Err(AgentError::Model(e.to_string()));
+                    match e.class() {
+                        ErrorClass::ContextOverflow => {
+                            tracing::warn!(error = %e,
+                                "context overflow; deferring to turn-level recovery");
+                            return Err(RetryFailure::Overflow(e.to_string()));
+                        }
+                        ErrorClass::Fatal => {
+                            self.sink.emit(AgentEvent::Error(e.to_string()));
+                            return Err(RetryFailure::Fatal(e.to_string()));
+                        }
+                        ErrorClass::Retryable => {
+                            attempt += 1;
+                            if attempt > self.config.max_retries {
+                                self.sink.emit(AgentEvent::Error(e.to_string()));
+                                return Err(RetryFailure::Fatal(e.to_string()));
+                            }
+                            tracing::warn!(attempt, error = %e, "model error, retrying");
+                            tokio::time::sleep(backoff_delay(attempt)).await;
+                        }
                     }
-                    tracing::warn!(attempt, error = %e, "model error, retrying");
-                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
                 }
             }
+        }
+    }
+
+    /// One place a built message list becomes a CompletionRequest (the turn
+    /// prologue and the overflow-recovery rebuild must not drift apart).
+    fn completion_request(
+        &self,
+        messages: Vec<Message>,
+        preserve_thinking: bool,
+    ) -> CompletionRequest {
+        CompletionRequest {
+            messages,
+            tools: self.tools.schemas(),
+            temperature: self.config.temperature,
+            max_tokens: self.config.max_tokens,
+            top_p: self.config.top_p,
+            top_k: self.config.top_k,
+            min_p: self.config.min_p,
+            presence_penalty: self.config.presence_penalty,
+            repeat_penalty: self.config.repeat_penalty,
+            enable_thinking: self.config.enable_thinking,
+            preserve_thinking,
         }
     }
 
@@ -278,27 +334,40 @@ impl AgentLoop {
                 turn: turn + 1,
                 max_turns: self.config.max_turns,
             });
-            let base = CompletionRequest {
-                messages,
-                tools: self.tools.schemas(),
-                temperature: self.config.temperature,
-                max_tokens: self.config.max_tokens,
-                top_p: self.config.top_p,
-                top_k: self.config.top_k,
-                min_p: self.config.min_p,
-                presence_penalty: self.config.presence_penalty,
-                repeat_penalty: self.config.repeat_penalty,
-                enable_thinking: self.config.enable_thinking,
-                preserve_thinking,
-            };
+            let mut base = self.completion_request(messages, preserve_thinking);
             let turn_started = std::time::Instant::now();
-            let assistant = match self.completion_with_retry(&base, &cancel).await {
-                Ok(t) => t,
-                Err(AgentError::Cancelled) => {
-                    self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
-                    return Ok(());
+            let mut overflow_recovered = false;
+            let assistant = loop {
+                match self.completion_with_retry(&base, &cancel).await {
+                    Ok(t) => break t,
+                    Err(RetryFailure::Cancelled) => {
+                        self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
+                        return Ok(());
+                    }
+                    Err(RetryFailure::Overflow(_)) if !overflow_recovered => {
+                        overflow_recovered = true;
+                        tracing::warn!("context overflow: forcing compaction and rebuilding once");
+                        ctx.request_compaction();
+                        let deps = crate::MaintCtx {
+                            model_limit: self.config.model_limit,
+                            model: &self.model,
+                            sink: &self.sink,
+                            cancel: &cancel,
+                        };
+                        ctx.maintain(&deps).await;
+                        let messages = ctx.build(self.config.model_limit);
+                        base = self.completion_request(messages, preserve_thinking);
+                    }
+                    Err(RetryFailure::Overflow(msg)) => {
+                        self.sink.emit(AgentEvent::Error(msg.clone()));
+                        self.sink.emit(AgentEvent::Done(StopReason::Error));
+                        return Err(AgentError::Model(msg));
+                    }
+                    Err(RetryFailure::Fatal(msg)) => {
+                        self.sink.emit(AgentEvent::Done(StopReason::Error));
+                        return Err(AgentError::Model(msg));
+                    }
                 }
-                Err(e) => return Err(e),
             };
             self.sink.emit(AgentEvent::ServerUsage {
                 prompt_tokens: assistant.prompt_tokens,
@@ -327,6 +396,7 @@ impl AgentLoop {
                          settings and try again"
                             .into(),
                     ));
+                    self.sink.emit(AgentEvent::Done(StopReason::Length));
                     return Ok(());
                 }
                 Err(e) if protocol_repairs < 1 => {
@@ -339,6 +409,7 @@ impl AgentLoop {
                 }
                 Err(e) => {
                     self.sink.emit(AgentEvent::Error(e.to_string()));
+                    self.sink.emit(AgentEvent::Done(StopReason::Error));
                     return Ok(());
                 }
             };
@@ -1325,6 +1396,57 @@ mod tests {
             !err.contains("EOF while parsing"),
             "must not surface the raw JSON EOF parse error: {err}"
         );
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("done"),
+            "the truncation abort must still terminate with Done; events were: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_repair_exhausted_emits_done() {
+        let ws = std::env::temp_dir();
+        // Two consecutive unparseable tool calls (malformed JSON args, stop is
+        // ToolCalls not Length): the first triggers a re-emit repair, the second
+        // exhausts the single repair budget and the turn aborts.
+        let bad = r#"{"path": "a.txt", "#.to_string();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "read_file".into(), bad.clone()),
+            Scripted::Call("c2".into(), "read_file".into(), bad),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "read a.txt".into()).await.unwrap();
+
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e.starts_with("error:")),
+            "expected an error event for the exhausted repair; events were: {events:?}"
+        );
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("done"),
+            "the repair-exhausted abort must still terminate with Done; events were: {events:?}"
+        );
     }
 
     use agent_policy::PolicyEngine;
@@ -1455,6 +1577,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fatal_400_fails_fast_without_retry() {
+        let ws = std::env::temp_dir();
+        // One scripted 400; a Text follow-up that must NEVER be consulted.
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Status {
+                code: 400,
+                body: "invalid request".into(),
+            }),
+            Scripted::Text("should not be reached".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model.clone(),
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 3,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        let err = agent.run(&mut ctx, "go".into()).await.unwrap_err();
+        assert!(matches!(err, AgentError::Model(_)));
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e.starts_with("error")),
+            "expected an error event: {events:?}"
+        );
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+        // The second scripted turn is still queued: the model was consulted once.
+        assert_eq!(model.remaining(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_429_is_retried_then_succeeds() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Status {
+                code: 429,
+                body: "rate limited".into(),
+            }),
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 3,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(
+            sink.events.lock().unwrap().last().map(String::as_str),
+            Some("done")
+        );
+    }
+
+    #[tokio::test]
+    async fn exhaustion_emits_done_error() {
+        let ws = std::env::temp_dir();
+        // All-retryable failures burn max_retries then abort WITH a Done.
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Http("down".into())),
+            Scripted::Fail(ModelError::Http("down".into())),
+            Scripted::Fail(ModelError::Http("down".into())),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        let err = agent.run(&mut ctx, "go".into()).await.unwrap_err();
+        assert!(matches!(err, AgentError::Model(_)));
+        assert_eq!(
+            sink.events.lock().unwrap().last().map(String::as_str),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn backoff_is_exponential_and_capped() {
+        assert_eq!(backoff_delay(1), Duration::from_millis(100));
+        assert_eq!(backoff_delay(2), Duration::from_millis(200));
+        assert_eq!(backoff_delay(3), Duration::from_millis(400));
+        assert_eq!(backoff_delay(7), Duration::from_millis(5_000)); // 6400 capped
+        assert_eq!(backoff_delay(60), Duration::from_millis(5_000)); // no overflow
+    }
+
+    #[tokio::test]
     async fn budget_exhaustion_stops_the_loop() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "X").unwrap();
@@ -1544,6 +1795,8 @@ mod tests {
         );
         let events = sink.events.lock().unwrap().clone();
         assert!(events.iter().any(|e| e.starts_with("error:")));
+        // Exhaustion now aborts WITH a terminal Done(StopReason::Error).
+        assert_eq!(events.last().map(String::as_str), Some("done"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3173,5 +3426,126 @@ mod tests {
             capture.turn_duration_ms.lock().unwrap().is_some(),
             "ServerUsage must carry a measured turn_duration_ms"
         );
+    }
+
+    /// Context stub for overflow recovery: counts request_compaction calls,
+    /// and after the first one build() returns a shrunk history.
+    struct OverflowCtx {
+        history: Vec<Message>,
+        compaction_requests: usize,
+        maintains: usize,
+    }
+    #[async_trait::async_trait]
+    impl ContextManager for OverflowCtx {
+        fn append(&mut self, m: Message) {
+            self.history.push(m);
+        }
+        fn set_system(&mut self, _: Message) {}
+        fn set_recall(&mut self, _: Vec<String>) {}
+        fn set_goal(&mut self, _: String) {}
+        fn build(&self, _limit: usize) -> Vec<Message> {
+            if self.compaction_requests > 0 {
+                self.history.iter().take(1).cloned().collect() // "shrunk"
+            } else {
+                self.history.clone()
+            }
+        }
+        async fn maintain(&mut self, _deps: &crate::MaintCtx<'_>) -> crate::MaintReport {
+            self.maintains += 1;
+            crate::MaintReport::default()
+        }
+        fn request_compaction(&mut self) {
+            self.compaction_requests += 1;
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_compacts_rebuilds_and_recovers_once() {
+        let ws = std::env::temp_dir();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Status {
+                code: 400,
+                body: "maximum context length exceeded".into(),
+            }),
+            Scripted::Text("recovered after compaction".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 0, // proving overflow recovery does NOT consume retry budget
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = OverflowCtx {
+            history: vec![],
+            compaction_requests: 0,
+            maintains: 0,
+        };
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(ctx.compaction_requests, 1);
+        assert!(ctx.maintains >= 1);
+        assert_eq!(
+            sink.events.lock().unwrap().last().map(String::as_str),
+            Some("done")
+        );
+    }
+
+    #[tokio::test]
+    async fn second_overflow_in_a_turn_is_fatal() {
+        let ws = std::env::temp_dir();
+        let overflow = || {
+            Scripted::Fail(ModelError::Status {
+                code: 400,
+                body: "maximum context length exceeded".into(),
+            })
+        };
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![overflow(), overflow()]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 3, // unused — overflow skips budget
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = OverflowCtx {
+            history: vec![],
+            compaction_requests: 0,
+            maintains: 0,
+        };
+        let err = agent.run(&mut ctx, "go".into()).await.unwrap_err();
+        assert!(matches!(err, AgentError::Model(_)));
+        assert_eq!(
+            ctx.compaction_requests, 1,
+            "recovery attempted exactly once"
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+        assert!(events.iter().any(|k| k.starts_with("error")));
     }
 }
