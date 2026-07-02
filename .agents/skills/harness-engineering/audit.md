@@ -323,6 +323,35 @@ interaction worth remembering: overflow recovery is now the runtime safety net f
 token-estimate undercount, raising the value of the deferred server-usage-calibrated
 budgeting item.
 
+Re-stamp note (2026-07-01, permissions cluster): the deep audit's final cluster — the two
+**Guardrails** MEDs (subcommand-unaware allowlist, Top-10 fix #9; memory tools declared
+Read, Top-10 fix #10) plus the folded third Guardrails MED (the 2-state engine fold) and
+the Tools-component git_status/execute_command friction asymmetry — is now **fixed and
+merged to `main`** (7 commits, `21e5fb0..366bf09` merge commit). `Access::Destroy` is a
+third tier (`agent-tools/src/types.rs`, additive Serde variant): its floor is Ask, never
+auto-allowed — enforced twice (engine command-branch guard `access != Destroy &&
+is_auto_allowed`, plus an explicit non-command `Destroy => Ask` arm; hard floor still
+Denies first). `is_auto_allowed` allowlist entries are now whitespace-token PREFIXES
+(one-word = legacy program match; `"git status"` gates the subcommand; unknown
+subcommands fail safe to Ask), and `default_allowlist()` swapped bare `git`/`cargo` for
+read-safe prefixes (git: status/log/diff/show/blame/rev-parse/ls-files; cargo:
+build/check/test/fmt/clippy/metadata/tree) — `git push --force`/`reset --hard`/`clean
+-fdx` now reach Ask, not Allow. agent-memory re-tiered: remember=Write, recall=Read,
+forget=Destroy (the deliberate "declare Read so RulePolicy auto-allows" bypass comment
+removed); every remember/forget now prompts. Friction symmetry pinned by test:
+`execute_command("git status …")` and the `git_status` tool both Allow. See
+`docs/superpowers/specs/2026-07-01-destroy-tier-subcommand-allowlist-design.md` and its
+plan. Accepted residuals (final whole-branch review — merge-clean): `git
+{log,diff,show} --output=<path>` is an auto-allowed arbitrary-file write under the
+default prefixes (pre-existing under bare `git`; documented at `default_allowlist()`;
+`--output`/`-o` arg-scanning is the follow-up candidate); saved user configs that
+persisted bare `git`/`cargo` keep legacy semantics (user-owned, per-field merge, no
+migration); the plan's `git diff HEAD~1` test assertion was impossible (`~` ∈
+SHELL_SIGNIFICANT — over-ask accepted, test pins `git diff HEAD`); MCP Trust→Access and
+HTTP Host→Access posture encodings, Write-vs-Destroy FS granularity (tracked-file
+overwrite vs scratch write), wire Access surfacing, and ApproveAlways persistence stay
+out of scope. **This closes the deep audit's Top-10.**
+
 ---
 
 **Finding 1 — Instructions: duplicated system prompt + skill files lack negative constraints**
@@ -349,10 +378,11 @@ SessionStats + web panel, ContextEvent forwarding, CI gate), the sandbox cluster
 (fail-closed degraded exec, env scrub, required `LoopConfig.sandbox`, MCP workspace cwd,
 nobody uid fallback), the context cluster (turn-atomic eviction/compaction + visible
 eviction), the tools cluster (16 KiB ingestion cap + eager offload, recall/read_file
-pagination), and the retry cluster (classified retries, overflow compact-and-rebuild,
-full Done parity) are **done** — for the full current backlog see
-`docs/superpowers/audits/2026-07-01-harness-deep-audit.md` (its Top-10 table; items
-1 through 8 are now complete; #9/#10 — the 2-state permission model — remain). Of this
+pagination), the retry cluster (classified retries, overflow compact-and-rebuild,
+full Done parity), and the permissions cluster (Access::Destroy tier, token-prefix
+subcommand-aware allowlist, memory re-tiering) are **done** — for the full current
+backlog see `docs/superpowers/audits/2026-07-01-harness-deep-audit.md` (its Top-10
+table; **all ten items are now complete — the Top-10 is closed**). Of this
 file's inline findings, one remains:
 
 1. **[Component 1 — Instructions] De-duplicate the system prompt + add negative constraints** (Finding 1)
