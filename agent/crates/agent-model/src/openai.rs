@@ -269,12 +269,23 @@ impl ModelClient for OpenAiCompatClient {
             .map_err(|e| ModelError::Http(e.to_string()))?;
         if !resp.status().is_success() {
             let code = resp.status().as_u16();
+            // Parse `Retry-After` before the body consumes the response.
+            // Integer-seconds form only; the HTTP-date form is ignored (None).
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
             // Capture the body — backends put the actionable error here (bad
             // request shape, slot limits, etc.). Truncate so a stray HTML page
             // can't flood logs.
             let mut body = resp.text().await.unwrap_or_default();
             body = body.trim().chars().take(1000).collect();
-            return Err(ModelError::Status { code, body });
+            return Err(ModelError::Status {
+                code,
+                body,
+                retry_after,
+            });
         }
 
         let mut byte_stream = resp.bytes_stream();
@@ -562,12 +573,67 @@ mod tests {
         };
         let err = client.stream(req).await.err().unwrap();
         match err {
-            ModelError::Status { code, body } => {
+            ModelError::Status { code, body, .. } => {
                 assert_eq!(code, 500);
                 assert!(
                     body.contains("cannot be greater than slots"),
                     "body was: {body}"
                 );
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parses_retry_after_seconds_on_429() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "7")
+                    .set_body_string("{\"error\":\"rate limited\"}"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
+        let req = CompletionRequest {
+            messages: vec![],
+            ..Default::default()
+        };
+        let err = client.stream(req).await.err().unwrap();
+        match err {
+            ModelError::Status {
+                code, retry_after, ..
+            } => {
+                assert_eq!(code, 429);
+                assert_eq!(retry_after, Some(7));
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ignores_http_date_retry_after_form() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")
+                    .set_body_string("{\"error\":\"busy\"}"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenAiCompatClient::new(server.uri(), "m".into(), None);
+        let req = CompletionRequest {
+            messages: vec![],
+            ..Default::default()
+        };
+        let err = client.stream(req).await.err().unwrap();
+        match err {
+            ModelError::Status { retry_after, .. } => {
+                assert_eq!(retry_after, None, "HTTP-date form must be ignored");
             }
             other => panic!("expected Status, got {other:?}"),
         }

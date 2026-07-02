@@ -164,7 +164,14 @@ pub enum ModelError {
     #[error("http error: {0}")]
     Http(String),
     #[error("status {code}: {body}")]
-    Status { code: u16, body: String },
+    Status {
+        code: u16,
+        body: String,
+        /// Seconds parsed from a `Retry-After` response header (integer form
+        /// only; HTTP-date form is ignored). `None` when absent. Advisory: the
+        /// retry loop honors it, capped, alongside jittered backoff.
+        retry_after: Option<u64>,
+    },
     #[error("decode error: {0}")]
     Decode(String),
     #[error("stream error: {0}")]
@@ -217,6 +224,7 @@ impl ModelError {
             ModelError::Status {
                 code: 400 | 413 | 422,
                 body,
+                ..
             } if body_is_overflow(body) => ErrorClass::ContextOverflow,
             ModelError::Stream(body) if body_is_overflow(body) => ErrorClass::ContextOverflow,
             ModelError::Process(body) if body_is_overflow(body) => ErrorClass::ContextOverflow,
@@ -285,6 +293,7 @@ mod tests {
                 ModelError::Status {
                     code: 500,
                     body: "oops".into(),
+                    retry_after: None,
                 },
                 Retryable,
             ),
@@ -292,6 +301,7 @@ mod tests {
                 ModelError::Status {
                     code: 503,
                     body: "busy".into(),
+                    retry_after: None,
                 },
                 Retryable,
             ),
@@ -299,6 +309,7 @@ mod tests {
                 ModelError::Status {
                     code: 408,
                     body: "timeout".into(),
+                    retry_after: None,
                 },
                 Retryable,
             ),
@@ -306,6 +317,7 @@ mod tests {
                 ModelError::Status {
                     code: 429,
                     body: "rate limited".into(),
+                    retry_after: None,
                 },
                 Retryable,
             ),
@@ -313,6 +325,7 @@ mod tests {
                 ModelError::Status {
                     code: 400,
                     body: "invalid request".into(),
+                    retry_after: None,
                 },
                 Fatal,
             ),
@@ -320,6 +333,7 @@ mod tests {
                 ModelError::Status {
                     code: 401,
                     body: "bad key".into(),
+                    retry_after: None,
                 },
                 Fatal,
             ),
@@ -327,6 +341,7 @@ mod tests {
                 ModelError::Status {
                     code: 403,
                     body: "forbidden".into(),
+                    retry_after: None,
                 },
                 Fatal,
             ),
@@ -334,6 +349,7 @@ mod tests {
                 ModelError::Status {
                     code: 404,
                     body: "no such model".into(),
+                    retry_after: None,
                 },
                 Fatal,
             ),
@@ -360,6 +376,7 @@ mod tests {
                 let e = ModelError::Status {
                     code,
                     body: body.into(),
+                    retry_after: None,
                 };
                 assert_eq!(e.class(), ContextOverflow, "code {code}, body {body}");
             }
@@ -375,6 +392,7 @@ mod tests {
         let e = ModelError::Status {
             code: 400,
             body: "context deadline exceeded".into(),
+            retry_after: None,
         };
         assert_eq!(e.class(), Fatal);
         let e = ModelError::Stream("context deadline exceeded".into());
@@ -383,11 +401,13 @@ mod tests {
         let e = ModelError::Status {
             code: 500,
             body: "context length exceeded".into(),
+            retry_after: None,
         };
         assert_eq!(e.class(), Retryable);
         let e = ModelError::Status {
             code: 404,
             body: "context length exceeded".into(),
+            retry_after: None,
         };
         assert_eq!(e.class(), Fatal);
     }
