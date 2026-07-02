@@ -140,6 +140,19 @@ pub struct AssistantTurn {
 pub struct ParsedTurn {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    /// Tool calls the protocol could not parse (native per-call isolation); the
+    /// loop answers each with a per-call error result instead of discarding the
+    /// whole turn. Always empty from the prompted protocol.
+    pub invalid: Vec<InvalidToolCall>,
+}
+
+/// A tool call the protocol could not parse; the loop answers it with a
+/// per-call error result instead of discarding the turn (spec 2026-07-02).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InvalidToolCall {
+    pub id: String,
+    pub name: String,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

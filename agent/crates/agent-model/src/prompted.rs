@@ -52,6 +52,7 @@ impl ToolCallProtocol for PromptedJsonProtocol {
             return Ok(ParsedTurn {
                 text: text.clone(),
                 tool_calls: vec![],
+                invalid: vec![],
             });
         };
         let after = &text[start + FENCE.len()..];
@@ -79,6 +80,7 @@ impl ToolCallProtocol for PromptedJsonProtocol {
                 name: name.into(),
                 args,
             }],
+            invalid: vec![],
         })
     }
 }

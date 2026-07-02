@@ -160,6 +160,7 @@ impl ToolCallProtocol for PassthroughProtocol {
         Ok(ParsedTurn {
             text: raw.text.clone(),
             tool_calls: calls,
+            invalid: vec![],
         })
     }
 }
