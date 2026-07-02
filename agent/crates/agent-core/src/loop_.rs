@@ -26,6 +26,14 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A `LoopConfig.max_parallel_tools` of 0 (the `Default`) resolves to this.
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
 
+/// Surfaced when a tool call is cut off at `max_tokens` (args are incomplete
+/// JSON). Shared by the whole-turn `Err(Length)` repair arm and the per-call
+/// `Ok`-with-`invalid` + `Length` guard so a truncated call takes the
+/// truncation path, not a per-call "re-emit" that would truncate again.
+const LENGTH_TRUNCATION_MSG: &str = "the model reached the max_tokens limit before it \
+    finished a tool call (e.g. writing a large file); increase max_tokens in settings \
+    and try again";
+
 /// Exponential retry backoff: 100ms · 2^(attempt-1), capped at 5s.
 fn backoff_delay(attempt: usize) -> Duration {
     let exp = (attempt.saturating_sub(1)).min(16) as u32; // 100ms << 16 is already > cap
@@ -414,12 +422,8 @@ impl AgentLoop {
                 // the same limit — so surface the real cause instead of a cryptic
                 // JSON parse error.
                 Err(_) if assistant.stop == StopReason::Length => {
-                    self.sink.emit(AgentEvent::Error(
-                        "the model reached the max_tokens limit before it finished a \
-                         tool call (e.g. writing a large file); increase max_tokens in \
-                         settings and try again"
-                            .into(),
-                    ));
+                    self.sink
+                        .emit(AgentEvent::Error(LENGTH_TRUNCATION_MSG.into()));
                     self.sink.emit(AgentEvent::Done(StopReason::Length));
                     return Ok(());
                 }
@@ -438,16 +442,40 @@ impl AgentLoop {
                 }
             };
 
+            // A call truncated by max_tokens must take the truncation path, not a
+            // per-call "re-emit" error that would truncate again (spec §3). The
+            // native protocol yields Ok-with-`invalid` here (not `Err`), so this
+            // guard mirrors the `Err(_) if Length` arm above for that shape.
+            if !parsed.invalid.is_empty() && assistant.stop == StopReason::Length {
+                self.sink
+                    .emit(AgentEvent::Error(LENGTH_TRUNCATION_MSG.into()));
+                self.sink.emit(AgentEvent::Done(StopReason::Length));
+                return Ok(());
+            }
+
             // Enforce the per-call id invariant for EVERY protocol before the ids
-            // feed the assistant message and the Phase-3 tool-result drain.
+            // feed the assistant message and the Phase-3 tool-result drain. Invalid
+            // (unparseable) calls participate in uniqueness too — each becomes its
+            // own tool message and needs a distinct id against the valid calls.
             normalize_tool_call_ids(&mut parsed.tool_calls);
+            normalize_invalid_ids(&parsed.tool_calls, &mut parsed.invalid);
+
+            // The assistant message must carry ALL ids (valid + invalid) so every
+            // tool message keeps a matching parent call; invalid calls carry `{}`
+            // args since their real args could not be parsed.
+            let mut all_calls = parsed.tool_calls.clone();
+            all_calls.extend(parsed.invalid.iter().map(|inv| ToolCall {
+                id: inv.id.clone(),
+                name: inv.name.clone(),
+                args: serde_json::json!({}),
+            }));
 
             let mut msg = Message::assistant(
                 parsed.text.clone(),
-                if parsed.tool_calls.is_empty() {
+                if all_calls.is_empty() {
                     None
                 } else {
-                    Some(parsed.tool_calls.clone())
+                    Some(all_calls.clone())
                 },
             );
             // Preserve reasoning as data, not inline text — the model backend
@@ -458,15 +486,43 @@ impl AgentLoop {
             }
             ctx.append(msg);
 
-            if parsed.tool_calls.is_empty() {
+            if all_calls.is_empty() {
                 self.sink.emit(AgentEvent::Done(assistant.stop));
                 return Ok(());
             }
 
             // Phase 1 — gate every call sequentially (one approval prompt at a time).
-            let mut order: Vec<String> = Vec::with_capacity(parsed.tool_calls.len());
+            let mut order: Vec<String> = Vec::with_capacity(all_calls.len());
             let mut results: HashMap<String, (String, Resolved)> = HashMap::new();
             let mut ready: Vec<ReadyCall> = Vec::new();
+            // Seed the unparseable calls first: each emits a ToolStart and joins the
+            // Phase-3 drain as a per-call ERROR result (the "re-emit only this call"
+            // prompt). N-1 good calls still gate + execute normally below.
+            for inv in &parsed.invalid {
+                self.sink.emit(AgentEvent::ToolStart {
+                    id: inv.id.clone(),
+                    name: inv.name.clone(),
+                    args: serde_json::json!({}),
+                    parent_id: None,
+                });
+                order.push(inv.id.clone());
+                results.insert(
+                    inv.id.clone(),
+                    (
+                        inv.name.clone(),
+                        Resolved::Err {
+                            status: ToolStatus::Error,
+                            content: format!(
+                                "ERROR: this tool call could not be parsed ({}); the other \
+                                 calls in this turn ran normally — re-emit only this call, \
+                                 with valid JSON arguments",
+                                inv.error
+                            ),
+                            duration_ms: 0,
+                        },
+                    ),
+                );
+            }
             for call in parsed.tool_calls {
                 match self.gate_tool(call, &cancel).await {
                     GateOutcome::Rejected { id, name, content } => {
@@ -815,6 +871,27 @@ fn normalize_tool_call_ids(calls: &mut [ToolCall]) {
                 n += 1;
             }
             c.id = candidate;
+        }
+    }
+}
+
+/// Make each invalid (unparseable) call's id unique against the already-normalized
+/// valid calls AND against the other invalid entries. Invalid calls each become
+/// their own tool message, so a collision with a valid call — or an empty/duplicate
+/// invalid id — would desync the transcript. Rewrites only offending ids,
+/// order-stable and deterministically. `valid` is treated as read-only (already
+/// normalized by [`normalize_tool_call_ids`]).
+fn normalize_invalid_ids(valid: &[ToolCall], invalid: &mut [agent_model::InvalidToolCall]) {
+    let mut seen: std::collections::HashSet<String> = valid.iter().map(|c| c.id.clone()).collect();
+    for (k, inv) in invalid.iter_mut().enumerate() {
+        if inv.id.is_empty() || !seen.insert(inv.id.clone()) {
+            let mut candidate = format!("{}_inv{k}", inv.id);
+            let mut n = 1;
+            while !seen.insert(candidate.clone()) {
+                candidate = format!("{}_inv{k}_{n}", inv.id);
+                n += 1;
+            }
+            inv.id = candidate;
         }
     }
 }
@@ -3669,6 +3746,195 @@ mod tests {
         assert_eq!(
             sink.events.lock().unwrap().last().map(String::as_str),
             Some("done")
+        );
+    }
+
+    /// A sink that keeps full per-event detail (ids, status, content, done
+    /// reason) — the shared `CollectingSink` collapses events to
+    /// `name:status` strings, too lossy for the per-call isolation asserts.
+    #[derive(Default)]
+    struct DetailSink {
+        tool_starts: std::sync::Mutex<Vec<(String, String)>>, // (id, name)
+        tool_results: std::sync::Mutex<Vec<(String, ToolStatus, String)>>, // (id, status, content)
+        errors: std::sync::Mutex<Vec<String>>,
+        done: std::sync::Mutex<Option<StopReason>>,
+    }
+    impl EventSink for DetailSink {
+        fn emit(&self, event: AgentEvent) {
+            match event {
+                AgentEvent::ToolStart { id, name, .. } => {
+                    self.tool_starts.lock().unwrap().push((id, name));
+                }
+                AgentEvent::ToolResult {
+                    id, status, output, ..
+                } => {
+                    self.tool_results
+                        .lock()
+                        .unwrap()
+                        .push((id, status, output.content));
+                }
+                AgentEvent::Error(e) => self.errors.lock().unwrap().push(e),
+                AgentEvent::Done(r) => *self.done.lock().unwrap() = Some(r),
+                _ => {}
+            }
+        }
+    }
+
+    /// One malformed call must not discard the turn: good calls execute, the bad
+    /// one gets a per-call ERROR result, and the assistant message keeps all ids.
+    #[tokio::test]
+    async fn malformed_call_isolated_good_calls_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "BODY").unwrap();
+        let ws = dir.path().to_path_buf();
+        // Turn 1: one good read_file call + one bad-args call (unparseable JSON).
+        // Turn 2: plain text stop.
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                (
+                    "c_good".into(),
+                    "read_file".into(),
+                    r#"{"path":"a.txt"}"#.into(),
+                ),
+                ("c_bad".into(), "read_file".into(), "{not json".into()),
+            ]),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(DetailSink::default());
+        let agent = AgentLoop::new(
+            model,
+            // The native protocol is the one that fills `parsed.invalid`.
+            Arc::new(agent_model::NativeProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "read twice".into()).await.unwrap();
+
+        // Both ids emitted a ToolStart.
+        let starts = sink.tool_starts.lock().unwrap().clone();
+        let start_ids: std::collections::HashSet<&str> =
+            starts.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            start_ids.contains("c_good") && start_ids.contains("c_bad"),
+            "expected ToolStart for both ids, got {starts:?}"
+        );
+
+        // The good call actually executed (Ok result); the bad one is an Error
+        // result whose content is the per-call re-emit guidance.
+        let results = sink.tool_results.lock().unwrap().clone();
+        assert!(
+            results
+                .iter()
+                .any(|(id, st, _)| id == "c_good" && *st == ToolStatus::Ok),
+            "good call must run to an Ok ToolResult, got {results:?}"
+        );
+        let bad = results
+            .iter()
+            .find(|(id, _, _)| id == "c_bad")
+            .expect("bad call must produce a ToolResult");
+        assert_eq!(bad.1, ToolStatus::Error, "bad call result must be Error");
+        assert!(
+            bad.2.contains("could not be parsed") && bad.2.contains("re-emit only this call"),
+            "bad-call content must be the per-call re-emit guidance, got: {}",
+            bad.2
+        );
+
+        // Run ended normally, NOT via the whole-turn protocol-repair path.
+        assert_eq!(*sink.done.lock().unwrap(), Some(StopReason::Stop));
+
+        // The assistant message in history carries BOTH ids.
+        let built = ctx.build(100_000);
+        let assistant_ids: Vec<String> = built
+            .iter()
+            .filter(|m| matches!(m.role, agent_model::Role::Assistant))
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flat_map(|calls| calls.iter().map(|c| c.id.clone()))
+            .collect();
+        assert!(
+            assistant_ids.iter().any(|id| id == "c_good")
+                && assistant_ids.iter().any(|id| id == "c_bad"),
+            "assistant message must keep both tool-call ids, got {assistant_ids:?}"
+        );
+        // No whole-turn protocol-repair user message was appended.
+        assert!(
+            !built
+                .iter()
+                .any(|m| m.content.contains("Re-emit it correctly")),
+            "a malformed call must not trigger the whole-turn repair prompt"
+        );
+    }
+
+    /// A call truncated by max_tokens (Ok-parse with a non-empty `invalid` and
+    /// stop == Length) must take the max_tokens truncation path, not the
+    /// per-call re-emit error — and execute nothing.
+    #[tokio::test]
+    async fn malformed_call_length_stop_takes_truncation_path() {
+        let ws = std::env::temp_dir();
+        // A single tool call cut off mid-args with a `length` finish reason. The
+        // native protocol yields Ok-with-invalid (bad JSON) + stop == Length.
+        let truncated = r##"{"path":"big.py","content":"#!/usr/bin/env python3\nprint('hi"##;
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::TruncatedCall(
+            "write_file".into(),
+            truncated.into(),
+        )]));
+        let sink = Arc::new(DetailSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(agent_model::NativeProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: Some(2048),
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent
+            .run(&mut ctx, "write a big file".into())
+            .await
+            .unwrap();
+
+        // The terminal event is Done(Length), and the error explains truncation.
+        assert_eq!(*sink.done.lock().unwrap(), Some(StopReason::Length));
+        let errors = sink.errors.lock().unwrap().clone();
+        assert!(
+            errors.iter().any(|e| {
+                let low = e.to_lowercase();
+                low.contains("max_tokens") || low.contains("truncat")
+            }),
+            "expected a max_tokens/truncation error, got {errors:?}"
+        );
+        // No tool ran and no per-call re-emit error was emitted.
+        assert!(
+            sink.tool_starts.lock().unwrap().is_empty(),
+            "the Length-truncation path must not start any tool"
+        );
+        assert!(
+            sink.tool_results.lock().unwrap().is_empty(),
+            "the Length-truncation path must not emit a tool result"
         );
     }
 }
