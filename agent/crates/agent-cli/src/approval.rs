@@ -66,9 +66,12 @@ impl ApprovalChannel for TerminalApproval {
         // spawned thread is orphaned — it stays parked on stdin until the next line or
         // EOF arrives, then its result is discarded. Harmless: one idle thread per
         // elapsed prompt (bounded by tokio's blocking pool), and the agent is no longer
-        // blocked. The approval loop prompts one at a time, so this does not accumulate
-        // in practice. A clean cancel would need raw-fd polling, not worth the
-        // complexity for a CLI approval prompt.
+        // blocked. The `gate` mutex below now enforces one-at-a-time for LIVE prompts
+        // (parallel sub-agents can each hit Ask — spec D12), so at most one prompt reads
+        // stdin at a time. But a timed-out orphan thread still holds its own `read_line`
+        // on stdin, so it can race the next prompt's read for the operator's keystrokes
+        // — an accepted residual: a clean cancel would need raw-fd polling, not worth
+        // the complexity for a CLI approval prompt.
         let _serialized = self.gate.lock().await;
         let summary = req.intent.summary.clone();
         let prompt = self.prompt.clone();

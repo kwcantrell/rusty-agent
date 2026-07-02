@@ -127,7 +127,10 @@ tool registry that is a **subset** of the parent's — never containing
   truth). Known accepted distortions, documented in code: child tool calls fold
   into session tool counters; `SessionStats.turns = max(turn)` may reflect a
   child's turn index; the web per-turn usage readout can flicker to a child
-  turn until the parent's next `Usage` corrects it.
+  turn until the parent's next `ServerUsage` frame corrects it (corrected
+  2026-07-01, final review — `Usage` is suppressed for children, so only the
+  forwarded `ServerUsage` moves the web readout; `web/src/state.ts` `server_usage`
+  case).
 - **D10 — Result contract.** Tool output content = concatenated `Token` text
   emitted **after the last child `ToolResult`** (i.e. the final turn's text);
   if that tail is empty, fall back to all collected text. Footer line appended:
@@ -244,8 +247,9 @@ verbatim; everything else → capture-only/suppress.
 
 ## Error handling & edge cases
 
-- **Child fatal model error** (`AgentError::Model`) → `ToolError::Execution`
-  with the message; parent loop records a normal tool error, parent turn
+- **Child fatal model error** (`AgentError::Model`) → `ToolError::Failed`
+  (corrected 2026-07-01, final review — the crate's variant is `ToolError::Failed`,
+  not `ToolError::Execution`) with the message; parent loop records a normal tool error, parent turn
   continues (failure isolation — one bad child never kills the batch, per
   `execute_isolated`).
 - **Child panic** → caught by the parent's `execute_isolated` catch_unwind

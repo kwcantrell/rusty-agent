@@ -420,6 +420,22 @@ mod tests {
     }
 
     #[test]
+    fn child_base_snapshot_includes_memory_tools_when_enabled() {
+        // Inclusion half of the snapshot invariant: the snapshot is taken AFTER
+        // memory tools register (and before context tools + dispatch), so an
+        // enabled memory tool is child-visible.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.memory = true;
+        let built = assemble_loop(
+            &c,
+            parts(dir.path().to_path_buf(), vec![fake_mem("remember")]),
+        );
+        let base = built.dispatch_base_names.expect("subagents on by default");
+        assert!(base.iter().any(|n| n == "remember"), "{base:?}");
+    }
+
+    #[test]
     fn child_base_snapshot_excludes_context_tools_and_dispatch_itself() {
         let dir = tempfile::tempdir().unwrap();
         let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));

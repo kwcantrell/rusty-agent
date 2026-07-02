@@ -457,6 +457,80 @@ async fn child_cannot_recurse_into_dispatch_agent() {
     );
 }
 
+/// A stub deliberately NAMED `dispatch_agent`, to prove the in-tool skip
+/// (dispatch.rs:279-281) drops it from the child registry even when a caller
+/// leaks it into the base snapshot — defense in depth for D4.
+struct StubDispatch;
+#[async_trait::async_trait]
+impl Tool for StubDispatch {
+    fn name(&self) -> &str {
+        "dispatch_agent"
+    }
+    fn description(&self) -> &str {
+        "stub"
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "dispatch_agent".into(),
+            description: "stub".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+    fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+        Ok(ToolIntent {
+            tool: "dispatch_agent".into(),
+            access: Access::Read,
+            paths: vec![],
+            command: None,
+            summary: "stub".into(),
+        })
+    }
+    async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            content: "STUB DISPATCH RAN".into(),
+            display: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn dispatch_agent_in_base_tools_is_still_excluded_from_child() {
+    let sink = Arc::new(FullSink::default());
+    // base_tools DELIBERATELY contains a tool named "dispatch_agent" — the child
+    // registry must still exclude it (dispatch.rs:279-281), so the child's call
+    // is denied as unknown rather than executing the stub.
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"nested"}"#.into(),
+            ),
+            Scripted::Text("done".into()),
+        ]),
+        sink.clone(),
+        vec![Arc::new(StubDispatch)],
+    ));
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+    assert!(out.content.starts_with("done"));
+    // The stub never executed; the child gate denied the excluded name.
+    assert!(
+        !out.content.contains("STUB DISPATCH RAN"),
+        "{}",
+        out.content
+    );
+    let events = sink.events.lock().unwrap().clone();
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n)| k == "tool_result:denied" && n == "sub:dispatch_agent"),
+        "{events:?}"
+    );
+}
+
 #[tokio::test]
 async fn pre_cancelled_parent_token_cancels_the_child() {
     let tool = DispatchAgentTool::new(deps(
@@ -492,6 +566,37 @@ async fn wall_clock_timeout_cancels_the_child_and_reports_timeout() {
         .unwrap_err();
     assert!(matches!(err, ToolError::Timeout), "{err:?}");
     assert_eq!(started.elapsed(), Duration::from_secs(1)); // virtual time: exactly the budget
+}
+
+#[tokio::test(start_paused = true)]
+async fn parent_cancel_mid_run_resolves_to_cancelled_promptly() {
+    // Child hangs on an open stream (HangOpen) with a huge idle timeout; the
+    // parent cancel must tear it down mid-run and surface a "cancelled" error.
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![Scripted::HangOpen]),
+        Arc::new(FullSink::default()),
+        vec![],
+    ));
+    let ctx = tool_ctx(); // timeout 600s; child stream_idle 3600s (child_config)
+    let cancel = ctx.cancel.clone();
+    // Cancel once the child is in flight (parked on the open stream). The child
+    // token derives from ctx.cancel, so this propagates down. Cancellation fires
+    // via task scheduling (yield), not a timer, so the paused clock never
+    // advances and the 600s wall-clock timeout never fires — no real sleeps.
+    let canceller = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        cancel.cancel();
+    });
+    let err = tool
+        .execute(serde_json::json!({"prompt": "p"}), &ctx)
+        .await
+        .unwrap_err();
+    canceller.await.unwrap();
+    assert!(
+        matches!(err, ToolError::Failed { ref message, .. } if message.contains("cancelled")),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]

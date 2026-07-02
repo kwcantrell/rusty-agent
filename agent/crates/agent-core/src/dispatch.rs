@@ -336,23 +336,28 @@ impl Tool for DispatchAgentTool {
         }
 
         let s = sink.summary();
-        let mut content = s.final_text;
-        if matches!(s.stop, Some(StopReason::BudgetExhausted)) {
-            content = format!("[sub-agent hit its turn budget before finishing]\n{content}");
-        }
         let stop = s.stop.unwrap_or(StopReason::Stop);
         let footer = format!(
             "[sub-agent: {} turns, {} tool calls, stop: {stop:?}]",
             s.turns, s.tool_calls
         );
-        // Spec: when there's no assembled content, the result is the footer alone
-        // (no leading blank lines).
-        if content.is_empty() {
-            content = footer;
+        let budget_note = matches!(s.stop, Some(StopReason::BudgetExhausted))
+            .then_some("[sub-agent hit its turn budget before finishing]");
+        // Apply the empty-check to the CHILD text first so a text-less child never
+        // emits a stray blank-line run: footer alone, or (budget) note + footer
+        // joined by a single newline. With text present: note prefix, the text, a
+        // blank line, then the footer.
+        let content = if s.final_text.is_empty() {
+            match budget_note {
+                Some(note) => format!("{note}\n{footer}"),
+                None => footer,
+            }
         } else {
-            content.push_str("\n\n");
-            content.push_str(&footer);
-        }
+            match budget_note {
+                Some(note) => format!("{note}\n{}\n\n{footer}", s.final_text),
+                None => format!("{}\n\n{footer}", s.final_text),
+            }
+        };
         Ok(ToolOutput {
             content,
             display: None,
@@ -516,5 +521,91 @@ mod tests {
         let a = next_dispatch_n();
         let b = next_dispatch_n();
         assert_ne!(a, b);
+    }
+
+    // --- Footer formatting pins (empty-text / budget-exhausted) -------------
+    use crate::testkit::{AlwaysApprove, PassthroughProtocol, Scripted, ScriptedModel};
+    use crate::LoopConfig;
+    use agent_tools::ToolCtx;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    fn exec_deps(model: ScriptedModel, max_turns: usize) -> DispatchDeps {
+        let ws = std::env::temp_dir();
+        DispatchDeps {
+            model: Arc::new(model),
+            protocol: Arc::new(PassthroughProtocol),
+            policy: Arc::new(agent_policy::RulePolicy {
+                workspace: ws.clone(),
+                command_allowlist: vec![],
+                command_denylist: vec![],
+            }),
+            approval: Arc::new(AlwaysApprove),
+            sink: Arc::new(FullSink::default()),
+            base_tools: vec![],
+            child_system_prompt: "SYS".into(),
+            loop_config: LoopConfig {
+                model_limit: 16384,
+                max_turns,
+                max_retries: 1,
+                tool_timeout: Duration::from_secs(5),
+                stream_idle_timeout: Duration::from_secs(3600),
+                workspace: ws,
+                ..LoopConfig::default()
+            },
+            max_result_bytes: 16 * 1024,
+            subagent_timeout: Duration::from_secs(600),
+        }
+    }
+
+    fn exec_ctx() -> ToolCtx {
+        ToolCtx {
+            workspace: std::env::temp_dir(),
+            timeout: Duration::from_secs(600),
+            cancel: CancellationToken::new(),
+            sandbox: Arc::new(agent_tools::HostExecutor),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_with_no_text_has_no_blank_line_run() {
+        // Child burns its 1-turn budget on a (denied) tool call and emits zero
+        // Token text. The budget note + footer must join without a stray blank
+        // line (no "\n\n\n"); the old prepend-then-append path produced one.
+        let tool = DispatchAgentTool::new(exec_deps(
+            ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "nope".into(), "{}".into()),
+                Scripted::Call("c2".into(), "nope".into(), "{}".into()),
+            ]),
+            1,
+        ));
+        let out = tool
+            .execute(serde_json::json!({"prompt": "p"}), &exec_ctx())
+            .await
+            .unwrap();
+        assert!(out.content.contains("turn budget"), "{:?}", out.content);
+        assert!(out.content.contains("[sub-agent:"), "{:?}", out.content);
+        assert!(!out.content.contains("\n\n\n"), "{:?}", out.content);
+    }
+
+    #[tokio::test]
+    async fn empty_text_child_returns_footer_alone_without_leading_whitespace() {
+        // Non-budget empty child: footer alone, no leading blank line/whitespace.
+        let tool = DispatchAgentTool::new(exec_deps(
+            ScriptedModel::new(vec![Scripted::Text(String::new())]),
+            5,
+        ));
+        let out = tool
+            .execute(serde_json::json!({"prompt": "p"}), &exec_ctx())
+            .await
+            .unwrap();
+        assert!(out.content.starts_with("[sub-agent:"), "{:?}", out.content);
+        assert!(out.content.contains("stop: Stop"), "{:?}", out.content);
+        assert!(
+            !out.content.starts_with(char::is_whitespace),
+            "{:?}",
+            out.content
+        );
+        assert!(!out.content.contains("\n\n\n"), "{:?}", out.content);
     }
 }
