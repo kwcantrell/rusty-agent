@@ -236,6 +236,24 @@ turns=max(turn) semantics, session_stats query has no client caller yet, trace f
 live trace toggle needs restart, id-based tool correlation in the web reducer. Remaining open
 finding below renumbered to 1.
 
+Re-stamp note (2026-07-01, sandbox cluster): the deep audit's "cluster 1" — **Sandboxes &
+Execution** (Component 3, Top-10 fixes #1 and #2) — is now **fixed and merged to `main`**
+(9 commits, `ffc8ac8..be67413`, fast-forward): a degraded sandbox **refuses** exec-capable
+launches instead of silently degrading to the host (`auto` stays the default; the error names
+`sandbox_mode: "off"` as the explicit opt-out), with a self-healing re-probe (2 s bounded,
+single-flighted) so Docker coming up mid-session recovers without restart; `HostExecutor` does
+`env_clear()` + a six-var allow-list (PATH/HOME/LANG/LC_ALL/TERM/TMPDIR, `spec.env` wins) closing
+the `AGENT_API_KEY` leak on every host path; `LoopConfig.sandbox` is a required field (the
+fail-open `unwrap_or_else(HostExecutor)` is gone at the type level); MCP servers spawn with
+`cwd = workspace` and are skipped loudly under refusal; `current_uid_gid()` falls back to nobody
+(`65534:65534`), never `0:0`. See `docs/superpowers/specs/2026-07-01-sandbox-fail-closed-design.md`
+and its plan. Accepted residuals (from the final whole-branch review): the test-only
+`Default for LoopConfig` constructs `HostExecutor` by documented contract, not by type (four
+integration suites depend on it); `enforce` refusals return the bare probe reason without the
+actionable copy; and — **new residual for the next audit pass** — `claude_cli.rs:41` spawns the
+Claude CLI model backend with the full inherited env including `AGENT_API_KEY` (trusted backend,
+outside the tool-execution threat model, but the last child process that still sees the secret).
+
 ---
 
 **Finding 1 — Instructions: duplicated system prompt + skill files lack negative constraints**
@@ -256,11 +274,13 @@ concrete proposed fix: The coding-agent system prompt is byte-identical but dupl
 
 ## Top highest-leverage fixes
 
-Ranked by impact (severity × remediation cost). All prior HIGH findings and the observability
+Ranked by impact (severity × remediation cost). All prior HIGH findings, the observability
 cluster (per-call terminal events + durations, JSONL session traces, usage/cost parsing,
-SessionStats + web panel, ContextEvent forwarding, CI gate) are **done** — for the full current
-backlog see `docs/superpowers/audits/2026-07-01-harness-deep-audit.md` (its Top-10 table; items
-3, 4, and 6 are now complete). Of this file's inline findings, one remains:
+SessionStats + web panel, ContextEvent forwarding, CI gate), and the sandbox cluster
+(fail-closed degraded exec, env scrub, required `LoopConfig.sandbox`, MCP workspace cwd,
+nobody uid fallback) are **done** — for the full current backlog see
+`docs/superpowers/audits/2026-07-01-harness-deep-audit.md` (its Top-10 table; items
+1, 2, 3, 4, and 6 are now complete). Of this file's inline findings, one remains:
 
 1. **[Component 1 — Instructions] De-duplicate the system prompt + add negative constraints** (Finding 1)
    `agent/crates/agent-server/src/daemon.rs:23` + `agent/crates/agent-cli/src/main.rs:15`; `.agents/skills/`
