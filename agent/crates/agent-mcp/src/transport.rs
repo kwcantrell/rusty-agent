@@ -205,10 +205,7 @@ mod tests {
         let sandbox = host_sandbox();
         let spec = McpServerSpec {
             command: "sh".into(),
-            args: vec![
-                "-c".into(),
-                r#"printf '{"cwd":"%s"}\n' "$(pwd)""#.into(),
-            ],
+            args: vec!["-c".into(), r#"printf '{"cwd":"%s"}\n' "$(pwd)""#.into()],
             env: BTreeMap::new(),
             trust: crate::config::Trust::Ask,
         };

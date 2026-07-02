@@ -46,7 +46,13 @@ pub async fn connect_mcp(
     if let Some(w) = warning {
         eprintln!("warning: {} ({}); MCP disabled", w, path.display());
     }
-    McpManager::connect(&cfg, Duration::from_secs(15), workspace.to_path_buf(), sandbox).await
+    McpManager::connect(
+        &cfg,
+        Duration::from_secs(15),
+        workspace.to_path_buf(),
+        sandbox,
+    )
+    .await
 }
 
 pub fn protocol_name_is_valid(name: &str) -> bool {

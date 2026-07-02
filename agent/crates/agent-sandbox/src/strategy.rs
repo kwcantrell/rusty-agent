@@ -193,8 +193,14 @@ mod tests {
         let Err(SandboxError::Unavailable(msg)) = result else {
             panic!("auto + degraded must refuse, got a launch");
         };
-        assert!(msg.contains("sandbox_mode"), "refusal must name the opt-out: {msg}");
-        assert!(msg.contains("no daemon"), "refusal must carry the probe reason: {msg}");
+        assert!(
+            msg.contains("sandbox_mode"),
+            "refusal must name the opt-out: {msg}"
+        );
+        assert!(
+            msg.contains("no daemon"),
+            "refusal must carry the probe reason: {msg}"
+        );
     }
 
     #[test]
@@ -210,7 +216,10 @@ mod tests {
         let Err(SandboxError::Unavailable(msg)) = sb.launch(spec()) else {
             panic!("must refuse");
         };
-        assert!(msg.contains("still down"), "must carry the re-probed reason: {msg}");
+        assert!(
+            msg.contains("still down"),
+            "must carry the re-probed reason: {msg}"
+        );
         assert_eq!(sb.describe().degraded.as_deref(), Some("still down"));
     }
 
@@ -224,7 +233,10 @@ mod tests {
         .with_prober(|| Availability::Available);
         // Don't spawn a real container: assert on the resolved availability + posture.
         assert_eq!(sb.resolve_availability(), Availability::Available);
-        assert!(sb.describe().degraded.is_none(), "recovery must clear the degraded posture");
+        assert!(
+            sb.describe().degraded.is_none(),
+            "recovery must clear the degraded posture"
+        );
     }
 
     #[test]
@@ -240,8 +252,15 @@ mod tests {
             c.fetch_add(1, AtomicOrdering::SeqCst);
             Availability::Available
         });
-        assert!(matches!(sb.launch(spec()), Err(SandboxError::Unavailable(_))));
-        assert_eq!(count.load(AtomicOrdering::SeqCst), 0, "enforce must not re-probe");
+        assert!(matches!(
+            sb.launch(spec()),
+            Err(SandboxError::Unavailable(_))
+        ));
+        assert_eq!(
+            count.load(AtomicOrdering::SeqCst),
+            0,
+            "enforce must not re-probe"
+        );
     }
 
     #[test]
@@ -259,6 +278,10 @@ mod tests {
         });
         let _ = sb.describe();
         let _ = sb.describe();
-        assert_eq!(count.load(AtomicOrdering::SeqCst), 0, "describe() must stay a cached read");
+        assert_eq!(
+            count.load(AtomicOrdering::SeqCst),
+            0,
+            "describe() must stay a cached read"
+        );
     }
 }

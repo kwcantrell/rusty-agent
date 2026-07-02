@@ -1,7 +1,7 @@
 # Sandbox Fail-Closed by Default — Design
 
 **Date:** 2026-07-01
-**Status:** Approved (brainstorming) → ready for plan
+**Status:** Implemented (this plan: docs/superpowers/plans/2026-07-01-sandbox-fail-closed.md)
 **Source:** Cluster 1 of the harness deep audit
 (`docs/superpowers/audits/2026-07-01-harness-deep-audit.md`, Component 3 —
 Sandboxes & Execution; Top-10 fixes #1 and #2). All five findings re-verified
