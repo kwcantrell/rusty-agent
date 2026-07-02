@@ -167,6 +167,7 @@ pub struct DispatchDeps {
     pub child_system_prompt: String,       // composed parent prompt + preamble
     pub loop_config: LoopConfig,           // parent values; max_turns overridden
     pub max_result_bytes: usize,           // child OffloadConfig + recall pages
+    pub subagent_timeout: Duration,        // returned by timeout_override (D7)
 }
 ```
 
