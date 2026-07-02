@@ -31,9 +31,11 @@ pub struct CuratedContext {
     pub(crate) config: OffloadConfig,
     pub(crate) high_water_pct: f32,
     pub(crate) compact_flag: Arc<AtomicBool>,
-    /// Message count omitted by eviction at the last maintain pass; dedups
-    /// repeated identical Evicted events while the window stays saturated.
-    last_evicted: usize,
+    /// `(messages, est_tokens)` omitted by eviction at the last maintain pass;
+    /// dedups repeated identical Evicted events while the window stays saturated,
+    /// yet re-emits when either the count OR the token estimate changes (offload
+    /// can shrink the evicted span's tokens without changing its message count).
+    last_evicted: (usize, usize),
 }
 
 impl CuratedContext {
@@ -53,7 +55,7 @@ impl CuratedContext {
             config: OffloadConfig::default(),
             high_water_pct: DEFAULT_HIGH_WATER_PCT,
             compact_flag,
-            last_evicted: 0,
+            last_evicted: (0, 0),
         }
     }
 
@@ -90,6 +92,24 @@ impl CuratedContext {
         out
     }
 
+    /// Estimated tokens of the pinned blocks, counted over references — the
+    /// non-cloning twin of `self.pinned().iter().map(message_tokens).sum()`
+    /// (the recall block is constructed regardless). Same total, no per-message
+    /// clone of `system`/`goal`/`compaction_summary`.
+    fn pinned_tokens(&self) -> usize {
+        let mut t = message_tokens(&self.system);
+        if let Some(g) = &self.goal {
+            t += message_tokens(g);
+        }
+        if let Some(r) = recall_block(&self.recall, self.recall_budget) {
+            t += message_tokens(&r);
+        }
+        if let Some(c) = &self.compaction_summary {
+            t += message_tokens(c);
+        }
+        t
+    }
+
     /// Borrow history (used by the compaction-failure test).
     #[cfg(test)]
     pub(crate) fn history(&self) -> &[Message] {
@@ -105,6 +125,7 @@ impl CuratedContext {
             &self.system,
             self.goal.as_ref(),
             &self.recall,
+            self.recall_budget,
             self.compaction_summary.as_ref(),
             &self.history,
         )
@@ -133,8 +154,7 @@ impl ContextManager for CuratedContext {
 
     fn build(&self, model_limit: usize) -> Vec<Message> {
         let pinned = self.pinned();
-        let pinned_tokens: usize = pinned.iter().map(message_tokens).sum();
-        let budget = model_limit.saturating_sub(pinned_tokens);
+        let budget = model_limit.saturating_sub(self.pinned_tokens());
         // Walk history newest-first in turn units, keep whole units while they
         // fit — never split a tool_calls parent from its Role::Tool results.
         let start = evict_start(&self.history, budget);
@@ -280,17 +300,20 @@ impl CuratedContext {
     /// Emit `ContextEvent::Evicted` when the built window omits history
     /// messages and the count changed since the last pass.
     fn emit_eviction(&mut self, deps: &MaintCtx<'_>) {
-        let pinned_tokens: usize = self.pinned().iter().map(message_tokens).sum();
-        let budget = deps.model_limit.saturating_sub(pinned_tokens);
+        let budget = deps.model_limit.saturating_sub(self.pinned_tokens());
         let start = evict_start(&self.history, budget);
-        if start > 0 && start != self.last_evicted {
-            let est_tokens: usize = self.history[..start].iter().map(message_tokens).sum();
+        let est_tokens: usize = self.history[..start].iter().map(message_tokens).sum();
+        // Dedup on (count, tokens): re-emit when EITHER changes, so an offload
+        // that shrinks the evicted span's tokens without moving the count still
+        // surfaces the reduced pressure.
+        let key = (start, est_tokens);
+        if start > 0 && key != self.last_evicted {
             deps.sink.emit(AgentEvent::Context(ContextEvent::Evicted {
                 messages: start,
                 est_tokens,
             }));
         }
-        self.last_evicted = start;
+        self.last_evicted = key;
     }
 }
 
@@ -628,6 +651,33 @@ mod tests {
             "unchanged eviction count must not re-emit"
         );
 
+        // Same count, different tokens → re-emit. Grow a message deep inside the
+        // already-evicted span (far below the kept-window boundary): the evicted
+        // message COUNT is unchanged, but its token estimate rises — the (count,
+        // tokens) key must still trip a fresh Evicted.
+        let start_before = evict_start(
+            &c.history,
+            deps.model_limit.saturating_sub(c.pinned_tokens()),
+        );
+        c.history[0]
+            .content
+            .push_str(" with a great deal of additional padding text appended to grow its tokens");
+        let start_after = evict_start(
+            &c.history,
+            deps.model_limit.saturating_sub(c.pinned_tokens()),
+        );
+        assert_eq!(
+            start_before, start_after,
+            "evicted count must be unchanged for this case to isolate a token-only change"
+        );
+        c.maintain(&deps).await;
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(
+            events.iter().filter(|e| e.starts_with("evicted:")).count(),
+            2,
+            "same count but different tokens must re-emit"
+        );
+
         // More history → count changes → re-emit.
         c.append(Message::user(
             "one more message with plenty of padding here",
@@ -636,7 +686,7 @@ mod tests {
         let events = sink.events.lock().unwrap().clone();
         assert_eq!(
             events.iter().filter(|e| e.starts_with("evicted:")).count(),
-            2
+            3
         );
     }
 

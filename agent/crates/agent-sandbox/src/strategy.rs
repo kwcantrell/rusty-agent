@@ -148,7 +148,11 @@ impl SandboxStrategy for DockerSandbox {
         match self.resolve_availability() {
             Availability::Available => self.spawn_docker(&spec, &name),
             Availability::Unavailable(reason) => match self.policy.mode {
-                Mode::Enforce => Err(SandboxError::Unavailable(reason)),
+                Mode::Enforce => Err(SandboxError::Unavailable(format!(
+                    "docker unreachable ({reason}); command refused — start Docker, \
+                     or set sandbox_mode=\"off\" to accept unsandboxed execution \
+                     (sandbox_mode=\"enforce\" never degrades)"
+                ))),
                 _ => {
                     // auto: fail closed. The old degrade-to-host arm is gone —
                     // unsandboxed execution is an explicit config choice only.
@@ -218,7 +222,13 @@ mod tests {
             Availability::Unavailable("no daemon".into()),
         );
         let result = sb.launch(spec());
-        assert!(matches!(result, Err(SandboxError::Unavailable(_))));
+        let Err(SandboxError::Unavailable(msg)) = result else {
+            panic!("enforce + unavailable must refuse");
+        };
+        assert!(
+            msg.contains("start Docker"),
+            "enforce refusal must be actionable: {msg}"
+        );
         assert!(sb.describe().degraded.is_some());
     }
 

@@ -13,7 +13,12 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+        let name = tool.name().to_string();
+        // Last-wins is intentional (rejecting could wedge startup on MCP
+        // cross-server name collisions); the warn makes silent shadowing visible.
+        if self.tools.insert(name.clone(), tool).is_some() {
+            tracing::warn!(tool = %name, "duplicate tool name registered — last wins");
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -233,6 +238,54 @@ mod tests {
         let mut names: Vec<String> = r.all().iter().map(|t| t.name().to_string()).collect();
         names.sort();
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    struct Named(&'static str, &'static str);
+    #[async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            self.1
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.0.into(),
+                description: self.1.into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+            Ok(ToolIntent {
+                tool: self.0.into(),
+                access: Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "x".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _a: serde_json::Value,
+            _c: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                content: self.1.into(),
+                display: None,
+            })
+        }
+    }
+
+    #[test]
+    fn duplicate_name_registration_is_last_wins() {
+        // Behavior pin for S8: registering a second tool under an existing name
+        // overwrites (the warn is best-effort observability, not asserted here).
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(Named("dup", "first")));
+        r.register(Arc::new(Named("dup", "second")));
+        assert_eq!(r.all().len(), 1, "collision must not grow the registry");
+        assert_eq!(r.get("dup").unwrap().description(), "second");
     }
 
     #[test]

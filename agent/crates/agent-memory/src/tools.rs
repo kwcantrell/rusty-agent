@@ -115,8 +115,8 @@ impl Tool for Remember {
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "The fact to remember"},
-                    "tags": {"type": "array", "items": {"type": "string"}},
-                    "scope": {"type": "string", "enum": ["project", "global"]}
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional labels to categorize this memory for later filtering."},
+                    "scope": {"type": "string", "enum": ["project", "global"], "description": "Visibility tier: 'project' (default, this project only) or 'global' (all projects)."}
                 },
                 "required": ["text"]
             }),
@@ -259,7 +259,7 @@ impl Tool for Recall {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Natural-language query to search saved memories for."},
-                    "k": {"type": "integer", "minimum": 1}
+                    "k": {"type": "integer", "minimum": 1, "description": "Maximum number of memories to return (defaults to the configured k)."}
                 },
                 "required": ["query"]
             }),
@@ -334,8 +334,8 @@ impl Tool for Forget {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string"},
-                    "query": {"type": "string"}
+                    "id": {"type": "string", "description": "Exact id of the memory to remove (as returned by a prior recall)."},
+                    "query": {"type": "string", "description": "Natural-language query; removes the single best match only if confidently similar."}
                 }
             }),
         }
@@ -754,6 +754,29 @@ mod recall_contract_tests {
         assert!(
             agent_tools::required_params_missing_description(&rec.schema()).is_empty(),
             "recall.query must have a description"
+        );
+
+        // Optional params also carry descriptions (S9): recall.k, forget.id/query.
+        let described = |schema: &ToolSchema, key: &str| -> bool {
+            schema.parameters["properties"][key]["description"]
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty())
+        };
+        assert!(described(&rec.schema(), "k"), "recall.k must be described");
+
+        let forget = Forget {
+            embedder: std::sync::Arc::new(StubEmbedder::d384()),
+            store: std::sync::Arc::new(InMemoryStore::new()),
+            cfg: std::sync::Arc::new(MemoryConfig::default()),
+            project_key: "A".into(),
+        };
+        assert!(
+            described(&forget.schema(), "id"),
+            "forget.id must be described"
+        );
+        assert!(
+            described(&forget.schema(), "query"),
+            "forget.query must be described"
         );
     }
 }

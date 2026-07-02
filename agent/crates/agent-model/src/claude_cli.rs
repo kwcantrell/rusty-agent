@@ -60,6 +60,10 @@ impl ModelClient for ClaudeCliClient {
             // Skip MCP discovery and session-to-disk writes (we're stateless).
             .arg("--strict-mcp-config")
             .arg("--no-session-persistence")
+            // The CLI authenticates via its own subscription/OAuth — it must not
+            // inherit the runtime's model API key. This is the last child that
+            // could see it; the rest of the env stays (trusted local backend).
+            .env_remove("AGENT_API_KEY")
             // NOTE: do NOT use `--bare` — it forces ANTHROPIC_API_KEY/apiKeyHelper
             // auth and never reads OAuth/keychain, which defeats the whole point
             // of driving the CLI (piggybacking the Claude subscription).
@@ -179,13 +183,25 @@ pub(crate) fn parse_event_line(line: &str) -> Result<Vec<Chunk>, ModelError> {
         }
         Some("result") => {
             if let Some(u) = v.get("usage").and_then(Value::as_object) {
+                let field = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+                let cache_read = field("cache_read_input_tokens");
+                // Fold cache tokens into prompt_tokens so it reflects the
+                // effective context size (input + cache read + cache creation);
+                // otherwise cluster 3's context calibration is inert here and
+                // the display under-reports. cached_tokens still surfaces the
+                // cache-read portion separately.
                 out.push(Chunk::Usage {
-                    prompt_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0)
+                    prompt_tokens: (field("input_tokens")
+                        + cache_read
+                        + field("cache_creation_input_tokens"))
                         as u32,
-                    completion_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
-                        as u32,
+                    completion_tokens: field("output_tokens") as u32,
                     reasoning_tokens: None,
-                    cached_tokens: None,
+                    cached_tokens: if cache_read > 0 {
+                        Some(cache_read as u32)
+                    } else {
+                        None
+                    },
                     cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
                 });
             }
@@ -385,6 +401,26 @@ mod tests {
                            cost_usd: Some(c), .. } if (*c - 0.0421).abs() < 1e-9)));
         // Done must still be emitted after the usage chunk
         assert!(matches!(chunks.last(), Some(Chunk::Done(StopReason::Stop))));
+    }
+
+    #[test]
+    fn result_event_folds_cache_tokens_into_prompt() {
+        // input=1000, cache_read=4000, cache_creation=500 -> prompt = 5500;
+        // cached_tokens reports the cache-read portion separately.
+        let line = r#"{"type":"result","subtype":"success","usage":{"input_tokens":1000,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500,"output_tokens":42}}"#;
+        let chunks = parse_event_line(line).unwrap();
+        assert!(
+            chunks.iter().any(|c| matches!(
+                c,
+                Chunk::Usage {
+                    prompt_tokens: 5500,
+                    completion_tokens: 42,
+                    cached_tokens: Some(4000),
+                    ..
+                }
+            )),
+            "expected folded usage, got {chunks:?}"
+        );
     }
 
     #[test]

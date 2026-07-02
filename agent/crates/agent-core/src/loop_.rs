@@ -46,6 +46,24 @@ fn backoff_delay(attempt: usize) -> Duration {
     Duration::from_millis((100u64 << exp).min(5_000))
 }
 
+/// `backoff_delay(attempt)` plus additive jitter in `0..=delay/4`, to
+/// de-correlate concurrent retriers hitting the same backend. The randomness
+/// is advisory (a thundering-herd smoother, not a security primitive), so it
+/// is `rand`-free: a hash of the current `Instant`'s nanos. Bound: the result
+/// is always in `[backoff_delay, backoff_delay * 1.25]`.
+fn jittered_backoff(attempt: usize) -> Duration {
+    use std::hash::{Hash, Hasher};
+    let base = backoff_delay(attempt);
+    let span = base.as_millis() as u64 / 4; // max jitter (25% of base)
+    if span == 0 {
+        return base;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::time::Instant::now().hash(&mut hasher);
+    let jitter = hasher.finish() % (span + 1); // uniform-ish 0..=span
+    base + Duration::from_millis(jitter)
+}
+
 /// Why `completion_with_retry` gave up. Loop-private: the turn loop maps
 /// these onto events + `AgentError`.
 enum RetryFailure {
@@ -343,8 +361,21 @@ impl AgentLoop {
                                     discarded_reasoning_chars: emitted.1,
                                 });
                             }
+                            // Honor a server-sent Retry-After (integer seconds,
+                            // capped at 30s) when present, but never sleep less
+                            // than the jittered exponential backoff.
+                            let retry_after = match &e {
+                                ModelError::Status { retry_after, .. } => *retry_after,
+                                _ => None,
+                            };
+                            let delay = match retry_after {
+                                Some(secs) => {
+                                    jittered_backoff(attempt).max(Duration::from_secs(secs.min(30)))
+                                }
+                                None => jittered_backoff(attempt),
+                            };
                             tracing::warn!(attempt, error = %e, "model error, retrying");
-                            tokio::time::sleep(backoff_delay(attempt)).await;
+                            tokio::time::sleep(delay).await;
                         }
                     }
                 }
@@ -2265,11 +2296,62 @@ mod tests {
         let mut ctx = WindowContext::new(Message::system("sys"));
         let start = tokio::time::Instant::now();
         agent.run(&mut ctx, "go".into()).await.unwrap();
-        // Paused clock: virtual elapsed is EXACTLY the loop's backoff sleeps —
-        // three failures -> backoff_delay(1..=3) = 100 + 200 + 400 ms. This pins
-        // that the LOOP sleeps the schedule, which the pure backoff_delay unit
-        // test cannot.
-        assert_eq!(start.elapsed(), std::time::Duration::from_millis(700));
+        // Paused clock: virtual elapsed is the loop's backoff sleeps — three
+        // failures -> jittered_backoff(1..=3), each `backoff_delay + 0..=25%`.
+        // Base schedule is 100 + 200 + 400 = 700ms; with per-attempt jitter the
+        // total lands in [700ms, 875ms]. This pins that the LOOP sleeps the
+        // schedule, which the pure backoff_delay unit test cannot.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(700)
+                && elapsed <= std::time::Duration::from_millis(875),
+            "backoff elapsed {elapsed:?} outside [700ms, 875ms]"
+        );
+        assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_header_delays_at_least_its_seconds() {
+        let ws = std::env::temp_dir();
+        // A single 429 carrying Retry-After: 3 seconds, then success. The loop
+        // must sleep >= 3s virtual (Retry-After dominates the ~100ms backoff),
+        // capped at 30s.
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Status {
+                code: 429,
+                body: "rate limited".into(),
+                retry_after: Some(3),
+            }),
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 3,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        let start = tokio::time::Instant::now();
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert!(
+            start.elapsed() >= std::time::Duration::from_secs(3),
+            "Retry-After: 3 should force >= 3s sleep, got {:?}",
+            start.elapsed()
+        );
         assert_eq!(sink.events.lock().unwrap().last().unwrap(), "done");
     }
 
@@ -2281,6 +2363,7 @@ mod tests {
             Scripted::Fail(ModelError::Status {
                 code: 400,
                 body: "invalid request".into(),
+                retry_after: None,
             }),
             Scripted::Text("should not be reached".into()),
         ]));
@@ -2324,6 +2407,7 @@ mod tests {
             Scripted::Fail(ModelError::Status {
                 code: 429,
                 body: "rate limited".into(),
+                retry_after: None,
             }),
             Scripted::Text("recovered".into()),
         ]));
@@ -4164,6 +4248,7 @@ mod tests {
             Scripted::Fail(ModelError::Status {
                 code: 400,
                 body: "maximum context length exceeded".into(),
+                retry_after: None,
             }),
             Scripted::Text("recovered after compaction".into()),
         ]));
@@ -4215,6 +4300,7 @@ mod tests {
             Scripted::Fail(ModelError::Status {
                 code: 400,
                 body: "maximum context length exceeded".into(),
+                retry_after: None,
             })
         };
         let model = std::sync::Arc::new(ScriptedModel::new(vec![overflow(), overflow()]));
@@ -4411,6 +4497,7 @@ mod tests {
                 ModelError::Status {
                     code: 400,
                     body: "maximum context length exceeded".into(),
+                    retry_after: None,
                 },
             ),
             Scripted::Text("done".into()),

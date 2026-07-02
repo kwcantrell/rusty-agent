@@ -37,7 +37,17 @@ impl TraceWriter {
         prune_retention(dir, RETAIN_FILES - 1); // -1: our new file makes 50
         let session_id = mint_session_id();
         let path = dir.join(format!("{session_id}.jsonl"));
-        let file = match fs::OpenOptions::new().create(true).append(true).open(&path) {
+        // Traces hold full conversation content: create new files 0600 so a
+        // permissive umask can't leave them world-readable. Unix-only (mode has
+        // no cross-platform meaning); existing files keep their perms.
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = match opts.open(&path) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(target: "trace", error = %e, path = %path.display(),
@@ -498,6 +508,17 @@ mod tests {
         let _w = TraceWriter::create(dir.path(), 64).unwrap();
         let count = std::fs::read_dir(dir.path()).unwrap().count();
         assert!(count <= 50, "expected <=50 files after prune, got {count}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_is_created_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let w = TraceWriter::create(dir.path(), 64).unwrap();
+        let path = dir.path().join(format!("{}.jsonl", w.session_id()));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "trace file must be owner-only");
     }
 
     #[test]

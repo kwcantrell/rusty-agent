@@ -9,6 +9,10 @@ use std::sync::Arc;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_FILE_BYTES: usize = 256 * 1024;
 const MAX_FILES: usize = 32;
+/// Cap on entries listed per `use_skill` section (examples, bundled files).
+/// Filesystem-authored skills can carry unbounded trees; the overflow marker
+/// points back to `read_skill_file`, which can reach any path under the dir.
+const MAX_LISTED_FILES: usize = 50;
 
 /// List available skills (name + when-to-use).
 pub struct ListSkills {
@@ -136,8 +140,14 @@ impl Tool for UseSkill {
                 "\n## Examples (worked exemplars, dir: {})\n",
                 skill.dir.display()
             ));
-            for p in &skill.examples {
+            for p in skill.examples.iter().take(MAX_LISTED_FILES) {
                 content.push_str(&format!("- {}\n", rel(p)));
+            }
+            if skill.examples.len() > MAX_LISTED_FILES {
+                let n = skill.examples.len() - MAX_LISTED_FILES;
+                content.push_str(&format!(
+                    "- …and {n} more (read_skill_file lists any path under the skill dir)\n"
+                ));
             }
             content.push_str(
                 "Read one with read_skill_file and imitate its shape and conventions; \
@@ -158,8 +168,15 @@ impl Tool for UseSkill {
                 "\n## Bundled files (dir: {})\n",
                 skill.dir.display()
             ));
-            for p in others {
+            let others_len = others.len();
+            for p in others.into_iter().take(MAX_LISTED_FILES) {
                 content.push_str(&format!("- {}\n", rel(p)));
+            }
+            if others_len > MAX_LISTED_FILES {
+                let n = others_len - MAX_LISTED_FILES;
+                content.push_str(&format!(
+                    "- …and {n} more (read_skill_file lists any path under the skill dir)\n"
+                ));
             }
             content.push_str(
                 "Read a bundled file with read_skill_file (paths above are relative, as it \
@@ -815,6 +832,52 @@ mod tests {
             .execute(json!({"skill": "flow", "path": "../escape"}), &ctx())
             .await;
         assert!(escape.is_err(), "escape not rejected");
+    }
+
+    #[tokio::test]
+    async fn use_skill_caps_bundled_listing_and_marks_overflow() {
+        // 51 bundled files → list exactly MAX_LISTED_FILES + the overflow marker.
+        let files: Vec<(String, String)> = (0..51)
+            .map(|i| (format!("f{i:02}.txt"), "x".to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(n, c)| (n.as_str(), c.as_str()))
+            .collect();
+        let (reg, _d) = reg_with_skill("big", "body", &refs);
+        let out = UseSkill::new(reg)
+            .execute(json!({"name": "big"}), &ctx())
+            .await
+            .unwrap();
+        let listed = out.content.lines().filter(|l| l.starts_with("- ")).count();
+        // 50 file lines + 1 marker line.
+        assert_eq!(listed, MAX_LISTED_FILES + 1, "{}", out.content);
+        assert!(
+            out.content
+                .contains("…and 1 more (read_skill_file lists any path under the skill dir)"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn use_skill_at_cap_lists_all_without_marker() {
+        // Exactly MAX_LISTED_FILES bundled files → all listed, no overflow marker.
+        let files: Vec<(String, String)> = (0..MAX_LISTED_FILES)
+            .map(|i| (format!("f{i:02}.txt"), "x".to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(n, c)| (n.as_str(), c.as_str()))
+            .collect();
+        let (reg, _d) = reg_with_skill("atcap", "body", &refs);
+        let out = UseSkill::new(reg)
+            .execute(json!({"name": "atcap"}), &ctx())
+            .await
+            .unwrap();
+        let listed = out.content.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(listed, MAX_LISTED_FILES, "{}", out.content);
+        assert!(!out.content.contains("…and"), "{}", out.content);
     }
 
     #[test]

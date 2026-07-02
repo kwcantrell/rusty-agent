@@ -109,11 +109,19 @@ mod tests {
 
     #[tokio::test]
     async fn denies_when_timeout_elapses() {
-        // A ~1ms timeout returns Deny promptly. Which arm fires is env-dependent: with a
-        // blocking terminal stdin the read parks and the `Err(_elapsed)` timeout arm fires;
-        // under a closed/EOF stdin (e.g. `cargo test` in CI) `read_line` returns Ok(0) and
-        // the `_ => Deny` arm fires first. Both resolve to Deny — which is all we assert.
-        let ch = TerminalApproval::new(Duration::from_millis(1));
+        // Exercise the timeout arm hermetically via `with_prompt` — the same injection
+        // seam `concurrent_requests_serialize` uses — so the test never touches process
+        // stdin. A prompt fn that sleeps well past the 1ms timeout guarantees the
+        // `Err(_elapsed)` arm fires and resolves to Deny. (The old test called `new()`,
+        // parking a spawn_blocking thread on REAL stdin; under an open, never-EOF stdin
+        // tokio's runtime teardown joined that orphan and wedged the binary for ~874s.)
+        let ch = TerminalApproval::with_prompt(
+            Duration::from_millis(1),
+            std::sync::Arc::new(|_summary: String| {
+                std::thread::sleep(Duration::from_millis(500));
+                ApprovalResponse::Approve
+            }),
+        );
         let resp = ch.request(req()).await;
         assert!(matches!(resp, ApprovalResponse::Deny));
     }
