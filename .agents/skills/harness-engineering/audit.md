@@ -427,6 +427,33 @@ design); `tool_time_ms` double-counts child tool time inside the dispatch call's
 customer `run_compaction` — role prompts, depth>1, fan-out ergonomics) is the remaining open
 sub-agent work; Examples context type remains the last absent capability.**
 
+Re-stamp note (2026-07-02, advanced dispatch — SUB-AGENT CAPABILITY COMPLETE): sub-spec **#3 is
+BUILT and merged to `main`** (7 commits + fix wave, `fef6209..4b2e7c5`, merge `d19625b`; spec
+`docs/superpowers/specs/2026-07-02-subagent-advanced-dispatch-design.md`), closing the sub-agent
+capability's planned scope (#1 `af4dd14`, #2 `0224383`, #3 `d19625b`). **Model routing:**
+`ModelRef` partial-override config (every None inherits the primary; `protocol` override for
+child loops) with two slots — `subagent_model` (child loops, incl. their retries/overflow
+recovery) and `compaction_model` (both `MaintCtx` sites via `AgentLoop::with_compaction_model`;
+one Arc shared by the parent loop and the whole dispatch subtree — the audit's "first customer
+`run_compaction`" is landed). Routed clients are built centrally in `assemble_loop` from
+frontend-supplied `LoopParts.api_key`/`claude_binary`; a `ModelRef` that switches the child
+backend to claude-cli defaults the child protocol to `"prompted"`. **Role:** bounded (≤2000
+chars) `role` arg → `Role:` block in the child system prompt. **Depth:** `subagent_max_depth`
+(default 1 = unchanged; clamped ≥1); nested dispatch tools carry `depth+1` and an
+`id_prefix = "sub{n}:"` so a grandchild's `parent_id` is the child's VISIBLE row id —
+attribution chains transitively across the #2 surfaces with zero web/wire changes (hand-verified
+to depth 3 in review); the `tools` allowlist now gates AND transitively scopes nested dispatch
+(monotonically narrowing — a descendant can never widen its inherited tool set). **Fan-out:**
+description sentence only (parallel tool_calls already provide the mechanism). Accepted
+residuals: routed endpoints are config-controlled and receive the api_key + conversation
+content (same posture as the wire-editable primary `base_url`); non-claude-cli children
+contribute $0 to `cost_usd` and mixed-backend token totals conflate tokenizers;
+`compaction_model.protocol` ignored by design; grandchild web rows render at child indent
+(flat+indent); depth-2 wall-clock nesting is structurally argued, not separately tested.
+Deferred (future work, on demand): skill-defined agent types / role registry, models map,
+per-call model override, live child token streaming. **The audit's remaining absent capability
+is the Examples context type — the last open item from the 2026-07-01 deep audit.**
+
 ---
 
 **Finding 1 — Instructions: duplicated system prompt + skill files lack negative constraints**
