@@ -254,26 +254,34 @@ pub fn build_sandbox(cfg: &RuntimeConfig) -> Arc<dyn SandboxStrategy> {
     Arc::new(DockerSandbox::new(policy, uid_gid, DockerSandbox::probe()))
 }
 
-/// Return `"uid:gid"` of the current process on Unix; `"0:0"` on other platforms.
-/// Uses `std::process::Command` to avoid a `nix`/`libc` dependency.
+/// Return `"uid:gid"` of the current process on Unix. On any failure (or on
+/// non-Unix), fall back to nobody (`65534:65534`) — NEVER `0:0`, which would
+/// run container workloads as root.
 fn current_uid_gid() -> String {
     #[cfg(unix)]
     {
-        let uid = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "0".into());
-        let gid = std::process::Command::new("id")
-            .arg("-g")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "0".into());
-        format!("{uid}:{gid}")
+        fn id_part(flag: &str) -> Option<String> {
+            let out = std::process::Command::new("id").arg(flag).output().ok()?;
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (!s.is_empty() && out.status.success()).then_some(s)
+        }
+        uid_gid_or_nobody(id_part("-u"), id_part("-g"))
     }
     #[cfg(not(unix))]
     {
-        "0:0".into()
+        "65534:65534".into()
+    }
+}
+
+/// Pure fallback logic, unit-tested: any missing part degrades BOTH to nobody.
+fn uid_gid_or_nobody(uid: Option<String>, gid: Option<String>) -> String {
+    match (uid, gid) {
+        (Some(u), Some(g)) => format!("{u}:{g}"),
+        _ => {
+            tracing::warn!(target: "sandbox",
+                "could not determine uid/gid via `id`; container will run as nobody (65534:65534)");
+            "65534:65534".into()
+        }
     }
 }
 
@@ -295,6 +303,17 @@ mod tests {
             "native".into(),
             8192,
         )
+    }
+
+    #[test]
+    fn uid_gid_fallback_is_nobody_never_root() {
+        assert_eq!(uid_gid_or_nobody(None, None), "65534:65534");
+        assert_eq!(uid_gid_or_nobody(Some("1000".into()), None), "65534:65534");
+        assert_eq!(uid_gid_or_nobody(None, Some("1000".into())), "65534:65534");
+        assert_eq!(
+            uid_gid_or_nobody(Some("1000".into()), Some("1000".into())),
+            "1000:1000"
+        );
     }
 
     #[test]
