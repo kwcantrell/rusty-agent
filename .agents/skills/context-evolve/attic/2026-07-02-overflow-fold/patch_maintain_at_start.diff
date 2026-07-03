@@ -1,0 +1,55 @@
+diff --git a/agent/crates/agent-core/src/loop_.rs b/agent/crates/agent-core/src/loop_.rs
+index 575d8a3..aa09103 100644
+--- a/agent/crates/agent-core/src/loop_.rs
++++ b/agent/crates/agent-core/src/loop_.rs
+@@ -474,6 +474,27 @@ impl AgentLoop {
+                 self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
+                 return Ok(());
+             }
++            // Maintain BEFORE building, so every model call sees a curated
++            // window (offload/compaction/fold applied first — a fold's recall
++            // marker must exist before the call that needs it). Start-of-turn
++            // also covers text-only turns, whose `return` used to skip the old
++            // end-of-turn pass entirely: a pure chat conversation was never
++            // curated at all, only silently truncated by build().
++            let deps = crate::MaintCtx {
++                model_limit: self.effective_model_limit(),
++                model: self.maint_model(),
++                sink: &self.sink,
++                cancel: &cancel,
++            };
++            let report = ctx.maintain(&deps).await;
++            if report.offloaded > 0 || report.compacted_turns > 0 {
++                tracing::debug!(
++                    offloaded = report.offloaded,
++                    offloaded_bytes = report.offloaded_bytes,
++                    compacted_turns = report.compacted_turns,
++                    "context maintained"
++                );
++            }
+             let messages = ctx.build(self.effective_model_limit());
+             // The chars/4 estimate for the request actually sent; reused for both the
+             // Usage event and the post-completion calibration sample. The
+@@ -945,22 +966,6 @@ impl AgentLoop {
+                      reply with a summary and no tool call if you are done.",
+                 ));
+             }
+-
+-            let deps = crate::MaintCtx {
+-                model_limit: self.effective_model_limit(),
+-                model: self.maint_model(),
+-                sink: &self.sink,
+-                cancel: &cancel,
+-            };
+-            let report = ctx.maintain(&deps).await;
+-            if report.offloaded > 0 || report.compacted_turns > 0 {
+-                tracing::debug!(
+-                    offloaded = report.offloaded,
+-                    offloaded_bytes = report.offloaded_bytes,
+-                    compacted_turns = report.compacted_turns,
+-                    "context maintained"
+-                );
+-            }
+         }
+         // Budget exhausted with the model still tool-hungry (text-only replies
+         // exit earlier with Done(Stop)). One best-effort, tools-disabled wrap-up

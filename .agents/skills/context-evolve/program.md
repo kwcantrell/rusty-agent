@@ -108,6 +108,21 @@ retries a logged dead end.
     NOT fill the window. The drift pressure comes from a small `context_limit` (4000)
     forcing compaction of the early "+N" instruction turns. 16000 does NOT discriminate.
 
+- **longhaul-manifest** (mode=`compaction`, `tasks/longhaul-manifest/`): **Admitted 2026-07-02**
+  — the extreme-scale long-horizon discriminator the longhaul-codename notes called for.
+  20 padded fact-bearing user turns (~86–106 est tok each, ~1719 total — far beyond the
+  effective ~1000 window), acks pinned to a bare "OK" so facts cannot leak into summarizable
+  chatter; the final turn assembles `manifest.txt` with all 20 `<name> = <value>` lines,
+  graded by hidden greps (all 20 must match).
+  - **Admit verdict = `Admitted`:** favorable **5/5** (~92–118K tok); realistic (champion v3)
+    **0/5** (~78–86K tok).
+  - Champion failure shape: `plan_retention`'s user pass drops the OLDEST user units once
+    user turns alone exceed the build budget. Entry #1 always survives via the pinned goal
+    block (`set_goal` captures the first prompt!); manifests come out ~16/20 with exactly
+    the ladder-evicted early-middle entries missing.
+  - **Optimization headroom is real but unclaimed** — see the 2026-07-02 overflow-fold
+    iteration log below: seven variants, none promoted.
+
 ## Locked tasks (real commits) — generalization report (run 2026-06-29)
 
 - **locked-hostpolicy** (mode=`code`, `tasks/locked-hostpolicy/`) — a **real** unit of this
@@ -171,6 +186,22 @@ retries a logged dead end.
   (durable placeholder units alone) measured 0/5 on offload-recall — same as A. The
   fix needed the boundary offload (C) to create the placeholder first; B's partition
   rule then keeps it. Ship invariants in the right order: create, then protect.
+- **Marker salience is positional (2026-07-02).** The model acts on markers it reads in
+  conversation flow (offload placeholders in tool results: 5/5 recall) and ignores the
+  same information appended to a pinned system block (0/5, zero recalls). But in-history
+  user markers OVER-elicit unless consolidated and task-conditional — and even then the
+  final assembly can be capability-bound.
+- **Per-turn maintenance requires batched compaction.** `over_high_water` measured on
+  the BUILT context is ~always true once saturated (build fills to the budget), so
+  maintain-every-turn ⇒ compact-every-turn without a span-size floor — and repeated
+  re-summarization destroys the running summary. Conversely, a span-size floor delays
+  summaries enough to break tasks that relied on the per-tool-turn cadence (portmap
+  10/10→~4/6). The compaction cadence is load-bearing in BOTH directions; treat any
+  change to it as a re-baselining event.
+- **The guard sweep is not optional.** The 2026-07-02 evening round looked promising on
+  its target task's mechanics (recall elicited, content correct once) while silently
+  destroying portmap (10/10→1/6) and drift (6/6→1/6). Non-regression on the full suite
+  is the only thing that caught it.
 
 - **Diagnostic beats param-guessing.** An env-gated `eprintln` of the compaction summary
   (since reverted) was worth more than any blind Tier-A sweep: it showed the summary
@@ -310,6 +341,60 @@ with optimization headroom; the rest are regression guards.
 runs returned `{"passed":false,"tokens":0,"turns":0}` until relaunched. Zero tokens/turns ⇒
 suspect the server, not the curation. Exact relaunch command is in the [[local-llama-server]]
 memory.
+
+## Iteration log (Tier-B — overflow-user folding, post-v3, 2026-07-02 evening) — NO PROMOTION, ALL REVERTED
+
+One hypothesis family — "fold overflow user turns instead of silently evicting them" —
+tested against the freshly admitted longhaul-manifest. Seven evidence-driven variants,
+every one **0/5** (== champion). Diffs archived in `attic/2026-07-02-overflow-fold/`.
+
+- **#6a fold-to-summary:** overflow users routed through the summarizer at compaction.
+  The summary carried all 12 folded pairs PERFECTLY — and the model still wrote 16/20,
+  deterministically skipping mid-list entries when transcribing from summary prose.
+  Dead end: summary *presence* ≠ summary *use*.
+- **#6b recall-only fold, marker in the pinned summary block:** model NEVER called
+  context_recall (0/5, zero recalls in any trajectory) — a pinned block line has no
+  salience. Also surfaced **speculative-recall poisoning**: the model guessed
+  `context_recall(1)` before any fold existed, got NotFound, and the summarizer
+  immortalized "recall #1 fails" as a durable fact that suppressed the later real recall.
+- **#6c eviction-triggered compaction:** compact the moment the plan would evict a user
+  unit. CATASTROPHIC: per-turn re-compaction collapsed the cumulative summary to
+  "No new information provided" within ~16 passes — the superset prompt survives one
+  pass, not sixteen. (Mechanism kept as a *sync, summarizer-free* fold trigger instead.)
+- **#6d maintain-at-start-of-turn (loop_.rs):** found that `maintain()` NEVER RUNS on
+  text-only turns (the text-reply path returns before the end-of-turn maintain) — pure
+  chat sessions get no curation at all, only silent build() truncation; longhaul-manifest's
+  20 ack turns ran completely unmaintained, so every fold fired only after the final write.
+  Moving maintain to start-of-turn fixes that ordering — but see the guard sweep below.
+- **#6e in-history user marker (like the loop's stuck-nudge):** finally elicits recall —
+  but OVER-elicits: 5–13 recalls/run, recall churn during routine acks, one run burned 33
+  turns without ever writing.
+- **#6f consolidated task-conditional marker + trivial-span re-compaction guard (256 est
+  tok):** ideal trajectories appear (one recall → one write with all 20 correct pairs once,
+  killed by a missing `path` arg) and still 0/5 — the 20-pair merge at an effective
+  ~1000-token window sits at the 3B-active model's capability edge.
+- **GUARD SWEEP FAILED → FULL REVERT.** The final tree (maintain-at-start + trivial-span
+  guard + fold) on the v3 ceilings: locked-portmap **1/6** (v3: 10/10), drift-ledger
+  **1/6** (v3: 6/6), offload-recall 5/5, longhaul-codename 5/5, memory-recall 5/5,
+  memory-roster 4/5. Bisect (loop change reverted, guard+fold kept): portmap 4/6 — both
+  the loop-ordering change and the guard/fold contribute. A failing portmap run's lib.rs
+  was missing exactly 'cache'+'search' (the early-middle entries) with a fully-correct
+  summary in-window — the same merge-across-sources dropout as the manifest task, exposed
+  by the guard's delayed compaction leaving no single complete source at write time.
+  **Champion stays v3; all code reverted to the v3 merge (1ad10c8).**
+
+**Open issues recorded (owner-level, do NOT slip into a campaign round):**
+1. `maintain()` skipped on text-only turns is a REAL structural gap (chat-only sessions
+   are never curated) — but it is also the semantics every admitted verdict and champion
+   result was measured under. Fixing it re-baselines the whole eval landscape (as
+   calibrated budgeting did) and, naively combined with per-turn compaction, destroys
+   running summaries and regressed portmap/drift hard. Needs its own spec'd change with
+   a full re-baseline, not a drive-by fix. Patch preserved in the attic.
+2. Summary poisoning by transient tool errors (see #6b) — the superset prompt happily
+   carries "tool X failed" forward forever.
+3. `set_goal` pins the FIRST user prompt verbatim — task authors must not put
+   load-bearing facts in prompt #1 (it silently survives all curation; both manifest
+   and portmap diagnostics show entry #1 always rescued).
 
 ## Iteration log (Tier-B — retention, v2→v3, 2026-07-02)
 

@@ -1,0 +1,456 @@
+diff --git a/agent/crates/agent-core/src/curated.rs b/agent/crates/agent-core/src/curated.rs
+index 90eb595..1cff625 100644
+--- a/agent/crates/agent-core/src/curated.rs
++++ b/agent/crates/agent-core/src/curated.rs
+@@ -38,6 +38,25 @@ pub struct CuratedContext {
+     last_evicted: (usize, usize),
+ }
+ 
++/// Prefix of the synthetic in-history user message a fold leaves behind. Kept
++/// in-history (not in a pinned block) for salience — models act on markers they
++/// read in conversation flow (see offload placeholders) and ignore ones buried
++/// in a pinned system block. Marker units are never themselves folded.
++const FOLD_MARKER_PREFIX: &str = "[context notice:";
++
++/// Offload ids referenced by a fold marker (`context_recall(<id>)` mentions).
++fn parse_marker_ids(content: &str) -> Vec<crate::OffloadId> {
++    content
++        .split("context_recall(")
++        .skip(1)
++        .filter_map(|rest| {
++            rest.split(')')
++                .next()
++                .and_then(|d| d.trim().parse::<crate::OffloadId>().ok())
++        })
++        .collect()
++}
++
+ impl CuratedContext {
+     pub fn new(
+         system: Message,
+@@ -194,7 +213,17 @@ impl ContextManager for CuratedContext {
+             });
+         }
+ 
+-        // (b) Compaction — async, gated by the high-water mark or an explicit request.
++        // (a') Fold overflow user turns — sync, no model call. The moment the
++        // retention plan would evict a user unit (invisible loss), the oldest
++        // user units leave history for the offload store behind a pinned
++        // context_recall marker. Folding down to a low watermark keeps this a
++        // rare batch operation, not a per-turn churn.
++        self.fold_overflow_users(deps, &mut report);
++
++        // (b) Compaction — async, gated by the high-water mark or an explicit
++        // request only. Folding is deliberately NOT a compaction trigger: each
++        // summarizer pass is generation-lossy, and per-turn re-compaction has
++        // been observed to collapse the cumulative summary entirely.
+         let requested = self.compact_flag.swap(false, Ordering::SeqCst);
+         let over_high_water = {
+             let built = self.build(deps.model_limit);
+@@ -220,6 +249,19 @@ impl ContextManager for CuratedContext {
+ /// like any other (a parent with several parallel placeholders stays under this).
+ const PLACEHOLDER_UNIT_MAX_TOKENS: usize = 160;
+ 
++/// Fraction of the (effective) window reserved for verbatim user turns.
++/// Once user units alone exceed it, the oldest are folded into the offload
++/// store (recall-only) rather than kept in history where `build()`'s budget
++/// could never assemble them again.
++const USER_VERBATIM_BUDGET_PCT: f32 = 0.5;
++
++/// Minimum estimated size of the NEW span before the summarizer is re-run over
++/// a prior summary. Re-compaction is generation-lossy: given a trivial span
++/// (one ack) the model degrades the prior instead of extending it — observed
++/// collapsing a 12-entry running summary to "No new information provided"
++/// under per-turn maintenance. Below this, chatter just accumulates.
++const MIN_RECOMPACTION_SPAN_TOKENS: usize = 256;
++
+ /// A turn unit whose tool results are all age-offload placeholders and whose
+ /// total estimated size stays anchor-small. Like user turns, these are durable:
+ /// each placeholder is the model's only pointer for `context_recall`ing the
+@@ -293,6 +335,9 @@ impl CuratedContext {
+         // with the prior summary carried forward so re-compaction accumulates
+         // instead of collapsing to the most recent turn. Partitioned in whole
+         // turn units so a kept placeholder never orphans its tool_calls parent.
++        // (Overflow user turns are handled by `fold_overflow_users`, which runs
++        // earlier in the same maintain pass — by this point the surviving user
++        // units are affordable and stay verbatim unconditionally.)
+         let mut verbatim: Vec<Message> = Vec::new();
+         let mut to_summarize: Vec<Message> = Vec::new();
+         for r in turn_unit_ranges(&self.history[..split]) {
+@@ -315,6 +360,12 @@ impl CuratedContext {
+         if to_summarize.is_empty() {
+             return;
+         }
++        // With a prior summary in hand, only re-summarize a substantial new
++        // span (see MIN_RECOMPACTION_SPAN_TOKENS); trivial chatter waits.
++        let span_tokens: usize = to_summarize.iter().map(message_tokens).sum();
++        if prior.is_some() && span_tokens < MIN_RECOMPACTION_SPAN_TOKENS {
++            return;
++        }
+         match run_compaction(&to_summarize, prior.as_ref(), deps.model, deps.cancel).await {
+             Ok(summary) if compaction_is_worthwhile(&summary, &replaced) => {
+                 let tokens_after = message_tokens(&summary);
+@@ -323,6 +374,15 @@ impl CuratedContext {
+                 let recent = self.history.split_off(split);
+                 self.history = verbatim;
+                 self.history.extend(recent);
++                if std::env::var("CE_DEBUG").is_ok() {
++                    eprintln!(
++                        "CE_DEBUG compacted {} msgs ({}→{} tok); summary:\n{}",
++                        to_summarize.len(),
++                        tokens_before,
++                        tokens_after,
++                        summary.content
++                    );
++                }
+                 self.compaction_summary = Some(summary);
+                 report.compacted_turns = to_summarize.len();
+                 deps.sink.emit(AgentEvent::Context(ContextEvent::Compacted {
+@@ -344,6 +404,141 @@ impl CuratedContext {
+         }
+     }
+ 
++    /// Fold overflow user turns out of history into the offload store. Fires
++    /// only when the retention plan would evict a user unit — then folds the
++    /// OLDEST user units (never touching the `keep_recent` tail) until the
++    /// remainder fits half the user budget (hysteresis: one batch instead of
++    /// per-turn churn). Synchronous; no summarizer involvement whatsoever.
++    fn fold_overflow_users(&mut self, deps: &MaintCtx<'_>, report: &mut MaintReport) {
++        let budget = deps.model_limit.saturating_sub(self.pinned_tokens());
++        let mut kept = vec![false; self.history.len()];
++        for r in plan_retention(&self.history, budget) {
++            kept[r].iter_mut().for_each(|k| *k = true);
++        }
++        let user_eviction_imminent = self
++            .history
++            .iter()
++            .enumerate()
++            .any(|(i, m)| matches!(m.role, Role::User) && !kept[i]);
++        if !user_eviction_imminent {
++            return;
++        }
++        // Only the old span is foldable — the in-flight tail stays put.
++        let split = snap_split_to_unit_boundary(
++            &self.history,
++            self.history.len().saturating_sub(self.config.keep_recent),
++        );
++        let units = turn_unit_ranges(&self.history[..split]);
++        let is_user_unit = |r: &std::ops::Range<usize>| {
++            self.history[r.clone()]
++                .iter()
++                .all(|m| matches!(m.role, Role::User))
++        };
++        let low_watermark =
++            (deps.model_limit as f32 * USER_VERBATIM_BUDGET_PCT / 2.0) as usize;
++        let mut fold: std::collections::HashSet<usize> = Default::default();
++        let mut user_tokens = 0usize;
++        let mut over = false;
++        for r in units.iter().rev() {
++            if !is_user_unit(r) {
++                continue;
++            }
++            let t: usize = self.history[r.clone()].iter().map(message_tokens).sum();
++            // A previous fold's marker is a rescue pointer, never fold fodder.
++            if self.history[r.start].content.starts_with(FOLD_MARKER_PREFIX) {
++                user_tokens += t;
++                continue;
++            }
++            if over || user_tokens + t > low_watermark {
++                over = true;
++                fold.insert(r.start);
++            } else {
++                user_tokens += t;
++            }
++        }
++        if fold.is_empty() {
++            return;
++        }
++        let folded: Vec<Message> = units
++            .iter()
++            .filter(|r| fold.contains(&r.start))
++            .flat_map(|r| self.history[r.clone()].iter().cloned())
++            .collect();
++        // Remove folded units from history (whole singleton user units).
++        let folded_idx: std::collections::HashSet<usize> = units
++            .iter()
++            .filter(|r| fold.contains(&r.start))
++            .flat_map(|r| r.clone())
++            .collect();
++        let mut i = 0;
++        self.history.retain(|_| {
++            let keep = !folded_idx.contains(&i);
++            i += 1;
++            keep
++        });
++        self.commit_fold(&folded, report, deps);
++    }
++
++    /// Commit the verbatim rescue path for a batch of folded user turns: the
++    /// exact text goes to the offload store; a marker that `pinned` appends to
++    /// the summary block (and the summarizer never sees, so re-compaction can't
++    /// paraphrase it away) points the model at `context_recall(id)`.
++    fn commit_fold(&mut self, folded: &[Message], report: &mut MaintReport, deps: &MaintCtx<'_>) {
++        let content = folded
++            .iter()
++            .map(|m| format!("[user] {}", m.content))
++            .collect::<Vec<_>>()
++            .join("\n");
++        let bytes = content.len();
++        let n = folded.len();
++        let id = self.store.put(crate::offload::OffloadEntry {
++            id: 0,
++            tool_call_id: String::new(),
++            tool_name: "user_history".into(),
++            kind: crate::offload::OffloadKind::Output,
++            content,
++            bytes,
++            turn: 0,
++        });
++        // ONE consolidated marker joins history at the front, as a user
++        // singleton unit: salient in conversation flow, prioritized by the
++        // retention ladder, durable through compaction, never re-folded. A
++        // previous marker is replaced (its ids are carried forward) so folds
++        // never stack notices, and the wording is task-conditional so routine
++        // turns don't trigger recall churn.
++        let mut ids: Vec<crate::OffloadId> = Vec::new();
++        if let Some(pos) = self
++            .history
++            .iter()
++            .position(|m| m.content.starts_with(FOLD_MARKER_PREFIX))
++        {
++            let old = self.history.remove(pos);
++            ids.extend(parse_marker_ids(&old.content));
++        }
++        ids.push(id);
++        let calls = ids
++            .iter()
++            .map(|i| format!("context_recall({i})"))
++            .collect::<Vec<_>>()
++            .join(", ");
++        self.history.insert(
++            0,
++            Message::user(format!(
++                "{FOLD_MARKER_PREFIX} some earlier user instructions are no longer \
++                 shown; they are stored VERBATIM and can be retrieved with {calls}. \
++                 Only do so when a task needs those earlier instructions (e.g. a \
++                 final assembly step); routine replies don't.]"
++            )),
++        );
++        report.offloaded += 1;
++        report.offloaded_bytes += bytes;
++        deps.sink.emit(AgentEvent::Context(ContextEvent::Offloaded {
++            id,
++            bytes,
++            tool: "user_history".into(),
++        }));
++    }
++
+     /// Emit `ContextEvent::Evicted` when the built window omits history
+     /// messages and the count changed since the last pass.
+     fn emit_eviction(&mut self, deps: &MaintCtx<'_>) {
+@@ -570,6 +765,184 @@ mod tests {
+         assert!(built.iter().any(|m| m.content.contains("chatter summary")));
+     }
+ 
++    #[tokio::test]
++    async fn compaction_folds_overflow_user_turns_recall_only() {
++        // When verbatim user turns alone outgrow the window's user budget, the
++        // OLDEST leave history for the offload store (recall-only; NOT
++        // paraphrased into a summary) — here the old span is all user turns,
++        // so the fold commits without any summarizer call.
++        let mut c = ctx();
++        c.high_water_pct = 0.0; // force compaction
++        c.config.keep_recent = 1;
++        for i in 0..12 {
++            c.append(Message::user(format!(
++                "ledger entry number {i}: setting item_{i} is assigned value {i}{i}{i}{i} for the manifest"
++            )));
++        }
++        c.append(Message::assistant("working on it", None));
++        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
++        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
++        let cancel = CancellationToken::new();
++        let mut deps = maint_deps(&model, &sink, &cancel);
++        // Small window: user turns (~280 est tok total) exceed the budget.
++        deps.model_limit = 250;
++        let report = c.maintain(&deps).await;
++
++        assert!(report.offloaded >= 1, "fold must commit to the store");
++        let kept_users: Vec<usize> = c
++            .history()
++            .iter()
++            .filter(|m| matches!(m.role, Role::User))
++            .filter_map(|m| {
++                m.content
++                    .split_whitespace()
++                    .nth(3)
++                    .and_then(|s| s.trim_end_matches(':').parse().ok())
++            })
++            .collect();
++        assert!(
++            !kept_users.is_empty() && kept_users.len() < 12,
++            "some but not all user turns stay verbatim: {kept_users:?}"
++        );
++        // The kept set is the NEWEST suffix — the oldest folded first.
++        let oldest_kept = *kept_users.iter().min().unwrap();
++        assert!(
++            kept_users.iter().all(|&i| i >= oldest_kept) && !kept_users.contains(&0),
++            "oldest user turns must be the folded ones: {kept_users:?}"
++        );
++        // The folded text is recoverable verbatim, and the marker is pinned
++        // even with no compaction summary present.
++        let entry = c.store.get(1).expect("folded entry stored");
++        assert!(entry.content.contains("item_0"));
++        let built = c.build(100_000);
++        assert!(
++            built
++                .iter()
++                .any(|m| m.content.contains("context_recall(1)")),
++            "marker pinned without a summary block"
++        );
++    }
++
++    #[tokio::test]
++    async fn recompaction_waits_for_a_substantial_span() {
++        // A prior summary + one trivial ack must NOT re-run the summarizer —
++        // each pass risks degrading the prior. The chatter simply accumulates.
++        let mut c = ctx();
++        c.high_water_pct = 0.0; // pressure permanently on
++        c.config.keep_recent = 1;
++        c.compaction_summary = Some(Message::system(
++            "Summary of earlier conversation:\nledger entries 1-12 recorded",
++        ));
++        c.append(Message::assistant("ok noted", None));
++        c.append(Message::user("next instruction"));
++        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
++        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
++        let cancel = CancellationToken::new();
++        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
++        assert_eq!(report.compacted_turns, 0, "trivial span must not compact");
++        assert!(
++            c.compaction_summary
++                .as_ref()
++                .unwrap()
++                .content
++                .contains("entries 1-12 recorded"),
++            "prior summary untouched"
++        );
++    }
++
++    #[tokio::test]
++    async fn user_eviction_triggers_compaction_before_silent_loss() {
++        // Even far below the high-water mark, the moment the retention plan
++        // would evict a user unit, maintain must compact (fold + mark) so the
++        // loss is never invisible.
++        let mut c = ctx();
++        c.high_water_pct = 100.0; // high-water can never fire; isolate the new trigger
++        c.config.keep_recent = 1;
++        for i in 0..12 {
++            c.append(Message::user(format!(
++                "ledger entry number {i}: setting item_{i} is assigned value {i}{i}{i}{i} for the manifest"
++            )));
++        }
++        c.append(Message::assistant("working on it", None));
++        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
++            "folded summary".into(),
++        )]));
++        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
++        let cancel = CancellationToken::new();
++        let mut deps = maint_deps(&model, &sink, &cancel);
++        deps.model_limit = 250; // user turns alone (~278 est tok) exceed the window
++        let report = c.maintain(&deps).await;
++        assert!(
++            report.offloaded >= 1,
++            "imminent user eviction must force the fold to commit"
++        );
++        assert!(c.store.get(1).is_some(), "fold stored the overflow verbatim");
++    }
++
++    #[tokio::test]
++    async fn folded_user_turns_are_recallable_and_marked() {
++        // With chatter alongside the overflow user turns, one compaction both
++        // summarizes the chatter and commits the fold: exact user text in the
++        // store, marker appended to the pinned summary block — and the marker
++        // never enters the summarizer-visible summary.
++        let mut c = ctx();
++        c.high_water_pct = 0.0;
++        c.config.keep_recent = 1;
++        for i in 0..12 {
++            c.append(Message::user(format!(
++                "ledger entry number {i}: setting item_{i} is assigned value {i}{i}{i}{i} for the manifest"
++            )));
++            c.append(Message::assistant(
++                format!("acknowledged entry {i}, plenty of filler chatter here"),
++                None,
++            ));
++        }
++        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
++            "chatter summary".into(),
++        )]));
++        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
++        let cancel = CancellationToken::new();
++        let mut deps = maint_deps(&model, &sink, &cancel);
++        deps.model_limit = 250;
++        let report = c.maintain(&deps).await;
++
++        assert!(report.compacted_turns > 0, "chatter must be summarized");
++        assert!(report.offloaded >= 1, "folded batch stored");
++        let entry = c.store.get(1).expect("folded user entry in store");
++        assert_eq!(entry.tool_name, "user_history");
++        assert!(
++            entry.content.contains("item_0"),
++            "oldest instruction stored verbatim: {}",
++            entry.content
++        );
++        // Folded content is NOT in the summary (recall-only); the rescue
++        // marker is an in-history USER message at the front of history.
++        let built = c.build(100_000);
++        assert!(
++            built.iter().any(|m| m.content.contains("chatter summary")),
++            "summary block present"
++        );
++        let marker = built
++            .iter()
++            .find(|m| m.content.starts_with(FOLD_MARKER_PREFIX))
++            .expect("in-history fold marker present");
++        assert!(matches!(marker.role, Role::User));
++        assert!(
++            marker.content.contains("context_recall(1)"),
++            "marker points at the stored batch: {}",
++            marker.content
++        );
++        // The summarizer-visible summary carries no recall pointer to degrade.
++        assert!(
++            !c.compaction_summary
++                .as_ref()
++                .unwrap()
++                .content
++                .contains("context_recall"),
++            "markers live outside the summarizer-visible summary"
++        );
++    }
++
+     #[tokio::test]
+     async fn compaction_offloads_departing_tool_results_before_summarizing() {
+         // A large tool result still inside the age-protection window when
+diff --git a/agent/crates/agent-runtime-config/tests/stress_context_management.rs b/agent/crates/agent-runtime-config/tests/stress_context_management.rs
+index d1c6e79..34d1c4f 100644
+--- a/agent/crates/agent-runtime-config/tests/stress_context_management.rs
++++ b/agent/crates/agent-runtime-config/tests/stress_context_management.rs
+@@ -387,10 +387,13 @@ async fn repeated_compaction_keeps_history_bounded_and_coherent() {
+         );
+     }
+ 
+-    // Compaction actually happened repeatedly (not a no-op test).
++    // Compaction actually happened repeatedly (not a no-op test). It batches:
++    // with a prior summary in hand the summarizer only re-runs once the new
++    // chatter span is substantial (MIN_RECOMPACTION_SPAN_TOKENS), so ~every
++    // 2-3 turns here — per-turn re-compaction degrades the running summary.
+     assert!(
+-        compactions >= 50,
+-        "compaction should fire most turns; got {compactions}"
++        compactions >= 25,
++        "compaction should fire regularly (batched); got {compactions}"
+     );
+ 
+     let built = ctx.build(MODEL_LIMIT);

@@ -1,0 +1,41 @@
+{
+  "id": "longhaul-manifest",
+  "mode": "compaction",
+  "realistic_window": 4000,
+  "favorable_window": 196608,
+  "memory_enabled": false,
+  "seed_files": [
+    {
+      "path": "manifest.txt",
+      "contents": "pending\n"
+    }
+  ],
+  "test_cmd": "bash hidden_tests/check.sh",
+  "sessions": [
+    {
+      "prompts": [
+        "Configuration ledger entry #1 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting alpha_timeout is assigned the value 4831. Remember it alongside the other ledger entries. There will be 20 entries in total; the final step needs every one of them.",
+        "Configuration ledger entry #2 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting bravo_retries is assigned the value 7207. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #3 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting charlie_port is assigned the value 9614. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #4 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting delta_batch is assigned the value 2358. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #5 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting echo_window is assigned the value 6079. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #6 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting foxtrot_ttl is assigned the value 1743. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #7 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting golf_quota is assigned the value 8926. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #8 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting hotel_depth is assigned the value 3465. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #9 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting india_limit is assigned the value 5192. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #10 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting juliet_rate is assigned the value 7840. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #11 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting kilo_buffer is assigned the value 2617. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #12 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting lima_threads is assigned the value 9053. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #13 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting mike_cache is assigned the value 4278. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #14 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting november_poll is assigned the value 6531. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #15 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting oscar_burst is assigned the value 1986. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #16 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting papa_grace is assigned the value 8342. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #17 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting quebec_span is assigned the value 3709. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #18 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting romeo_slots is assigned the value 5864. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #19 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting sierra_fanout is assigned the value 2145. Remember it alongside the other ledger entries.",
+        "Configuration ledger entry #20 of 20 (reply with exactly OK \u2014 do not repeat the setting back, do not summarize it, and do not write any files yet): for the final deployment manifest you will assemble at the end, the setting tango_backoff is assigned the value 9427. Remember it alongside the other ledger entries.",
+        "Now assemble the deployment manifest: use write_file to save manifest.txt with one line per ledger entry from this session, formatted exactly '<name> = <value>' (e.g. 'sample_key = 1234'), covering EVERY one of the 20 settings I gave you, in any order. Then reply with one word: done."
+      ]
+    }
+  ]
+}
