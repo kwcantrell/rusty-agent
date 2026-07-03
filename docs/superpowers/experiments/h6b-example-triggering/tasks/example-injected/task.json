@@ -1,0 +1,22 @@
+{
+  "id": "h6b-example-injected",
+  "mode": "context",
+  "realistic_window": 196608,
+  "favorable_window": 196608,
+  "memory_enabled": false,
+  "seed_files": [
+    {
+      "path": "data.csv",
+      "contents": "metric,value\nalpha,10.5\nbeta,3.2\ngamma,7\n"
+    }
+  ],
+  "test_cmd": "bash hidden_tests/check.sh",
+  "sessions": [
+    {
+      "prompts": [
+        "Produce the team's standard summary report for data.csv and write it to report.md. Use EXACTLY this house format:\n- First line exactly: `# Report: <dataset-name>` where <dataset-name> is the CSV file name without its .csv extension (so `data`).\n- Then a markdown table: header row exactly `| metric | value |`, then a separator row `| --- | --- |`, then one row per metric.\n- Every numeric value rounded to EXACTLY 2 decimals (e.g. 7 -> 7.00, 3.5 -> 3.50).\n- Final line exactly: `TOTAL: <sum-of-values-2dp>` (the 2-decimal sum of all values), with no blank line before it.\nExample for a file sales.csv with revenue=1200.5, cost=800, margin=399.5:\n```\n# Report: sales\n| metric | value |\n| --- | --- |\n| revenue | 1200.50 |\n| cost | 800.00 |\n| margin | 399.50 |\nTOTAL: 2400.50\n```"
+      ]
+    }
+  ],
+  "gold_trajectory": []
+}
