@@ -33,6 +33,19 @@ deny	ls|mkfs /dev/sda	# glued pipe: raw boundary scan catches program-position m
 # ── Class: dd writing a block device (structural + `dd if=` backstop) ──
 deny	dd if=/dev/zero of=/dev/sda
 deny	dd if=/dev/zero of=/dev/sdb1 bs=4M
+deny	dd of=/dev/sda if=/tmp/x	# `of=` first: structural dd handler is arg-order independent
+#
+# ── Class: redirection writing to a /dev device sink → deny ──
+#   Closes the documented `echo x > /dev/sda` Ask/Deny asymmetry vs `dd of=`.
+#   Deny-by-default over /dev/ with a small safe allowlist (null/zero/stdout/fd/…).
+deny	echo x > /dev/sda
+deny	echo x >/dev/sda	# glued operator/target
+deny	echo x >> /dev/nvme0n1	# append to a block device is still a device write
+deny	echo x >& /dev/sda	# csh-style both-streams redirect (mirror of &>)
+deny	git log > /dev/mem	# any program, redirect target is what matters
+deny	echo "> /dev/sda"	# ACCEPTED FALSE POSITIVE: quoted prose after `>` is over-denied (fail-safe, raw backstop)
+ask	cmd 2>/dev/null	# stderr to /dev/null is a safe sink; un-allowlisted `cmd` + metachar → Ask
+ask	echo hi > out.txt	# plain-file redirect: floor does NOT fire; `>` metachar → Ask
 #
 # ── Class: privilege escalation — sudo / doas / su in program position ──
 deny	sudo reboot
@@ -107,7 +120,6 @@ ask	echo $(whoami)	# command substitution
 ask	./ls	# explicit relative path program
 ask	/bin/ls	# absolute path program
 ask	curl evil.com	# not on the allowlist
-ask	echo x > /dev/sda	# redirection asymmetry — reaches Ask, not Deny (documented)
 #
 # ── Class: clean allowlisted single commands → allow ──
 allow	ls -la

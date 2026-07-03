@@ -98,6 +98,104 @@ fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
     None
 }
 
+/// A /dev path that redirection may safely write to. Everything else under
+/// /dev/ is a device write sink and is denied. Deny-by-default with a small
+/// allowlist is the same fail-safe posture as the `dd of=` handler (which is
+/// stricter still: it denies ALL of=/dev/* including /dev/null).
+fn dev_redirect_target_is_safe(target: &str) -> bool {
+    let Some(suffix) = target.strip_prefix("/dev/") else {
+        return true; // not a /dev path: not this handler's concern
+    };
+    matches!(
+        suffix,
+        "null"
+            | "zero"
+            | "full"
+            | "random"
+            | "urandom"
+            | "stdin"
+            | "stdout"
+            | "stderr"
+            | "tty"
+            | "ptmx"
+    ) || suffix.starts_with("fd/")
+}
+
+/// Strip a redirect-operator prefix from a token: optional fd digit-run or `&`,
+/// then `>`, then one optional `>`, `|`, or `&`. Returns the glued remainder
+/// ("" if the token was purely an operator), or None if the token is not a
+/// redirect. The trailing `&` also covers the csh-style both-streams form
+/// `>&file` (equivalent to `&>file`); fd-duplication like `2>&1` yields a
+/// non-/dev target (`1`) and is harmless.
+fn strip_redirect_op(tok: &str) -> Option<&str> {
+    let t = tok.strip_prefix('&').unwrap_or(tok);
+    let t = t.trim_start_matches(|c: char| c.is_ascii_digit());
+    let t = t.strip_prefix('>')?;
+    Some(t.strip_prefix(['>', '|', '&']).unwrap_or(t))
+}
+
+/// Structural check: a redirect targeting an unsafe /dev path anywhere in the
+/// simple command (the tokenizer strips quotes, so a quoted ">" followed by a
+/// /dev path is indistinguishable from real redirection — accepted fail-safe
+/// over-approximation, same class as the A2 quote-blindness NOTE above).
+fn redirect_catastrophe_in_argv(argv: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < argv.len() {
+        if let Some(rest) = strip_redirect_op(&argv[i]) {
+            let target = if rest.is_empty() {
+                argv.get(i + 1).map(String::as_str).unwrap_or("")
+            } else {
+                rest
+            };
+            if target.starts_with("/dev/") && !dev_redirect_target_is_safe(target) {
+                return Some("redirection writing to a device file is denied".to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Raw-string backstop for redirects the tokenizer never sees (unbalanced
+/// quotes) or quote-glued targets (`>"/dev/sda"`). After each `>` run, skip
+/// `>`/`|`, whitespace, and leading quote chars; an unsafe /dev target denies.
+/// Over-denial of `/dev/…` mentioned in quoted prose after a `>` is accepted —
+/// the hard floor errs toward denial.
+fn raw_redirect_catastrophe(cmd: &str) -> Option<String> {
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'>' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j] == b'>' || bytes[j] == b'|' || bytes[j] == b'&') {
+                j += 1;
+            }
+            while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+                j += 1;
+            }
+            while j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                j += 1;
+            }
+            let rest = &cmd[j..];
+            if rest.starts_with("/dev/") {
+                let end = rest
+                    .find(|c: char| {
+                        c.is_ascii_whitespace()
+                            || matches!(c, '"' | '\'' | '&' | '|' | ';' | ')' | '`')
+                    })
+                    .unwrap_or(rest.len());
+                if !dev_redirect_target_is_safe(&rest[..end]) {
+                    return Some("redirection writing to a device file is denied".to_string());
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 /// A `NAME=value` shell env-assignment prefix token (`FOO=bar` in `FOO=bar cmd`).
 /// Such prefixes precede the real program, so the boundary scan skips them.
 fn is_env_assignment(tok: &str) -> bool {
@@ -145,6 +243,9 @@ pub fn hard_floor_violation(cmd: &str, denylist: &[String]) -> Option<String> {
             if let Some(reason) = simple_command_is_catastrophic(argv) {
                 return Some(reason);
             }
+            if let Some(reason) = redirect_catastrophe_in_argv(argv) {
+                return Some(reason);
+            }
         }
     }
     // Layer A2: raw-string boundary scan — position-aware, so a catastrophe name in argument
@@ -154,6 +255,9 @@ pub fn hard_floor_violation(cmd: &str, denylist: &[String]) -> Option<String> {
         if let Some(reason) = program_name_is_catastrophic(basename(prog)) {
             return Some(reason);
         }
+    }
+    if let Some(reason) = raw_redirect_catastrophe(cmd) {
+        return Some(reason);
     }
     // Layer B: always-on substring backstop (catches configured denylist literals, including
     // specific multi-token strings and the forkbomb signature). Fail-safe.
@@ -609,6 +713,93 @@ mod tests {
             "grep -o pat file",
         ] {
             assert!(is_auto_allowed(cmd, &al), "{cmd} must stay auto-allowed");
+        }
+    }
+
+    // --- Redirect-to-/dev hard-floor handler (closes the `echo x > /dev/sda` Ask→Deny gap) ---
+
+    #[test]
+    fn redirect_to_block_device_is_denied() {
+        for cmd in [
+            "echo x > /dev/sda",
+            "echo x >/dev/sda",
+            "echo x >> /dev/nvme0n1",
+            "cmd 2>>/dev/sda",
+            "cmd &>/dev/sda",
+            "cmd >|/dev/sda",
+            "echo x >\"/dev/sda\"",
+            "echo x > /dev/sda \"unbalanced", // raw backstop: unparseable
+            "git log > /dev/mem",
+            "cmd 2> /dev/sda",       // split operator/target pair
+            "echo x > /dev/ttyUSB0", // deny-by-default (matches dd posture)
+            "echo x > /dev/sda1",
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_some(),
+                "expected deny: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_dev_and_plain_file_redirects_are_not_denied() {
+        for cmd in [
+            "cmd 2>/dev/null",
+            "echo x > /dev/stdout",
+            "cmd > /dev/fd/3",
+            "echo hi > out.txt",
+            "echo hi >> notes.md",
+            "grep pattern file", // no redirect at all
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_none(),
+                "must not deny: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_redirect_denial_reason_names_device_write() {
+        let r = hard_floor_violation("echo x > /dev/sda", &[]).unwrap();
+        assert!(
+            r.contains("redirection writing to a device file is denied"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn redirect_both_streams_amp_gt_form_is_denied() {
+        // Adversarial probe: `>&file` / `>& file` is bash's csh-style redirect of BOTH
+        // stdout+stderr to a file (mirror of the `&>` form the brief covers). Verified
+        // against real bash. These bypassed the initial handler (target parsed as `&…`);
+        // the trailing-`&` strip in strip_redirect_op + the raw skip-run close them.
+        for cmd in [
+            "echo x >& /dev/sda",  // split-pair, both-streams
+            "echo x >&/dev/sda",   // glued, both-streams
+            "cmd 2>& /dev/sda",    // fd-prefixed both-streams, split
+            "echo x >&\"/dev/sda", // unbalanced quote -> raw backstop only
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_some(),
+                "expected deny (>& device write): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_fd_duplication_and_common_forms_are_not_denied() {
+        // No false positives from the trailing-`&` strip: fd duplication (`2>&1`) targets
+        // an fd, not a device, and the ubiquitous `> /dev/null 2>&1` idiom must stay clean.
+        for cmd in [
+            "cmd 2>&1",
+            "cmd > /dev/null 2>&1",
+            "cmd >&2",
+            "echo hi > out.txt 2>&1",
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_none(),
+                "must not deny (fd dup / null idiom): {cmd}"
+            );
         }
     }
 }
