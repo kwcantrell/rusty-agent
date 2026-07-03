@@ -87,13 +87,184 @@ fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
     if name == "rm" && rest.iter().any(|a| is_recursive_flag(a)) && targets_root(rest) {
         return Some("recursive delete of a root path is denied".to_string());
     }
+    // `dd of=<target>` denies ANY write whose target lexically resolves to a
+    // path under /dev — sharing the redirect handler's `..`/`.`//`-run resolver
+    // so `dd of=/../dev/sda`, `//dev/sda`, `/dev/./sda` no longer evade it. dd
+    // is stricter than redirects: it denies even the safe sinks (`/dev/null`),
+    // so it keys on resolver PRESENCE, not the safe-set.
     if name == "dd"
         && rest.iter().any(|a| {
             a.strip_prefix("of=")
-                .is_some_and(|v| v.starts_with("/dev/"))
+                .and_then(resolved_dev_suffix)
+                .is_some()
         })
     {
         return Some("`dd` writing to a block device is denied".to_string());
+    }
+    None
+}
+
+/// A /dev path that redirection may safely write to. Everything else under
+/// /dev/ is a device write sink and is denied. Deny-by-default with a small
+/// allowlist is the same fail-safe posture as the `dd of=` handler (which is
+/// stricter still: it denies ALL of=/dev/* including /dev/null).
+///
+/// The target's path is fully lexically normalized before the /dev match so
+/// redundant `/`-runs, `.` segments, and `..` navigation cannot dodge it:
+/// `//dev/sda`, `/./dev/sda`, `/dev/./sda` all resolve to a write UNDER /dev
+/// and deny. `..` is resolved the way the kernel resolves it — pop the previous
+/// kept segment, a leading `..` at root simply drops (POSIX `/..` == `/`) — so
+/// `/../dev/sda`, `/usr/../dev/sda`, and `/dev/shm/../sda` all resolve to
+/// `/dev/sda` and deny, while `/dev/foo/../null` resolves to the safe `/dev/null`.
+/// Full resolution tracks the real kernel target, which is strictly more correct
+/// than the earlier over-approximation (which missed leading/mid-path `..`).
+/// Only an absolute path can name a device node, so a relative `dev/sda` (an
+/// ordinary cwd file) is not this handler's concern. `/dev/shm/…` is a standard
+/// world-writable tmpfs (files, not devices) and is allowed, alongside the
+/// `/dev/fd/…` fds. We do NOT resolve symlinks — symlink-indirection into /dev
+/// is out of scope for this static floor and reaches Ask.
+fn dev_redirect_target_is_safe(target: &str) -> bool {
+    match resolved_dev_suffix(target) {
+        None => true, // not a (sub-)/dev path: not this handler's concern
+        Some(suffix) => is_safe_dev_suffix(&suffix),
+    }
+}
+
+/// Lexical path-resolution core shared by the redirect and `dd of=` handlers.
+///
+/// Returns `Some(suffix)` when `target` is an ABSOLUTE path that lexically
+/// resolves to a path STRICTLY UNDER `/dev` — i.e. the first resolved segment is
+/// `dev` and there is at least one more segment; `suffix` is those trailing
+/// segments rejoined (`sda`, `shm/f`, `null`). Returns `None` otherwise:
+/// relative targets (a normal cwd file, not a device node), non-/dev-rooted
+/// paths, and bare `/dev` (a directory, not a write sink).
+///
+/// Resolution drops empty (`//`-run) and `.` segments and pops the last kept
+/// segment on `..` (a leading `..` at root simply drops, matching POSIX
+/// `/..` == `/`). This tracks the real kernel target so `..` cannot navigate
+/// INTO /dev undetected: `//dev/sda`, `/./dev/sda`, `/dev/./sda`,
+/// `/../dev/sda`, and `/usr/../dev/sda` all resolve to `dev/sda`, while
+/// `/dev/foo/../null` resolves to `null`. Symlinks are NOT resolved (out of
+/// scope for this static floor; symlink-indirection reaches Ask).
+fn resolved_dev_suffix(target: &str) -> Option<String> {
+    // Only an absolute path can name a /dev device node; a relative target is a
+    // normal file and not this handler's concern.
+    if !target.starts_with('/') {
+        return None;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+    // Must be a path UNDER /dev — first resolved segment `dev` plus at least one
+    // more segment. Bare `/dev` is a directory, not a device write sink.
+    if segments.first() != Some(&"dev") || segments.len() < 2 {
+        return None;
+    }
+    Some(segments[1..].join("/"))
+}
+
+/// True if a resolved `/dev` suffix (from `resolved_dev_suffix`) names a sink
+/// that redirection may safely write to. The redirect handler treats everything
+/// else under /dev as a device write sink and denies. The `dd of=` handler does
+/// NOT consult this — it is stricter still, denying ALL of=/dev/* (including the
+/// safe sinks like /dev/null) via mere `resolved_dev_suffix` presence.
+fn is_safe_dev_suffix(suffix: &str) -> bool {
+    matches!(
+        suffix,
+        "null"
+            | "zero"
+            | "full"
+            | "random"
+            | "urandom"
+            | "stdin"
+            | "stdout"
+            | "stderr"
+            | "tty"
+            | "ptmx"
+    ) || suffix.starts_with("fd/")
+        || suffix.starts_with("shm/")
+}
+
+/// Strip a redirect-operator prefix from a token: optional fd digit-run or `&`,
+/// then `>`, then one optional `>`, `|`, or `&`. Returns the glued remainder
+/// ("" if the token was purely an operator), or None if the token is not a
+/// redirect. The trailing `&` also covers the csh-style both-streams form
+/// `>&file` (equivalent to `&>file`); fd-duplication like `2>&1` yields a
+/// non-/dev target (`1`) and is harmless.
+fn strip_redirect_op(tok: &str) -> Option<&str> {
+    let t = tok.strip_prefix('&').unwrap_or(tok);
+    let t = t.trim_start_matches(|c: char| c.is_ascii_digit());
+    let t = t.strip_prefix('>')?;
+    Some(t.strip_prefix(['>', '|', '&']).unwrap_or(t))
+}
+
+/// Structural check: a redirect targeting an unsafe /dev path anywhere in the
+/// simple command (the tokenizer strips quotes, so a quoted ">" followed by a
+/// /dev path is indistinguishable from real redirection — accepted fail-safe
+/// over-approximation, same class as the A2 quote-blindness NOTE above).
+fn redirect_catastrophe_in_argv(argv: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < argv.len() {
+        if let Some(rest) = strip_redirect_op(&argv[i]) {
+            let target = if rest.is_empty() {
+                argv.get(i + 1).map(String::as_str).unwrap_or("")
+            } else {
+                rest
+            };
+            // No literal `/dev/` pre-gate: the predicate normalizes the target
+            // itself, so `//dev/sda`, `/./dev/sda`, `/dev/./sda` are all caught.
+            if !dev_redirect_target_is_safe(target) {
+                return Some("redirection writing to a device file is denied".to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Raw-string backstop for redirects the tokenizer never sees (unbalanced
+/// quotes) or quote-glued targets (`>"/dev/sda"`). After each `>` run, skip
+/// `>`/`|`, whitespace, and leading quote chars; an unsafe /dev target denies.
+/// Over-denial of `/dev/…` mentioned in quoted prose after a `>` is accepted —
+/// the hard floor errs toward denial.
+fn raw_redirect_catastrophe(cmd: &str) -> Option<String> {
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'>' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j] == b'>' || bytes[j] == b'|' || bytes[j] == b'&') {
+                j += 1;
+            }
+            while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+                j += 1;
+            }
+            while j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                j += 1;
+            }
+            let rest = &cmd[j..];
+            // Extract the target token to the next shell delimiter and let the
+            // normalized predicate decide. No literal `/dev/` pre-gate, so the
+            // `//dev`, `/./dev`, `///dev` spellings enter the same as `/dev`.
+            let end = rest
+                .find(|c: char| {
+                    c.is_ascii_whitespace() || matches!(c, '"' | '\'' | '&' | '|' | ';' | ')' | '`')
+                })
+                .unwrap_or(rest.len());
+            if !dev_redirect_target_is_safe(&rest[..end]) {
+                return Some("redirection writing to a device file is denied".to_string());
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
     }
     None
 }
@@ -145,6 +316,9 @@ pub fn hard_floor_violation(cmd: &str, denylist: &[String]) -> Option<String> {
             if let Some(reason) = simple_command_is_catastrophic(argv) {
                 return Some(reason);
             }
+            if let Some(reason) = redirect_catastrophe_in_argv(argv) {
+                return Some(reason);
+            }
         }
     }
     // Layer A2: raw-string boundary scan — position-aware, so a catastrophe name in argument
@@ -154,6 +328,9 @@ pub fn hard_floor_violation(cmd: &str, denylist: &[String]) -> Option<String> {
         if let Some(reason) = program_name_is_catastrophic(basename(prog)) {
             return Some(reason);
         }
+    }
+    if let Some(reason) = raw_redirect_catastrophe(cmd) {
+        return Some(reason);
     }
     // Layer B: always-on substring backstop (catches configured denylist literals, including
     // specific multi-token strings and the forkbomb signature). Fail-safe.
@@ -610,5 +787,199 @@ mod tests {
         ] {
             assert!(is_auto_allowed(cmd, &al), "{cmd} must stay auto-allowed");
         }
+    }
+
+    // --- Redirect-to-/dev hard-floor handler (closes the `echo x > /dev/sda` Ask→Deny gap) ---
+
+    #[test]
+    fn redirect_to_block_device_is_denied() {
+        for cmd in [
+            "echo x > /dev/sda",
+            "echo x >/dev/sda",
+            "echo x >> /dev/nvme0n1",
+            "cmd 2>>/dev/sda",
+            "cmd &>/dev/sda",
+            "cmd >|/dev/sda",
+            "echo x >\"/dev/sda\"",
+            "echo x > /dev/sda \"unbalanced", // raw backstop: unparseable
+            "git log > /dev/mem",
+            "cmd 2> /dev/sda",       // split operator/target pair
+            "echo x > /dev/ttyUSB0", // deny-by-default (matches dd posture)
+            "echo x > /dev/sda1",
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_some(),
+                "expected deny: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_dev_and_plain_file_redirects_are_not_denied() {
+        for cmd in [
+            "cmd 2>/dev/null",
+            "echo x > /dev/stdout",
+            "cmd > /dev/fd/3",
+            "echo hi > out.txt",
+            "echo hi >> notes.md",
+            "grep pattern file", // no redirect at all
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_none(),
+                "must not deny: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_redirect_denial_reason_names_device_write() {
+        let r = hard_floor_violation("echo x > /dev/sda", &[]).unwrap();
+        assert!(
+            r.contains("redirection writing to a device file is denied"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn redirect_both_streams_amp_gt_form_is_denied() {
+        // Adversarial probe: `>&file` / `>& file` is bash's csh-style redirect of BOTH
+        // stdout+stderr to a file (mirror of the `&>` form the brief covers). Verified
+        // against real bash. These bypassed the initial handler (target parsed as `&…`);
+        // the trailing-`&` strip in strip_redirect_op + the raw skip-run close them.
+        for cmd in [
+            "echo x >& /dev/sda",  // split-pair, both-streams
+            "echo x >&/dev/sda",   // glued, both-streams
+            "cmd 2>& /dev/sda",    // fd-prefixed both-streams, split
+            "echo x >&\"/dev/sda", // unbalanced quote -> raw backstop only
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_some(),
+                "expected deny (>& device write): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_path_normalization_bypasses_are_denied() {
+        // Linux collapses `/`-runs and `.` segments and resolves `..`, so these
+        // all WRITE to /dev/sda yet the old literal `/dev/` prefix compare (and
+        // the old `..`-over-approx) missed the leading/mid-path `..` forms. Full
+        // lexical resolution closes the bypass.
+        for cmd in [
+            "echo x > //dev/sda",
+            "echo x >//dev/sda", // glued, doubled slash
+            "echo x > ///dev/sda",
+            "echo x > /./dev/sda",
+            "echo x > /dev/./sda", // `.` segment between dev and the device
+            "echo x > /dev/../dev/sda", // `..` resolves back to /dev/sda
+            "echo x > /dev/shm/../sda", // `..` escapes /dev/shm back to a device
+            "echo x > /dev/fd/../sda", // `..` escapes /dev/fd back to a device
+            // Leading/mid-path `..` that navigates INTO /dev — POSIX `/..` == `/`,
+            // so each of these resolves to the live block device /dev/sda. The old
+            // predicate saw `first() == ".."`, treated the target as not-/dev, and
+            // returned SAFE. Full resolution now denies them.
+            "echo x > /../dev/sda",
+            "echo x > /../../dev/sda",
+            "echo x > /usr/../dev/sda",
+            "echo x > /tmp/../dev/sda",
+            "echo x > /./../dev/sda",
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_some(),
+                "expected deny (normalized /dev write): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_safe_dev_and_shm_are_not_denied() {
+        // Normalization must not over-deny: safe /dev sinks reached via redundant
+        // `/`/`.` segments stay safe, and /dev/shm is a world-writable tmpfs (a
+        // file, not a device) so writes under it are allowed.
+        for cmd in [
+            "echo x > /dev/shm/f",     // tmpfs file, not a device
+            "echo x > //dev/null",     // doubled slash, safe sink
+            "cmd > /dev/./null",       // `.` segment, safe sink
+            "echo x > /dev/fd/3",      // fd still safe after normalization
+            "echo x > /dev/shm/sub/f", // nested tmpfs path
+            "echo x > /dev/stderr",    // named safe sink
+            // `..` that resolves to a genuine safe sink stays safe: full
+            // resolution is symmetric — it can allow as well as deny.
+            "echo x > /dev/foo/../null",  // resolves to /dev/null (safe)
+            "echo x > /dev/shm/sub/../f", // stays under /dev/shm (safe tmpfs)
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_none(),
+                "must not deny (safe after normalization): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_fd_duplication_and_common_forms_are_not_denied() {
+        // No false positives from the trailing-`&` strip: fd duplication (`2>&1`) targets
+        // an fd, not a device, and the ubiquitous `> /dev/null 2>&1` idiom must stay clean.
+        for cmd in [
+            "cmd 2>&1",
+            "cmd > /dev/null 2>&1",
+            "cmd >&2",
+            "echo hi > out.txt 2>&1",
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_none(),
+                "must not deny (fd dup / null idiom): {cmd}"
+            );
+        }
+    }
+
+    // --- dd `of=` handler shares the lexical /dev resolver (fix wave 3) ---
+
+    #[test]
+    fn dd_of_normalized_dev_writes_are_denied() {
+        // The dd handler now runs the of= target through resolved_dev_suffix, so
+        // the same `..`/`.`//`-run spellings the redirect handler already caught
+        // no longer evade the dd-specific hard deny.
+        for cmd in [
+            "dd of=/../dev/sda",
+            "dd of=//dev/sda",
+            "dd of=/dev/./sda",
+            "dd of=/usr/../dev/sda",
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_some(),
+                "expected deny (normalized dd of= device write): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn dd_of_dev_denies_even_safe_sink() {
+        // Existing behavior preserved: dd is stricter than redirects — it denies
+        // ALL of=/dev/* including the safe /dev/null sink (resolver PRESENCE,
+        // not the safe-set).
+        assert!(hard_floor_violation("dd of=/dev/sda", &[]).is_some());
+        assert!(hard_floor_violation("dd of=/dev/null", &[]).is_some());
+    }
+
+    #[test]
+    fn dd_of_non_dev_targets_are_not_denied() {
+        // A dd write to a plain file (absolute or relative) is not this handler's
+        // concern; `if=/dev/zero` reads a device but only `of=` is the write sink.
+        for cmd in ["dd of=/tmp/x", "dd of=out.img", "dd if=/dev/zero of=/tmp/x"] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_none(),
+                "must not deny (non-/dev dd target): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_semantics_preserved_after_resolver_extraction() {
+        // Regression: extracting resolved_dev_suffix must not change redirect
+        // behavior — a device write denies, /dev/shm and a `..`-to-safe-sink stay
+        // allowed.
+        assert!(hard_floor_violation("echo x > /dev/sda", &[]).is_some());
+        assert!(hard_floor_violation("echo x > /dev/shm/f", &[]).is_none());
+        assert!(hard_floor_violation("echo x > /dev/foo/../null", &[]).is_none());
     }
 }
