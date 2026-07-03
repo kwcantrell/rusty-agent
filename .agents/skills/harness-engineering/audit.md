@@ -653,6 +653,29 @@ un-retracted display text (partial beats none); calibration skips the wrap-up sa
 `PartialRuntimeConfig` mirror/merge arm — a `"memory": false` in a partial on-disk file is
 silently ignored; this cluster's Task-1 pattern is the exact fix.
 
+Re-stamp note (2026-07-02, /dev-redirection Deny parity — decision-round cluster 2/5): item 10
+(the documented `dd of=/dev/sda` Deny vs `echo x > /dev/sda` Ask asymmetry) is now **fixed and
+merged to `main`** (impl + 3 adversarial fix waves, `41c30ea..ad5c2f4`, merge `8197934`; spec
+`docs/superpowers/specs/2026-07-02-dev-redirect-denial-design.md`). A shared lexical `/dev` target
+resolver (`resolved_dev_suffix` in `agent-policy/src/command.rs`: absolute-only, drops `/`-runs +
+`.` segs, pops on `..` with leading-`..`-drops-at-root per POSIX `/..`==`/`, returns the suffix
+only when strictly under `/dev`) backs two hard-floor layers — a structural per-simple-command
+scan (`redirect_catastrophe_in_argv`) and a raw-string backstop (`raw_redirect_catastrophe`) for
+unparseable/quote-glued forms — that Deny redirection (`>`, `>>`, `>|`, `&>`, `>&`, fd-prefixed,
+split-pair) to any unsafe `/dev` target; safe sinks (null/zero/full/random/urandom/std*/tty/ptmx,
+`fd/`, `shm/`) still reach Ask. The `dd of=` handler now shares the same resolver (stricter: denies
+`/dev/null` too via presence). Fires from `hard_floor_violation` (CLI + server), no config/wire/tier
+change. **The adversarial loop earned its keep:** each of three review passes caught a same-class
+device-write bypass the prior fix missed — csh `>&` both-streams (impl), `//dev`//`/./dev`
+`/`-run+`.`-seg (wave 1), leading/mid `..` into /dev (wave 2, → full lexical resolution), and the
+literal-prefix dd sibling (wave 3). Regression-pinned in `command.rs` unit tests + `policy_corpus.tsv`
+rows through the real engine. Accepted residuals (out-of-scope, reach Ask not Deny; documented in
+the spec): variable-expansion (`>$D/sda`, `dd of=$DEV`) and cwd-relative (`cd /dev && … > sda`)
+targets, non-redirect write vehicles (`tee`/`cp` to /dev), symlink-indirection into /dev, and input
+redirection (`< /dev/sda` — reads are not destructive). One accepted fail-safe over-denial: `/dev/…`
+named in quoted prose after a `>` (e.g. `echo "watch out > /dev/sda"`). DISCOVERY (pre-existing,
+carried from Cluster A): `memory: bool` still lacks a PartialRuntimeConfig mirror.
+
 ---
 
 ## Top highest-leverage fixes
