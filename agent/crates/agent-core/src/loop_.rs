@@ -469,6 +469,13 @@ impl AgentLoop {
         // claude_cli inline). Plain config still controls the tool-less case.
         let preserve_thinking = self.config.preserve_thinking || !self.tools.schemas().is_empty();
 
+        // Whether this run has already been curated by a loop-bottom maintain
+        // (i.e. completed at least one tool turn). Gates the text-exit maintain
+        // to PURE text-only runs — the structural gap — so tool-bearing runs
+        // keep the exact v3 maintenance cadence (an extra exit pass measurably
+        // wobbled locked-portmap/memory-roster; see the 2026-07-02 spec).
+        let mut run_maintained = false;
+
         for turn in 0..self.config.max_turns {
             if cancel.is_cancelled() {
                 self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
@@ -684,6 +691,36 @@ impl AgentLoop {
             ctx.append(msg);
 
             if all_calls.is_empty() {
+                // End-of-run curation for PURE text-only runs: their reply
+                // ends the run before the loop-bottom maintain, so a chat
+                // session would never be curated at all — only silently
+                // truncated by build(). Tool-bearing runs skip this: they were
+                // already maintained after each tool turn, and an extra exit
+                // pass measurably wobbled locked-portmap/memory-roster by
+                // compacting one unit deeper per run. (Start-of-turn
+                // maintenance was tried first and regressed memory-roster
+                // 10/10 -> 6/10: maintaining with the fresh user prompt
+                // already appended pushes the previous tool turn into the
+                // compactable span one run earlier, and the model imitates the
+                // visible ack-without-tool-call pattern. See the 2026-07-02
+                // maintain-start-of-turn spec.)
+                if !run_maintained {
+                    let deps = crate::MaintCtx {
+                        model_limit: self.effective_model_limit(),
+                        model: self.maint_model(),
+                        sink: &self.sink,
+                        cancel: &cancel,
+                    };
+                    let report = ctx.maintain(&deps).await;
+                    if report.offloaded > 0 || report.compacted_turns > 0 {
+                        tracing::debug!(
+                            offloaded = report.offloaded,
+                            offloaded_bytes = report.offloaded_bytes,
+                            compacted_turns = report.compacted_turns,
+                            "context maintained at text-only exit"
+                        );
+                    }
+                }
                 self.sink.emit(AgentEvent::Done(assistant.stop));
                 return Ok(());
             }
@@ -953,6 +990,7 @@ impl AgentLoop {
                 cancel: &cancel,
             };
             let report = ctx.maintain(&deps).await;
+            run_maintained = true;
             if report.offloaded > 0 || report.compacted_turns > 0 {
                 tracing::debug!(
                     offloaded = report.offloaded,
@@ -4704,6 +4742,140 @@ mod tests {
         fn request_compaction(&mut self) {
             self.compaction_requests += 1;
         }
+    }
+
+    /// Context stub recording the order of maintain() and build() calls.
+    struct SeqCtx {
+        history: Vec<Message>,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+    #[async_trait::async_trait]
+    impl ContextManager for SeqCtx {
+        fn append(&mut self, m: Message) {
+            self.history.push(m);
+        }
+        fn set_system(&mut self, _: Message) {}
+        fn set_recall(&mut self, _: Vec<String>) {}
+        fn set_goal(&mut self, _: String) {}
+        fn build(&self, _limit: usize) -> Vec<Message> {
+            self.calls.lock().unwrap().push("build");
+            self.history.clone()
+        }
+        async fn maintain(&mut self, _deps: &crate::MaintCtx<'_>) -> crate::MaintReport {
+            self.calls.lock().unwrap().push("maintain");
+            crate::MaintReport::default()
+        }
+        fn request_compaction(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn text_only_run_is_curated_at_exit() {
+        // The text-reply exit used to return before the loop-bottom maintain,
+        // so a pure chat run was never curated at all — only silently
+        // truncated by build(). The exit path must maintain before Done.
+        // (Deliberately NOT start-of-turn: maintaining with the fresh user
+        // prompt already appended pushed the previous tool turn into the
+        // compactable span one run earlier and regressed memory-roster.)
+        let ws = std::env::temp_dir();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "just a chat reply".into(),
+        )]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = SeqCtx {
+            history: vec![],
+            calls: Default::default(),
+        };
+        agent.run(&mut ctx, "hello".into()).await.unwrap();
+        let calls = ctx.calls.lock().unwrap().clone();
+        assert!(
+            calls.contains(&"maintain"),
+            "a text-only run must still be curated: {calls:?}"
+        );
+        // Exit-path semantics: the run's final maintain comes AFTER the model
+        // call's build, curating the settled context (reply included).
+        let m = calls.iter().rposition(|c| *c == "maintain").unwrap();
+        let b = calls.iter().rposition(|c| *c == "build").unwrap();
+        assert!(
+            b < m,
+            "the exit maintain must follow the last build: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_bearing_run_skips_the_exit_maintain() {
+        // A run with tool turns is already curated by the loop-bottom maintain
+        // after each turn; the text-exit pass is for PURE text-only runs only.
+        // An extra exit maintain compacts one unit deeper per run and wobbled
+        // locked-portmap/memory-roster in paired eval batches.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "FILEBODY").unwrap();
+        let ws = dir.path().to_path_buf();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
+            Scripted::Text("The file says FILEBODY".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = SeqCtx {
+            history: vec![],
+            calls: Default::default(),
+        };
+        agent.run(&mut ctx, "read it".into()).await.unwrap();
+        let calls = ctx.calls.lock().unwrap().clone();
+        let maintains = calls.iter().filter(|c| **c == "maintain").count();
+        assert_eq!(
+            maintains, 1,
+            "exactly the loop-bottom maintain, no exit pass: {calls:?}"
+        );
+        // The single maintain is the loop-bottom one: after the tool turn's
+        // build, before the final text turn's build.
+        let m = calls.iter().position(|c| *c == "maintain").unwrap();
+        let last_b = calls.iter().rposition(|c| *c == "build").unwrap();
+        assert!(
+            m < last_b,
+            "loop-bottom maintain precedes the final turn's build: {calls:?}"
+        );
     }
 
     #[tokio::test]

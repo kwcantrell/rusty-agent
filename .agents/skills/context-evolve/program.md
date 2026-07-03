@@ -3,6 +3,63 @@
 Append-only research memory. The loop reads this first every iteration and never
 retries a logged dead end.
 
+## Baseline shift (2026-07-03) — text-only-exit curation + summarizer guards — CURRENT BASELINE
+
+**Champion remains v3 (code + config); this is a baseline shift like calibrated
+budgeting, not a promotion.** Merged from `evolve/maintain-start-of-turn` (spec:
+`docs/superpowers/specs/2026-07-02-maintain-start-of-turn-curation-design.md`).
+Closes open issue #1 of the overflow-fold round: `maintain()` never ran on
+text-only turns (chat-only sessions were never curated, only silently truncated
+by `build()`).
+
+**What shipped (3 coupled changes):**
+1. **Text-only-exit curation (`loop_.rs`).** A run that ends in a text reply now
+   maintains at the exit, before `Done` — but ONLY when no loop-bottom maintain
+   fired this run (`run_maintained` flag). Tool-bearing runs keep the exact v3
+   maintenance cadence by construction; pure chat runs are curated once per run.
+2. **Trivial-chatter skip (`curated.rs`).** The summarizer is skipped when the
+   span is all-assistant AND < `TRIVIAL_CHATTER_SPAN_TOKENS` (256 est tok) —
+   ack chatter accumulates instead of degrading the prior via per-turn re-passes.
+   Tool-bearing spans are exempt at ANY size (a flat floor here broke portmap in
+   the attic round). An explicit `request_compaction()` (overflow recovery)
+   bypasses the skip.
+3. **Monotone prior guard (`curated.rs`).** A candidate summary smaller (est tok,
+   strict) than the prior it replaces is discarded — a shrinking "superset" is a
+   degraded pass; collapse ("No new information provided") is now impossible by
+   construction, not just unlikely.
+
+**Re-baselined numbers (gated binary, window 4000, 2026-07-03 night):**
+- locked-portmap **10/10** (median pass 57,239 tok; paired v3 same night 10/10 @ 53,669)
+- drift-ledger **6/6** (55,822), offload-recall **5/5** (34,299),
+  longhaul-codename **5/5** (53,932), memory-recall **5/5** real-emb (19,906)
+- memory-roster **9/10** real-emb k=10 (67,944; paired v3 10/10 @ 69,746). The
+  single miss stored 7/8 facts — a session-1 slip at fact #3 whose preceding
+  runs all had remember tool turns, i.e. a byte-identical-to-v3 code path up to
+  the failing call. Attribution: server nondeterminism (llama.cpp batching is
+  not bit-deterministic at temp 0), NOT the change. Roster shows a ~5-10%
+  per-batch storage-slip rate across ALL non-start-of-turn code states.
+- longhaul-manifest **0/5** — unchanged, still the open discriminator. Failure
+  shape on the new baseline: manifests written with entries #2–5 missing
+  (ladder-evicted early-middle; entry #1 survives via the pinned goal); one run
+  CONFABULATED the missing entries (invented `bravo_window = 3291` etc. — wrong
+  names AND values); models call `context_compact`/speculative `context_recall`
+  — pressure is noticed but nothing points at the evicted entries.
+
+**How the ordering was settled (3 paired iterations, one variable each):**
+- **Start-of-turn maintain** (the "natural fix"): held every ceiling EXCEPT
+  memory-roster **6/10** vs paired v3 **10/10** — systematic session-1 storage
+  misses (model acks "remember X" without calling the tool, instruction verbatim
+  in-window). Mechanism: maintaining with the fresh user prompt appended pushes
+  the previous remember tool-turn into the compactable span one run earlier; the
+  model's most recent visible template becomes ack-without-tool-call and it
+  imitates it. REVERTED.
+- **Unconditional exit maintain:** roster recovered (9/10, miss = retrieval
+  churn with all 8 stored) but portmap wobbled **9/10** (a 6/8 merge-dropout) —
+  the exit pass after a tool-bearing run's ack added an extra compaction beyond
+  v3 cadence. REFINED.
+- **Gated exit maintain** (shipped): portmap **10/10**, roster **9/10** (see
+  attribution above), all other ceilings held.
+
 ## Champion (v3) — promoted 2026-07-02 (Tier-B: durable-anchor curation) — CURRENT
 
 - **Config:** `tasks/drift-ledger/champion_v3.json` — byte-identical to v2 (`default_k=10`);
@@ -202,6 +259,32 @@ retries a logged dead end.
   its target task's mechanics (recall elicited, content correct once) while silently
   destroying portmap (10/10→1/6) and drift (6/6→1/6). Non-regression on the full suite
   is the only thing that caught it.
+- **Maintain ORDERING is behaviorally live, not plumbing (2026-07-03).** Moving
+  maintain to start-of-turn — with zero change to what maintain does — regressed
+  memory-roster 10/10→6/10: with the fresh prompt already appended, the split
+  (`len - keep_recent`) lands one message deeper, the previous tool turn becomes
+  compactable one run earlier, and the model IMITATES the visible
+  ack-without-tool-call pattern instead of calling the tool. The window's most
+  recent turns are a behavioral template, not just facts.
+- **An extra maintain per run is a cadence change too (2026-07-03).** An
+  unconditional text-exit maintain after tool-bearing runs (one extra compaction
+  per run beyond v3) produced single-miss wobbles on exactly the fact-delivery
+  tasks (portmap 9/10 merge-dropout, roster 9/10). Gating the exit pass to pure
+  text-only runs restored portmap 10/10. When a task's ceiling was measured
+  under a cadence, ship changes that leave that cadence byte-identical wherever
+  possible.
+- **Attribute single misses by prefix identity, not batch counts (2026-07-03).**
+  Roster session-1 has a ~5-10% per-batch storage-slip rate from server
+  nondeterminism (llama.cpp batching at temp 0). A 9/10 vs 10/10 batch says
+  little; what settles attribution is whether the failing call's context could
+  differ from the old code AT ALL (under the gated design it provably could not
+  — every preceding run took a byte-identical path). Paired same-night batches +
+  identical-prefix reasoning beat chasing flakes with more N.
+- **Silent eviction invites confabulation (2026-07-03).** A manifest run with
+  entries #2–5 evicted didn't just omit them — it INVENTED plausible
+  names/values for them. The cost of losing a fact is not only absence; the
+  model fills gaps with fabrications. Phase-2 fold/marker work is also a
+  fabrication-prevention measure.
 
 - **Diagnostic beats param-guessing.** An env-gated `eprintln` of the compaction summary
   (since reverted) was worth more than any blind Tier-A sweep: it showed the summary
@@ -341,6 +424,32 @@ with optimization headroom; the rest are regression guards.
 runs returned `{"passed":false,"tokens":0,"turns":0}` until relaunched. Zero tokens/turns ⇒
 suspect the server, not the curation. Exact relaunch command is in the [[local-llama-server]]
 memory.
+
+## Iteration log (Tier-B — maintain ordering + summarizer guards, 2026-07-03) — BASELINE SHIFT, MERGED
+
+Spec'd change (repo SDLC: spec + plan committed on the branch) closing open
+issue #1 from the overflow-fold round. One ordering variable per iteration,
+paired against snapshot v3 binaries per the Tier-B pairing method.
+
+- **Guards (curated.rs), constant across iterations:** trivial-chatter skip
+  (all-assistant span < 256 est tok skips the summarizer; explicit requests
+  exempt; tool-bearing spans exempt at any size — the attic's flat floor is why
+  portmap broke last round) + monotone prior guard (candidate summary smaller
+  than the prior = discarded). 5 new unit tests; 4 existing tests fattened past
+  the floor (they tested compaction mechanics with tiny chatter); stress-test
+  compaction bound 50→25 (batching is now intended behavior).
+- **Ordering #1 — start-of-turn:** full sweep held every ceiling (portmap 10/10,
+  drift 6/6, offload 5/5, codename 5/5, mem-recall 5/5) EXCEPT memory-roster
+  6/10 vs paired v3 10/10 — systematic storage-phase misses (see Learnings).
+  REVERTED per the spec's fallback clause.
+- **Ordering #2 — unconditional exit maintain:** roster 9/10 (miss = retrieval
+  churn, all 8 stored — pre-existing mode), but portmap 9/10 (6/8 merge-dropout,
+  mechanism-consistent with the extra per-run compaction); paired v3 portmap
+  10/10. REFINED.
+- **Ordering #3 — exit maintain gated to pure text-only runs (SHIPPED):**
+  portmap 10/10, roster 9/10 (single miss on a byte-identical-to-v3 prefix →
+  server nondeterminism), drift 6/6, offload 5/5, codename 5/5, mem-recall 5/5,
+  manifest 0/5 (expected). Full numbers in the Baseline-shift block above.
 
 ## Iteration log (Tier-B — overflow-user folding, post-v3, 2026-07-02 evening) — NO PROMOTION, ALL REVERTED
 
