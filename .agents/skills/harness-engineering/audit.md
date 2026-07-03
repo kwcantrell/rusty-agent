@@ -721,6 +721,62 @@ validator counts as a `tool_call` (spec-intended); unbounded read buffer before 
 correctly). Deferred (spec out-of-scope): per-validator trigger filters, a subagent-scoped disable,
 blocking/veto (rollback) semantics, auto-fix (mutating validators).
 
+Re-stamp note (2026-07-02, H6b measuring experiment — decision-round cluster 5/5): item 3 was
+adjudicated "run the measuring experiment first" (not build, not keep-deferred-blind). The
+experiment is BUILT, RUN, and merged to `main` (2 commits, merge `25950a1`; package at
+`docs/superpowers/experiments/h6b-example-triggering/`). It is a MEASUREMENT, not a feature: an
+example-bearing `csv-report` skill (strict-format `examples/` exemplar), an example-NECESSARY task
+(gold_trajectory `[list_skills,use_skill,read_skill_file]` + hidden grading that requires the
+example's format), an example-INJECTED control task, a runner, and a decision rule. The one
+mergeable code change is an additive `SKILLS_DIR` hook in `eval_context.rs` letting a run opt into
+a skills catalog. **Smoke (N=3/arm, live qwen3.6-35b-a3b):** model-initiative arm — example-load
+trigger 3/3 (1.00), pass 3/3 (real ~20k-token/6-turn `list_skills→use_skill→read_skill_file(example)
+→write` trajectories); injected-control arm — pass 3/3 at ~13.8k tokens/4 turns with NO skill
+tools. **FINDING (directional):** model-initiative example-loading does NOT under-trigger for this
+model/task; H6b auto-injection is NOT warranted for correctness — its only observed value is a
+~7k-token/2-turn cost optimization (load vs inject). **=> H6b stays DEFERRED**, now with evidence
+on record (was "deferred pending eval evidence"). Caveats: favorable-biased smoke (single obvious
+skill, short exemplar), N=3 directional, eval harness pins the ingestion cap OFF; full-N execution
+belongs to the context-evolve campaign (package is ready-to-run there). Footgun surfaced: eval
+`AGENT_E2E_URL` must be `http://localhost:8080` (NOT `/v1` — the client appends
+`/v1/chat/completions`; `/v1` doubles → silent 404 → tokens:0/turns:0).
+
+---
+
+## 2026-07 PRODUCT-DECISION ROUND — CLOSED
+
+The parked PRODUCT DECISIONS list left at the close of the 2026-07 backlog drain was verified
+against live source (four Explore agents), briefed, adjudicated by the owner in one batched
+decision round, and executed. Final disposition of all 12 items:
+
+**SHIPPED (5):**
+- Item 8 — `max_parallel_tools` → RuntimeConfig — merged `7f05ebe` (cluster A).
+- Item 7 — graceful max_turns landing (tools-disabled wrap-up) — merged `7f05ebe` (cluster A).
+- Item 10 — /dev redirection + dd Deny parity (shared lexical resolver) — merged `8197934` (cluster B).
+- Item 4 — widen eval CandidateConfig (system_prompt + protocol axes) — merged `87fdaf9` (cluster C).
+- Item 6 — post-execution validator hook — merged `5f41db5` (cluster D).
+- Item 3 — H6b measuring experiment (run, not build) — merged `25950a1` (cluster E); FINDING:
+  keep H6b deferred (model-initiative suffices; evidence on record).
+
+**DECLINED-BY-OWNER (6) — recorded, do not re-propose without new cause:**
+- Item 1 — git tool consolidation (Access is per-tool; re-does allowlist/Destroy-tier work).
+- Item 2 — persisted OffloadStore (no session rehydration exists; revisit only as a durable-
+  sessions feature).
+- Item 5 — inline list_skills catalog into the system prompt (permanent static cost vs
+  progressive-disclosure design; testable later as a prompt variant via the now-widened
+  CandidateConfig).
+- Item 9 — live trace toggle without restart (niche; restart cheap; RAM-only sessions).
+- Item 11 — lexical/FS split of the read-boundary hook (the decision-time FS I/O is read-only and
+  deliberately closes the symlink escape; split risks a security regression).
+- Item 12 — sub-agent extras (role registry, per-call model override, live child token streaming) —
+  stay "on demand".
+
+Carried follow-up discoveries (pre-existing, not part of any approved item): `memory: bool` has no
+`PartialRuntimeConfig` mirror/merge arm (silently ignored in partial on-disk configs; cluster-A
+Task-1 pattern is the exact fix); tool-description eval variants need a `ToolRegistry`
+description-override seam before they can be a candidate axis. Ledger:
+`.superpowers/sdd/progress.md`. The next audit run starts from a clean slate.
+
 ---
 
 ## Top highest-leverage fixes
