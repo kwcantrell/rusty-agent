@@ -34,6 +34,7 @@ deny	ls|mkfs /dev/sda	# glued pipe: raw boundary scan catches program-position m
 deny	dd if=/dev/zero of=/dev/sda
 deny	dd if=/dev/zero of=/dev/sdb1 bs=4M
 deny	dd of=/dev/sda if=/tmp/x	# `of=` first: structural dd handler is arg-order independent
+deny	dd of=/../dev/sda	# path-normalization: `..` navigates INTO /dev; dd shares the lexical resolver
 #
 # ── Class: redirection writing to a /dev device sink → deny ──
 #   Closes the documented `echo x > /dev/sda` Ask/Deny asymmetry vs `dd of=`.

@@ -130,4 +130,10 @@ the real engine path for the deny cases above plus `2>/dev/null` → ask and
   variables or track the working directory, so these reach Ask (not Deny). Path
   normalization now covers redundant `/` runs, `.` segments, AND full lexical
   `..` resolution (fix wave 2); it does NOT resolve symlinks.
-- Revisiting the dd handler's /dev/null strictness (pre-existing, unhit).
+- The dd handler now shares the lexical /dev resolver (`resolved_dev_suffix`,
+  extracted in fix wave 3), so `dd of=/../dev/sda`, `dd of=//dev/sda`, and
+  `dd of=/dev/./sda` deny through the same normalization as redirects — the
+  earlier literal `/dev/` prefix check no longer lets them fall to Ask. Only the
+  /dev/null strictness difference remains intentional: dd denies ALL of=/dev/*
+  (including the safe sinks like /dev/null) via resolver PRESENCE, whereas
+  redirects consult the safe-set and allow /dev/null.

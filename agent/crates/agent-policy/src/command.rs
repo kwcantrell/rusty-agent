@@ -87,10 +87,16 @@ fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
     if name == "rm" && rest.iter().any(|a| is_recursive_flag(a)) && targets_root(rest) {
         return Some("recursive delete of a root path is denied".to_string());
     }
+    // `dd of=<target>` denies ANY write whose target lexically resolves to a
+    // path under /dev — sharing the redirect handler's `..`/`.`//`-run resolver
+    // so `dd of=/../dev/sda`, `//dev/sda`, `/dev/./sda` no longer evade it. dd
+    // is stricter than redirects: it denies even the safe sinks (`/dev/null`),
+    // so it keys on resolver PRESENCE, not the safe-set.
     if name == "dd"
         && rest.iter().any(|a| {
             a.strip_prefix("of=")
-                .is_some_and(|v| v.starts_with("/dev/"))
+                .and_then(resolved_dev_suffix)
+                .is_some()
         })
     {
         return Some("`dd` writing to a block device is denied".to_string());
@@ -118,15 +124,34 @@ fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
 /// `/dev/fd/…` fds. We do NOT resolve symlinks — symlink-indirection into /dev
 /// is out of scope for this static floor and reaches Ask.
 fn dev_redirect_target_is_safe(target: &str) -> bool {
+    match resolved_dev_suffix(target) {
+        None => true, // not a (sub-)/dev path: not this handler's concern
+        Some(suffix) => is_safe_dev_suffix(&suffix),
+    }
+}
+
+/// Lexical path-resolution core shared by the redirect and `dd of=` handlers.
+///
+/// Returns `Some(suffix)` when `target` is an ABSOLUTE path that lexically
+/// resolves to a path STRICTLY UNDER `/dev` — i.e. the first resolved segment is
+/// `dev` and there is at least one more segment; `suffix` is those trailing
+/// segments rejoined (`sda`, `shm/f`, `null`). Returns `None` otherwise:
+/// relative targets (a normal cwd file, not a device node), non-/dev-rooted
+/// paths, and bare `/dev` (a directory, not a write sink).
+///
+/// Resolution drops empty (`//`-run) and `.` segments and pops the last kept
+/// segment on `..` (a leading `..` at root simply drops, matching POSIX
+/// `/..` == `/`). This tracks the real kernel target so `..` cannot navigate
+/// INTO /dev undetected: `//dev/sda`, `/./dev/sda`, `/dev/./sda`,
+/// `/../dev/sda`, and `/usr/../dev/sda` all resolve to `dev/sda`, while
+/// `/dev/foo/../null` resolves to `null`. Symlinks are NOT resolved (out of
+/// scope for this static floor; symlink-indirection reaches Ask).
+fn resolved_dev_suffix(target: &str) -> Option<String> {
     // Only an absolute path can name a /dev device node; a relative target is a
     // normal file and not this handler's concern.
     if !target.starts_with('/') {
-        return true;
+        return None;
     }
-    // Fully resolve the path lexically: drop empty (`//`-run) and `.` segments;
-    // on `..` pop the last kept segment if any (a leading `..` at root drops,
-    // matching POSIX `/..` == `/`); otherwise keep the segment. This tracks the
-    // real kernel target so `..` cannot navigate INTO /dev undetected.
     let mut segments: Vec<&str> = Vec::new();
     for seg in target.split('/') {
         match seg {
@@ -140,11 +165,19 @@ fn dev_redirect_target_is_safe(target: &str) -> bool {
     // Must be a path UNDER /dev — first resolved segment `dev` plus at least one
     // more segment. Bare `/dev` is a directory, not a device write sink.
     if segments.first() != Some(&"dev") || segments.len() < 2 {
-        return true; // not a (sub-)/dev path: not this handler's concern
+        return None;
     }
-    let suffix = segments[1..].join("/");
+    Some(segments[1..].join("/"))
+}
+
+/// True if a resolved `/dev` suffix (from `resolved_dev_suffix`) names a sink
+/// that redirection may safely write to. The redirect handler treats everything
+/// else under /dev as a device write sink and denies. The `dd of=` handler does
+/// NOT consult this — it is stricter still, denying ALL of=/dev/* (including the
+/// safe sinks like /dev/null) via mere `resolved_dev_suffix` presence.
+fn is_safe_dev_suffix(suffix: &str) -> bool {
     matches!(
-        suffix.as_str(),
+        suffix,
         "null"
             | "zero"
             | "full"
@@ -897,5 +930,56 @@ mod tests {
                 "must not deny (fd dup / null idiom): {cmd}"
             );
         }
+    }
+
+    // --- dd `of=` handler shares the lexical /dev resolver (fix wave 3) ---
+
+    #[test]
+    fn dd_of_normalized_dev_writes_are_denied() {
+        // The dd handler now runs the of= target through resolved_dev_suffix, so
+        // the same `..`/`.`//`-run spellings the redirect handler already caught
+        // no longer evade the dd-specific hard deny.
+        for cmd in [
+            "dd of=/../dev/sda",
+            "dd of=//dev/sda",
+            "dd of=/dev/./sda",
+            "dd of=/usr/../dev/sda",
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_some(),
+                "expected deny (normalized dd of= device write): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn dd_of_dev_denies_even_safe_sink() {
+        // Existing behavior preserved: dd is stricter than redirects — it denies
+        // ALL of=/dev/* including the safe /dev/null sink (resolver PRESENCE,
+        // not the safe-set).
+        assert!(hard_floor_violation("dd of=/dev/sda", &[]).is_some());
+        assert!(hard_floor_violation("dd of=/dev/null", &[]).is_some());
+    }
+
+    #[test]
+    fn dd_of_non_dev_targets_are_not_denied() {
+        // A dd write to a plain file (absolute or relative) is not this handler's
+        // concern; `if=/dev/zero` reads a device but only `of=` is the write sink.
+        for cmd in ["dd of=/tmp/x", "dd of=out.img", "dd if=/dev/zero of=/tmp/x"] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_none(),
+                "must not deny (non-/dev dd target): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_semantics_preserved_after_resolver_extraction() {
+        // Regression: extracting resolved_dev_suffix must not change redirect
+        // behavior — a device write denies, /dev/shm and a `..`-to-safe-sink stay
+        // allowed.
+        assert!(hard_floor_violation("echo x > /dev/sda", &[]).is_some());
+        assert!(hard_floor_violation("echo x > /dev/shm/f", &[]).is_none());
+        assert!(hard_floor_violation("echo x > /dev/foo/../null", &[]).is_none());
     }
 }
