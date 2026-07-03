@@ -151,6 +151,11 @@ async fn eval_context_run() {
         cfg.memory = task.memory_enabled && cc.memory_enabled;
         cfg.sandbox_mode = "off".into();
         cfg.max_turns = 12;
+        // Additive eval hook: let a run opt into a skills catalog so example-bearing
+        // skills (list_skills/use_skill/read_skill_file) are exercised. Unset = no skills.
+        if let Ok(d) = std::env::var("SKILLS_DIR") {
+            cfg.skills_dirs = vec![d];
+        }
 
         // Memory: shared SqliteStore so facts persist across sessions. Default embedder
         // is the deterministic StubEmbedder (exact-match only, no network). Set
