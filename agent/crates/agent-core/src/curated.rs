@@ -586,7 +586,10 @@ mod tests {
         for i in 0..4 {
             c.append(Message::user(format!("instruction {i}: add value {i}{i}")));
             c.append(Message::assistant(
-                format!("ok, acknowledged {i}, {}", "lots of filler chatter ".repeat(15)),
+                format!(
+                    "ok, acknowledged {i}, {}",
+                    "lots of filler chatter ".repeat(15)
+                ),
                 None,
             ));
         }
