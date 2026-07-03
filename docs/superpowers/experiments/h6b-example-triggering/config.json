@@ -1,0 +1,16 @@
+{
+  "context_limit": 196608,
+  "high_water_pct": 0.85,
+  "keep_recent": 4,
+  "error_min_bytes": 1024,
+  "output_min_bytes": 4096,
+  "recall_budget": 512,
+  "memory_enabled": false,
+  "default_k": 5,
+  "relevance_threshold": 0.3,
+  "dedup_threshold": 0.95,
+  "forget_threshold": 0.85,
+  "max_recall_chars": 4096,
+  "recall_token_budget": 512,
+  "auto_recall": true
+}

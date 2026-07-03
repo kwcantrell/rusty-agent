@@ -1,0 +1,22 @@
+{
+  "id": "h6b-model-initiative",
+  "mode": "context",
+  "realistic_window": 196608,
+  "favorable_window": 196608,
+  "memory_enabled": false,
+  "seed_files": [
+    {
+      "path": "data.csv",
+      "contents": "metric,value\nalpha,10.5\nbeta,3.2\ngamma,7\n"
+    }
+  ],
+  "test_cmd": "bash hidden_tests/check.sh",
+  "sessions": [
+    {
+      "prompts": [
+        "Produce the team's standard summary report for data.csv and write it to report.md. Follow the csv-report skill."
+      ]
+    }
+  ],
+  "gold_trajectory": ["list_skills", "use_skill", "read_skill_file"]
+}
