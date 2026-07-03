@@ -35,6 +35,18 @@ pub struct TaskSpec {
     /// empty = no process expectation.
     #[serde(default)]
     pub gold_trajectory: Vec<String>,
+    /// Execution profile. None = host semantics (sandbox off — every pre-2026-07-03
+    /// task). "node-offline" = docker sandbox enforced, node image, network none,
+    /// grading in-container (spec 2026-07-03 harness-evolve phase-0).
+    #[serde(default)]
+    pub exec_profile: Option<String>,
+    /// Directory copied recursively into the workspace BEFORE seed_files, resolved
+    /// relative to task.json's parent dir. Carries trees seed_files can't (node_modules).
+    #[serde(default)]
+    pub seed_dir: Option<String>,
+    /// Per-prompt driver timeout in seconds. None = 120 (the historical value).
+    #[serde(default)]
+    pub prompt_timeout_secs: Option<u64>,
 }
 
 impl TaskSpec {
@@ -96,5 +108,22 @@ mod tests {
         }"#;
         let t = TaskSpec::from_json(json).unwrap();
         assert_eq!(t.gold_trajectory, vec!["read_file".to_string()]);
+    }
+    #[test]
+    fn phase0_fields_default_absent_and_parse_when_present() {
+        let t = TaskSpec::from_json(JSON).unwrap(); // existing fixture: no new fields
+        assert!(t.exec_profile.is_none() && t.seed_dir.is_none());
+        assert!(t.prompt_timeout_secs.is_none());
+        let json = r#"{
+          "id": "w", "mode": "code", "realistic_window": 8000,
+          "favorable_window": 196608, "memory_enabled": false, "seed_files": [],
+          "test_cmd": "true", "sessions": [{ "prompts": ["p"] }],
+          "exec_profile": "node-offline", "seed_dir": "seed",
+          "prompt_timeout_secs": 600
+        }"#;
+        let t = TaskSpec::from_json(json).unwrap();
+        assert_eq!(t.exec_profile.as_deref(), Some("node-offline"));
+        assert_eq!(t.seed_dir.as_deref(), Some("seed"));
+        assert_eq!(t.prompt_timeout_secs, Some(600));
     }
 }
