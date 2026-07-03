@@ -32,6 +32,13 @@ pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
 pub const STUCK_NUDGE_AFTER: usize = 2;
 pub const STUCK_ABORT_AFTER: usize = 4;
 
+/// Appended when `max_turns` exhausts with the model still issuing tool calls;
+/// the run then gets ONE tools-disabled wrap-up completion (best-effort) so it
+/// ends on a summary instead of mid-thought (spec: runtime-knobs Part 2).
+const BUDGET_WRAP_UP_PROMPT: &str = "The turn limit for this run has been reached and \
+tools are disabled for the remainder of this run. Reply with a brief summary of what \
+you accomplished, what remains to be done, and any state or next steps the user needs.";
+
 /// Surfaced when a tool call is cut off at `max_tokens` (args are incomplete
 /// JSON). Shared by the whole-turn `Err(Length)` repair arm and the per-call
 /// `Ok`-with-`invalid` + `Length` guard so a truncated call takes the
@@ -876,6 +883,47 @@ impl AgentLoop {
                 );
             }
         }
+        // Budget exhausted with the model still tool-hungry (text-only replies
+        // exit earlier with Done(Stop)). One best-effort, tools-disabled wrap-up
+        // completion; it must never fail the run. Single attempt by design: no
+        // retry, no overflow recovery, no StreamRetry accounting (spec Part 2).
+        if !cancel.is_cancelled() {
+            ctx.append(Message::user(BUDGET_WRAP_UP_PROMPT));
+            let messages = ctx.build(self.effective_model_limit());
+            let mut req = self.completion_request(messages, preserve_thinking);
+            req.tools = Vec::new();
+            let started = std::time::Instant::now();
+            let mut emitted = (0usize, 0usize);
+            match self.one_completion(req, &cancel, &mut emitted).await {
+                Ok(wrap) => {
+                    if wrap.prompt_tokens > 0 || wrap.completion_tokens > 0 {
+                        self.sink.emit(AgentEvent::ServerUsage {
+                            prompt_tokens: wrap.prompt_tokens,
+                            completion_tokens: wrap.completion_tokens,
+                            reasoning_tokens: wrap.reasoning_tokens,
+                            cached_tokens: wrap.cached_tokens,
+                            cost_usd: wrap.cost_usd,
+                            turn_duration_ms: started.elapsed().as_millis() as u64,
+                            turn: self.config.max_turns,
+                            parent_id: None,
+                        });
+                    }
+                    // Text-only append: stray tool calls are discarded so no
+                    // dangling tool_call ids enter persistent history. An empty
+                    // reply appends nothing.
+                    if !wrap.text.is_empty() {
+                        ctx.append(Message::assistant(wrap.text, None));
+                    }
+                }
+                Err(ModelError::Cancelled) => {
+                    self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "budget wrap-up completion skipped");
+                }
+            }
+        }
         self.sink
             .emit(AgentEvent::Done(StopReason::BudgetExhausted));
         Ok(())
@@ -1337,6 +1385,233 @@ mod tests {
         assert!(
             events.iter().any(|e| e == "server_usage:900:12"),
             "expected server_usage event with real token totals; got {events:?}"
+        );
+    }
+
+    /// Wraps a `ScriptedModel` and records each request's tool-schema count, so a
+    /// test can prove the wrap-up completion carries no tools (spec Part 2).
+    struct ToolCountingModel {
+        inner: ScriptedModel,
+        tool_counts: std::sync::Mutex<Vec<usize>>,
+    }
+    #[async_trait::async_trait]
+    impl agent_model::ModelClient for ToolCountingModel {
+        async fn stream(
+            &self,
+            req: agent_model::CompletionRequest,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<agent_model::Chunk, agent_model::ModelError>,
+            >,
+            agent_model::ModelError,
+        > {
+            self.tool_counts.lock().unwrap().push(req.tools.len());
+            self.inner.stream(req).await
+        }
+    }
+
+    /// Budget exhaustion triggers ONE tools-disabled wrap-up completion; its text
+    /// streams and lands as a text-only assistant append; run still ends
+    /// Done(BudgetExhausted). (spec: runtime-knobs Part 2)
+    #[tokio::test]
+    async fn budget_exhaustion_runs_tools_disabled_wrap_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        std::fs::write(ws.join("f.txt"), "x").unwrap();
+        let model = Arc::new(ToolCountingModel {
+            inner: ScriptedModel::new(vec![
+                Scripted::Call(
+                    "c1".into(),
+                    "read_file".into(),
+                    format!(r#"{{"path":"{}"}}"#, ws.join("f.txt").display()),
+                ),
+                Scripted::Text("wrap-up summary".into()),
+            ]),
+            tool_counts: Default::default(),
+        });
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model.clone(),
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 1,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let counts = model.tool_counts.lock().unwrap().clone();
+        assert_eq!(counts.len(), 2, "turn + wrap-up = exactly two model calls");
+        assert!(counts[0] > 0, "the real turn carries tool schemas");
+        assert_eq!(counts[1], 0, "the wrap-up is tools-disabled");
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e == "token:wrap-up summary"),
+            "wrap-up streamed: {events:?}"
+        );
+    }
+
+    /// A wrap-up failure is swallowed: no append, still Done(BudgetExhausted).
+    #[tokio::test]
+    async fn budget_wrap_up_failure_is_best_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        std::fs::write(ws.join("f.txt"), "x").unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                format!(r#"{{"path":"{}"}}"#, ws.join("f.txt").display()),
+            ),
+            Scripted::Fail(ModelError::Http("boom".into())),
+        ]));
+        let sink = Arc::new(DetailSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 1,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(
+            *sink.done.lock().unwrap(),
+            Some(StopReason::BudgetExhausted),
+            "a failed wrap-up still lands Done(BudgetExhausted)"
+        );
+    }
+
+    /// Cancel during the wrap-up ends Done(Cancelled), matching loop-entry behavior.
+    #[tokio::test]
+    async fn budget_wrap_up_cancel_yields_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        std::fs::write(ws.join("f.txt"), "x").unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                format!(r#"{{"path":"{}"}}"#, ws.join("f.txt").display()),
+            ),
+            Scripted::Hang,
+        ]));
+        let sink = Arc::new(DetailSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 1,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        let cancel = CancellationToken::new();
+        let cancel_bg = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_bg.cancel();
+        });
+        agent
+            .run_with_cancel(&mut ctx, "go".into(), cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *sink.done.lock().unwrap(),
+            Some(StopReason::Cancelled),
+            "a cancel racing the wrap-up ends Done(Cancelled)"
+        );
+    }
+
+    /// Stray tool calls in the wrap-up reply are discarded — text-only append,
+    /// no dangling ids, still Done(BudgetExhausted).
+    #[tokio::test]
+    async fn budget_wrap_up_discards_stray_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        std::fs::write(ws.join("f.txt"), "x").unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                format!(r#"{{"path":"{}"}}"#, ws.join("f.txt").display()),
+            ),
+            Scripted::Call(
+                "c2".into(),
+                "read_file".into(),
+                format!(r#"{{"path":"{}"}}"#, ws.join("f.txt").display()),
+            ),
+        ]));
+        let sink = Arc::new(DetailSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 1,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(
+            *sink.done.lock().unwrap(),
+            Some(StopReason::BudgetExhausted),
+            "wrap-up's stray tool call does not change the terminal reason"
+        );
+        assert_eq!(
+            sink.tool_starts.lock().unwrap().len(),
+            1,
+            "only the real turn's call executed — the wrap-up call was NOT run"
         );
     }
 
