@@ -69,6 +69,10 @@ pub struct RuntimeConfig {
     /// Max tool calls executed concurrently within one turn.
     #[serde(default = "default_max_parallel_tools")]
     pub max_parallel_tools: usize,
+    /// Shell commands run once after any turn in which a mutating (Write/Destroy)
+    /// tool call succeeded; failures are fed back to the model. Empty = disabled.
+    #[serde(default)]
+    pub post_tool_validators: Vec<String>,
     #[serde(default = "default_true")]
     pub memory: bool,
     #[serde(default = "default_true")]
@@ -150,6 +154,7 @@ struct PartialRuntimeConfig {
     context_limit: Option<usize>,
     max_tool_result_bytes: Option<usize>,
     max_parallel_tools: Option<usize>,
+    post_tool_validators: Option<Vec<String>>,
     subagents: Option<bool>,
     subagent_max_turns: Option<usize>,
     subagent_timeout_secs: Option<u64>,
@@ -246,6 +251,7 @@ impl RuntimeConfig {
             context_limit,
             max_tool_result_bytes: default_max_tool_result_bytes(),
             max_parallel_tools: default_max_parallel_tools(),
+            post_tool_validators: Vec::new(),
             memory: true,
             subagents: true,
             subagent_max_turns: default_subagent_max_turns(),
@@ -406,6 +412,9 @@ impl RuntimeConfig {
         }
         if let Some(v) = p.max_parallel_tools {
             self.max_parallel_tools = v;
+        }
+        if let Some(v) = p.post_tool_validators {
+            self.post_tool_validators = v;
         }
         if let Some(v) = p.subagents {
             self.subagents = v;
@@ -591,6 +600,25 @@ mod tests {
         let round: RuntimeConfig =
             serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(round.max_parallel_tools, 3);
+    }
+
+    #[test]
+    fn post_tool_validators_default_empty_and_merge() {
+        let mut v = serde_json::to_value(base()).unwrap();
+        v.as_object_mut().unwrap().remove("post_tool_validators");
+        let parsed: RuntimeConfig = serde_json::from_value(v).unwrap();
+        assert!(
+            parsed.post_tool_validators.is_empty(),
+            "serde default is empty"
+        );
+
+        let merged = base().merge(
+            serde_json::from_str::<PartialRuntimeConfig>(
+                r#"{"post_tool_validators": ["cargo check"]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(merged.post_tool_validators, vec!["cargo check".to_string()]);
     }
 
     #[test]

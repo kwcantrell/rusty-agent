@@ -110,6 +110,8 @@ pub struct LoopConfig {
     /// Max tool calls from one assistant turn to execute concurrently.
     /// 0 (the default) means `DEFAULT_MAX_PARALLEL_TOOLS`.
     pub max_parallel_tools: usize,
+    /// Shell commands run after a mutating turn (see RuntimeConfig). Empty = off.
+    pub post_tool_validators: Vec<String>,
 }
 
 impl Default for LoopConfig {
@@ -136,6 +138,7 @@ impl Default for LoopConfig {
             preserve_thinking: false,
             sandbox: std::sync::Arc::new(agent_tools::HostExecutor),
             max_parallel_tools: 0,
+            post_tool_validators: Vec::new(),
         }
     }
 }
