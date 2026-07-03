@@ -3,7 +3,50 @@
 Append-only research memory. The loop reads this first every iteration and never
 retries a logged dead end.
 
-## Champion (v2) — promoted 2026-06-29 (default_k 5→10) — CURRENT
+## Champion (v3) — promoted 2026-07-02 (Tier-B: durable-anchor curation) — CURRENT
+
+- **Config:** `tasks/drift-ledger/champion_v3.json` — byte-identical to v2 (`default_k=10`);
+  the promotion is CODE. Three coupled retention changes in `agent-core`
+  (`context.rs::plan_retention`, `curated.rs` build/compaction):
+  1. **User-priority build retention.** `build()` no longer keeps a contiguous
+     newest-first suffix. A priority ladder charges est-tokens in order: (1) the newest
+     unit unconditionally, (2) `Role::User` units newest-first, (3) everything else
+     newest-first (`plan_retention`, whole units, orphan-safe). v1 kept user turns
+     verbatim in *history*, but `build()`'s token-bounded eviction silently dropped
+     them from the *window* — the guarantee has to hold at every discarding layer.
+  2. **Boundary offload.** Tool results leaving the window through compaction are
+     lifted into the offload store FIRST (age protection no longer applies to a
+     departing result), so the summarizer can never destroy the last copy of a tool
+     result — the recall chain survives compaction.
+  3. **Durable placeholder units.** Offload-placeholder units (every result starts
+     `[tool_result#`, unit ≤160 est tok) are partitioned out of the summarizer
+     verbatim, like user turns — a paraphrased placeholder severs `context_recall`.
+- **Trigger — STATE DRIFT, not a checkpoint hypothesis:** the 2026-07-02
+  calibrated-budgeting merge (`ae3750d`) divides `model_limit` by the observed
+  server/estimate token ratio (clamped ≤4.0). At `context_limit=4000` the effective
+  build/maintain budget is ~1000 est tok. Every pre-2026-07-02 number was stale;
+  champion re-baselined on current main: drift-ledger **0/6** (was 3/6), offload-recall
+  **1/5** (was 5/5), locked-portmap **8/10** (was 4/10 — accidentally improved).
+- **Paired results (window 4000, current-main champion legs, same session):**
+  - **locked-portmap N=10:** champ **8/10** (median pass 69,250 tok) → v3 **10/10**
+    (50,093 tok, −28%). `eval_gate` = **Promote**. THE PORTMAP GAP IS CLOSED
+    (favorable was 5/5; realistic now matches it).
+  - **drift-ledger N=6:** champ **0/6** → v3 **6/6** (median 51,796 vs ~67–90K tok).
+    Gate prints the known 0-passes token artifact; promote on correctness (6 > 0).
+    6/6 exceeds even v1's pre-calibration 3/6 "model-bound" ceiling — boundary
+    offload keeps noise out of the summarizer, and the verbatim in-window increments
+    let the model sum correctly.
+  - **offload-recall N=5:** champ **1/5** → v3 **5/5** (median 34,538 tok). Gate =
+    **Promote**. Trajectories show the ideal shape again (read×3 → overwrite →
+    `context_recall` → answer).
+  - **Held-outs at ceiling, no regression:** longhaul-codename **5/5**, memory-recall
+    (real emb) **5/5**, memory-roster (real emb, k=10) **5/5**.
+- All three changes ship with unit tests (`plan_retention_keeps_user_units_over_newer_chatter`,
+  `build_keeps_user_instructions_under_tight_budget`,
+  `compaction_offloads_departing_tool_results_before_summarizing`,
+  `maintain_keeps_offload_placeholders_verbatim_through_compaction`).
+
+## Champion (v2) — promoted 2026-06-29 (default_k 5→10)
 
 - **Config:** `tasks/drift-ledger/champion_v2.json` → `/tmp/champion.json` (canonical going
   forward). Identical to v0 except **`default_k` 5→10**. **Code:** v1 compaction (unchanged).
@@ -102,8 +145,32 @@ retries a logged dead end.
     favorable's 5/5, so some context degradation remains at 4000 even with v1 (partial recovery,
     not full) — but the compaction improvement is decisively better than v0 here, not just on the
     synthetic ledger.
+  - **2026-07-02 update: GAP CLOSED by champion v3 — 10/10 at window 4000** (the 4/10
+    above is a stale pre-calibration number; see the v3 block and the v2→v3 iteration log).
 
 ## Learnings (accumulated; never re-tried)
+
+- **Calibrated budgeting rewrote the eval landscape (2026-07-02).** `ae3750d` divides
+  the configured window by the observed server/estimate ratio (clamp 4.0): configured
+  4000 → effective ~1000 est tok. ANY number recorded before it is stale — re-baseline
+  the champion under current main before comparing a candidate. It regressed
+  drift-ledger 3/6→0/6 and offload-recall 5/5→1/5 while accidentally improving
+  portmap 4/10→8/10 (harder window → more compactions → the cumulative summary
+  carried the facts more often).
+- **A curation guarantee must hold at every layer that discards content.** v1's
+  "user turns verbatim" held in history but not in the built window: `build()`'s
+  newest-first suffix eviction silently dropped exactly the turns v1 preserved.
+  Diagnosis came from an env-gated eviction dump, not param sweeps (again).
+- **Compaction can outrace age-based offload.** With `keep_recent=2` protecting the
+  newest tool results and compaction firing nearly every turn at ~1000 budget, a
+  large fresh result is summarized (destroyed) before the age pass ever placeholders
+  it — no pointer, no `context_recall`, offload-recall 0/5 with zero recall calls in
+  any trajectory. Offloading at the compaction boundary is the timing-independent
+  invariant; a `keep_recent` tweak would have been luck.
+- **Protecting placeholders is useless if the placeholder never forms.** Candidate B
+  (durable placeholder units alone) measured 0/5 on offload-recall — same as A. The
+  fix needed the boundary offload (C) to create the placeholder first; B's partition
+  rule then keeps it. Ship invariants in the right order: create, then protect.
 
 - **Diagnostic beats param-guessing.** An env-gated `eprintln` of the compaction summary
   (since reverted) was worth more than any blind Tier-A sweep: it showed the summary
@@ -243,6 +310,29 @@ with optimization headroom; the rest are regression guards.
 runs returned `{"passed":false,"tokens":0,"turns":0}` until relaunched. Zero tokens/turns ⇒
 suspect the server, not the curation. Exact relaunch command is in the [[local-llama-server]]
 memory.
+
+## Iteration log (Tier-B — retention, v2→v3, 2026-07-02)
+
+- **Re-baseline (forced by state drift).** CE_DEBUG diagnostic run on locked-portmap
+  showed `budget+pinned ≈ 1000`, not 4000 → traced to calibrated budgeting
+  (`effective_model_limit`, merged post-checkpoint). All 8 fact-bearing user turns
+  were being evicted from the built window; facts survived only via summary luck.
+  Champion re-baselined on current main: portmap 8/10, drift 0/6, offload 1/5.
+- **Tier-B #3 — user-priority build retention (cand A).** Paired portmap N=10:
+  champ 8/10 → A **10/10**, median pass tokens 69,250→60,095; `gate`=Promote.
+  Paired drift N=6: 0/6 → **3/6** (~35% fewer tokens). Held-outs: longhaul 5/5,
+  memory-recall 5/5, memory-roster 5/5, but **offload-recall 0/5 vs champ 1/5 →
+  blocked on the held-out hard gate** (placeholder pointers lost to the summarizer).
+- **Tier-B #4 — durable placeholder units (cand B = A + partition).** offload-recall
+  still **0/5**, zero `context_recall` calls in any trajectory. Diagnosis: the
+  placeholder never forms — compaction consumes the raw alpha read while
+  `keep_recent=2` still age-protects it. **Dead end standalone; kept as C's guard.**
+  (B side-data: portmap 6/6, drift 5/6, longhaul/memory 5/5 — the A-part held.)
+- **Tier-B #5 — boundary offload (cand C = A+B + offload departing results at the
+  compaction split).** offload-recall **5/5** (gate=Promote), portmap **10/10**
+  (gate=Promote), drift **6/6**, longhaul 5/5, memory-recall 5/5, memory-roster 5/5.
+  **PROMOTED 2026-07-02 → champion v3** (code merged to main; config file
+  `champion_v3.json` = v2 params, frozen).
 
 ## Iteration log (Tier-B — compaction, v0→v1)
 
