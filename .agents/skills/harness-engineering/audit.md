@@ -771,11 +771,20 @@ decision round, and executed. Final disposition of all 12 items:
 - Item 12 — sub-agent extras (role registry, per-call model override, live child token streaming) —
   stay "on demand".
 
-Carried follow-up discoveries (pre-existing, not part of any approved item): `memory: bool` has no
-`PartialRuntimeConfig` mirror/merge arm (silently ignored in partial on-disk configs; cluster-A
-Task-1 pattern is the exact fix); tool-description eval variants need a `ToolRegistry`
-description-override seam before they can be a candidate axis. Ledger:
-`.superpowers/sdd/progress.md`. The next audit run starts from a clean slate.
+Carried follow-up discoveries — **both closed 2026-07-02**:
+- `memory: bool` missing from the `PartialRuntimeConfig` mirror/merge — FIXED (merged to main,
+  `fix(runtime-config): mirror memory in PartialRuntimeConfig merge`). The fix also added a
+  structural guard test (`full_saved_file_overrides_every_field_via_partial_merge`) that flips
+  every `RuntimeConfig` field and round-trips it through the partial-merge path, so any future
+  field added without a mirror fails CI (and the exhaustive struct literal makes forgetting to
+  update the guard a compile error). Field-by-field audit confirmed `memory` was the only gap.
+- Tool-description eval axis (ToolRegistry description-override seam) — DECLINED-FOR-NOW by
+  owner (no consumer: H6b resolved without it, catalog-inlining declined, no scheduled
+  experiment varies tool descriptions). Full investigated design sketch + revisit trigger
+  recorded in `docs/superpowers/specs/2026-07-02-tool-description-override-seam-design.md`
+  (~half-day build via a registry override map + additive RuntimeConfig thread when needed).
+
+The next audit run starts from a clean slate. Ledger: `.superpowers/sdd/progress.md`.
 
 ---
 
