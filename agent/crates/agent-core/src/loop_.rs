@@ -36,8 +36,8 @@ pub const STUCK_ABORT_AFTER: usize = 4;
 /// the run then gets ONE tools-disabled wrap-up completion (best-effort) so it
 /// ends on a summary instead of mid-thought (spec: runtime-knobs Part 2).
 const BUDGET_WRAP_UP_PROMPT: &str = "The turn limit for this run has been reached and \
-tools are now disabled. Reply with a brief summary of what you accomplished, what \
-remains to be done, and any state or next steps the user needs.";
+tools are disabled for the remainder of this run. Reply with a brief summary of what \
+you accomplished, what remains to be done, and any state or next steps the user needs.";
 
 /// Surfaced when a tool call is cut off at `max_tokens` (args are incomplete
 /// JSON). Shared by the whole-turn `Err(Length)` repair arm and the per-call

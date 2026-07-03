@@ -322,6 +322,42 @@ async fn budget_exhausted_child_reports_it() {
     );
 }
 
+/// The headline dispatch benefit: a child that exhausts its turn budget still
+/// hands the parent a real wrap-up SUMMARY. The child's last (tools-disabled)
+/// wrap-up turn is a `Scripted::Text`, so its text must surface in the parent's
+/// dispatch tool result — alongside the `stop: BudgetExhausted` footer.
+#[tokio::test]
+async fn budget_exhausted_child_wrap_up_summary_reaches_parent() {
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            // The one real turn (budget = 1): a tool call.
+            Scripted::Call("c1".into(), "echo".into(), "{}".into()),
+            // The tools-disabled wrap-up completion the child gets after budget
+            // exhaustion — plain text, which should reach the parent verbatim.
+            Scripted::Text("child wrap-up summary".into()),
+        ]),
+        sink,
+        vec![Arc::new(Echo)],
+    );
+    d.loop_config.max_turns = 1;
+    let tool = DispatchAgentTool::new(d);
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+    assert!(
+        out.content.contains("child wrap-up summary"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("stop: BudgetExhausted"),
+        "{}",
+        out.content
+    );
+}
+
 #[tokio::test]
 async fn tools_allowlist_filters_and_rejects_unknown_names() {
     let sink = Arc::new(FullSink::default());
