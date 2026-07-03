@@ -3,6 +3,39 @@
 Append-only research memory. The loop reads this first every iteration and never
 retries a logged dead end.
 
+## Champion (v4) — promoted 2026-07-03 (Tier-B: extractive fold to the goal-block ledger) — CURRENT
+
+- **Config:** `tasks/drift-ledger/champion_v4.json` — byte-identical to v3/v2
+  params; the promotion is CODE. Spec:
+  `docs/superpowers/specs/2026-07-03-extractive-fold-pinned-ledger-design.md`.
+- **The mechanism (curated.rs + compactor.rs):** when `plan_retention` would
+  evict a `Role::User` unit, the OLDEST user units (down to
+  `USER_FOLD_LOW_WATERMARK_PCT = 0.25` of the window, `keep_recent` tail
+  untouched) are **folded**: one `run_extraction` model call (dedicated
+  fact-extraction prompt) turns them into compact verbatim fact lines; the
+  lines are appended to a **numbered ledger rendered INSIDE the goal block**
+  ("copy EVERY numbered line" task-conditional directive); the verbatim
+  originals go to the offload store (id advertised, non-eliciting); the units
+  leave history. All-or-nothing per batch (extraction failure = retry next
+  maintain); ledger capped at `FOLDED_FACTS_MAX_TOKENS = 512` (oldest lines
+  drop; originals stay recoverable). Enabled by the 2026-07-03 baseline shift:
+  the text-only-exit maintain is what lets folds fire during chat-only ack runs
+  BEFORE the model call that needs them.
+- **THE MANIFEST GAP IS CLOSED: longhaul-manifest 0/5 → 5/5, with 20/20 correct
+  entries in every run** (median 77,620 tok — below even favorable's ~92–118K
+  passing reference). Extraction fidelity was perfect in every observed fold
+  (9+8, 10+6 entries, zero errors).
+- **Guard sweep (equal N, same night, no regression):** portmap **10/10**
+  (52,211), codename **5/5** (53,931 — folds DO fire here on the filler turns;
+  goal-block dilution did not hurt), offload **5/5**, mem-recall **5/5**,
+  mem-roster **9/10** (== the baseline's own 9/10; noise), drift **5/6 then
+  6/6 re-run = 11/12** — the single miss wrote all 8 increments correctly and
+  then INVENTED a ninth step (+9 → 116): perfect context fidelity, model-bound
+  generation, the documented drift failure mode.
+- Ships with unit tests: fold trigger/extraction/removal, no-op when users
+  fit, extraction-failure leaves history intact, ledger cap drops oldest,
+  ledger survives compaction, ledger rides inside the goal block.
+
 ## Baseline shift (2026-07-03) — text-only-exit curation + summarizer guards — CURRENT BASELINE
 
 **Champion remains v3 (code + config); this is a baseline shift like calibrated
@@ -60,7 +93,7 @@ by `build()`).
 - **Gated exit maintain** (shipped): portmap **10/10**, roster **9/10** (see
   attribution above), all other ceilings held.
 
-## Champion (v3) — promoted 2026-07-02 (Tier-B: durable-anchor curation) — CURRENT
+## Champion (v3) — promoted 2026-07-02 (Tier-B: durable-anchor curation) — superseded by v4
 
 - **Config:** `tasks/drift-ledger/champion_v3.json` — byte-identical to v2 (`default_k=10`);
   the promotion is CODE. Three coupled retention changes in `agent-core`
@@ -179,6 +212,8 @@ by `build()`).
     the ladder-evicted early-middle entries missing.
   - **Optimization headroom is real but unclaimed** — see the 2026-07-02 overflow-fold
     iteration log below: seven variants, none promoted.
+  - **2026-07-03 update: GAP CLOSED by champion v4 — 5/5 at 20/20 correct entries**
+    (extractive fold to the goal-block ledger; see the v4 champion block).
 
 ## Locked tasks (real commits) — generalization report (run 2026-06-29)
 
@@ -285,6 +320,23 @@ by `build()`).
   names/values for them. The cost of losing a fact is not only absence; the
   model fills gaps with fabrications. Phase-2 fold/marker work is also a
   fabrication-prevention measure.
+- **Pinned salience is a hierarchy, and the goal block sits alone at the top
+  (2026-07-03).** The same 17-line fact ledger was: partially used as a
+  standalone pinned block (mid-list block skipped), no better numbered, and
+  **perfectly transcribed 5/5 once merged INTO the goal block**. The model
+  treats generic pinned system blocks as skimmable reference but reads the
+  goal block attentively every run. Content that MUST be acted on belongs in
+  (or attached to) the goal block; this extends the marker-salience learning
+  from actions to data.
+- **A 3B extractor is reliable at verbatim fact extraction (2026-07-03).**
+  Every observed `run_extraction` batch (9, 8, 10, 6 messages) produced
+  perfect `name = value` lines — extraction (copy) is far below the
+  capability edge that assembly (merge) sits on. Compress via extraction,
+  not summarization, when fidelity is the requirement.
+- **Self-anchoring confabulation:** a model that believes it already did the
+  task ("Done. The manifest has been assembled" visible in-window) may
+  regenerate FROM MEMORY instead of re-reading sources, fabricating at scale
+  even with perfect data pinned in front of it.
 
 - **Diagnostic beats param-guessing.** An env-gated `eprintln` of the compaction summary
   (since reverted) was worth more than any blind Tier-A sweep: it showed the summary
@@ -424,6 +476,30 @@ with optimization headroom; the rest are regression guards.
 runs returned `{"passed":false,"tokens":0,"turns":0}` until relaunched. Zero tokens/turns ⇒
 suspect the server, not the curation. Exact relaunch command is in the [[local-llama-server]]
 memory.
+
+## Iteration log (Tier-B — extractive fold, 2026-07-03) — PROMOTED → CHAMPION v4
+
+Phase 2 of the manifest arc. Design anchored in a CE_DEBUG diagnosis (final
+assembly call: goal pins entry #1, window holds #13-20 verbatim, #2-5 have NO
+surviving representation; the model transcribes everything visible with zero
+dropout and confabulates what's missing). Constraint math: 20 padded entries
+(~81 est tok each) can never fit a ~1350-tok budget verbatim; condensed
+`name = value` lines (~8 tok) fit trivially. Three iterations, one rendering
+variable each, paired vs the sweep-3 champion legs:
+
+- **#7a standalone pinned ledger:** extraction PERFECT (every fold, every
+  line), block confirmed in the final window — and 0/5: the model used the
+  ledger only partially (took lines 10-17, skipped 2-9) or ignored it in favor
+  of parametric confabulation. One run wrote a PERFECT unprompted mid-session
+  manifest from the ledger, then confabulated 15 entries at the real final
+  prompt (anchored on its own "Done. The manifest has been assembled" reply).
+- **#7b numbered lines + copy-all directive:** 0/5 with an IDENTICAL missing
+  set (#2-9) in 4/5 runs — numbering alone didn't fix pinned-block neglect.
+- **#7c ledger merged INTO the goal block:** **5/5 at 20/20.** The goal block
+  is the one pinned region with demonstrated per-run attention (its fact was
+  reproduced in 100% of every prior batch); riding it transfers that attention
+  to the whole ledger. PROMOTED after the full guard sweep (see champion
+  block).
 
 ## Iteration log (Tier-B — maintain ordering + summarizer guards, 2026-07-03) — BASELINE SHIFT, MERGED
 

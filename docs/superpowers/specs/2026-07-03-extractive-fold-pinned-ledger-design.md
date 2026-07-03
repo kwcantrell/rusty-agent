@@ -130,3 +130,13 @@ in the ledger header. Folded units are then REMOVED from history (whole units).
   frozen copy), program.md champion block + iteration log, campaign-state memory
   re-stamp. On failure: log the dead end; the 14-entry smaller discriminator is
   the documented next step for signal headroom.
+
+## Outcome (2026-07-03, post-implementation)
+
+Three rendering iterations (standalone pinned block 0/5 → numbered 0/5 →
+**merged into the goal block 5/5 at 20/20 entries per run**). Extraction
+fidelity was perfect throughout; the variable was pinned-block salience — the
+goal block is the only pinned region the model reads attentively every run.
+Guard sweep clean (portmap 10/10, codename 5/5 with folds firing, drift 11/12
+with the single miss model-bound, roster 9/10 == baseline, offload/recall 5/5).
+Promoted as champion v4. Full record: program.md.

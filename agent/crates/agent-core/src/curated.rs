@@ -88,8 +88,21 @@ impl CuratedContext {
     /// The pinned blocks, in assembly order, that precede windowed history.
     fn pinned(&self) -> Vec<Message> {
         let mut out = vec![self.system.clone()];
-        if let Some(g) = &self.goal {
-            out.push(g.clone());
+        match (&self.goal, self.folded_facts.is_empty()) {
+            // The ledger rides INSIDE the goal block: the goal block is the
+            // one pinned region with demonstrated per-run attention (its fact
+            // is reproduced in 100% of observed runs), while a standalone
+            // pinned ledger was used only intermittently at the decisive call
+            // — pinned-block salience is unreliable, in line with the
+            // marker-salience learning.
+            (Some(g), false) => out.push(Message::system(format!(
+                "{}\n\n{}",
+                g.content,
+                self.folded_block_body()
+            ))),
+            (Some(g), true) => out.push(g.clone()),
+            (None, false) => out.push(Message::system(self.folded_block_body())),
+            (None, true) => {}
         }
         if let Some(r) = recall_block(&self.recall, self.recall_budget) {
             out.push(r);
@@ -97,48 +110,59 @@ impl CuratedContext {
         if let Some(c) = &self.compaction_summary {
             out.push(c.clone());
         }
-        if !self.folded_facts.is_empty() {
-            out.push(self.folded_block());
-        }
         out
     }
 
-    /// The pinned ledger of facts extracted from folded user units. Compact
-    /// (`name = value` lines), always visible, and requiring NO model action —
-    /// pinned data is demonstrably used (goal block) even though pinned
-    /// markers fail to elicit tool calls. The recall mention is informational.
-    fn folded_block(&self) -> Message {
+    /// The ledger of facts extracted from folded user units. Compact
+    /// (`name = value` lines), always visible, and requiring NO model action.
+    /// Numbered lines + an explicit copy-all directive: transcription from an
+    /// unnumbered list was observed dropping a contiguous mid-list block;
+    /// numbering makes the block a checklist and a skipped line visible.
+    /// Task-conditional wording so routine turns aren't over-influenced.
+    fn folded_block_body(&self) -> String {
         let ids = self
             .folded_ids
             .iter()
             .map(|i| format!("context_recall({i})"))
             .collect::<Vec<_>>()
             .join(", ");
-        Message::system(format!(
+        let lines = self
+            .folded_facts
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{}. {}", i + 1, l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
             "Ledger of earlier user instructions (facts extracted verbatim; the full \
              original messages are stored and can be retrieved with {ids} if ever \
-             needed):\n- {}",
-            self.folded_facts.join("\n- ")
-        ))
+             needed). When a task needs ALL earlier instructions — e.g. assembling a \
+             final list, manifest, or report — copy EVERY numbered line below, without \
+             skipping any:\n{lines}"
+        )
     }
 
-    /// Estimated tokens of the pinned blocks, counted over references — the
-    /// non-cloning twin of `self.pinned().iter().map(message_tokens).sum()`
-    /// (the recall block is constructed regardless). Same total, no per-message
-    /// clone of `system`/`goal`/`compaction_summary`.
+    /// The ledger as a standalone message, for size accounting (`fold` cap).
+    fn folded_block(&self) -> Message {
+        Message::system(self.folded_block_body())
+    }
+
+    /// Estimated tokens of the pinned blocks. Kept in lockstep with
+    /// `pinned()`; the goal/ledger merge means the ledger body is counted
+    /// alongside the goal it rides in (the "\n\n" joiner is sub-token noise).
     fn pinned_tokens(&self) -> usize {
         let mut t = message_tokens(&self.system);
         if let Some(g) = &self.goal {
             t += message_tokens(g);
+        }
+        if !self.folded_facts.is_empty() {
+            t += message_tokens(&self.folded_block());
         }
         if let Some(r) = recall_block(&self.recall, self.recall_budget) {
             t += message_tokens(&r);
         }
         if let Some(c) = &self.compaction_summary {
             t += message_tokens(c);
-        }
-        if !self.folded_facts.is_empty() {
-            t += message_tokens(&self.folded_block());
         }
         t
     }
@@ -828,6 +852,31 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("entry number 11")),
             "newest user units stay verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_rides_inside_the_goal_block() {
+        // The goal block is the one pinned region with demonstrated per-run
+        // attention; the ledger merges into it rather than standing alone.
+        let mut c = ctx();
+        c.set_goal("assemble the manifest".into());
+        c.folded_facts = vec!["alpha_timeout = 4831".into()];
+        let built = c.build(100_000);
+        let goal = built
+            .iter()
+            .find(|m| m.content.starts_with("Original goal:"))
+            .expect("goal block present");
+        assert!(
+            goal.content.contains("1. alpha_timeout = 4831"),
+            "ledger numbered lines live inside the goal block: {}",
+            goal.content
+        );
+        assert!(
+            !built
+                .iter()
+                .any(|m| m.content.starts_with("Ledger of earlier user instructions")),
+            "no standalone ledger block when a goal exists"
         );
     }
 
