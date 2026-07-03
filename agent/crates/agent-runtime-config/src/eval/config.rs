@@ -150,10 +150,9 @@ impl CandidateConfig {
         if let Some(v) = self.max_turns {
             cfg.max_turns = v;
         }
-        // tool_descriptions arm added in Task 3 (needs the RuntimeConfig field):
-        // if let Some(v) = &self.tool_descriptions {
-        //     cfg.tool_description_overrides = v.clone();
-        // }
+        if let Some(v) = &self.tool_descriptions {
+            cfg.tool_description_overrides = v.clone();
+        }
     }
 
     /// The in-window offload thresholds for this candidate.
@@ -292,7 +291,7 @@ mod widening_tests {
         assert_eq!(cfg.active_skills, vec!["sdlc".to_string()]);
         assert_eq!(cfg.max_turns, 30);
         // enabled in Task 3
-        // assert_eq!(cfg.tool_description_overrides.get("read_file").unwrap(), "OVERRIDE");
+        assert_eq!(cfg.tool_description_overrides.get("read_file").unwrap(), "OVERRIDE");
     }
 
     #[test]

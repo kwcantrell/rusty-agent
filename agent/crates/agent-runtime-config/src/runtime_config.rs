@@ -73,6 +73,11 @@ pub struct RuntimeConfig {
     /// tool call succeeded; failures are fed back to the model. Empty = disabled.
     #[serde(default)]
     pub post_tool_validators: Vec<String>,
+    /// Per-tool base-description replacements (eval/optimizer seam). The
+    /// `when_not_to_call` fold still appends afterwards. Empty = use every tool's
+    /// own schema text.
+    #[serde(default)]
+    pub tool_description_overrides: std::collections::HashMap<String, String>,
     #[serde(default = "default_true")]
     pub memory: bool,
     #[serde(default = "default_true")]
@@ -155,6 +160,7 @@ struct PartialRuntimeConfig {
     max_tool_result_bytes: Option<usize>,
     max_parallel_tools: Option<usize>,
     post_tool_validators: Option<Vec<String>>,
+    tool_description_overrides: Option<std::collections::HashMap<String, String>>,
     memory: Option<bool>,
     subagents: Option<bool>,
     subagent_max_turns: Option<usize>,
@@ -253,6 +259,7 @@ impl RuntimeConfig {
             max_tool_result_bytes: default_max_tool_result_bytes(),
             max_parallel_tools: default_max_parallel_tools(),
             post_tool_validators: Vec::new(),
+            tool_description_overrides: Default::default(),
             memory: true,
             subagents: true,
             subagent_max_turns: default_subagent_max_turns(),
@@ -416,6 +423,9 @@ impl RuntimeConfig {
         }
         if let Some(v) = p.post_tool_validators {
             self.post_tool_validators = v;
+        }
+        if let Some(v) = p.tool_description_overrides {
+            self.tool_description_overrides = v;
         }
         if let Some(v) = p.memory {
             self.memory = v;
@@ -798,6 +808,7 @@ mod tests {
             max_tool_result_bytes: 1234,
             max_parallel_tools: 3,
             post_tool_validators: vec!["cargo check".into()],
+            tool_description_overrides: Default::default(),
             memory: false,
             subagents: false,
             subagent_max_turns: 4,
