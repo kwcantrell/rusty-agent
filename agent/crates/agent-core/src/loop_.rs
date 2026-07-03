@@ -474,26 +474,6 @@ impl AgentLoop {
                 self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
                 return Ok(());
             }
-            // Curate BEFORE building, so every model call sees a maintained
-            // window — including the just-appended user prompt. Start-of-turn
-            // also covers text-only turns, whose early `return` skipped the
-            // old end-of-turn pass entirely: a pure chat conversation was
-            // never curated at all, only silently truncated by build().
-            let deps = crate::MaintCtx {
-                model_limit: self.effective_model_limit(),
-                model: self.maint_model(),
-                sink: &self.sink,
-                cancel: &cancel,
-            };
-            let report = ctx.maintain(&deps).await;
-            if report.offloaded > 0 || report.compacted_turns > 0 {
-                tracing::debug!(
-                    offloaded = report.offloaded,
-                    offloaded_bytes = report.offloaded_bytes,
-                    compacted_turns = report.compacted_turns,
-                    "context maintained"
-                );
-            }
             let messages = ctx.build(self.effective_model_limit());
             // The chars/4 estimate for the request actually sent; reused for both the
             // Usage event and the post-completion calibration sample. The
@@ -704,6 +684,31 @@ impl AgentLoop {
             ctx.append(msg);
 
             if all_calls.is_empty() {
+                // End-of-run curation: the text reply ends the run before the
+                // loop-bottom maintain, so a pure chat session would never be
+                // curated at all — only silently truncated by build(). Curate
+                // here, before Done, so the context is settled when the run
+                // ends. (Start-of-turn maintenance was tried instead and
+                // regressed memory-roster 10/10 -> 6/10: maintaining with the
+                // fresh user prompt already appended pushes the previous tool
+                // turn into the compactable span one run earlier, and the
+                // model then imitates the visible ack-without-tool-call
+                // pattern. See the 2026-07-02 maintain-start-of-turn spec.)
+                let deps = crate::MaintCtx {
+                    model_limit: self.effective_model_limit(),
+                    model: self.maint_model(),
+                    sink: &self.sink,
+                    cancel: &cancel,
+                };
+                let report = ctx.maintain(&deps).await;
+                if report.offloaded > 0 || report.compacted_turns > 0 {
+                    tracing::debug!(
+                        offloaded = report.offloaded,
+                        offloaded_bytes = report.offloaded_bytes,
+                        compacted_turns = report.compacted_turns,
+                        "context maintained at text-only exit"
+                    );
+                }
                 self.sink.emit(AgentEvent::Done(assistant.stop));
                 return Ok(());
             }
@@ -964,6 +969,22 @@ impl AgentLoop {
                      repeating them will not change the result. Change your approach, or \
                      reply with a summary and no tool call if you are done.",
                 ));
+            }
+
+            let deps = crate::MaintCtx {
+                model_limit: self.effective_model_limit(),
+                model: self.maint_model(),
+                sink: &self.sink,
+                cancel: &cancel,
+            };
+            let report = ctx.maintain(&deps).await;
+            if report.offloaded > 0 || report.compacted_turns > 0 {
+                tracing::debug!(
+                    offloaded = report.offloaded,
+                    offloaded_bytes = report.offloaded_bytes,
+                    compacted_turns = report.compacted_turns,
+                    "context maintained"
+                );
             }
         }
         // Budget exhausted with the model still tool-hungry (text-only replies
@@ -4735,12 +4756,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_only_turn_maintains_before_the_model_call() {
-        // The text-reply exit used to return before the end-of-turn maintain,
+    async fn text_only_run_is_curated_at_exit() {
+        // The text-reply exit used to return before the loop-bottom maintain,
         // so a pure chat run was never curated at all — only silently
-        // truncated by build(). Start-of-turn maintenance must cover it, and
-        // must run BEFORE the window is built so the model call sees the
-        // curated context.
+        // truncated by build(). The exit path must maintain before Done.
+        // (Deliberately NOT start-of-turn: maintaining with the fresh user
+        // prompt already appended pushed the previous tool turn into the
+        // compactable span one run earlier and regressed memory-roster.)
         let ws = std::env::temp_dir();
         let model = std::sync::Arc::new(ScriptedModel::new(vec![Scripted::Text(
             "just a chat reply".into(),
@@ -4775,9 +4797,14 @@ mod tests {
             calls.contains(&"maintain"),
             "a text-only run must still be curated: {calls:?}"
         );
-        let m = calls.iter().position(|c| *c == "maintain").unwrap();
-        let b = calls.iter().position(|c| *c == "build").unwrap();
-        assert!(m < b, "maintain must precede the first build: {calls:?}");
+        // Exit-path semantics: the run's final maintain comes AFTER the model
+        // call's build, curating the settled context (reply included).
+        let m = calls.iter().rposition(|c| *c == "maintain").unwrap();
+        let b = calls.iter().rposition(|c| *c == "build").unwrap();
+        assert!(
+            b < m,
+            "the exit maintain must follow the last build: {calls:?}"
+        );
     }
 
     #[tokio::test]

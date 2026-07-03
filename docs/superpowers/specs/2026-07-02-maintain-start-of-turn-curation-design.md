@@ -77,6 +77,24 @@ Alternatives considered:
 - **Fidelity guard only** (no ordering change): does not fix the structural gap.
 - **Both call sites** (start and end): doubles maintenance per tool turn. Rejected.
 
+**Amendment 2 (re-baseline outcome): the fallback SHIPPED.** Start-of-turn held
+every ceiling except memory-roster: paired at N=10 on the same server window,
+v3 = 10/10 vs start-of-turn = 6/10. Every failure was a session-1 storage miss —
+the model acked a "remember X" prompt without issuing the `remember` call, with
+the instruction verbatim in-window. Mechanism: maintaining with the fresh user
+prompt already appended pushes the split (`len - keep_recent`) one message
+deeper, so the PREVIOUS remember tool-turn enters the compactable span one run
+earlier; at the decision call the model's most recent visible template is
+"user asks to remember → assistant just acks" (the tool call summarized away),
+and it imitates it. The exit-path variant maintains before the next prompt
+lands, so the newest tool unit snaps into the recent window and the template
+survives. Ordering (1) is therefore replaced by: loop-bottom maintain stays
+(tool turns byte-identical to v3) plus a maintain at the text-only exit, before
+`Done`. Guards (2) and (3) are unchanged and not implicated. Phase-2 note: the
+pre-call blind spot returns — a fold triggered by history growth is created at
+the PREVIOUS run's exit, so fold hysteresis must leave headroom for one
+incoming prompt.
+
 ### 2. Trivial-chatter skip (`curated.rs::compact_old_span`)
 
 After the durable/summarizable partition, skip the summarizer when the span is
