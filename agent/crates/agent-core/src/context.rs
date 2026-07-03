@@ -73,6 +73,47 @@ pub(crate) fn evict_start(history: &[Message], budget: usize) -> usize {
     start
 }
 
+/// Retention plan under `budget`: which whole units stay in the built window.
+/// Est-tokens are charged down a priority ladder:
+///   1. the newest unit, unconditionally (the in-flight turn — the keep-≥1
+///      floor, unit-shaped);
+///   2. `Role::User` singleton units, newest-first while they fit (durable,
+///      author-authored instructions — the facts most costly to lose);
+///   3. everything else, newest-first while it fits.
+///
+/// Returns kept unit ranges in chronological order. Whole units only, so a
+/// tool result can never be orphaned from its `tool_calls` parent. When every
+/// user unit already sits inside the newest-first fitting suffix, the plan is
+/// identical to `evict_start`'s contiguous window.
+pub(crate) fn plan_retention(history: &[Message], budget: usize) -> Vec<std::ops::Range<usize>> {
+    let units = turn_unit_ranges(history);
+    let Some(newest) = units.last().cloned() else {
+        return Vec::new();
+    };
+    let unit_tokens = |r: &std::ops::Range<usize>| -> usize {
+        history[r.clone()].iter().map(message_tokens).sum()
+    };
+    let is_user =
+        |r: &std::ops::Range<usize>| r.len() == 1 && matches!(history[r.start].role, Role::User);
+    let mut used = unit_tokens(&newest);
+    let mut kept = vec![newest];
+    for pass_users in [true, false] {
+        for r in units.iter().rev().skip(1) {
+            if is_user(r) != pass_users {
+                continue;
+            }
+            let t = unit_tokens(r);
+            if used + t > budget {
+                break;
+            }
+            used += t;
+            kept.push(r.clone());
+        }
+    }
+    kept.sort_by_key(|r| r.start);
+    kept
+}
+
 /// Largest unit boundary `<= split`. Snapping only moves left (keeps more in
 /// the recent window), never right.
 pub(crate) fn snap_split_to_unit_boundary(history: &[Message], split: usize) -> usize {
@@ -467,6 +508,40 @@ mod tests {
         // One token short of the tool unit: the cut moves to the unit start,
         // never inside it.
         assert_eq!(evict_start(&h, tool_unit + newest - 1), 3);
+    }
+
+    #[test]
+    fn plan_retention_keeps_user_units_over_newer_chatter() {
+        // Old user instructions outlive newer, bigger assistant/tool chatter:
+        // the plan charges the newest unit, then user units, then the rest.
+        let h = vec![
+            Message::user("fact one: auth is 8401"), // old user — must survive
+            parent("c1"),
+            Message::tool("c1", "shell", "x".repeat(400)), // big chatter unit
+            Message::user("fact two: cache is 9213"),      // user — must survive
+            parent("c2"),
+            Message::tool("c2", "shell", "y".repeat(400)), // big chatter unit
+            Message::user("now implement"),                // newest — unconditional
+        ];
+        let users: usize = [0usize, 3, 6].iter().map(|&i| message_tokens(&h[i])).sum();
+        // Budget fits the three user units but not a 400-byte tool unit.
+        let kept = plan_retention(&h, users + 10);
+        let kept_idx: Vec<usize> = kept.iter().flat_map(|r| r.clone()).collect();
+        assert_eq!(kept_idx, vec![0, 3, 6], "user units kept, chatter dropped");
+        // Chronological, whole-unit, no orphans in the flattened output.
+        let flat: Vec<Message> = kept
+            .iter()
+            .flat_map(|r| h[r.clone()].iter().cloned())
+            .collect();
+        assert!(orphaned_tool_positions(&flat).is_empty());
+        // Huge budget: everything kept, in order.
+        let all = plan_retention(&h, 1_000_000);
+        let all_idx: Vec<usize> = all.iter().flat_map(|r| r.clone()).collect();
+        assert_eq!(all_idx, (0..h.len()).collect::<Vec<_>>());
+        // Zero budget: only the newest unit (keep-≥1 floor).
+        let floor = plan_retention(&h, 0);
+        let floor_idx: Vec<usize> = floor.iter().flat_map(|r| r.clone()).collect();
+        assert_eq!(floor_idx, vec![6]);
     }
 
     #[test]
