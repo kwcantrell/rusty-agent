@@ -105,6 +105,38 @@ pub async fn run_compaction(
     Ok(Message::system(body))
 }
 
+const EXTRACTION_SYSTEM: &str = "You are a fact extraction engine. You are given user \
+messages that are about to leave the conversation window. Output every concrete, durable \
+fact they contain — settings, names, values, identifiers, instructions — ONE per line, \
+copying names and values VERBATIM (e.g. 'alpha_timeout = 4831'). Drop greetings, padding, \
+and meta-instructions about how to reply. Output ONLY the fact lines, no commentary.";
+
+/// Extract the durable facts from `span` (user messages leaving the window),
+/// one line per fact. Read-only: the caller decides whether to commit.
+pub(crate) async fn run_extraction(
+    span: &[Message],
+    model: &Arc<dyn ModelClient>,
+    cancel: &CancellationToken,
+) -> Result<Vec<String>, CompactError> {
+    let mut body = String::from("USER MESSAGES:\n");
+    for m in span {
+        body.push_str("[user] ");
+        body.push_str(&m.content);
+        body.push('\n');
+    }
+    let req = CompletionRequest {
+        messages: vec![Message::system(EXTRACTION_SYSTEM), Message::user(body)],
+        temperature: 0.0,
+        ..Default::default()
+    };
+    let text = collect_stream(model, req, cancel).await?;
+    Ok(text
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['-', '*']).trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
 /// True when `summary` is a net token win over `span` (and non-empty).
 pub(crate) fn compaction_is_worthwhile(summary: &Message, span: &[Message]) -> bool {
     let summary_body = summary

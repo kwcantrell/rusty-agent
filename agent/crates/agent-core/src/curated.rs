@@ -1,4 +1,4 @@
-use crate::compactor::{compaction_is_worthwhile, run_compaction};
+use crate::compactor::{compaction_is_worthwhile, run_compaction, run_extraction};
 use crate::context::{
     message_tokens, orphaned_tool_positions, plan_retention, recall_block,
     snap_split_to_unit_boundary, turn_unit_ranges, ContextManager, MaintCtx, MaintReport,
@@ -27,6 +27,12 @@ pub struct CuratedContext {
     recall: Vec<String>,
     recall_budget: usize,
     pub(crate) compaction_summary: Option<Message>,
+    /// Extracted fact lines from folded (evicted) user units — rendered as a
+    /// pinned ledger block. Append-only; never re-summarized (no generation
+    /// loss by construction); capped at `FOLDED_FACTS_MAX_TOKENS`.
+    pub(crate) folded_facts: Vec<String>,
+    /// Offload-store ids of the verbatim originals behind `folded_facts`.
+    folded_ids: Vec<crate::OffloadId>,
     pub(crate) store: Arc<dyn OffloadStore>,
     pub(crate) config: OffloadConfig,
     pub(crate) high_water_pct: f32,
@@ -51,6 +57,8 @@ impl CuratedContext {
             recall: Vec::new(),
             recall_budget: DEFAULT_RECALL_TOKEN_BUDGET,
             compaction_summary: None,
+            folded_facts: Vec::new(),
+            folded_ids: Vec::new(),
             store,
             config: OffloadConfig::default(),
             high_water_pct: DEFAULT_HIGH_WATER_PCT,
@@ -89,7 +97,29 @@ impl CuratedContext {
         if let Some(c) = &self.compaction_summary {
             out.push(c.clone());
         }
+        if !self.folded_facts.is_empty() {
+            out.push(self.folded_block());
+        }
         out
+    }
+
+    /// The pinned ledger of facts extracted from folded user units. Compact
+    /// (`name = value` lines), always visible, and requiring NO model action —
+    /// pinned data is demonstrably used (goal block) even though pinned
+    /// markers fail to elicit tool calls. The recall mention is informational.
+    fn folded_block(&self) -> Message {
+        let ids = self
+            .folded_ids
+            .iter()
+            .map(|i| format!("context_recall({i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Message::system(format!(
+            "Ledger of earlier user instructions (facts extracted verbatim; the full \
+             original messages are stored and can be retrieved with {ids} if ever \
+             needed):\n- {}",
+            self.folded_facts.join("\n- ")
+        ))
     }
 
     /// Estimated tokens of the pinned blocks, counted over references — the
@@ -106,6 +136,9 @@ impl CuratedContext {
         }
         if let Some(c) = &self.compaction_summary {
             t += message_tokens(c);
+        }
+        if !self.folded_facts.is_empty() {
+            t += message_tokens(&self.folded_block());
         }
         t
     }
@@ -194,6 +227,12 @@ impl ContextManager for CuratedContext {
             });
         }
 
+        // (a') Extractive fold — when the retention plan would evict user
+        // units (invisible loss, observed to invite confabulation), the oldest
+        // are folded: facts extracted to the pinned ledger, verbatim originals
+        // offloaded, units removed. All-or-nothing per batch.
+        self.fold_evicted_users(deps, &mut report).await;
+
         // (b) Compaction — async, gated by the high-water mark or an explicit request.
         let requested = self.compact_flag.swap(false, Ordering::SeqCst);
         let over_high_water = {
@@ -219,6 +258,18 @@ impl ContextManager for CuratedContext {
 /// placeholder anchor; a unit dragged large by parent chatter is summarized
 /// like any other (a parent with several parallel placeholders stays under this).
 const PLACEHOLDER_UNIT_MAX_TOKENS: usize = 160;
+
+/// Cap on the pinned folded-facts ledger. Past it the OLDEST lines drop —
+/// their verbatim originals remain in the offload store, so a cap eviction is
+/// strictly no worse than the silent full eviction it replaces.
+const FOLDED_FACTS_MAX_TOKENS: usize = 512;
+
+/// Fraction of the effective window that verbatim user units are folded DOWN
+/// to once eviction becomes imminent. Folding to well below the trigger point
+/// is hysteresis: one batch per overflow episode instead of per-turn churn,
+/// with headroom for the next incoming prompt (curation only runs before the
+/// prompt after next — see the 2026-07-02 ordering spec).
+const USER_FOLD_LOW_WATERMARK_PCT: f32 = 0.25;
 
 /// Minimum estimated size of a PURE-ASSISTANT chatter span before it is
 /// worth a summarizer pass. Re-running the summarizer over `prior + one
@@ -262,6 +313,115 @@ impl CuratedContext {
             id,
             bytes,
             tool,
+        }));
+    }
+
+    /// Fold user units the retention plan is about to evict: extract their
+    /// durable facts into the pinned ledger (one extraction model call per
+    /// batch), offload the verbatim originals, remove the units from history.
+    /// Oldest-first, down to `USER_FOLD_LOW_WATERMARK_PCT` of the window
+    /// (hysteresis); the `keep_recent` tail is never touched. All-or-nothing:
+    /// an extraction failure leaves history intact for the next maintain.
+    async fn fold_evicted_users(&mut self, deps: &MaintCtx<'_>, report: &mut MaintReport) {
+        let budget = deps.model_limit.saturating_sub(self.pinned_tokens());
+        let mut kept = vec![false; self.history.len()];
+        for r in plan_retention(&self.history, budget) {
+            kept[r].iter_mut().for_each(|k| *k = true);
+        }
+        let user_eviction_imminent = self
+            .history
+            .iter()
+            .enumerate()
+            .any(|(i, m)| matches!(m.role, Role::User) && !kept[i]);
+        if !user_eviction_imminent {
+            return;
+        }
+        // Only the old span is foldable — the in-flight tail stays put.
+        let split = snap_split_to_unit_boundary(
+            &self.history,
+            self.history.len().saturating_sub(self.config.keep_recent),
+        );
+        let units = turn_unit_ranges(&self.history[..split]);
+        let is_user_unit = |r: &std::ops::Range<usize>| {
+            self.history[r.clone()]
+                .iter()
+                .all(|m| matches!(m.role, Role::User))
+        };
+        let low_watermark = (deps.model_limit as f32 * USER_FOLD_LOW_WATERMARK_PCT) as usize;
+        let mut fold: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut user_tokens = 0usize;
+        let mut over = false;
+        for r in units.iter().rev() {
+            if !is_user_unit(r) {
+                continue;
+            }
+            let t: usize = self.history[r.clone()].iter().map(message_tokens).sum();
+            if over || user_tokens + t > low_watermark {
+                over = true;
+                fold.push(r.clone());
+            } else {
+                user_tokens += t;
+            }
+        }
+        if fold.is_empty() {
+            return;
+        }
+        fold.reverse(); // chronological order for extraction + storage
+        let folded: Vec<Message> = fold
+            .iter()
+            .flat_map(|r| self.history[r.clone()].iter().cloned())
+            .collect();
+        let lines = match run_extraction(&folded, deps.model, deps.cancel).await {
+            Ok(l) if !l.is_empty() => l,
+            Ok(_) => {
+                tracing::debug!("fold extraction produced no lines; skipped");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "fold extraction failed; leaving history intact");
+                return;
+            }
+        };
+        // Verbatim originals to the offload store, one batch entry.
+        let content = folded
+            .iter()
+            .map(|m| format!("[user] {}", m.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bytes = content.len();
+        let id = self.store.put(crate::offload::OffloadEntry {
+            id: 0,
+            tool_call_id: String::new(),
+            tool_name: "user_history".into(),
+            kind: crate::offload::OffloadKind::Output,
+            content,
+            bytes,
+            turn: 0,
+        });
+        self.folded_ids.push(id);
+        self.folded_facts.extend(lines);
+        // Cap the ledger, dropping OLDEST lines first (originals stay in the
+        // store, so this is strictly no worse than silent eviction).
+        while message_tokens(&self.folded_block()) > FOLDED_FACTS_MAX_TOKENS
+            && self.folded_facts.len() > 1
+        {
+            self.folded_facts.remove(0);
+        }
+        // Remove the folded units from history (whole units, orphan-safe).
+        let folded_idx: std::collections::HashSet<usize> =
+            fold.iter().flat_map(|r| r.clone()).collect();
+        let mut i = 0;
+        self.history.retain(|_| {
+            let keep = !folded_idx.contains(&i);
+            i += 1;
+            keep
+        });
+        report.offloaded += 1;
+        report.offloaded_bytes += bytes;
+        deps.sink.emit(AgentEvent::Context(ContextEvent::Offloaded {
+            id,
+            bytes,
+            tool: "user_history".into(),
         }));
     }
 
@@ -615,6 +775,188 @@ mod tests {
         }
         // And a compaction summary block exists for the chatter.
         assert!(built.iter().any(|m| m.content.contains("chatter summary")));
+    }
+
+    #[tokio::test]
+    async fn fold_extracts_evicted_users_to_pinned_ledger() {
+        // When user units overflow the retention budget, the OLDEST are folded:
+        // their durable facts extracted into a pinned ledger block (compact,
+        // always visible — pinned DATA is used even where pinned markers fail
+        // to elicit actions), the verbatim originals offloaded, the units
+        // removed from history. The newest user units stay verbatim.
+        let mut c = ctx();
+        c.config.keep_recent = 1;
+        for i in 0..12 {
+            c.append(Message::user(format!(
+                "ledger entry number {i}: setting item_{i} is assigned value {i}{i}{i}{i} for the manifest"
+            )));
+        }
+        c.append(Message::assistant("working on it", None));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "item_0 = 0000\nitem_1 = 1111\nitem_2 = 2222".into(),
+        )]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let mut deps = maint_deps(&model, &sink, &cancel);
+        deps.model_limit = 250; // user turns alone exceed the budget
+        let report = c.maintain(&deps).await;
+
+        assert!(report.offloaded >= 1, "fold must commit");
+        let built = c.build(100_000);
+        let block = built
+            .iter()
+            .find(|m| m.content.starts_with("Ledger of earlier user instructions"))
+            .expect("pinned ledger block present");
+        assert!(matches!(block.role, Role::System));
+        assert!(block.content.contains("item_0 = 0000"));
+        assert!(
+            block.content.contains("context_recall(1)"),
+            "originals advertised: {}",
+            block.content
+        );
+        // Verbatim originals recoverable from the store.
+        assert!(c.store.get(1).unwrap().content.contains("entry number 0"));
+        // Oldest user turns left history; the newest survive verbatim.
+        assert!(
+            !c.history()
+                .iter()
+                .any(|m| m.content.contains("entry number 0:")),
+            "folded units must leave history"
+        );
+        assert!(
+            c.history()
+                .iter()
+                .any(|m| m.content.contains("entry number 11")),
+            "newest user units stay verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn fold_is_noop_when_users_fit() {
+        let mut c = ctx();
+        c.config.keep_recent = 1;
+        for i in 0..4 {
+            c.append(Message::user(format!("instruction {i}")));
+        }
+        c.append(Message::assistant("ok", None));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        // Roomy window: no eviction, no fold, no ledger.
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        assert_eq!(report.offloaded, 0);
+        assert_eq!(c.store.len(), 0);
+        assert!(!c
+            .build(100_000)
+            .iter()
+            .any(|m| m.content.starts_with("Ledger of earlier user instructions")));
+        assert_eq!(
+            c.history()
+                .iter()
+                .filter(|m| matches!(m.role, Role::User))
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn fold_extraction_failure_leaves_history_intact() {
+        // All-or-nothing: if the extraction call fails, nothing is folded —
+        // the user units stay in history and are retried at the next maintain.
+        let mut c = ctx();
+        c.config.keep_recent = 1;
+        for i in 0..12 {
+            c.append(Message::user(format!(
+                "ledger entry number {i}: setting item_{i} is assigned value {i}{i}{i}{i} for the manifest"
+            )));
+        }
+        c.append(Message::assistant("working on it", None));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Error]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let mut deps = maint_deps(&model, &sink, &cancel);
+        deps.model_limit = 250;
+        c.maintain(&deps).await;
+        assert_eq!(c.store.len(), 0, "nothing offloaded on failure");
+        assert_eq!(
+            c.history()
+                .iter()
+                .filter(|m| matches!(m.role, Role::User))
+                .count(),
+            12,
+            "history untouched on extraction failure"
+        );
+        assert!(!c
+            .build(100_000)
+            .iter()
+            .any(|m| m.content.starts_with("Ledger of earlier user instructions")));
+    }
+
+    #[tokio::test]
+    async fn ledger_is_capped_dropping_oldest_lines() {
+        // The pinned ledger never grows unboundedly: past the cap the OLDEST
+        // lines drop (their verbatim originals remain in the offload store —
+        // strictly no worse than today's silent eviction).
+        let mut c = ctx();
+        c.config.keep_recent = 1;
+        c.folded_facts = (0..300).map(|i| format!("old_fact_{i} = {i}")).collect();
+        for i in 0..12 {
+            c.append(Message::user(format!(
+                "ledger entry number {i}: setting item_{i} is assigned value {i}{i}{i}{i} for the manifest"
+            )));
+        }
+        c.append(Message::assistant("working on it", None));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "brand_new_fact = 42".into(),
+        )]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let mut deps = maint_deps(&model, &sink, &cancel);
+        deps.model_limit = 250;
+        c.maintain(&deps).await;
+        let block = c
+            .build(100_000)
+            .into_iter()
+            .find(|m| m.content.starts_with("Ledger of earlier user instructions"))
+            .expect("ledger present");
+        assert!(block.content.contains("brand_new_fact = 42"), "newest kept");
+        assert!(!block.content.contains("old_fact_0 = 0"), "oldest dropped");
+        assert!(
+            message_tokens(&block) <= FOLDED_FACTS_MAX_TOKENS,
+            "ledger stays under its cap: {} tok",
+            message_tokens(&block)
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_survives_compaction_untouched() {
+        // The ledger is pinned — the summarizer never sees it, so compaction
+        // cannot paraphrase it away (append-only, no generation loss).
+        let mut c = ctx();
+        c.high_water_pct = 0.0; // force compaction
+        c.config.keep_recent = 1;
+        c.folded_facts = vec!["alpha_timeout = 4831".into(), "bravo_retries = 7207".into()];
+        c.append(parent("c1"));
+        c.append(Message::tool(
+            "c1",
+            "shell",
+            "a fairly long tool result with plenty of words to summarize away here",
+        ));
+        c.append(Message::assistant("done", None));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "Summary:\nshell call happened and returned data of interest".into(),
+        )]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        assert!(report.compacted_turns > 0, "compaction fired");
+        let block = c
+            .build(100_000)
+            .into_iter()
+            .find(|m| m.content.starts_with("Ledger of earlier user instructions"))
+            .expect("ledger still pinned");
+        assert!(block.content.contains("alpha_timeout = 4831"));
+        assert!(block.content.contains("bravo_retries = 7207"));
     }
 
     #[tokio::test]
