@@ -115,6 +115,7 @@ pub fn loop_config_from(
         preserve_thinking: cfg.preserve_thinking,
         sandbox: build_sandbox(cfg),
         max_parallel_tools: cfg.max_parallel_tools,
+        post_tool_validators: cfg.post_tool_validators.clone(),
     }
 }
 
@@ -515,6 +516,14 @@ mod tests {
             loop_config_from(&cfg2, dir.path().to_path_buf(), Duration::from_secs(77))
                 .max_parallel_tools,
             2
+        );
+
+        let mut cfg3 = c.clone();
+        cfg3.post_tool_validators = vec!["cargo check".into()];
+        assert_eq!(
+            loop_config_from(&cfg3, dir.path().to_path_buf(), Duration::from_secs(77))
+                .post_tool_validators,
+            vec!["cargo check".to_string()]
         );
     }
 
