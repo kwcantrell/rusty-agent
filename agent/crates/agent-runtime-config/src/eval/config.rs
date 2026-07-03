@@ -244,9 +244,19 @@ mod widening_tests {
         let json = serde_json::to_value(CandidateConfig::favorable(8192)).unwrap();
         let mut obj = json.as_object().unwrap().clone();
         for k in [
-            "active_skills", "skills_dirs", "temperature", "top_p", "top_k", "min_p",
-            "subagents", "subagent_max_turns", "subagent_max_depth", "subagent_model",
-            "tool_descriptions", "max_result_bytes", "max_turns",
+            "active_skills",
+            "skills_dirs",
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "subagents",
+            "subagent_max_turns",
+            "subagent_max_depth",
+            "subagent_model",
+            "tool_descriptions",
+            "max_result_bytes",
+            "max_turns",
         ] {
             obj.remove(k);
         }
@@ -262,11 +272,18 @@ mod widening_tests {
     #[test]
     fn apply_to_inherits_on_none_and_overrides_on_some() {
         let mut cfg = crate::RuntimeConfig::from_launch(
-            "openai".into(), "http://x".into(), "m".into(), "native".into(), 8192,
+            "openai".into(),
+            "http://x".into(),
+            "m".into(),
+            "native".into(),
+            8192,
         );
         let baseline = cfg.clone();
         CandidateConfig::favorable(8192).apply_to(&mut cfg);
-        assert_eq!(cfg, baseline, "all-None candidate must not touch the config");
+        assert_eq!(
+            cfg, baseline,
+            "all-None candidate must not touch the config"
+        );
 
         let mut cc = CandidateConfig::favorable(8192);
         cc.temperature = Some(0.7);
@@ -274,24 +291,36 @@ mod widening_tests {
         cc.subagents = Some(false);
         cc.subagent_max_turns = Some(4);
         cc.subagent_max_depth = Some(2);
-        cc.subagent_model = Some(crate::ModelRef { model: Some("other".into()), ..Default::default() });
+        cc.subagent_model = Some(crate::ModelRef {
+            model: Some("other".into()),
+            ..Default::default()
+        });
         cc.skills_dirs = Some(vec!["/skills".into()]);
         cc.active_skills = Some(vec!["sdlc".into()]);
         cc.max_turns = Some(30);
-        cc.tool_descriptions =
-            Some([("read_file".to_string(), "OVERRIDE".to_string())].into_iter().collect());
+        cc.tool_descriptions = Some(
+            [("read_file".to_string(), "OVERRIDE".to_string())]
+                .into_iter()
+                .collect(),
+        );
         cc.apply_to(&mut cfg);
         assert_eq!(cfg.temperature, 0.7);
         assert_eq!(cfg.top_k, Some(40));
         assert!(!cfg.subagents);
         assert_eq!(cfg.subagent_max_turns, 4);
         assert_eq!(cfg.subagent_max_depth, 2);
-        assert_eq!(cfg.subagent_model.as_ref().unwrap().model.as_deref(), Some("other"));
+        assert_eq!(
+            cfg.subagent_model.as_ref().unwrap().model.as_deref(),
+            Some("other")
+        );
         assert_eq!(cfg.skills_dirs, vec!["/skills".to_string()]);
         assert_eq!(cfg.active_skills, vec!["sdlc".to_string()]);
         assert_eq!(cfg.max_turns, 30);
         // enabled in Task 3
-        assert_eq!(cfg.tool_description_overrides.get("read_file").unwrap(), "OVERRIDE");
+        assert_eq!(
+            cfg.tool_description_overrides.get("read_file").unwrap(),
+            "OVERRIDE"
+        );
     }
 
     #[test]

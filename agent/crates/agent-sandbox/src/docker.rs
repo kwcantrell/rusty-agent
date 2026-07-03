@@ -180,7 +180,10 @@ mod tests {
     #[test]
     fn home_defaults_to_tmp_unless_spec_sets_it() {
         let v = docker_run_args(&policy(false), &oneshot(), "n", "1000:1000");
-        assert!(v.join(" ").contains("-e HOME=/tmp"), "default HOME on writable tmpfs");
+        assert!(
+            v.join(" ").contains("-e HOME=/tmp"),
+            "default HOME on writable tmpfs"
+        );
         let mut spec = oneshot();
         spec.env.insert("HOME".into(), "/workspace".into());
         let s = docker_run_args(&policy(false), &spec, "n", "1000:1000").join(" ");

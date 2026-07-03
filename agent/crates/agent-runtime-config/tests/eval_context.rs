@@ -124,7 +124,10 @@ async fn eval_context_run() {
     .unwrap();
     let hidden = std::env::var("HIDDEN_TESTS_DIR").expect("set HIDDEN_TESTS_DIR");
     let task_json_path = std::path::PathBuf::from(std::env::var("TASK_JSON").unwrap());
-    let task_dir = task_json_path.parent().expect("TASK_JSON has a parent dir").to_path_buf();
+    let task_dir = task_json_path
+        .parent()
+        .expect("TASK_JSON has a parent dir")
+        .to_path_buf();
     let node_offline = task.exec_profile.as_deref() == Some("node-offline");
 
     // Throwaway workspace + seed files. Memory store SHARED across sessions; each
@@ -133,7 +136,11 @@ async fn eval_context_run() {
     let ws = dir.path().to_path_buf();
     if let Some(sd) = &task.seed_dir {
         let src = task_dir.join(sd);
-        assert!(src.is_dir(), "seed_dir {} missing — run the task's seed.sh first", src.display());
+        assert!(
+            src.is_dir(),
+            "seed_dir {} missing — run the task's seed.sh first",
+            src.display()
+        );
         // cp -a preserves the node_modules tree (symlinked .bin entries included).
         let st = std::process::Command::new("cp")
             .arg("-a")
@@ -286,8 +293,22 @@ async fn eval_context_run() {
     let status = if node_offline {
         // Grade INSIDE the same container profile: vitest/vite execute agent-written
         // code (untrusted output) — it gets the same boundary as the agent.
-        let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
-        let gid = String::from_utf8(std::process::Command::new("id").arg("-g").output().unwrap().stdout).unwrap();
+        let uid = String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let gid = String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-g")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
         let policy = agent_sandbox::SandboxPolicy {
             mode: agent_tools::Mode::Enforce,
             image: "node:22-bookworm-slim".into(),
@@ -316,7 +337,10 @@ async fn eval_context_run() {
             &name,
             &format!("{}:{}", uid.trim(), gid.trim()),
         );
-        std::process::Command::new("docker").args(&args).status().unwrap()
+        std::process::Command::new("docker")
+            .args(&args)
+            .status()
+            .unwrap()
     } else {
         std::process::Command::new("bash")
             .arg("-c")

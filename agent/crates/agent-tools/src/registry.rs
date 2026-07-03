@@ -335,7 +335,10 @@ mod tests {
         let echo = schemas.iter().find(|s| s.name == "echo").unwrap();
         assert_eq!(echo.description, "OVERRIDDEN");
         let conf = schemas.iter().find(|s| s.name == "confusable").unwrap();
-        assert!(conf.description.starts_with("NEW BASE"), "override replaces the BASE");
+        assert!(
+            conf.description.starts_with("NEW BASE"),
+            "override replaces the BASE"
+        );
         assert!(
             conf.description.contains(WHEN_NOT_TO_CALL_MARKER)
                 && conf.description.contains("use echo instead for X"),
