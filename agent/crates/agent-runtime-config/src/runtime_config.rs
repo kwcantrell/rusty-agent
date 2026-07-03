@@ -155,6 +155,7 @@ struct PartialRuntimeConfig {
     max_tool_result_bytes: Option<usize>,
     max_parallel_tools: Option<usize>,
     post_tool_validators: Option<Vec<String>>,
+    memory: Option<bool>,
     subagents: Option<bool>,
     subagent_max_turns: Option<usize>,
     subagent_timeout_secs: Option<u64>,
@@ -415,6 +416,9 @@ impl RuntimeConfig {
         }
         if let Some(v) = p.post_tool_validators {
             self.post_tool_validators = v;
+        }
+        if let Some(v) = p.memory {
+            self.memory = v;
         }
         if let Some(v) = p.subagents {
             self.subagents = v;
@@ -756,6 +760,83 @@ mod tests {
             "temperature":0.2,"max_tokens":2048,"max_turns":25,"context_limit":8192}"#;
         let c: RuntimeConfig = serde_json::from_str(json).unwrap();
         assert!(c.memory);
+    }
+
+    #[test]
+    fn memory_partial_file_overrides_only_that_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.json");
+        std::fs::write(&path, r#"{"memory": false}"#).unwrap();
+        let b = base();
+        let loaded = RuntimeConfig::load_over(b.clone(), &path);
+        assert!(!loaded.memory, "partial file must override memory");
+        assert_eq!(loaded.model, b.model); // absent fields fall back to base
+        assert!(loaded.subagents); // sibling bool untouched
+    }
+
+    #[test]
+    fn full_saved_file_overrides_every_field_via_partial_merge() {
+        // Structural guard: every RuntimeConfig field needs a PartialRuntimeConfig
+        // mirror + merge arm. Every field here is flipped away from the launch
+        // defaults, so a dropped mirror surfaces as an inequality after load_over;
+        // the exhaustive struct literal makes adding a field without updating
+        // this test a compile error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.json");
+        let c = RuntimeConfig {
+            backend: "claude-cli".into(),
+            base_url: "http://other:9999".into(),
+            model: "m2".into(),
+            protocol: "prompted".into(),
+            command_allowlist: vec!["only".into()],
+            command_denylist: vec!["nope".into()],
+            http_allow_hosts: vec!["docs.rs".into()],
+            temperature: 0.9,
+            max_tokens: 4096,
+            max_turns: 7,
+            context_limit: 4096,
+            max_tool_result_bytes: 1234,
+            max_parallel_tools: 3,
+            post_tool_validators: vec!["cargo check".into()],
+            memory: false,
+            subagents: false,
+            subagent_max_turns: 4,
+            subagent_timeout_secs: 30,
+            subagent_model: Some(ModelRef {
+                model: Some("haiku".into()),
+                ..Default::default()
+            }),
+            compaction_model: Some(ModelRef {
+                model: Some("mini".into()),
+                ..Default::default()
+            }),
+            subagent_max_depth: 2,
+            top_p: Some(0.9),
+            top_k: Some(40),
+            min_p: Some(0.05),
+            presence_penalty: Some(0.5),
+            repeat_penalty: Some(1.1),
+            enable_thinking: false,
+            preserve_thinking: true,
+            skills_dirs: vec!["/s".into()],
+            active_skills: vec!["greeter".into()],
+            sandbox_mode: "enforce".into(),
+            sandbox_image: "alpine:3".into(),
+            sandbox_network: true,
+            sandbox_memory: "1g".into(),
+            sandbox_cpus: "1".into(),
+            sandbox_pids: 64,
+            sandbox_fsize: Some("10m".into()),
+            sandbox_tmp_size: "64m".into(),
+            sandbox_extra_rw: vec!["/rw".into()],
+            sandbox_extra_ro: vec!["/ro".into()],
+            trace: false,
+            trace_dir: Some("/tmp/traces".into()),
+            trace_max_mb: 8,
+        };
+        c.save(&path).unwrap();
+        let loaded = RuntimeConfig::load_over(base(), &path);
+        assert_eq!(loaded, c);
     }
 
     #[test]
