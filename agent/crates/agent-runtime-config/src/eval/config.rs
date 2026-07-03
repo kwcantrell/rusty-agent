@@ -140,8 +140,7 @@ mod widening_tests {
         let mut obj = json.as_object().unwrap().clone();
         obj.remove("system_prompt");
         obj.remove("protocol");
-        let cc: CandidateConfig =
-            serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+        let cc: CandidateConfig = serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
         assert!(cc.system_prompt.is_none() && cc.protocol.is_none());
     }
 
