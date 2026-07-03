@@ -66,6 +66,9 @@ pub struct RuntimeConfig {
     pub context_limit: usize,
     #[serde(default = "default_max_tool_result_bytes")]
     pub max_tool_result_bytes: usize,
+    /// Max tool calls executed concurrently within one turn.
+    #[serde(default = "default_max_parallel_tools")]
+    pub max_parallel_tools: usize,
     #[serde(default = "default_true")]
     pub memory: bool,
     #[serde(default = "default_true")]
@@ -146,6 +149,7 @@ struct PartialRuntimeConfig {
     max_turns: Option<usize>,
     context_limit: Option<usize>,
     max_tool_result_bytes: Option<usize>,
+    max_parallel_tools: Option<usize>,
     subagents: Option<bool>,
     subagent_max_turns: Option<usize>,
     subagent_timeout_secs: Option<u64>,
@@ -181,6 +185,9 @@ fn default_true() -> bool {
 }
 fn default_max_tool_result_bytes() -> usize {
     agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES
+}
+fn default_max_parallel_tools() -> usize {
+    agent_core::DEFAULT_MAX_PARALLEL_TOOLS
 }
 fn default_subagent_max_turns() -> usize {
     10
@@ -238,6 +245,7 @@ impl RuntimeConfig {
             max_turns: 25,
             context_limit,
             max_tool_result_bytes: default_max_tool_result_bytes(),
+            max_parallel_tools: default_max_parallel_tools(),
             memory: true,
             subagents: true,
             subagent_max_turns: default_subagent_max_turns(),
@@ -311,6 +319,9 @@ impl RuntimeConfig {
         }
         if self.max_turns == 0 {
             return Err("max_turns must be >= 1".into());
+        }
+        if self.max_parallel_tools == 0 {
+            return Err("max_parallel_tools must be >= 1".into());
         }
         if self.context_limit < 1024 {
             return Err("context_limit must be >= 1024".into());
@@ -392,6 +403,9 @@ impl RuntimeConfig {
         }
         if let Some(v) = p.max_tool_result_bytes {
             self.max_tool_result_bytes = v;
+        }
+        if let Some(v) = p.max_parallel_tools {
+            self.max_parallel_tools = v;
         }
         if let Some(v) = p.subagents {
             self.subagents = v;
@@ -557,6 +571,46 @@ mod tests {
             parsed.max_tool_result_bytes,
             agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES
         );
+    }
+
+    #[test]
+    fn max_parallel_tools_defaults_and_merges() {
+        // A JSON blob missing the field parses to the default (old files).
+        let mut v = serde_json::to_value(base()).unwrap();
+        v.as_object_mut().unwrap().remove("max_parallel_tools");
+        let parsed: RuntimeConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            parsed.max_parallel_tools,
+            agent_core::DEFAULT_MAX_PARALLEL_TOOLS,
+            "serde default is DEFAULT_MAX_PARALLEL_TOOLS"
+        );
+
+        // An explicit value round-trips.
+        let mut c = base();
+        c.max_parallel_tools = 3;
+        let round: RuntimeConfig =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(round.max_parallel_tools, 3);
+    }
+
+    #[test]
+    fn max_parallel_tools_partial_file_overrides_only_that_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.json");
+        std::fs::write(&path, r#"{"max_parallel_tools": 2}"#).unwrap();
+        let b = base();
+        let loaded = RuntimeConfig::load_over(b.clone(), &path);
+        assert_eq!(loaded.max_parallel_tools, 2); // file wins
+        assert_eq!(loaded.model, b.model); // absent fields fall back to base
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_parallel_tools() {
+        let mut c = base();
+        c.max_parallel_tools = 0;
+        assert!(c.validate().unwrap_err().contains("max_parallel_tools"));
+        c.max_parallel_tools = 1;
+        assert!(c.validate().is_ok());
     }
 
     #[test]

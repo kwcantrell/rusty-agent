@@ -114,7 +114,7 @@ pub fn loop_config_from(
         enable_thinking: cfg.enable_thinking,
         preserve_thinking: cfg.preserve_thinking,
         sandbox: build_sandbox(cfg),
-        max_parallel_tools: 8,
+        max_parallel_tools: cfg.max_parallel_tools,
     }
 }
 
@@ -501,12 +501,21 @@ mod tests {
         assert_eq!(lc.max_tokens, Some(1234));
         assert_eq!(lc.tool_timeout, Duration::from_secs(120));
         assert_eq!(lc.stream_idle_timeout, Duration::from_secs(77));
-        assert_eq!(lc.max_parallel_tools, 8);
+        assert_eq!(lc.max_parallel_tools, 8); // default passthrough
         assert_eq!(lc.top_p, Some(0.5));
         assert!(!lc.enable_thinking);
         assert!(lc.preserve_thinking);
         assert!((lc.temperature - 0.7).abs() < 1e-6);
         assert!(!lc.sandbox.describe().mechanism.is_empty());
+
+        // A non-default value passes straight through (no longer a hard-coded literal).
+        let mut cfg2 = c.clone();
+        cfg2.max_parallel_tools = 2;
+        assert_eq!(
+            loop_config_from(&cfg2, dir.path().to_path_buf(), Duration::from_secs(77))
+                .max_parallel_tools,
+            2
+        );
     }
 
     #[test]
