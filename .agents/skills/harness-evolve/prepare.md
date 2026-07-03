@@ -16,7 +16,9 @@ capability-bound). Same two-sided test as context-evolve: favorable pass-rate
   THE AGENT NEVER INSTALLS — runs are offline by construction.
 - `hidden_tests/` — sealed grading, copied in post-run: `check.sh` runs
   `npx tsc --noEmit`, copies the hidden vitest spec into `src/`, runs
-  `npx vitest run`, `npx vite build`, then greps `dist/` for required content.
+  `npx vitest run src` (path-filter: vitest's default include would otherwise
+  collect hidden_tests/*.test.ts in place, where relative imports break),
+  `npx vite build`, then greps `dist/` for required content.
   Grading executes IN the sandbox container (network none).
 - `favorable.json` / `champion_v0.json` — the two sides. Favorable = context
   manager neutralized (context-evolve's reference values) + `max_turns` ≥ 25.

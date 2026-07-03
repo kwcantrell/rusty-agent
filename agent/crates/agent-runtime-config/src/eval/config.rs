@@ -114,8 +114,9 @@ impl CandidateConfig {
         self.protocol.as_deref().unwrap_or(default)
     }
 
-    /// Overlay every `Some` v2 field onto a RuntimeConfig; `None` fields leave
-    /// the config untouched (inherit). Unit-testable without the live harness.
+    /// Overlay the RuntimeConfig-shaped v2 fields onto `cfg`; `None` inherits.
+    /// NOTE: `max_result_bytes` applies via `offload_config()`, and
+    /// `system_prompt`/`protocol` via their resolvers — apply those separately.
     pub fn apply_to(&self, cfg: &mut crate::RuntimeConfig) {
         if let Some(v) = self.temperature {
             cfg.temperature = v;
@@ -316,7 +317,6 @@ mod widening_tests {
         assert_eq!(cfg.skills_dirs, vec!["/skills".to_string()]);
         assert_eq!(cfg.active_skills, vec!["sdlc".to_string()]);
         assert_eq!(cfg.max_turns, 30);
-        // enabled in Task 3
         assert_eq!(
             cfg.tool_description_overrides.get("read_file").unwrap(),
             "OVERRIDE"

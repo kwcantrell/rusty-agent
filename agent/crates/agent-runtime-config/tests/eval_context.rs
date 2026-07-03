@@ -107,6 +107,47 @@ impl EventSink for TokenMeter {
     }
 }
 
+/// Phase-0 exec-profile → sandbox mapping (spec 2026-07-03 harness-evolve).
+/// Kept as a testable helper: a silent flip of this branch would run
+/// agent-written node code on the HOST.
+fn apply_exec_profile(cfg: &mut agent_runtime_config::RuntimeConfig, node_offline: bool) {
+    if node_offline {
+        cfg.sandbox_mode = "enforce".into();
+        cfg.sandbox_image = "node:22-bookworm-slim".into();
+        cfg.sandbox_memory = "4g".into();
+        cfg.sandbox_pids = 1024;
+    } else {
+        cfg.sandbox_mode = "off".into();
+    }
+}
+
+#[test]
+fn exec_profile_mapping_is_fail_closed() {
+    let base = || {
+        agent_runtime_config::RuntimeConfig::from_launch(
+            "openai".into(),
+            "http://x".into(),
+            "m".into(),
+            "native".into(),
+            8192,
+        )
+    };
+    let mut off = base();
+    apply_exec_profile(&mut off, false);
+    assert_eq!(off.sandbox_mode, "off");
+
+    let mut node = base();
+    apply_exec_profile(&mut node, true);
+    assert_eq!(node.sandbox_mode, "enforce");
+    assert_eq!(node.sandbox_image, "node:22-bookworm-slim");
+    assert_eq!(node.sandbox_memory, "4g");
+    assert_eq!(node.sandbox_pids, 1024);
+    assert!(
+        !node.sandbox_network,
+        "network must stay none for node-offline"
+    );
+}
+
 // Legacy lint, unrelated to this branch: field-by-field config build reads clearly here.
 #[allow(clippy::field_reassign_with_default)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -179,16 +220,9 @@ async fn eval_context_run() {
         );
         cfg.context_limit = cc.context_limit; // realistic (or favorable) window
         cfg.memory = task.memory_enabled && cc.memory_enabled;
-        if node_offline {
-            // Phase-0 node-offline profile (spec 2026-07-03): enforced docker
-            // sandbox, pinned node image, network stays none (the default).
-            cfg.sandbox_mode = "enforce".into();
-            cfg.sandbox_image = "node:22-bookworm-slim".into();
-            cfg.sandbox_memory = "4g".into();
-            cfg.sandbox_pids = 1024;
-        } else {
-            cfg.sandbox_mode = "off".into();
-        }
+        // Phase-0 node-offline profile (spec 2026-07-03): enforced docker
+        // sandbox, pinned node image, network stays none (the default).
+        apply_exec_profile(&mut cfg, node_offline);
         cfg.max_turns = 12; // historical default; candidates override via max_turns
         cc.apply_to(&mut cfg);
         // Additive eval hook: let a run opt into a skills catalog so example-bearing

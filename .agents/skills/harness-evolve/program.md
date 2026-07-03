@@ -85,6 +85,7 @@ never retries a logged dead end. Campaign spec:
 - (seed) Favorable ≈5/5 or the signal is mud — locked-hostpolicy precedent.
 - (seed) `gate`'s 0-pass/passes-increased token artifacts — read passes().
 - (seed) Attribute single misses by prefix identity, not batch counts.
+- (bring-up) The eval driver applies the SKILLS_DIR env hook AFTER apply_to — an exported SKILLS_DIR silently overrides a candidate's skills_dirs genome; unset it for axis-5 iterations.
 
 ## Iteration log
 
