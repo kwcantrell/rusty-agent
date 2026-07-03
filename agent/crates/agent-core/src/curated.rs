@@ -1,7 +1,7 @@
 use crate::compactor::{compaction_is_worthwhile, run_compaction};
 use crate::context::{
-    evict_start, message_tokens, orphaned_tool_positions, recall_block,
-    snap_split_to_unit_boundary, ContextManager, MaintCtx, MaintReport,
+    message_tokens, orphaned_tool_positions, plan_retention, recall_block,
+    snap_split_to_unit_boundary, turn_unit_ranges, ContextManager, MaintCtx, MaintReport,
     DEFAULT_RECALL_TOKEN_BUDGET,
 };
 use crate::event::{AgentEvent, ContextEvent};
@@ -155,11 +155,13 @@ impl ContextManager for CuratedContext {
     fn build(&self, model_limit: usize) -> Vec<Message> {
         let pinned = self.pinned();
         let budget = model_limit.saturating_sub(self.pinned_tokens());
-        // Walk history newest-first in turn units, keep whole units while they
-        // fit — never split a tool_calls parent from its Role::Tool results.
-        let start = evict_start(&self.history, budget);
+        // Priority retention over whole turn units: the in-flight newest unit,
+        // then user instructions (durable facts), then the rest newest-first —
+        // never splitting a tool_calls parent from its Role::Tool results.
         let mut out = pinned;
-        out.extend(self.history[start..].iter().cloned());
+        for r in plan_retention(&self.history, budget) {
+            out.extend(self.history[r].iter().cloned());
+        }
         debug_assert!(
             orphaned_tool_positions(&out).is_empty(),
             "CuratedContext::build produced an orphaned tool message"
@@ -213,6 +215,23 @@ impl ContextManager for CuratedContext {
     }
 }
 
+/// Cap on the estimated size of a turn unit that qualifies as a durable
+/// placeholder anchor; a unit dragged large by parent chatter is summarized
+/// like any other (a parent with several parallel placeholders stays under this).
+const PLACEHOLDER_UNIT_MAX_TOKENS: usize = 160;
+
+/// A turn unit whose tool results are all age-offload placeholders and whose
+/// total estimated size stays anchor-small. Like user turns, these are durable:
+/// each placeholder is the model's only pointer for `context_recall`ing the
+/// offloaded content, so it must survive compaction verbatim.
+fn is_durable_placeholder_unit(unit: &[Message]) -> bool {
+    unit.len() >= 2
+        && unit[1..]
+            .iter()
+            .all(|m| matches!(m.role, Role::Tool) && m.content.starts_with("[tool_result#"))
+        && unit.iter().map(message_tokens).sum::<usize>() <= PLACEHOLDER_UNIT_MAX_TOKENS
+}
+
 impl CuratedContext {
     /// Store a hit's full content in the offload table and replace the window
     /// copy with whatever `replacement` renders for the assigned id. Shared by
@@ -249,15 +268,43 @@ impl CuratedContext {
             self.history.len() - self.config.keep_recent,
         );
         let prior = self.compaction_summary.clone();
-        // User turns are durable, author-authored instructions — the facts most
-        // costly to lose. Keep them VERBATIM and never feed them to the lossy
-        // summarizer; only assistant/tool chatter in the old span is compacted, with
-        // the prior summary carried forward so re-compaction accumulates instead of
-        // collapsing to the most recent turn.
-        let (verbatim, to_summarize): (Vec<Message>, Vec<Message>) = self.history[..split]
-            .iter()
-            .cloned()
-            .partition(|m| matches!(m.role, Role::User));
+        // Tool results leaving the live window through compaction are lifted
+        // into the offload store FIRST — age protection (`keep_recent`) no
+        // longer applies to a result that is leaving regardless. Without this,
+        // a large fresh result can be destroyed by the summarizer before the
+        // age-based pass ever placeholders it, severing the recall chain.
+        let boundary_cfg = OffloadConfig {
+            keep_recent: 0,
+            ..self.config.clone()
+        };
+        for hit in select_offloads(&self.history[..split], &boundary_cfg) {
+            let tool = hit.entry.tool_name.clone();
+            let kind = hit.entry.kind.clone();
+            let bytes = hit.entry.bytes;
+            self.lift(hit, report, deps, |id| {
+                placeholder_for(id, &tool, &kind, bytes)
+            });
+        }
+        // Durable anchors never enter the lossy summarizer: user turns (the
+        // author-authored facts most costly to lose) and offload-placeholder
+        // units (the model's only pointers for recalling offloaded content —
+        // paraphrasing one away severs the recall chain). Both stay VERBATIM in
+        // history; only real assistant/tool chatter in the old span is compacted,
+        // with the prior summary carried forward so re-compaction accumulates
+        // instead of collapsing to the most recent turn. Partitioned in whole
+        // turn units so a kept placeholder never orphans its tool_calls parent.
+        let mut verbatim: Vec<Message> = Vec::new();
+        let mut to_summarize: Vec<Message> = Vec::new();
+        for r in turn_unit_ranges(&self.history[..split]) {
+            let unit = &self.history[r];
+            let durable = unit.iter().all(|m| matches!(m.role, Role::User))
+                || is_durable_placeholder_unit(unit);
+            if durable {
+                verbatim.extend(unit.iter().cloned());
+            } else {
+                to_summarize.extend(unit.iter().cloned());
+            }
+        }
         // "Worthwhile" (non-empty AND a net token win) is judged against everything
         // actually replaced: the prior summary plus the chatter being summarized.
         let mut replaced: Vec<Message> = prior.iter().cloned().collect();
@@ -301,15 +348,24 @@ impl CuratedContext {
     /// messages and the count changed since the last pass.
     fn emit_eviction(&mut self, deps: &MaintCtx<'_>) {
         let budget = deps.model_limit.saturating_sub(self.pinned_tokens());
-        let start = evict_start(&self.history, budget);
-        let est_tokens: usize = self.history[..start].iter().map(message_tokens).sum();
+        // Mirror build()'s priority retention: evicted = the plan's complement
+        // (no longer a contiguous oldest prefix — user units are kept out of order).
+        let mut kept = vec![false; self.history.len()];
+        for r in plan_retention(&self.history, budget) {
+            kept[r].iter_mut().for_each(|k| *k = true);
+        }
+        let evicted: Vec<usize> = (0..self.history.len()).filter(|&i| !kept[i]).collect();
+        let est_tokens: usize = evicted
+            .iter()
+            .map(|&i| message_tokens(&self.history[i]))
+            .sum();
         // Dedup on (count, tokens): re-emit when EITHER changes, so an offload
         // that shrinks the evicted span's tokens without moving the count still
         // surfaces the reduced pressure.
-        let key = (start, est_tokens);
-        if start > 0 && key != self.last_evicted {
+        let key = (evicted.len(), est_tokens);
+        if !evicted.is_empty() && key != self.last_evicted {
             deps.sink.emit(AgentEvent::Context(ContextEvent::Evicted {
-                messages: start,
+                messages: evicted.len(),
                 est_tokens,
             }));
         }
@@ -514,6 +570,128 @@ mod tests {
         assert!(built.iter().any(|m| m.content.contains("chatter summary")));
     }
 
+    #[tokio::test]
+    async fn compaction_offloads_departing_tool_results_before_summarizing() {
+        // A large tool result still inside the age-protection window when
+        // compaction fires must NOT be destroyed by the summarizer: it is
+        // lifted to the offload store at the compaction boundary and its
+        // placeholder survives verbatim as a recall pointer.
+        let mut c = ctx();
+        c.high_water_pct = 0.0; // force compaction
+        c.config.keep_recent = 2; // age pass alone would protect the result
+        let secret = format!("the secret is QH7-ZEBRA {}", "x".repeat(1500));
+        c.append(parent("c1"));
+        c.append(Message::tool("c1", "read_file", secret.clone()));
+        for i in 0..4 {
+            c.append(Message::assistant(
+                format!("chatter {i} padding text"),
+                None,
+            ));
+        }
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "compact summary".into(),
+        )]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+
+        assert!(report.offloaded >= 1, "departing result must be offloaded");
+        assert_eq!(
+            c.store.get(1).unwrap().content,
+            secret,
+            "full content recoverable from the store"
+        );
+        let built = c.build(100_000);
+        assert!(
+            built
+                .iter()
+                .any(|m| m.content.starts_with("[tool_result#1 offloaded")),
+            "placeholder survives compaction as a durable anchor: {:?}",
+            built.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn maintain_keeps_offload_placeholders_verbatim_through_compaction() {
+        // An age-offloaded placeholder is the model's only recall pointer; the
+        // summarizer must never paraphrase it away. Real chatter still compacts.
+        let mut c = ctx();
+        c.high_water_pct = 0.0; // force compaction
+        c.config.keep_recent = 1;
+        let ph = crate::offload_policy::placeholder_for(
+            7,
+            "read_file",
+            &crate::offload::OffloadKind::Output,
+            5000,
+        );
+        c.append(parent("c1"));
+        c.append(Message::tool("c1", "read_file", ph.clone()));
+        for i in 0..3 {
+            c.append(Message::assistant(
+                format!("chatter {i} with plenty of padding text to summarize"),
+                None,
+            ));
+        }
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "chatter summary".into(),
+        )]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+
+        assert!(report.compacted_turns > 0, "chatter should compact");
+        let built = c.build(100_000);
+        assert!(
+            built.iter().any(|m| m.content == ph),
+            "placeholder unit must survive compaction verbatim"
+        );
+        assert!(
+            built.iter().any(|m| m.content.contains("chatter summary")),
+            "non-placeholder chatter still summarized"
+        );
+        use crate::context::orphaned_tool_positions;
+        assert!(orphaned_tool_positions(&built).is_empty());
+    }
+
+    #[test]
+    fn build_keeps_user_instructions_under_tight_budget() {
+        // The durable-user-turn contract must hold in build() itself, not just
+        // through compaction: when the budget can't hold everything, user
+        // instructions outrank newer assistant/tool chatter.
+        let mut c = ctx();
+        c.append(Message::user("the service auth listens on port 8401"));
+        c.append(parent("c1"));
+        c.append(Message::tool("c1", "shell", "n".repeat(600)));
+        c.append(Message::user("the service cache listens on port 9213"));
+        c.append(parent("c2"));
+        c.append(Message::tool("c2", "shell", "n".repeat(600)));
+        c.append(Message::user("now implement port_for"));
+        use crate::context::message_tokens;
+        let sys = message_tokens(&Message::system("SYS"));
+        let users: usize = c
+            .history()
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .map(message_tokens)
+            .sum();
+        // Window fits pinned + the user turns + slack, but not a 600-byte tool unit.
+        let built = c.build(sys + users + 20);
+        for want in [
+            "the service auth listens on port 8401",
+            "the service cache listens on port 9213",
+            "now implement port_for",
+        ] {
+            assert!(
+                built.iter().any(|m| m.content == want),
+                "user turn {want:?} must survive a tight build budget"
+            );
+        }
+        assert!(
+            !built.iter().any(|m| matches!(m.role, Role::Tool)),
+            "big chatter units should be the ones evicted"
+        );
+    }
+
     #[test]
     fn curated_snapshot_reports_system_recall_and_messages() {
         let mut c = CuratedContext::new(
@@ -655,6 +833,7 @@ mod tests {
         // already-evicted span (far below the kept-window boundary): the evicted
         // message COUNT is unchanged, but its token estimate rises — the (count,
         // tokens) key must still trip a fresh Evicted.
+        use crate::context::evict_start;
         let start_before = evict_start(
             &c.history,
             deps.model_limit.saturating_sub(c.pinned_tokens()),
