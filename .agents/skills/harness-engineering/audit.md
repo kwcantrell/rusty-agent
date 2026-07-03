@@ -625,6 +625,34 @@ validator hook, graceful max_turns landing, max_parallel_tools→RuntimeConfig, 
 dd-redirection parity, lexical/FS split of the read-boundary hook). The next audit run starts
 from a genuinely clean slate.
 
+Re-stamp note (2026-07-02, product-decision round — ADJUDICATED; runtime-knobs cluster 1/5
+merged): the parked PRODUCT DECISIONS list was verified against live source (four Explore
+agents), briefed, and adjudicated by the owner in one batched decision round. **APPROVED:**
+/dev-redirection Deny parity, post-exec validator hook, max_parallel_tools→RuntimeConfig,
+graceful max_turns landing, CandidateConfig widening, and the H6b measuring experiment
+(experiment, not build). **DECLINED-BY-OWNER:** git-tool consolidation, persisted OffloadStore,
+list_skills catalog inlining, live trace toggle, lexical/FS split of the read-boundary hook,
+and the sub-agent extras (role registry / per-call model override / live child token streaming
+— stay "on demand"). Ledger: `.superpowers/sdd/progress.md` (drain ledger archived alongside).
+**Cluster A (runtime knobs) is MERGED to `main`** (4 commits + fix wave, `6037779..2301310`,
+merge `7f05ebe`; spec `docs/superpowers/specs/2026-07-02-runtime-knobs-design.md`):
+`RuntimeConfig.max_parallel_tools` (serde-defaulted to `DEFAULT_MAX_PARALLEL_TOOLS` = 8,
+per-field merge, `validate()` rejects 0, `loop_config_from` passthrough replaces the hardcoded
+8), and a graceful max_turns landing — ONE best-effort tools-disabled wrap-up completion at the
+budget fall-through (`one_completion` direct: no retry/overflow/StreamRetry; Cancelled →
+`Done(Cancelled)`; other errors swallowed; text-only append, stray calls discarded; no estimate
+`Usage` event, `ServerUsage` gated on nonzero usage at `turn = max_turns`) before
+`Done(BudgetExhausted)`. Dispatch children inherit it — a child hitting `subagent_max_turns`
+now hands its parent a real summary (pinned by `budget_exhausted_child_wrap_up_summary_reaches_parent`).
+Zero wire changes. Accepted residuals (final whole-branch review — merge-clean): wrap-up reply
+bypasses `protocol.parse` (a prompted-backend fenced block would append verbatim; `prepare` skip
+verified benign); wrap-up ServerUsage shares `turn = max_turns` with the last real turn (verified
+harmless in stats/web/CLI consumers); a wrap-up that streams partial text then errors leaves
+un-retracted display text (partial beats none); calibration skips the wrap-up sample (consistent
+— no estimate exists). DISCOVERY (pre-existing, follow-up candidate): `memory: bool` has NO
+`PartialRuntimeConfig` mirror/merge arm — a `"memory": false` in a partial on-disk file is
+silently ignored; this cluster's Task-1 pattern is the exact fix.
+
 ---
 
 ## Top highest-leverage fixes
