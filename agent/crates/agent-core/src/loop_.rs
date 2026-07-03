@@ -5459,6 +5459,103 @@ mod tests {
         Arc::new(r)
     }
 
+    /// A Write-tier tool whose `execute` FAILS. Same `Access::Write` intent as
+    /// `WriteStub` (so the gate treats it as a mutation) but returns `Err`, so the
+    /// call never becomes `Executed::Ok` and must NOT set `turn_mutated`. Named
+    /// `write_stub` so it drops into `validator_loop`'s scripted call.
+    struct FailStub;
+    #[async_trait::async_trait]
+    impl Tool for FailStub {
+        fn name(&self) -> &str {
+            "write_stub"
+        }
+        fn description(&self) -> &str {
+            "writes then fails (test stub)"
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: "write_stub".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<agent_tools::ToolIntent, ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: "write_stub".into(),
+                access: agent_tools::Access::Write,
+                paths: vec![],
+                command: None,
+                summary: "write".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, ToolError> {
+            Err(ToolError::Failed {
+                message: "write failed".into(),
+                stderr: None,
+            })
+        }
+    }
+
+    fn fail_stub_registry() -> Arc<ToolRegistry> {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(FailStub));
+        Arc::new(r)
+    }
+
+    /// A Write-tier tool that succeeds (setting `turn_mutated`) but cancels the run
+    /// token from inside `execute`. By the time the validator phase runs, the token
+    /// is already cancelled, so `run_validator` short-circuits to `Skipped` without
+    /// ever launching the (blocking) command. Named `write_stub` for `validator_loop`.
+    struct WriteStubSelfCancel;
+    #[async_trait::async_trait]
+    impl Tool for WriteStubSelfCancel {
+        fn name(&self) -> &str {
+            "write_stub"
+        }
+        fn description(&self) -> &str {
+            "writes then cancels the run (test stub)"
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: "write_stub".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<agent_tools::ToolIntent, ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: "write_stub".into(),
+                access: agent_tools::Access::Write,
+                paths: vec![],
+                command: None,
+                summary: "write".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            ctx: &ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, ToolError> {
+            // Cancel the live run token (a Ctrl-C mid-turn, after the mutation
+            // succeeded). The validator phase must then skip cleanly, never blocking.
+            ctx.cancel.cancel();
+            Ok(agent_tools::ToolOutput {
+                content: "wrote".into(),
+                display: None,
+            })
+        }
+    }
+
+    fn self_cancel_registry() -> Arc<ToolRegistry> {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(WriteStubSelfCancel));
+        Arc::new(r)
+    }
+
     /// Build a loop that scripts one `write_stub` call then finishes, with the
     /// given validator list. Returns (agent, sink).
     fn validator_loop(
@@ -5564,6 +5661,11 @@ mod tests {
             "one post_tool_validate result expected: {ev:?}"
         );
         assert_eq!(ev[0].1, ToolStatus::Ok, "passing validator -> Ok");
+        assert_eq!(
+            ev[0].2, "validator passed",
+            "a passing validator's Ok event carries the canonical message: {}",
+            ev[0].2
+        );
         assert!(
             appended_validation_msg(&ctx).is_none(),
             "a passing validator appends no feedback message"
@@ -5637,6 +5739,105 @@ mod tests {
                 .iter()
                 .any(|(id, st, _)| id == "c1" && *st == ToolStatus::Ok),
             "the write call still executed normally: {results:?}"
+        );
+    }
+
+    /// A mutating call that FAILS does not set `turn_mutated`, so validators never
+    /// run — guards the `matches!(ex, Executed::Ok(_))` trigger against refactors.
+    #[tokio::test]
+    async fn failed_mutation_does_not_trigger_validators() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        // FailStub declares Access::Write but its execute returns Err; a validator
+        // that would always fail ("false") proves nothing fires on a failed mutation.
+        let (agent, sink) = validator_loop(ws, vec!["false".into()], fail_stub_registry());
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert!(
+            validate_events(&sink).is_empty(),
+            "a failed mutation must emit no post_tool_validate events"
+        );
+        assert!(
+            appended_validation_msg(&ctx).is_none(),
+            "a failed mutation appends no validation feedback"
+        );
+    }
+
+    /// Two validators where the first passes and the second fails: BOTH events fire
+    /// (Ok then Error) and the single appended feedback names only the failing one.
+    #[tokio::test]
+    async fn multiple_validators_first_passes_second_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let (agent, sink) = validator_loop(
+            ws,
+            vec!["true".into(), "false".into()],
+            write_stub_registry(),
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let ev = validate_events(&sink);
+        assert_eq!(ev.len(), 2, "both validators emit a result: {ev:?}");
+        assert_eq!(ev[0].1, ToolStatus::Ok, "first validator passes -> Ok");
+        assert_eq!(
+            ev[0].2, "validator passed",
+            "passing event message: {}",
+            ev[0].2
+        );
+        assert_eq!(
+            ev[1].1,
+            ToolStatus::Error,
+            "second validator fails -> Error"
+        );
+        assert!(
+            ev[1].2.contains("exit 1"),
+            "failing event carries its exit code: {}",
+            ev[1].2
+        );
+
+        let appended = appended_validation_msg(&ctx).expect("validation feedback appended");
+        assert!(
+            appended.contains("false") && appended.contains("exit 1"),
+            "appended message names the failing command + exit: {appended}"
+        );
+        assert!(
+            !appended.contains("true"),
+            "appended message must not mention the passing command: {appended}"
+        );
+    }
+
+    /// A run cancelled mid-turn (after the mutation succeeds) skips the validator
+    /// phase cleanly: the run returns without hanging on the blocking command, the
+    /// validator outcome is a Skip, and no failure feedback is appended.
+    #[tokio::test]
+    async fn cancelled_run_skips_validators_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        // WriteStubSelfCancel succeeds (turn_mutated=true) then cancels the run
+        // token. "sleep 30" would hang for 30s if ever launched; a clean skip proves
+        // it never is (run_validator short-circuits on the cancelled token).
+        let (agent, sink) = validator_loop(ws, vec!["sleep 30".into()], self_cancel_registry());
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        // Returning at all (well under 30s) proves the validator did not block.
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let ev = validate_events(&sink);
+        assert_eq!(ev.len(), 1, "the validator is reached but skips: {ev:?}");
+        assert_eq!(
+            ev[0].1,
+            ToolStatus::Error,
+            "a skip surfaces as an Error event"
+        );
+        assert!(
+            ev[0].2.contains("skipped"),
+            "a cancelled validator is reported as skipped: {}",
+            ev[0].2
+        );
+        assert!(
+            appended_validation_msg(&ctx).is_none(),
+            "a skipped validator appends no failure feedback"
         );
     }
 
