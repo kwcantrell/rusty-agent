@@ -676,6 +676,25 @@ redirection (`< /dev/sda` — reads are not destructive). One accepted fail-safe
 named in quoted prose after a `>` (e.g. `echo "watch out > /dev/sda"`). DISCOVERY (pre-existing,
 carried from Cluster A): `memory: bool` still lacks a PartialRuntimeConfig mirror.
 
+Re-stamp note (2026-07-02, CandidateConfig widening — decision-round cluster 3/5): item 4 (widen
+the eval genome beyond context knobs) is now **fixed and merged to `main`** (2 commits + fmt fix,
+`b81b3a0..8ab27d5`, merge `87fdaf9`; spec
+`docs/superpowers/specs/2026-07-02-candidateconfig-widening-design.md`). `CandidateConfig`
+(`agent-runtime-config/src/eval/config.rs`) gains two additive serde-default `Option` axes —
+`system_prompt` and `protocol` — each inherit-on-`None`, with `resolved_system_prompt(default)` /
+`resolved_protocol(default)` resolvers so the logic is unit-tested outside the `#[ignore]` live
+harness; `tests/eval_context.rs` consumes them (protocol default `"native"`, prompt lifted to a
+byte-identical `EVAL_DEFAULT_PROMPT` const). Frozen champion-config JSON still parses (missing
+fields → inherit); the promotion gate and admissibility are UNTOUCHED (prompt/protocol are new
+optimizer axes, judged by outcome exactly as before). This is the enabler for the item-3 measuring
+experiment (prompt/protocol variants become candidates instead of guesses). **Tool-description
+variants deliberately deferred** — unlike prompt/protocol they have no override seam (descriptions
+come from each `Tool::schema()` across agent-tools); a per-candidate description-override layer on
+`ToolRegistry` is a tool-vocabulary build, recorded as follow-up. Accepted residual Minors
+(optional): back-compat test derives the frozen shape from `favorable()` rather than a pinned JSON
+literal (wouldn't catch existing-field-rename drift); no `skip_serializing_if` (emits explicit
+nulls); `protocol` is a free string validated downstream at `RuntimeConfig::validate` (by design).
+
 ---
 
 ## Top highest-leverage fixes
