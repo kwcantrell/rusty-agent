@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+const EVAL_DEFAULT_PROMPT: &str =
+    "You are a coding agent operating in a sandboxed workspace. Use the provided \
+    tools to complete each task, then give a short final reply.";
+
 /// Bounds the blast radius regardless of model behaviour: workspace-bounded fs +
 /// context/memory tools are allowed; `execute_command` only for read-only commands.
 struct SafeApproval {
@@ -135,11 +139,12 @@ async fn eval_context_run() {
     });
 
     for session in &task.sessions {
+        let protocol = cc.resolved_protocol("native").to_string();
         let mut cfg = RuntimeConfig::from_launch(
             "openai".into(),
             url.clone(),
             model.clone(),
-            "native".into(),
+            protocol,
             cc.context_limit,
         );
         cfg.context_limit = cc.context_limit; // realistic (or favorable) window
@@ -207,10 +212,7 @@ async fn eval_context_run() {
                 memory_tools: mem_tools,
                 memory_retriever: retriever,
                 stream_idle_timeout: Duration::from_secs(120),
-                base_system_prompt:
-                    "You are a coding agent operating in a sandboxed workspace. Use \
-                    the provided tools to complete each task, then give a short final reply."
-                        .into(),
+                base_system_prompt: cc.resolved_system_prompt(EVAL_DEFAULT_PROMPT).to_string(),
                 offload_store: offload.clone(),
                 compact_flag: flag.clone(),
                 stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
