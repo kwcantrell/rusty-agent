@@ -43,15 +43,42 @@ never retries a logged dead end. Campaign spec:
 8. Audit carry-overs: summary poisoning by transient tool errors;
    max_result_bytes realism.
 
-## Champion (v0) — pending admission
+## Champion (v0) — baseline, set at admission (2026-07-03)
 
-<!-- Filled by the web-multipage admission run: config, pass-rate, median
-tokens, wall_ms medians, failure shape. -->
+- **Config:** `tasks/web-multipage/champion_v0.json` — context-evolve champion-v4
+  params (`high_water_pct=0.85, keep_recent=2, error_min=200, output_min=1024,
+  recall_budget=512, default_k=10`, memory off) at **`context_limit=3000`**,
+  `max_turns=25`. Code state = this branch (v4 curation + phase-0 driver).
+- **Baseline on `web-multipage` (N=5): 2/5 pass**, passing tokens 82,894 /
+  98,122 (median-of-passing 90,508); wall ~35–60 s/run. Favorable reference:
+  5/5 at ~195K tokens, ~33 s.
+- **The loop's job:** raise the realistic pass-rate toward favorable's 5/5
+  without token blowup — via HARNESS axes (prompt, SDLC skill, tools,
+  sub-agents, sampling), not context-curation code (that is context-evolve's
+  lane; Tier-B curation edits here must sweep BOTH campaigns).
 
 ## Admitted training tasks
 
-<!-- web-multipage entry goes here on Admitted verdict: both configs, N=5
-numbers each side, realistic window found, failure shape. -->
+- **web-multipage** (mode=`code`, exec_profile=`node-offline`,
+  `tasks/web-multipage/`): **Admitted 2026-07-03.**
+  - Favorable (`favorable.json`, window 196608): **5/5**, tokens
+    183–214K (median 195,863), 21–23 turns, ~33 s/run.
+  - Realistic (`champion_v0.json`, window 3000): **2/5**, tokens
+    55–131K. `eval_gate admit` → **Admitted** (favorable ≥0.8, realistic <0.5).
+  - **Window ladder (task unchanged, config-only):** 8000 → 5/5 NoWeakness;
+    4000 → 3/5 NoWeakness (boundary); **3000 → 2/5 Admitted**. Calibrated
+    budgeting makes effective ≈ window/4 (~750 est tok at 3000).
+  - **Failure shape at 3000 — GOAL-DRIFT CHURN, not fact loss:** the three
+    failing runs never `write_file` router.ts at all. One run: 44 read_file +
+    9 list_directory over 37 turns / 131K tokens, a single speculative
+    `context_recall`, zero implementation. The model loses the PLAN (what to
+    do next), not the facts — it re-orients by re-reading the workspace until
+    turns run out. Distinct from longhaul-manifest's fact-eviction mode (v4
+    already fixed that); this is the whole-harness weakness the campaign
+    exists to attack (goal restatement, SDLC skill, verify-loop discipline
+    are the obvious first levers).
+  - Passing realistic runs cost LESS than failing ones (52–98K vs 55–131K) —
+    churn is expensive; correctness and token economy point the same way.
 
 ## Learnings (accumulated; never re-tried)
 
