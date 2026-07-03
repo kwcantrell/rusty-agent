@@ -75,6 +75,12 @@ pub fn docker_run_args(
         a.push("-e".into());
         a.push(format!("{k}={v}"));
     }
+    // --user with no passwd entry leaves HOME=/ (read-only) — node/npx tooling
+    // needs a writable HOME for caches. Default to the tmpfs unless the spec set one.
+    if !spec.env.contains_key("HOME") {
+        a.push("-e".into());
+        a.push("HOME=/tmp".into());
+    }
     a.push(policy.image.clone());
     a.push(spec.program.clone());
     a.extend(spec.args.iter().cloned());
@@ -169,5 +175,15 @@ mod tests {
         p.limits.fsize = Some("1g".into());
         let v = docker_run_args(&p, &oneshot(), "n", "1000:1000");
         assert!(v.join(" ").contains("--ulimit fsize=1g"));
+    }
+
+    #[test]
+    fn home_defaults_to_tmp_unless_spec_sets_it() {
+        let v = docker_run_args(&policy(false), &oneshot(), "n", "1000:1000");
+        assert!(v.join(" ").contains("-e HOME=/tmp"), "default HOME on writable tmpfs");
+        let mut spec = oneshot();
+        spec.env.insert("HOME".into(), "/workspace".into());
+        let s = docker_run_args(&policy(false), &spec, "n", "1000:1000").join(" ");
+        assert!(s.contains("-e HOME=/workspace") && !s.contains("-e HOME=/tmp"));
     }
 }
