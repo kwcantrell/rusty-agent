@@ -3,7 +3,9 @@
 set -euo pipefail
 npx tsc --noEmit
 cp hidden_tests/hidden.test.ts src/hidden.test.ts
-npx vitest run
+# Path-filter to src: vitest's default include would otherwise also collect
+# hidden_tests/hidden.test.ts IN PLACE, where its ./router import can't resolve.
+npx vitest run src
 npx vite build
 grep -rq "Plans & Pricing" dist/assets
 grep -rq "Founded 2019" dist/assets
