@@ -95,6 +95,20 @@ pre-call blind spot returns — a fold triggered by history growth is created at
 the PREVIOUS run's exit, so fold hysteresis must leave headroom for one
 incoming prompt.
 
+**Amendment 3 (second re-baseline outcome): the exit maintain is gated to PURE
+text-only runs.** The unconditional exit maintain held drift/offload/codename/
+recall at ceiling but left single-miss wobbles exactly on the two tool-bearing
+fact-delivery tasks — locked-portmap 9/10 (a 6/8 merge-dropout run) and
+memory-roster 9/10 — while the paired v3 binary scored 10/10 on both the same
+night. Neither miss is individually significant, but both sit on runs where the
+exit pass added an extra compaction beyond v3's cadence (tool turn already
+maintained at loop bottom, then the text ack maintained again, compacting one
+unit deeper per run). Final semantics: `run_maintained` tracks whether a
+loop-bottom maintain fired this run; the exit maintain runs only when it did
+not — i.e. only for runs with no tool turns, the exact structural gap. Tool-
+bearing runs are byte-identical to v3 by construction; chat-only sessions are
+curated once per run at exit.
+
 ### 2. Trivial-chatter skip (`curated.rs::compact_old_span`)
 
 After the durable/summarizable partition, skip the summarizer when the span is
