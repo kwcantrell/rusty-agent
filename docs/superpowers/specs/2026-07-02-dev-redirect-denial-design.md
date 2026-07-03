@@ -36,15 +36,23 @@ or starts with `fd/` or `shm/`. Everything else (`sda`, `nvme0n1`, `mem`,
 is unsafe. Case-sensitive (device names are lowercase). `/dev/shm/…` is a
 standard world-writable tmpfs (files, not devices) so writes under it are safe.
 
-**Path normalization (added by the /dev-redirect-denial hardening pass):** the
-target's leading path structure is normalized before the /dev match — redundant
-`/`-runs and `.` segments are discarded — so `//dev/sda`, `///dev/sda`,
-`/./dev/sda`, and `/dev/./sda` all resolve to a write under /dev and deny, while
-`//dev/null` and `/dev/./null` normalize to a safe sink. `..` is deliberately
-NOT collapsed (collapsing it could turn a deny into an allow), so `..` forms
-(`/dev/../dev/sda`) keep denying via over-approximation. Only an absolute path
-can name a device node, so a relative `dev/sda` (an ordinary cwd file) is not
-this handler's concern.
+**Path normalization (added by the /dev-redirect-denial hardening pass; `..`
+resolution corrected by fix wave 2):** the target's full path is lexically
+normalized before the /dev match — redundant `/`-runs and `.` segments are
+discarded, and `..` is fully resolved by popping the previous kept segment (a
+leading `..` at root drops, matching POSIX `/..` == `/`). So `//dev/sda`,
+`///dev/sda`, `/./dev/sda`, `/dev/./sda`, `/dev/../dev/sda`, and — critically —
+the leading/mid-path forms `/../dev/sda`, `/usr/../dev/sda`, `/tmp/../dev/sda`
+all resolve to a write under /dev and deny, while `//dev/null` and `/dev/./null`
+normalize to a safe sink and `/dev/foo/../null` resolves to `/dev/null` (safe).
+Full lexical resolution replaces the earlier "do NOT collapse `..`" over-
+approximation, which returned SAFE for any target whose first segment was `..`
+(`/../dev/sda`) and thus missed device writes that navigate INTO /dev. Resolving
+`..` tracks the real kernel target and is strictly more correct; deny-by-default
+still applies to the resolved /dev-rooted result. Symlinks are NOT resolved
+(symlink-indirection into /dev is out of scope for this static floor and reaches
+Ask). Only an absolute path can name a device node, so a relative `dev/sda` (an
+ordinary cwd file) is not this handler's concern.
 
 Note: `/dev/ttyUSB0`-style serial targets are hard-denied. This matches the
 existing dd posture exactly (`dd of=/dev/ttyUSB0` is denied today) and is the
@@ -120,6 +128,6 @@ the real engine path for the deny cases above plus `2>/dev/null` → ask and
 - Variable-expansion targets (`>$D/sda`, `> ${DEV}`) and cwd-relative redirects
   (`cd /dev && echo x > sda`) — this static floor does not resolve shell
   variables or track the working directory, so these reach Ask (not Deny). Path
-  normalization covers only redundant `/` runs and `.` segments; it does NOT
-  collapse `..`.
+  normalization now covers redundant `/` runs, `.` segments, AND full lexical
+  `..` resolution (fix wave 2); it does NOT resolve symlinks.
 - Revisiting the dd handler's /dev/null strictness (pre-existing, unhit).

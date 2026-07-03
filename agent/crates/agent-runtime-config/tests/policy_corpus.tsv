@@ -45,6 +45,7 @@ deny	echo x >& /dev/sda	# csh-style both-streams redirect (mirror of &>)
 deny	git log > /dev/mem	# any program, redirect target is what matters
 deny	echo "> /dev/sda"	# ACCEPTED FALSE POSITIVE: quoted prose after `>` is over-denied (fail-safe, raw backstop)
 deny	echo x > //dev/sda	# path-normalization: redundant `/`-run still resolves under /dev
+deny	echo x > /../dev/sda	# leading `..` navigates INTO /dev (POSIX `/..` == `/`); full lexical resolution denies
 ask	cmd 2>/dev/null	# stderr to /dev/null is a safe sink; un-allowlisted `cmd` + metachar → Ask
 ask	echo hi > out.txt	# plain-file redirect: floor does NOT fire; `>` metachar → Ask
 ask	echo x > /dev/shm/f	# /dev/shm is a world-writable tmpfs (file, not device) → safe sink; metachar → Ask

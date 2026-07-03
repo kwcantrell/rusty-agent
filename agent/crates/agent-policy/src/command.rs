@@ -103,38 +103,44 @@ fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
 /// allowlist is the same fail-safe posture as the `dd of=` handler (which is
 /// stricter still: it denies ALL of=/dev/* including /dev/null).
 ///
-/// The target's leading path structure is normalized before the /dev match so
-/// redundant `/`-runs and `.` segments cannot dodge it: `//dev/sda`,
-/// `/./dev/sda`, and `/dev/./sda` all resolve to a write UNDER /dev and deny.
-/// `..` is deliberately NOT collapsed — doing so could turn a deny into an
-/// allow — so `..` forms (`/dev/../dev/sda`) keep denying via over-
-/// approximation. Only an absolute path can name a device node, so a relative
-/// `dev/sda` (an ordinary cwd file) is not this handler's concern. `/dev/shm/…`
-/// is a standard world-writable tmpfs (files, not devices) and is allowed,
-/// alongside the `/dev/fd/…` fds.
+/// The target's path is fully lexically normalized before the /dev match so
+/// redundant `/`-runs, `.` segments, and `..` navigation cannot dodge it:
+/// `//dev/sda`, `/./dev/sda`, `/dev/./sda` all resolve to a write UNDER /dev
+/// and deny. `..` is resolved the way the kernel resolves it — pop the previous
+/// kept segment, a leading `..` at root simply drops (POSIX `/..` == `/`) — so
+/// `/../dev/sda`, `/usr/../dev/sda`, and `/dev/shm/../sda` all resolve to
+/// `/dev/sda` and deny, while `/dev/foo/../null` resolves to the safe `/dev/null`.
+/// Full resolution tracks the real kernel target, which is strictly more correct
+/// than the earlier over-approximation (which missed leading/mid-path `..`).
+/// Only an absolute path can name a device node, so a relative `dev/sda` (an
+/// ordinary cwd file) is not this handler's concern. `/dev/shm/…` is a standard
+/// world-writable tmpfs (files, not devices) and is allowed, alongside the
+/// `/dev/fd/…` fds. We do NOT resolve symlinks — symlink-indirection into /dev
+/// is out of scope for this static floor and reaches Ask.
 fn dev_redirect_target_is_safe(target: &str) -> bool {
     // Only an absolute path can name a /dev device node; a relative target is a
     // normal file and not this handler's concern.
     if !target.starts_with('/') {
         return true;
     }
-    // Normalize the leading path structure: drop empty (`//`-run) and `.`
-    // segments while PRESERVING `..` (collapsing it could unsafe-ify a deny).
-    let segments: Vec<&str> = target
-        .split('/')
-        .filter(|seg| !seg.is_empty() && *seg != ".")
-        .collect();
-    // Must be a path UNDER /dev — first real segment `dev` plus at least one
+    // Fully resolve the path lexically: drop empty (`//`-run) and `.` segments;
+    // on `..` pop the last kept segment if any (a leading `..` at root drops,
+    // matching POSIX `/..` == `/`); otherwise keep the segment. This tracks the
+    // real kernel target so `..` cannot navigate INTO /dev undetected.
+    let mut segments: Vec<&str> = Vec::new();
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+    // Must be a path UNDER /dev — first resolved segment `dev` plus at least one
     // more segment. Bare `/dev` is a directory, not a device write sink.
     if segments.first() != Some(&"dev") || segments.len() < 2 {
         return true; // not a (sub-)/dev path: not this handler's concern
-    }
-    // A `..` segment escapes upward (`/dev/shm/../sda` and `/dev/fd/../sda` both
-    // resolve to /dev/sda). We do NOT resolve it; instead any /dev-rooted target
-    // carrying `..` is denied (over-approximation) — this keeps the brief's `..`
-    // deny posture AND stops `..` slipping past the `fd/`/`shm/` prefixes.
-    if segments.contains(&"..") {
-        return false;
     }
     let suffix = segments[1..].join("/");
     matches!(
@@ -822,18 +828,28 @@ mod tests {
 
     #[test]
     fn redirect_path_normalization_bypasses_are_denied() {
-        // Linux collapses `/`-runs and `.` segments, so these WRITE to /dev/sda
-        // yet the old literal `/dev/` prefix compare missed them. Normalizing the
-        // target's leading path structure closes the bypass.
+        // Linux collapses `/`-runs and `.` segments and resolves `..`, so these
+        // all WRITE to /dev/sda yet the old literal `/dev/` prefix compare (and
+        // the old `..`-over-approx) missed the leading/mid-path `..` forms. Full
+        // lexical resolution closes the bypass.
         for cmd in [
             "echo x > //dev/sda",
             "echo x >//dev/sda", // glued, doubled slash
             "echo x > ///dev/sda",
             "echo x > /./dev/sda",
             "echo x > /dev/./sda", // `.` segment between dev and the device
-            "echo x > /dev/../dev/sda", // `..` kept (over-approx) → still denies
+            "echo x > /dev/../dev/sda", // `..` resolves back to /dev/sda
             "echo x > /dev/shm/../sda", // `..` escapes /dev/shm back to a device
             "echo x > /dev/fd/../sda", // `..` escapes /dev/fd back to a device
+            // Leading/mid-path `..` that navigates INTO /dev — POSIX `/..` == `/`,
+            // so each of these resolves to the live block device /dev/sda. The old
+            // predicate saw `first() == ".."`, treated the target as not-/dev, and
+            // returned SAFE. Full resolution now denies them.
+            "echo x > /../dev/sda",
+            "echo x > /../../dev/sda",
+            "echo x > /usr/../dev/sda",
+            "echo x > /tmp/../dev/sda",
+            "echo x > /./../dev/sda",
         ] {
             assert!(
                 hard_floor_violation(cmd, &[]).is_some(),
@@ -853,6 +869,11 @@ mod tests {
             "cmd > /dev/./null",       // `.` segment, safe sink
             "echo x > /dev/fd/3",      // fd still safe after normalization
             "echo x > /dev/shm/sub/f", // nested tmpfs path
+            "echo x > /dev/stderr",    // named safe sink
+            // `..` that resolves to a genuine safe sink stays safe: full
+            // resolution is symmetric — it can allow as well as deny.
+            "echo x > /dev/foo/../null",  // resolves to /dev/null (safe)
+            "echo x > /dev/shm/sub/../f", // stays under /dev/shm (safe tmpfs)
         ] {
             assert!(
                 hard_floor_violation(cmd, &[]).is_none(),
