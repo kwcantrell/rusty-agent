@@ -98,6 +98,11 @@ The skip applies whether or not a prior summary exists (without one there is no
 decay risk, but summarizing three "OK"s is a wasted model call either way; tokens
 are the campaign tiebreak).
 
+**Amendment (implementation finding):** an explicit `request_compaction()` — the
+overflow-recovery imperative — **bypasses** the skip. The skip is a cadence
+heuristic for routine high-water passes; a forced "shrink now" outranks it
+(pinned by `tests/compaction_routing.rs` and a new unit test).
+
 ### 3. Monotone prior guard (`curated.rs::compact_old_span`)
 
 In the `Ok(summary)` arm: if a prior summary exists and the candidate's est-token

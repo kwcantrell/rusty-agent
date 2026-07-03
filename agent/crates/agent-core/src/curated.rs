@@ -202,7 +202,7 @@ impl ContextManager for CuratedContext {
             (used as f32) > (deps.model_limit as f32 * self.high_water_pct)
         };
         if (requested || over_high_water) && self.history.len() > self.config.keep_recent + 1 {
-            self.compact_old_span(deps, &mut report).await;
+            self.compact_old_span(deps, &mut report, requested).await;
         }
 
         // (c) Eviction visibility — runs on EVERY maintain exit.
@@ -219,6 +219,14 @@ impl ContextManager for CuratedContext {
 /// placeholder anchor; a unit dragged large by parent chatter is summarized
 /// like any other (a parent with several parallel placeholders stays under this).
 const PLACEHOLDER_UNIT_MAX_TOKENS: usize = 160;
+
+/// Minimum estimated size of a PURE-ASSISTANT chatter span before it is
+/// worth a summarizer pass. Re-running the summarizer over `prior + one
+/// trivial ack` is generation loss — a small model degrades the prior
+/// instead of extending it — and even without a prior it wastes a model
+/// call. Tool-bearing spans are exempt at ANY size: their per-turn cadence
+/// is load-bearing (a flat floor here regressed locked-portmap).
+const TRIVIAL_CHATTER_SPAN_TOKENS: usize = 256;
 
 /// A turn unit whose tool results are all age-offload placeholders and whose
 /// total estimated size stays anchor-small. Like user turns, these are durable:
@@ -259,7 +267,15 @@ impl CuratedContext {
 
     /// Compact the old span into the pinned summary. Extracted from `maintain`
     /// so its early exits cannot skip the eviction check that follows.
-    async fn compact_old_span(&mut self, deps: &MaintCtx<'_>, report: &mut MaintReport) {
+    /// `forced` marks an explicit `request_compaction()` (overflow recovery):
+    /// it bypasses the trivial-chatter cadence skip — an imperative "shrink
+    /// now" outranks a heuristic that only exists to batch routine passes.
+    async fn compact_old_span(
+        &mut self,
+        deps: &MaintCtx<'_>,
+        report: &mut MaintReport,
+        forced: bool,
+    ) {
         // Snap left to a unit boundary so the cut never separates a
         // tool_calls parent from its results; the torn turn lands wholly
         // in the recent window (keep_recent temporarily keeps a bit more).
@@ -313,6 +329,18 @@ impl CuratedContext {
         // Nothing summarizable beyond the prior summary — the verbatim user turns are
         // already the most compact faithful form, so don't burn a model call.
         if to_summarize.is_empty() {
+            return;
+        }
+        // Degenerate span: pure assistant chatter too small to be worth a
+        // summarizer pass (see TRIVIAL_CHATTER_SPAN_TOKENS). The chatter
+        // accumulates until the span is substantial or gains a tool-bearing
+        // unit; history and the prior summary stay untouched. An explicit
+        // compaction request (overflow recovery) is exempt.
+        let span_tokens: usize = to_summarize.iter().map(message_tokens).sum();
+        let all_assistant = to_summarize
+            .iter()
+            .all(|m| matches!(m.role, Role::Assistant));
+        if !forced && all_assistant && span_tokens < TRIVIAL_CHATTER_SPAN_TOKENS {
             return;
         }
         match run_compaction(&to_summarize, prior.as_ref(), deps.model, deps.cancel).await {
@@ -513,7 +541,10 @@ mod tests {
         for i in 0..6 {
             // Assistant chatter (not user instructions) is what gets summarized.
             c.append(Message::assistant(
-                format!("turn {i} with a fair bit of padding text here"),
+                format!(
+                    "turn {i} {}",
+                    "with a fair bit of padding text here ".repeat(12)
+                ),
                 None,
             ));
         }
@@ -542,7 +573,7 @@ mod tests {
         for i in 0..4 {
             c.append(Message::user(format!("instruction {i}: add value {i}{i}")));
             c.append(Message::assistant(
-                format!("ok, acknowledged {i}, lots of filler chatter"),
+                format!("ok, acknowledged {i}, {}", "lots of filler chatter ".repeat(15)),
                 None,
             ));
         }
@@ -568,6 +599,96 @@ mod tests {
         }
         // And a compaction summary block exists for the chatter.
         assert!(built.iter().any(|m| m.content.contains("chatter summary")));
+    }
+
+    #[tokio::test]
+    async fn trivial_assistant_chatter_skips_the_summarizer() {
+        // A prior summary plus a handful of tiny acks must NOT re-run the
+        // summarizer — each pass over `prior + trivia` risks degrading the
+        // prior (observed collapsing the running summary to "No new
+        // information provided" under per-turn maintenance). The chatter
+        // simply accumulates until the span is substantial.
+        let mut c = ctx();
+        c.high_water_pct = 0.0; // pressure permanently on
+        c.config.keep_recent = 1;
+        c.compaction_summary = Some(Message::system(
+            "Summary of earlier conversation:\nledger entries 1-12 recorded",
+        ));
+        for i in 0..4 {
+            c.append(Message::assistant(format!("ok {i}"), None));
+        }
+        c.append(Message::user("next instruction"));
+        let model: Arc<dyn ModelClient> =
+            Arc::new(ScriptedModel::new(vec![Scripted::Text("DEGRADED".into())]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        assert_eq!(report.compacted_turns, 0, "trivial span must not compact");
+        assert!(
+            c.compaction_summary
+                .as_ref()
+                .unwrap()
+                .content
+                .contains("entries 1-12 recorded"),
+            "prior summary untouched"
+        );
+        // The acks stay in history, awaiting a substantial span.
+        assert!(c.history().iter().any(|m| m.content == "ok 0"));
+    }
+
+    #[tokio::test]
+    async fn explicit_request_bypasses_the_trivial_chatter_skip() {
+        // request_compaction() is the overflow-recovery imperative — "shrink
+        // now". The trivial-chatter skip is a cadence heuristic for routine
+        // high-water passes and must not veto an explicit request.
+        let mut c = ctx();
+        c.high_water_pct = 2.0; // size trigger disabled; only the flag fires
+        c.config.keep_recent = 1;
+        for i in 0..4 {
+            c.append(Message::assistant(format!("ok {i} noted, thanks"), None));
+        }
+        c.append(Message::user("next instruction"));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "compact summary".into(),
+        )]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        c.request_compaction();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        assert!(
+            report.compacted_turns > 0,
+            "an explicit request must compact even a trivial span"
+        );
+    }
+
+    #[tokio::test]
+    async fn tiny_tool_bearing_span_still_compacts() {
+        // The degenerate-span skip must NOT throttle tool-bearing spans: a
+        // flat recompaction floor did exactly that and regressed
+        // locked-portmap 10/10 -> ~4/6 (delayed compaction left no single
+        // complete source at write time). Tool-bearing spans of any size
+        // keep the per-turn cadence the eval ceilings were measured under.
+        let mut c = ctx();
+        c.high_water_pct = 0.0; // force compaction
+        c.config.keep_recent = 1;
+        c.compaction_summary = Some(Message::system("Summary:\nbase"));
+        c.append(parent("c1"));
+        c.append(Message::tool(
+            "c1",
+            "shell",
+            "a short tool result with a few extra words of output here",
+        ));
+        c.append(Message::assistant("done", None));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "Summary:\nbase plus the shell call output".into(),
+        )]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        assert!(
+            report.compacted_turns > 0,
+            "tool-bearing spans keep the per-turn cadence"
+        );
     }
 
     #[tokio::test]
@@ -628,7 +749,10 @@ mod tests {
         c.append(Message::tool("c1", "read_file", ph.clone()));
         for i in 0..3 {
             c.append(Message::assistant(
-                format!("chatter {i} with plenty of padding text to summarize"),
+                format!(
+                    "chatter {i} {}",
+                    "with plenty of padding text to summarize ".repeat(12)
+                ),
                 None,
             ));
         }
@@ -1042,7 +1166,10 @@ mod tests {
         c.config.keep_recent = 1;
         for i in 0..6 {
             c.append(Message::assistant(
-                format!("turn {i} with a fair bit of padding text here"),
+                format!(
+                    "turn {i} {}",
+                    "with a fair bit of padding text here ".repeat(12)
+                ),
                 None,
             ));
         }
