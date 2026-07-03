@@ -808,7 +808,9 @@ mod tests {
             max_tool_result_bytes: 1234,
             max_parallel_tools: 3,
             post_tool_validators: vec!["cargo check".into()],
-            tool_description_overrides: Default::default(),
+            tool_description_overrides: [("read_file".to_string(), "GUARD".to_string())]
+                .into_iter()
+                .collect(),
             memory: false,
             subagents: false,
             subagent_max_turns: 4,
