@@ -1,0 +1,27 @@
+{
+  "id": "web-multipage",
+  "mode": "code",
+  "realistic_window": 8000,
+  "favorable_window": 196608,
+  "memory_enabled": false,
+  "exec_profile": "node-offline",
+  "seed_dir": "seed",
+  "prompt_timeout_secs": 600,
+  "seed_files": [],
+  "test_cmd": "bash hidden_tests/check.sh",
+  "sessions": [
+    {
+      "prompts": [
+        "You are working in a small Vite + TypeScript site. Over the next messages I will give you the content requirements one at a time; do NOT write any code until I say so. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): the route '/' must have the title 'Acme Dashboard Home' and its body must include the text 'Welcome to Acme'. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): the route '/pricing' must have the title 'Plans & Pricing' and its body must include 'Starter: $9/mo'. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): the route '/about' must have the title 'About Acme' and its body must include 'Founded 2019'. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): the route '/stats' must have the title 'Usage Statistics' and its body must include 'Daily Active Users'. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): in formatStats, the raw field 'dau' maps to the view field 'dailyActive' unchanged. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): in formatStats, the raw field 'p95_ms' maps to 'latencyP95' as the number followed by a space and 'ms', e.g. '142 ms'. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): in formatStats, the raw field 'uptime_pct' maps to 'uptime' as the number followed by '%', e.g. '99.95%'. Unknown routes must make routeFor return null. Acknowledge in one sentence.",
+        "Now implement src/router.ts (routeFor) and src/stats.ts (formatStats) to satisfy EVERY requirement I gave across the previous messages. Use write_file to save each file. Then verify your work by running 'npx vitest run' and 'npx tsc --noEmit' with execute_command, fix any failures, and finish with a one-line summary."
+      ]
+    }
+  ]
+}

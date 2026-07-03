@@ -262,6 +262,8 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         )));
     }
 
+    registry.set_description_overrides(cfg.tool_description_overrides.clone());
+
     #[cfg(test)]
     let schemas = registry.schemas();
     #[cfg(test)]

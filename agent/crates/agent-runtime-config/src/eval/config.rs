@@ -30,6 +30,40 @@ pub struct CandidateConfig {
     /// the harness default. A protocol-encoding genome axis.
     #[serde(default)]
     pub protocol: Option<String>,
+    // ---- v2 genome axes (spec 2026-07-03 harness-evolve). All inherit-on-None. ----
+    /// Runtime skills inlined into the system prompt (axis 5). None = inherit.
+    #[serde(default)]
+    pub active_skills: Option<Vec<String>>,
+    /// Skill tree roots served to the loop (axis 5). None = inherit.
+    #[serde(default)]
+    pub skills_dirs: Option<Vec<String>>,
+    /// Sampler overrides (axis 7a). None = inherit the harness default.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    /// Sub-agent policy (axis 4). None = inherit.
+    #[serde(default)]
+    pub subagents: Option<bool>,
+    #[serde(default)]
+    pub subagent_max_turns: Option<usize>,
+    #[serde(default)]
+    pub subagent_max_depth: Option<usize>,
+    #[serde(default)]
+    pub subagent_model: Option<crate::ModelRef>,
+    /// Per-tool description overrides (axis 3). None = every tool's own schema text.
+    #[serde(default)]
+    pub tool_descriptions: Option<std::collections::HashMap<String, String>>,
+    /// Ingestion cap (axis 8). None = the eval's historical "cap off" semantics.
+    #[serde(default)]
+    pub max_result_bytes: Option<usize>,
+    /// Per-prompt turn budget. None = the driver default (12).
+    #[serde(default)]
+    pub max_turns: Option<usize>,
 }
 
 impl CandidateConfig {
@@ -55,6 +89,19 @@ impl CandidateConfig {
             auto_recall: true,
             system_prompt: None,
             protocol: None,
+            active_skills: None,
+            skills_dirs: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            subagents: None,
+            subagent_max_turns: None,
+            subagent_max_depth: None,
+            subagent_model: None,
+            tool_descriptions: None,
+            max_result_bytes: None,
+            max_turns: None,
         }
     }
 
@@ -67,6 +114,48 @@ impl CandidateConfig {
         self.protocol.as_deref().unwrap_or(default)
     }
 
+    /// Overlay the RuntimeConfig-shaped v2 fields onto `cfg`; `None` inherits.
+    /// NOTE: `max_result_bytes` applies via `offload_config()`, and
+    /// `system_prompt`/`protocol` via their resolvers — apply those separately.
+    pub fn apply_to(&self, cfg: &mut crate::RuntimeConfig) {
+        if let Some(v) = self.temperature {
+            cfg.temperature = v;
+        }
+        if let Some(v) = self.top_p {
+            cfg.top_p = Some(v);
+        }
+        if let Some(v) = self.top_k {
+            cfg.top_k = Some(v);
+        }
+        if let Some(v) = self.min_p {
+            cfg.min_p = Some(v);
+        }
+        if let Some(v) = self.subagents {
+            cfg.subagents = v;
+        }
+        if let Some(v) = self.subagent_max_turns {
+            cfg.subagent_max_turns = v;
+        }
+        if let Some(v) = self.subagent_max_depth {
+            cfg.subagent_max_depth = v;
+        }
+        if let Some(v) = &self.subagent_model {
+            cfg.subagent_model = Some(v.clone());
+        }
+        if let Some(v) = &self.skills_dirs {
+            cfg.skills_dirs = v.clone();
+        }
+        if let Some(v) = &self.active_skills {
+            cfg.active_skills = v.clone();
+        }
+        if let Some(v) = self.max_turns {
+            cfg.max_turns = v;
+        }
+        if let Some(v) = &self.tool_descriptions {
+            cfg.tool_description_overrides = v.clone();
+        }
+    }
+
     /// The in-window offload thresholds for this candidate.
     pub fn offload_config(&self) -> OffloadConfig {
         OffloadConfig {
@@ -74,15 +163,10 @@ impl CandidateConfig {
             output_min_bytes: self.output_min_bytes,
             keep_recent: self.keep_recent,
             exclude_tools: Vec::new(),
-            // The eager ingestion cap (`max_result_bytes`, size-based and
-            // age-agnostic via `select_oversized`) is intentionally NOT part
-            // of the candidate genome — eval semantics predate it, and an
-            // active context-evolve campaign validated its champion without
-            // it. Neutralize it for the whole harness so `favorable` and every
-            // candidate share the "no ingestion cap" baseline; `Default`'s
-            // 16 KiB cap would otherwise silently apply regardless of the
-            // `usize::MAX` age thresholds above.
-            max_result_bytes: usize::MAX,
+            // None = the eval's historical "ingestion cap off" semantics (the
+            // context-evolve champion was validated without the cap). Some(n)
+            // lets a candidate opt into a realistic cap (harness-evolve axis 8).
+            max_result_bytes: self.max_result_bytes.unwrap_or(usize::MAX),
         }
     }
 }
@@ -153,5 +237,98 @@ mod widening_tests {
             serde_json::from_str(&serde_json::to_string(&cc).unwrap()).unwrap();
         assert_eq!(back.system_prompt.as_deref(), Some("P"));
         assert_eq!(back.protocol.as_deref(), Some("prompted"));
+    }
+
+    #[test]
+    fn v2_fields_default_to_none_and_parse_from_v1_json() {
+        // A pre-v2 config (the existing field set only) must still deserialize.
+        let json = serde_json::to_value(CandidateConfig::favorable(8192)).unwrap();
+        let mut obj = json.as_object().unwrap().clone();
+        for k in [
+            "active_skills",
+            "skills_dirs",
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "subagents",
+            "subagent_max_turns",
+            "subagent_max_depth",
+            "subagent_model",
+            "tool_descriptions",
+            "max_result_bytes",
+            "max_turns",
+        ] {
+            obj.remove(k);
+        }
+        let cc: CandidateConfig = serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+        assert!(cc.temperature.is_none() && cc.subagent_model.is_none());
+        assert!(cc.tool_descriptions.is_none() && cc.max_turns.is_none());
+        // favorable leaves every v2 field None
+        let f = CandidateConfig::favorable(8192);
+        assert!(f.active_skills.is_none() && f.skills_dirs.is_none());
+        assert!(f.subagents.is_none() && f.max_result_bytes.is_none());
+    }
+
+    #[test]
+    fn apply_to_inherits_on_none_and_overrides_on_some() {
+        let mut cfg = crate::RuntimeConfig::from_launch(
+            "openai".into(),
+            "http://x".into(),
+            "m".into(),
+            "native".into(),
+            8192,
+        );
+        let baseline = cfg.clone();
+        CandidateConfig::favorable(8192).apply_to(&mut cfg);
+        assert_eq!(
+            cfg, baseline,
+            "all-None candidate must not touch the config"
+        );
+
+        let mut cc = CandidateConfig::favorable(8192);
+        cc.temperature = Some(0.7);
+        cc.top_k = Some(40);
+        cc.subagents = Some(false);
+        cc.subagent_max_turns = Some(4);
+        cc.subagent_max_depth = Some(2);
+        cc.subagent_model = Some(crate::ModelRef {
+            model: Some("other".into()),
+            ..Default::default()
+        });
+        cc.skills_dirs = Some(vec!["/skills".into()]);
+        cc.active_skills = Some(vec!["sdlc".into()]);
+        cc.max_turns = Some(30);
+        cc.tool_descriptions = Some(
+            [("read_file".to_string(), "OVERRIDE".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        cc.apply_to(&mut cfg);
+        assert_eq!(cfg.temperature, 0.7);
+        assert_eq!(cfg.top_k, Some(40));
+        assert!(!cfg.subagents);
+        assert_eq!(cfg.subagent_max_turns, 4);
+        assert_eq!(cfg.subagent_max_depth, 2);
+        assert_eq!(
+            cfg.subagent_model.as_ref().unwrap().model.as_deref(),
+            Some("other")
+        );
+        assert_eq!(cfg.skills_dirs, vec!["/skills".to_string()]);
+        assert_eq!(cfg.active_skills, vec!["sdlc".to_string()]);
+        assert_eq!(cfg.max_turns, 30);
+        assert_eq!(
+            cfg.tool_description_overrides.get("read_file").unwrap(),
+            "OVERRIDE"
+        );
+    }
+
+    #[test]
+    fn max_result_bytes_defaults_to_neutralized_and_overrides() {
+        let f = CandidateConfig::favorable(8192);
+        assert_eq!(f.offload_config().max_result_bytes, usize::MAX);
+        let mut cc = CandidateConfig::favorable(8192);
+        cc.max_result_bytes = Some(16 * 1024);
+        assert_eq!(cc.offload_config().max_result_bytes, 16 * 1024);
     }
 }

@@ -5,6 +5,10 @@ use std::sync::Arc;
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    /// Per-tool BASE-description replacements (eval/optimizer seam). The
+    /// `when_not_to_call` fold still appends afterwards, so exclusion prose
+    /// survives unless deliberately included in the override text.
+    description_overrides: HashMap<String, String>,
 }
 
 impl ToolRegistry {
@@ -30,11 +34,25 @@ impl ToolRegistry {
         self.tools.values().cloned().collect()
     }
 
+    /// Replace base descriptions per tool name. Unknown names warn and are
+    /// ignored (mirrors the unknown-preset handling in assemble).
+    pub fn set_description_overrides(&mut self, overrides: HashMap<String, String>) {
+        for name in overrides.keys() {
+            if !self.tools.contains_key(name) {
+                tracing::warn!(tool = %name, "description override for unknown tool — ignored");
+            }
+        }
+        self.description_overrides = overrides;
+    }
+
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools
             .values()
             .map(|t| {
                 let mut s = t.schema();
+                if let Some(over) = self.description_overrides.get(t.name()) {
+                    s.description = over.clone();
+                }
                 if let Some(excl) = t.when_not_to_call() {
                     s.description =
                         format!("{}\n\n{} {}", s.description, WHEN_NOT_TO_CALL_MARKER, excl);
@@ -297,5 +315,42 @@ mod tests {
         let schemas = r.schemas();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0].name, "echo");
+    }
+
+    #[test]
+    fn description_override_replaces_base_but_keeps_exclusion_fold() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(Echo));
+        r.register(Arc::new(Confusable));
+        r.set_description_overrides(
+            [
+                ("echo".to_string(), "OVERRIDDEN".to_string()),
+                ("confusable".to_string(), "NEW BASE".to_string()),
+                ("missing".to_string(), "ignored".to_string()), // unknown: warn + ignore
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let schemas = r.schemas();
+        let echo = schemas.iter().find(|s| s.name == "echo").unwrap();
+        assert_eq!(echo.description, "OVERRIDDEN");
+        let conf = schemas.iter().find(|s| s.name == "confusable").unwrap();
+        assert!(
+            conf.description.starts_with("NEW BASE"),
+            "override replaces the BASE"
+        );
+        assert!(
+            conf.description.contains(WHEN_NOT_TO_CALL_MARKER)
+                && conf.description.contains("use echo instead for X"),
+            "when_not_to_call fold still appends after the override"
+        );
+    }
+
+    #[test]
+    fn empty_overrides_change_nothing() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(Echo));
+        r.set_description_overrides(Default::default());
+        assert_eq!(r.schemas()[0].description, "echoes");
     }
 }
