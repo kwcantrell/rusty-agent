@@ -695,6 +695,32 @@ come from each `Tool::schema()` across agent-tools); a per-candidate description
 literal (wouldn't catch existing-field-rename drift); no `skip_serializing_if` (emits explicit
 nulls); `protocol` is a free string validated downstream at `RuntimeConfig::validate` (by design).
 
+Re-stamp note (2026-07-02, post-execution validator hook — decision-round cluster 4/5): item 6
+(the last unbuilt Guardrails/Hooks capability — no post-exec validation after edit/write/commit)
+is now **built and merged to `main`** (2 tasks + test fix wave, `e536ee2..36374a6`, merge `5f41db5`;
+spec `docs/superpowers/specs/2026-07-02-post-tool-validator-hook-design.md`). A config-driven
+`RuntimeConfig.post_tool_validators: Vec<String>` (serde-default empty = disabled, plumbed to
+`LoopConfig`) drives a **once-per-turn** validator pass in the agent loop: after Phase-3 tool-result
+append and before the stuck-nudge, iff at least one `Access::Write|Destroy` call resolved
+`Executed::Ok`, each configured command runs via `sh -c` through `self.config.sandbox` (a sink-free
+`run_validator` mirroring `shell.rs`'s launch + concurrent-pipe-drain + timeout/cancel select;
+4 KiB char-boundary-safe output cap; best-effort → a refusal/spawn-error/timeout/cancel is
+`Skipped`, NEVER a run failure). Failures append ONE user message ("Post-edit validation reported
+problems…") so the model fixes the break next turn; all-pass/all-skip append nothing. Each run
+emits a synthetic `post_tool_validate` ToolStart/ToolResult pair on the EXISTING event frames
+(old-SPA safe — no new kind; turn-unique ids; `SubagentSink` stamps `parent_id` for child runs, so
+attribution is free). `ReadyCall` gained an `access` field threaded from `intent.access` (Copy).
+Trusted config → NOT policy/approval-gated, but sandboxed. Whole-branch review adversarial probes
+all clean (no child-leak/deadlock: Drop + `kill_on_drop` + docker-kill backstop; zero `?`/unwrap
+escapes to run failure; read-only turns and failed mutations correctly excluded — the last pinned by
+a `FailStub` regression test added in the fix wave). Accepted residuals (merge-clean): `Skipped`
+folds into `SessionStats.tools_error` (spec-conformant, conflates skip/failure in the counter); a
+validator counts as a `tool_call` (spec-intended); unbounded read buffer before the 4 KiB cap
+(shell.rs parity); env allowlist means `cargo`/`npm` must be on the daemon PATH (same posture as
+`execute_command`); synthetic id repeats across `run()` calls at the same turn index (reducer pairs
+correctly). Deferred (spec out-of-scope): per-validator trigger filters, a subagent-scoped disable,
+blocking/veto (rollback) semantics, auto-fix (mutating validators).
+
 ---
 
 ## Top highest-leverage fixes
