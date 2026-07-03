@@ -346,6 +346,19 @@ impl CuratedContext {
         match run_compaction(&to_summarize, prior.as_ref(), deps.model, deps.cancel).await {
             Ok(summary) if compaction_is_worthwhile(&summary, &replaced) => {
                 let tokens_after = message_tokens(&summary);
+                // Monotone prior guard: the compaction prompt mandates a
+                // strict superset of the prior summary, so a candidate
+                // smaller than the prior it replaces is a degraded pass —
+                // the collapse mechanism under repeated re-compaction. Keep
+                // the prior; the span stays in history and is retried once
+                // it has grown. (`compaction_is_worthwhile` cannot catch
+                // this: a collapsed summary looks like a huge token win.)
+                if let Some(p) = prior.as_ref() {
+                    if tokens_after < message_tokens(p) {
+                        tracing::debug!("compaction shrank the prior summary; discarded");
+                        return;
+                    }
+                }
                 // Reassemble history: verbatim user instructions (chronological), then
                 // the recent window. The summarized chatter becomes the pinned summary.
                 let recent = self.history.split_off(split);
@@ -634,6 +647,38 @@ mod tests {
         );
         // The acks stay in history, awaiting a substantial span.
         assert!(c.history().iter().any(|m| m.content == "ok 0"));
+    }
+
+    #[tokio::test]
+    async fn shrinking_summary_is_rejected_keeping_prior() {
+        // The compaction prompt mandates a strict superset of the prior; a
+        // candidate SMALLER than the prior is by definition a degraded pass
+        // (the collapse mechanism under repeated re-compaction) and must be
+        // discarded — prior kept, span left in history for a later pass.
+        let mut c = ctx();
+        c.high_water_pct = 0.0; // force compaction
+        c.config.keep_recent = 1;
+        let fat_prior = format!(
+            "Summary of earlier conversation:\n{}",
+            "ledger entry detail ".repeat(30)
+        );
+        c.compaction_summary = Some(Message::system(fat_prior.clone()));
+        c.append(parent("c1"));
+        c.append(Message::tool("c1", "shell", "output ".repeat(60)));
+        c.append(Message::assistant("done", None));
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "No new information provided".into(),
+        )]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        assert_eq!(
+            report.compacted_turns, 0,
+            "shrinking candidate must be discarded"
+        );
+        assert_eq!(c.compaction_summary.as_ref().unwrap().content, fat_prior);
+        // The span stays in history for a later, larger pass.
+        assert!(c.history().iter().any(|m| matches!(m.role, Role::Tool)));
     }
 
     #[tokio::test]
