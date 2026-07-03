@@ -751,7 +751,7 @@ impl AgentLoop {
             } else {
                 self.config.max_parallel_tools
             };
-            let executed: Vec<(String, String, Executed, u64, Duration)> =
+            let executed: Vec<(String, String, Executed, u64, Duration, agent_tools::Access)> =
                 futures::stream::iter(ready.into_iter().map(|rc| {
                     let ReadyCall {
                         tool,
@@ -759,6 +759,7 @@ impl AgentLoop {
                         id,
                         name,
                         ctx,
+                        access,
                     } = rc;
                     // The effective per-call deadline (may be a tool's
                     // timeout_override, not the loop default) — logged on timeout.
@@ -766,13 +767,30 @@ impl AgentLoop {
                     async move {
                         let started = std::time::Instant::now();
                         let ex = execute_isolated(tool, args, &name, &ctx).await;
-                        (id, name, ex, started.elapsed().as_millis() as u64, timeout)
+                        (
+                            id,
+                            name,
+                            ex,
+                            started.elapsed().as_millis() as u64,
+                            timeout,
+                            access,
+                        )
                     }
                 }))
                 .buffer_unordered(cap)
                 .collect()
                 .await;
-            for (id, name, ex, duration_ms, timeout) in executed {
+            // A mutating turn is one where at least one Write/Destroy call ran to
+            // an Ok result. Read-only turns and turns whose only mutations failed
+            // do NOT trigger post-execution validation.
+            let turn_mutated = executed.iter().any(|(_, _, ex, _, _, access)| {
+                matches!(ex, Executed::Ok(_))
+                    && matches!(
+                        access,
+                        agent_tools::Access::Write | agent_tools::Access::Destroy
+                    )
+            });
+            for (id, name, ex, duration_ms, timeout, _access) in executed {
                 let resolved = match ex {
                     Executed::Ok(o) => Resolved::Ok(o, duration_ms),
                     Executed::ToolErr(s) => Resolved::Err {
@@ -857,6 +875,64 @@ impl AgentLoop {
                     }
                 };
                 ctx.append(Message::tool(id, name, content));
+            }
+
+            // Post-execution validation: once per turn, only when a mutating call
+            // succeeded and validators are configured. Emits synthetic
+            // `post_tool_validate` tool events (reusing existing ToolStart/ToolResult
+            // wire kinds) and appends any failures as a single user message so the
+            // model sees them. Sits AFTER the Phase-3 tool results and BEFORE the
+            // stuck-nudge append (OpenAI-compat ordering: a user message must not
+            // land between the assistant tool_calls and its Role::Tool results).
+            if turn_mutated && !self.config.post_tool_validators.is_empty() {
+                let mut failures: Vec<String> = Vec::new();
+                for (n, command) in self.config.post_tool_validators.iter().enumerate() {
+                    let vid = format!("validate:{}:{}", turn + 1, n);
+                    self.sink.emit(AgentEvent::ToolStart {
+                        id: vid.clone(),
+                        name: "post_tool_validate".into(),
+                        args: serde_json::json!({ "command": command }),
+                        parent_id: None,
+                    });
+                    let started = std::time::Instant::now();
+                    let outcome = run_validator(
+                        &self.config.sandbox,
+                        &self.config.workspace,
+                        command,
+                        self.config.tool_timeout,
+                        &cancel,
+                    )
+                    .await;
+                    let (status, content) = match &outcome {
+                        ValidatorOutcome::Passed => {
+                            (ToolStatus::Ok, "validator passed".to_string())
+                        }
+                        ValidatorOutcome::Failed { code, output } => {
+                            failures.push(format!("$ {command}  (exit {code})\n{output}"));
+                            (ToolStatus::Error, format!("exit {code}\n{output}"))
+                        }
+                        ValidatorOutcome::Skipped { reason } => {
+                            (ToolStatus::Error, format!("validator skipped: {reason}"))
+                        }
+                    };
+                    self.sink.emit(AgentEvent::ToolResult {
+                        id: vid,
+                        name: "post_tool_validate".into(),
+                        status,
+                        output: agent_tools::ToolOutput {
+                            content,
+                            display: None,
+                        },
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        parent_id: None,
+                    });
+                }
+                if !failures.is_empty() {
+                    ctx.append(Message::user(format!(
+                        "Post-edit validation reported problems. Fix these before continuing:\n\n{}",
+                        failures.join("\n\n")
+                    )));
+                }
             }
 
             // Constraint (b): the nudge goes in AFTER the turn's tool-result
@@ -975,6 +1051,9 @@ impl AgentLoop {
                 }
             }
         };
+        // Capture the access tier before `intent` may be moved into the
+        // `Decision::Ask` arm below (Access is Copy).
+        let access = intent.access;
         let allowed = match self.policy.check(&intent) {
             Decision::Allow => true,
             Decision::Deny(reason) => {
@@ -1046,6 +1125,7 @@ impl AgentLoop {
             id: call.id,
             name: call.name,
             ctx,
+            access,
         })
     }
 }
@@ -1057,6 +1137,9 @@ struct ReadyCall {
     id: String,
     name: String,
     ctx: ToolCtx,
+    /// The gated call's declared access tier — carried through execution so the
+    /// turn loop can tell a mutating turn (Write/Destroy) from a read-only one.
+    access: agent_tools::Access,
 }
 
 /// Outcome of gating a single call before execution.
@@ -1093,6 +1176,110 @@ enum Executed {
     Panicked(String),
     /// Dispatch timeout tripped — surfaced loudly.
     TimedOut(String),
+}
+
+/// Outcome of one post-execution validator command. Best-effort: a runner
+/// failure is `Skipped`, never a run failure.
+enum ValidatorOutcome {
+    Passed,
+    Failed { code: i32, output: String },
+    Skipped { reason: String },
+}
+
+const VALIDATOR_OUTPUT_CAP: usize = 4096;
+
+/// Run one validator command via `sh -c` through the sandbox, cwd = workspace.
+/// Sink-free (caller owns event emission). Combined stdout+stderr capped to
+/// VALIDATOR_OUTPUT_CAP (char-boundary safe). A degraded sandbox / spawn error /
+/// cancellation yields `Skipped`.
+async fn run_validator(
+    sandbox: &Arc<dyn agent_tools::SandboxStrategy>,
+    workspace: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> ValidatorOutcome {
+    use tokio::io::AsyncReadExt;
+    if cancel.is_cancelled() {
+        return ValidatorOutcome::Skipped {
+            reason: "run cancelled".into(),
+        };
+    }
+    let spec = agent_tools::CommandSpec {
+        program: "sh".into(),
+        args: vec!["-c".into(), command.to_string()],
+        cwd: workspace.to_path_buf(),
+        env: Default::default(),
+        kind: agent_tools::ProcKind::OneShot,
+    };
+    let mut child = match sandbox.launch(spec) {
+        Ok(c) => c,
+        Err(agent_tools::SandboxError::Unavailable(m)) => {
+            return ValidatorOutcome::Skipped {
+                reason: format!("sandbox refused: {m}"),
+            }
+        }
+        Err(e) => {
+            return ValidatorOutcome::Skipped {
+                reason: e.to_string(),
+            }
+        }
+    };
+    let mut out_pipe = child.take_stdout();
+    let mut err_pipe = child.take_stderr();
+    let read_out = async {
+        let mut s = String::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_string(&mut s).await;
+        }
+        s
+    };
+    let read_err = async {
+        let mut s = String::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_string(&mut s).await;
+        }
+        s
+    };
+    let run = async {
+        let (status, o, e) = tokio::join!(child.wait(), read_out, read_err);
+        (status, o, e)
+    };
+    let (status, stdout, stderr) = tokio::select! {
+        _ = cancel.cancelled() => return ValidatorOutcome::Skipped { reason: "run cancelled".into() },
+        r = tokio::time::timeout(timeout, run) => match r {
+            Ok(v) => v,
+            Err(_) => return ValidatorOutcome::Skipped { reason: format!("validator exceeded {timeout:?}") },
+        },
+    };
+    let mut combined = stdout;
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    let output = truncate_on_char_boundary(&combined, VALIDATOR_OUTPUT_CAP);
+    // status: io::Result<ExitStatus>. A signal-killed child has no code(); treat
+    // as failure.
+    let code = status.ok().and_then(|s| s.code());
+    match code {
+        Some(0) => ValidatorOutcome::Passed,
+        Some(c) => ValidatorOutcome::Failed { code: c, output },
+        None => ValidatorOutcome::Failed { code: -1, output },
+    }
+}
+
+/// Truncate to at most `cap` bytes on a char boundary, appending a marker when cut.
+fn truncate_on_char_boundary(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…(truncated)", &s[..end])
 }
 
 /// Run one tool with panic + timeout isolation. Sink-free and free of `'static`
@@ -5222,5 +5409,273 @@ mod tests {
             100_000,
             "low samples decay the ratio back to 1.0 (configured limit): {recorded:?}"
         );
+    }
+
+    // ---- post-execution validator hook (Task 2) ----------------------------
+
+    /// A deterministic Write-tier tool: intent declares `Access::Write`, execute
+    /// always succeeds. Lets a validator test drive a "mutating turn" without any
+    /// real fs coupling. Mirrors `HangsUntilCancel`'s trait shape.
+    struct WriteStub;
+    #[async_trait::async_trait]
+    impl Tool for WriteStub {
+        fn name(&self) -> &str {
+            "write_stub"
+        }
+        fn description(&self) -> &str {
+            "writes (test stub)"
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: "write_stub".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<agent_tools::ToolIntent, ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: "write_stub".into(),
+                access: agent_tools::Access::Write,
+                paths: vec![],
+                command: None,
+                summary: "write".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, ToolError> {
+            Ok(agent_tools::ToolOutput {
+                content: "wrote".into(),
+                display: None,
+            })
+        }
+    }
+
+    fn write_stub_registry() -> Arc<ToolRegistry> {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(WriteStub));
+        Arc::new(r)
+    }
+
+    /// Build a loop that scripts one `write_stub` call then finishes, with the
+    /// given validator list. Returns (agent, sink).
+    fn validator_loop(
+        ws: std::path::PathBuf,
+        validators: Vec<String>,
+        registry: Arc<ToolRegistry>,
+    ) -> (AgentLoop, Arc<DetailSink>) {
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "write_stub".into(), "{}".into()),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(DetailSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry,
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                post_tool_validators: validators,
+                ..Default::default()
+            },
+        );
+        (agent, sink)
+    }
+
+    fn appended_validation_msg(ctx: &WindowContext) -> Option<String> {
+        ctx.build(100_000)
+            .into_iter()
+            .find(|m| {
+                matches!(m.role, agent_model::Role::User)
+                    && m.content.contains("Post-edit validation reported problems")
+            })
+            .map(|m| m.content)
+    }
+
+    fn validate_events(sink: &DetailSink) -> Vec<(String, ToolStatus, String)> {
+        sink.tool_results
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _, _)| id.starts_with("validate:"))
+            .cloned()
+            .collect()
+    }
+
+    /// A write-tier tool succeeds, then a failing validator -> a validation
+    /// message is appended AND a `post_tool_validate` Error event is emitted.
+    #[tokio::test]
+    async fn failing_validator_appends_feedback_and_emits_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let (agent, sink) = validator_loop(
+            ws,
+            vec!["echo boom 1>&2; exit 3".into()],
+            write_stub_registry(),
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let ev = validate_events(&sink);
+        assert_eq!(
+            ev.len(),
+            1,
+            "one post_tool_validate result expected: {ev:?}"
+        );
+        assert_eq!(ev[0].1, ToolStatus::Error, "failing validator -> Error");
+        assert!(
+            ev[0].2.contains("exit 3") && ev[0].2.contains("boom"),
+            "event content carries exit code + output: {}",
+            ev[0].2
+        );
+
+        let appended = appended_validation_msg(&ctx).expect("validation feedback appended");
+        assert!(
+            appended.contains("boom") && appended.contains("exit 3"),
+            "appended user message carries the failure: {appended}"
+        );
+    }
+
+    /// A passing validator emits an Ok event but appends nothing to context.
+    #[tokio::test]
+    async fn passing_validator_emits_event_but_appends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let (agent, sink) = validator_loop(ws, vec!["true".into()], write_stub_registry());
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let ev = validate_events(&sink);
+        assert_eq!(
+            ev.len(),
+            1,
+            "one post_tool_validate result expected: {ev:?}"
+        );
+        assert_eq!(ev[0].1, ToolStatus::Ok, "passing validator -> Ok");
+        assert!(
+            appended_validation_msg(&ctx).is_none(),
+            "a passing validator appends no feedback message"
+        );
+    }
+
+    /// A read-only turn (the only call is a read_file) never runs validators.
+    #[tokio::test]
+    async fn read_only_turn_does_not_run_validators() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "BODY").unwrap();
+        let ws = dir.path().to_path_buf();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(DetailSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                post_tool_validators: vec!["false".into()],
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert!(
+            validate_events(&sink).is_empty(),
+            "read-only turn must emit no post_tool_validate events"
+        );
+        assert!(appended_validation_msg(&ctx).is_none());
+    }
+
+    /// An empty validator list is a strict no-op: a write-tier call succeeds and
+    /// still ZERO validator events fire (regression guard).
+    #[tokio::test]
+    async fn empty_validators_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let (agent, sink) = validator_loop(ws, vec![], write_stub_registry());
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert!(
+            validate_events(&sink).is_empty(),
+            "empty validator list must emit no post_tool_validate events"
+        );
+        assert!(appended_validation_msg(&ctx).is_none());
+        // The write tool itself still ran (Ok result) — the turn was unaffected.
+        let results = sink.tool_results.lock().unwrap().clone();
+        assert!(
+            results
+                .iter()
+                .any(|(id, st, _)| id == "c1" && *st == ToolStatus::Ok),
+            "the write call still executed normally: {results:?}"
+        );
+    }
+
+    /// `run_validator` caps combined output on a char boundary and marks the cut.
+    #[tokio::test]
+    async fn validator_helper_truncates_large_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox: Arc<dyn agent_tools::SandboxStrategy> = Arc::new(agent_tools::HostExecutor);
+        let cancel = CancellationToken::new();
+        let outcome = run_validator(
+            &sandbox,
+            dir.path(),
+            "yes x | head -c 20000; exit 3",
+            std::time::Duration::from_secs(5),
+            &cancel,
+        )
+        .await;
+        match outcome {
+            ValidatorOutcome::Failed { code, output } => {
+                assert_eq!(code, 3);
+                assert!(
+                    output.len() <= VALIDATOR_OUTPUT_CAP + 20,
+                    "output capped near VALIDATOR_OUTPUT_CAP, got {} bytes",
+                    output.len()
+                );
+                assert!(
+                    output.ends_with("(truncated)"),
+                    "truncated output carries the marker: {:?}",
+                    &output[output.len().saturating_sub(32)..]
+                );
+            }
+            other => panic!(
+                "expected Failed with capped output, got a different outcome: {}",
+                match other {
+                    ValidatorOutcome::Passed => "Passed",
+                    ValidatorOutcome::Skipped { .. } => "Skipped",
+                    ValidatorOutcome::Failed { .. } => unreachable!(),
+                }
+            ),
+        }
     }
 }
