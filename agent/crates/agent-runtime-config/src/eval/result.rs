@@ -23,6 +23,10 @@ pub struct RunResult {
     /// Some(matched) when the task defines a non-empty gold_trajectory.
     #[serde(default)]
     pub gold_matched: Option<bool>,
+    /// Wall-clock for the whole run in ms. DIAGNOSTIC ONLY — never gates
+    /// (shared llama server makes wall-clock noisy); tokens stay the cost metric.
+    #[serde(default)]
+    pub wall_ms: u64,
 }
 
 /// True iff `gold` (tool names) appears as an ordered subsequence of the
@@ -88,6 +92,7 @@ mod tests {
             trajectory: Vec::new(),
             denials: 0,
             gold_matched: None,
+            wall_ms: 0,
         }
     }
     fn step(tool: &str) -> TrajectoryStep {
@@ -133,6 +138,12 @@ mod tests {
         assert!(r.trajectory.is_empty());
         assert_eq!(r.denials, 0);
         assert_eq!(r.gold_matched, None);
+    }
+    #[test]
+    fn wall_ms_defaults_to_zero_on_old_jsonl() {
+        let old = r#"{"passed":true,"tokens":123,"turns":4}"#;
+        let r: RunResult = serde_json::from_str(old).unwrap();
+        assert_eq!(r.wall_ms, 0);
     }
     #[test]
     fn median_uses_only_passing_runs() {

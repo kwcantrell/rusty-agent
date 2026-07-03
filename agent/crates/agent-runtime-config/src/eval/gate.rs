@@ -59,6 +59,7 @@ mod tests {
                     trajectory: Vec::new(),
                     denials: 0,
                     gold_matched: None,
+                    wall_ms: 0,
                 })
                 .collect(),
         }
