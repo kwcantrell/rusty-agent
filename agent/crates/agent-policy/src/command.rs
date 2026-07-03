@@ -102,12 +102,43 @@ fn simple_command_is_catastrophic(argv: &[String]) -> Option<String> {
 /// /dev/ is a device write sink and is denied. Deny-by-default with a small
 /// allowlist is the same fail-safe posture as the `dd of=` handler (which is
 /// stricter still: it denies ALL of=/dev/* including /dev/null).
+///
+/// The target's leading path structure is normalized before the /dev match so
+/// redundant `/`-runs and `.` segments cannot dodge it: `//dev/sda`,
+/// `/./dev/sda`, and `/dev/./sda` all resolve to a write UNDER /dev and deny.
+/// `..` is deliberately NOT collapsed — doing so could turn a deny into an
+/// allow — so `..` forms (`/dev/../dev/sda`) keep denying via over-
+/// approximation. Only an absolute path can name a device node, so a relative
+/// `dev/sda` (an ordinary cwd file) is not this handler's concern. `/dev/shm/…`
+/// is a standard world-writable tmpfs (files, not devices) and is allowed,
+/// alongside the `/dev/fd/…` fds.
 fn dev_redirect_target_is_safe(target: &str) -> bool {
-    let Some(suffix) = target.strip_prefix("/dev/") else {
-        return true; // not a /dev path: not this handler's concern
-    };
+    // Only an absolute path can name a /dev device node; a relative target is a
+    // normal file and not this handler's concern.
+    if !target.starts_with('/') {
+        return true;
+    }
+    // Normalize the leading path structure: drop empty (`//`-run) and `.`
+    // segments while PRESERVING `..` (collapsing it could unsafe-ify a deny).
+    let segments: Vec<&str> = target
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .collect();
+    // Must be a path UNDER /dev — first real segment `dev` plus at least one
+    // more segment. Bare `/dev` is a directory, not a device write sink.
+    if segments.first() != Some(&"dev") || segments.len() < 2 {
+        return true; // not a (sub-)/dev path: not this handler's concern
+    }
+    // A `..` segment escapes upward (`/dev/shm/../sda` and `/dev/fd/../sda` both
+    // resolve to /dev/sda). We do NOT resolve it; instead any /dev-rooted target
+    // carrying `..` is denied (over-approximation) — this keeps the brief's `..`
+    // deny posture AND stops `..` slipping past the `fd/`/`shm/` prefixes.
+    if segments.contains(&"..") {
+        return false;
+    }
+    let suffix = segments[1..].join("/");
     matches!(
-        suffix,
+        suffix.as_str(),
         "null"
             | "zero"
             | "full"
@@ -119,6 +150,7 @@ fn dev_redirect_target_is_safe(target: &str) -> bool {
             | "tty"
             | "ptmx"
     ) || suffix.starts_with("fd/")
+        || suffix.starts_with("shm/")
 }
 
 /// Strip a redirect-operator prefix from a token: optional fd digit-run or `&`,
@@ -147,7 +179,9 @@ fn redirect_catastrophe_in_argv(argv: &[String]) -> Option<String> {
             } else {
                 rest
             };
-            if target.starts_with("/dev/") && !dev_redirect_target_is_safe(target) {
+            // No literal `/dev/` pre-gate: the predicate normalizes the target
+            // itself, so `//dev/sda`, `/./dev/sda`, `/dev/./sda` are all caught.
+            if !dev_redirect_target_is_safe(target) {
                 return Some("redirection writing to a device file is denied".to_string());
             }
         }
@@ -177,16 +211,16 @@ fn raw_redirect_catastrophe(cmd: &str) -> Option<String> {
                 j += 1;
             }
             let rest = &cmd[j..];
-            if rest.starts_with("/dev/") {
-                let end = rest
-                    .find(|c: char| {
-                        c.is_ascii_whitespace()
-                            || matches!(c, '"' | '\'' | '&' | '|' | ';' | ')' | '`')
-                    })
-                    .unwrap_or(rest.len());
-                if !dev_redirect_target_is_safe(&rest[..end]) {
-                    return Some("redirection writing to a device file is denied".to_string());
-                }
+            // Extract the target token to the next shell delimiter and let the
+            // normalized predicate decide. No literal `/dev/` pre-gate, so the
+            // `//dev`, `/./dev`, `///dev` spellings enter the same as `/dev`.
+            let end = rest
+                .find(|c: char| {
+                    c.is_ascii_whitespace() || matches!(c, '"' | '\'' | '&' | '|' | ';' | ')' | '`')
+                })
+                .unwrap_or(rest.len());
+            if !dev_redirect_target_is_safe(&rest[..end]) {
+                return Some("redirection writing to a device file is denied".to_string());
             }
             i = j;
         } else {
@@ -782,6 +816,47 @@ mod tests {
             assert!(
                 hard_floor_violation(cmd, &[]).is_some(),
                 "expected deny (>& device write): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_path_normalization_bypasses_are_denied() {
+        // Linux collapses `/`-runs and `.` segments, so these WRITE to /dev/sda
+        // yet the old literal `/dev/` prefix compare missed them. Normalizing the
+        // target's leading path structure closes the bypass.
+        for cmd in [
+            "echo x > //dev/sda",
+            "echo x >//dev/sda", // glued, doubled slash
+            "echo x > ///dev/sda",
+            "echo x > /./dev/sda",
+            "echo x > /dev/./sda", // `.` segment between dev and the device
+            "echo x > /dev/../dev/sda", // `..` kept (over-approx) → still denies
+            "echo x > /dev/shm/../sda", // `..` escapes /dev/shm back to a device
+            "echo x > /dev/fd/../sda", // `..` escapes /dev/fd back to a device
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_some(),
+                "expected deny (normalized /dev write): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_safe_dev_and_shm_are_not_denied() {
+        // Normalization must not over-deny: safe /dev sinks reached via redundant
+        // `/`/`.` segments stay safe, and /dev/shm is a world-writable tmpfs (a
+        // file, not a device) so writes under it are allowed.
+        for cmd in [
+            "echo x > /dev/shm/f",     // tmpfs file, not a device
+            "echo x > //dev/null",     // doubled slash, safe sink
+            "cmd > /dev/./null",       // `.` segment, safe sink
+            "echo x > /dev/fd/3",      // fd still safe after normalization
+            "echo x > /dev/shm/sub/f", // nested tmpfs path
+        ] {
+            assert!(
+                hard_floor_violation(cmd, &[]).is_none(),
+                "must not deny (safe after normalization): {cmd}"
             );
         }
     }

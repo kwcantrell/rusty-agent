@@ -106,7 +106,8 @@ task defines a non-empty gold, `None` otherwise. The gate (gate.rs) is UNCHANGED
   allow, `git log --output=/tmp/x` → ask (cluster 4), `git diff
   --output-indicator-new=+` → allow, `cargo build` → allow, `bash -c "sudo x"` → ask,
   `dd of=/dev/sda` → deny, `echo x > /dev/sda` → ask (redirection asymmetry,
-  documented). Expected values are pinned from CURRENT behavior — the corpus is a
+  documented; behavior changed to deny as of the /dev-redirect-denial spec,
+  2026-07-02). Expected values are pinned from CURRENT behavior — the corpus is a
   regression net, not a wishlist; rows that document accepted asymmetries carry a
   `#` comment saying so.
 

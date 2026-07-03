@@ -172,7 +172,7 @@ deny	rm  -rf   /
 deny	:(){ :|:& };:
 deny	mkfs.ext4 /dev/sda1
 deny	dd if=/dev/zero of=/dev/sda
-ask	echo x > /dev/sda	# redirection asymmetry — documented, reaches Ask not Deny
+ask	echo x > /dev/sda	# redirection asymmetry — documented, reaches Ask not Deny (behavior changed to Deny as of the /dev-redirect-denial spec, 2026-07-02)
 ask	git push --force
 ask	git reset --hard
 ask	git clean -fdx
