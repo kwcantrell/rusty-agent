@@ -16,6 +16,7 @@ use agent_model::{Message, OpenAiCompatClient};
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse};
 use agent_runtime_config::eval::{CandidateConfig, RunResult, TaskSpec, TrajectoryStep};
 use agent_runtime_config::{assemble_loop, LoopParts, RuntimeConfig};
+use agent_sandbox::docker_run_args;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,6 +29,10 @@ const EVAL_DEFAULT_PROMPT: &str =
 /// context/memory tools are allowed; `execute_command` only for read-only commands.
 struct SafeApproval {
     denied: Mutex<Vec<String>>,
+    /// True for exec_profile == "node-offline": node/npx/vite/vitest/tsc are
+    /// approvable because execution is docker-contained (network none, read-only
+    /// root). NOT extended to npm install/ci — offline by construction.
+    node_profile: bool,
 }
 #[async_trait::async_trait]
 impl ApprovalChannel for SafeApproval {
@@ -51,7 +56,8 @@ impl ApprovalChannel for SafeApproval {
                             // build/check its work. Bounded: eval crates are std-only, no deps,
                             // no build.rs — so cargo only invokes rustc on trusted local source.
                             | "cargo"
-                    )
+                    ) || (self.node_profile
+                        && matches!(base, "node" | "npx" | "tsc" | "vitest" | "vite"))
                 })
                 .unwrap_or(false),
             _ => false,
@@ -117,11 +123,26 @@ async fn eval_context_run() {
     )
     .unwrap();
     let hidden = std::env::var("HIDDEN_TESTS_DIR").expect("set HIDDEN_TESTS_DIR");
+    let task_json_path = std::path::PathBuf::from(std::env::var("TASK_JSON").unwrap());
+    let task_dir = task_json_path.parent().expect("TASK_JSON has a parent dir").to_path_buf();
+    let node_offline = task.exec_profile.as_deref() == Some("node-offline");
 
     // Throwaway workspace + seed files. Memory store SHARED across sessions; each
     // session gets a FRESH window (new CuratedContext + new offload store).
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().to_path_buf();
+    if let Some(sd) = &task.seed_dir {
+        let src = task_dir.join(sd);
+        assert!(src.is_dir(), "seed_dir {} missing — run the task's seed.sh first", src.display());
+        // cp -a preserves the node_modules tree (symlinked .bin entries included).
+        let st = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(format!("{}/.", src.display()))
+            .arg(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "seed_dir copy failed");
+    }
     for sf in &task.seed_files {
         let dest = ws.join(&sf.path);
         if let Some(parent) = dest.parent() {
@@ -136,8 +157,10 @@ async fn eval_context_run() {
     // stay in scope at RunResult construction below.
     let approval = Arc::new(SafeApproval {
         denied: Mutex::new(Vec::new()),
+        node_profile: node_offline,
     });
 
+    let started = std::time::Instant::now();
     for session in &task.sessions {
         let protocol = cc.resolved_protocol("native").to_string();
         let mut cfg = RuntimeConfig::from_launch(
@@ -149,8 +172,18 @@ async fn eval_context_run() {
         );
         cfg.context_limit = cc.context_limit; // realistic (or favorable) window
         cfg.memory = task.memory_enabled && cc.memory_enabled;
-        cfg.sandbox_mode = "off".into();
-        cfg.max_turns = 12;
+        if node_offline {
+            // Phase-0 node-offline profile (spec 2026-07-03): enforced docker
+            // sandbox, pinned node image, network stays none (the default).
+            cfg.sandbox_mode = "enforce".into();
+            cfg.sandbox_image = "node:22-bookworm-slim".into();
+            cfg.sandbox_memory = "4g".into();
+            cfg.sandbox_pids = 1024;
+        } else {
+            cfg.sandbox_mode = "off".into();
+        }
+        cfg.max_turns = 12; // historical default; candidates override via max_turns
+        cc.apply_to(&mut cfg);
         // Additive eval hook: let a run opt into a skills catalog so example-bearing
         // skills (list_skills/use_skill/read_skill_file) are exercised. Unset = no skills.
         if let Ok(d) = std::env::var("SKILLS_DIR") {
@@ -233,10 +266,11 @@ async fn eval_context_run() {
                 .with_offload_config(cc.offload_config())
                 .with_high_water_pct(cc.high_water_pct);
 
+        let per_prompt = Duration::from_secs(task.prompt_timeout_secs.unwrap_or(120));
         for prompt in &session.prompts {
             let cancel = tokio_util::sync::CancellationToken::new();
             let run = agent.run_with_cancel(&mut ctx, prompt.clone(), cancel.clone());
-            let _ = tokio::time::timeout(Duration::from_secs(120), run).await;
+            let _ = tokio::time::timeout(per_prompt, run).await;
         }
     }
 
@@ -249,12 +283,48 @@ async fn eval_context_run() {
             std::fs::copy(e.path(), dest.join(e.file_name())).unwrap();
         }
     }
-    let status = std::process::Command::new("bash")
-        .arg("-c")
-        .arg(&task.test_cmd)
-        .current_dir(&ws)
-        .status()
-        .unwrap();
+    let status = if node_offline {
+        // Grade INSIDE the same container profile: vitest/vite execute agent-written
+        // code (untrusted output) — it gets the same boundary as the agent.
+        let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+        let gid = String::from_utf8(std::process::Command::new("id").arg("-g").output().unwrap().stdout).unwrap();
+        let policy = agent_sandbox::SandboxPolicy {
+            mode: agent_tools::Mode::Enforce,
+            image: "node:22-bookworm-slim".into(),
+            network: false,
+            limits: agent_tools::Limits {
+                memory: "4g".into(),
+                cpus: "2".into(),
+                pids: 1024,
+                fsize: None,
+                tmp_size: "256m".into(),
+            },
+            extra_rw: vec![],
+            extra_ro: vec![],
+        };
+        let spec = agent_tools::CommandSpec {
+            program: "bash".into(),
+            args: vec!["-c".into(), task.test_cmd.clone()],
+            cwd: ws.clone(),
+            env: Default::default(),
+            kind: agent_tools::ProcKind::OneShot,
+        };
+        let name = format!("eval-grade-{}", std::process::id());
+        let args = docker_run_args(
+            &policy,
+            &spec,
+            &name,
+            &format!("{}:{}", uid.trim(), gid.trim()),
+        );
+        std::process::Command::new("docker").args(&args).status().unwrap()
+    } else {
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&task.test_cmd)
+            .current_dir(&ws)
+            .status()
+            .unwrap()
+    };
 
     // Denials go to stderr only (prefixed `eval-denied:`); stdout stays exactly one JSON line.
     let denied = approval.denied.lock().unwrap();
@@ -277,6 +347,7 @@ async fn eval_context_run() {
         trajectory,
         denials: denied.len(),
         gold_matched,
+        wall_ms: started.elapsed().as_millis() as u64,
     };
     println!("{}", serde_json::to_string(&result).unwrap());
 }
