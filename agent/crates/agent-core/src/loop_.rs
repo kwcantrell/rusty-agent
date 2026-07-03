@@ -474,6 +474,26 @@ impl AgentLoop {
                 self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
                 return Ok(());
             }
+            // Curate BEFORE building, so every model call sees a maintained
+            // window — including the just-appended user prompt. Start-of-turn
+            // also covers text-only turns, whose early `return` skipped the
+            // old end-of-turn pass entirely: a pure chat conversation was
+            // never curated at all, only silently truncated by build().
+            let deps = crate::MaintCtx {
+                model_limit: self.effective_model_limit(),
+                model: self.maint_model(),
+                sink: &self.sink,
+                cancel: &cancel,
+            };
+            let report = ctx.maintain(&deps).await;
+            if report.offloaded > 0 || report.compacted_turns > 0 {
+                tracing::debug!(
+                    offloaded = report.offloaded,
+                    offloaded_bytes = report.offloaded_bytes,
+                    compacted_turns = report.compacted_turns,
+                    "context maintained"
+                );
+            }
             let messages = ctx.build(self.effective_model_limit());
             // The chars/4 estimate for the request actually sent; reused for both the
             // Usage event and the post-completion calibration sample. The
@@ -944,22 +964,6 @@ impl AgentLoop {
                      repeating them will not change the result. Change your approach, or \
                      reply with a summary and no tool call if you are done.",
                 ));
-            }
-
-            let deps = crate::MaintCtx {
-                model_limit: self.effective_model_limit(),
-                model: self.maint_model(),
-                sink: &self.sink,
-                cancel: &cancel,
-            };
-            let report = ctx.maintain(&deps).await;
-            if report.offloaded > 0 || report.compacted_turns > 0 {
-                tracing::debug!(
-                    offloaded = report.offloaded,
-                    offloaded_bytes = report.offloaded_bytes,
-                    compacted_turns = report.compacted_turns,
-                    "context maintained"
-                );
             }
         }
         // Budget exhausted with the model still tool-hungry (text-only replies
@@ -4704,6 +4708,76 @@ mod tests {
         fn request_compaction(&mut self) {
             self.compaction_requests += 1;
         }
+    }
+
+    /// Context stub recording the order of maintain() and build() calls.
+    struct SeqCtx {
+        history: Vec<Message>,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+    #[async_trait::async_trait]
+    impl ContextManager for SeqCtx {
+        fn append(&mut self, m: Message) {
+            self.history.push(m);
+        }
+        fn set_system(&mut self, _: Message) {}
+        fn set_recall(&mut self, _: Vec<String>) {}
+        fn set_goal(&mut self, _: String) {}
+        fn build(&self, _limit: usize) -> Vec<Message> {
+            self.calls.lock().unwrap().push("build");
+            self.history.clone()
+        }
+        async fn maintain(&mut self, _deps: &crate::MaintCtx<'_>) -> crate::MaintReport {
+            self.calls.lock().unwrap().push("maintain");
+            crate::MaintReport::default()
+        }
+        fn request_compaction(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn text_only_turn_maintains_before_the_model_call() {
+        // The text-reply exit used to return before the end-of-turn maintain,
+        // so a pure chat run was never curated at all — only silently
+        // truncated by build(). Start-of-turn maintenance must cover it, and
+        // must run BEFORE the window is built so the model call sees the
+        // curated context.
+        let ws = std::env::temp_dir();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "just a chat reply".into(),
+        )]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = SeqCtx {
+            history: vec![],
+            calls: Default::default(),
+        };
+        agent.run(&mut ctx, "hello".into()).await.unwrap();
+        let calls = ctx.calls.lock().unwrap().clone();
+        assert!(
+            calls.contains(&"maintain"),
+            "a text-only run must still be curated: {calls:?}"
+        );
+        let m = calls.iter().position(|c| *c == "maintain").unwrap();
+        let b = calls.iter().position(|c| *c == "build").unwrap();
+        assert!(m < b, "maintain must precede the first build: {calls:?}");
     }
 
     #[tokio::test]
