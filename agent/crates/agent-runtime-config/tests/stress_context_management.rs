@@ -387,10 +387,14 @@ async fn repeated_compaction_keeps_history_bounded_and_coherent() {
         );
     }
 
-    // Compaction actually happened repeatedly (not a no-op test).
+    // Compaction actually happened repeatedly (not a no-op test). It batches:
+    // each turn's summarizable span is one ~100-est-tok assistant ack, below
+    // TRIVIAL_CHATTER_SPAN_TOKENS, so the summarizer re-runs roughly every
+    // 3rd turn — per-turn re-compaction over trivia degrades the running
+    // summary (see curated.rs).
     assert!(
-        compactions >= 50,
-        "compaction should fire most turns; got {compactions}"
+        compactions >= 25,
+        "compaction should fire regularly (batched); got {compactions}"
     );
 
     let built = ctx.build(MODEL_LIMIT);
