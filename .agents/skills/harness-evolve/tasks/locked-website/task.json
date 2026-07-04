@@ -1,0 +1,28 @@
+{
+  "id": "locked-website",
+  "mode": "code",
+  "realistic_window": 3000,
+  "favorable_window": 196608,
+  "memory_enabled": false,
+  "exec_profile": "node-offline",
+  "seed_dir": "seed",
+  "prompt_timeout_secs": 600,
+  "seed_files": [],
+  "test_cmd": "bash hidden_tests/check.sh",
+  "sessions": [
+    {
+      "prompts": [
+        "You are working in a fresh Vite + TypeScript workspace: config files only, there is no src/ directory yet — you will build the whole site from scratch. Over the next messages I will give you the requirements one at a time; do NOT write any code until I say so. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): the site is a hash-routed multi-page app; src/router.ts must export routeFor(path) returning {title, body} for known routes or null for unknown ones. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): the route '/' must have the title 'Orbit Books Home' and its body must include the text 'Welcome to Orbit Books'. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): the route '/catalog' must have the title 'Book Catalog' and its body must include 'Browse our shelves'. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): the route '/contact' must have the title 'Contact Orbit' and its body must include 'orbit@example.com'. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): src/catalog.ts must export formatBook(raw) mapping a raw record {title, price_cents, in_stock} to a view {title, price, availability}; 'title' passes through unchanged. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): in formatBook, 'price_cents' maps to 'price' as a dollar string with two decimals, e.g. 1999 becomes '$19.99' and 500 becomes '$5.00'. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): in formatBook, 'in_stock' true maps to availability 'In stock' and false maps to 'Out of stock'. Acknowledge in one sentence.",
+        "Read noise.txt in full with read_file. Then note this requirement (no code yet): you must also write your own test file src/catalog.test.ts with vitest, covering every route (including an unknown route returning null) and formatBook for both availability values. Acknowledge in one sentence.",
+        "Now build the whole site to satisfy EVERY requirement from the previous messages: create src/main.ts (render the current hash route into #app; on '/catalog' also fetch /catalog.json and append each book via formatBook), src/router.ts, src/catalog.ts, and src/catalog.test.ts. Use write_file to save each file. Then verify your work by running 'npx vitest run' and 'npx tsc --noEmit' with execute_command, fix any failures, and finish with a one-line summary."
+      ]
+    }
+  ]
+}

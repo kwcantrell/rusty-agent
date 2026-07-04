@@ -1,0 +1,5 @@
+[
+  { "title": "Dune", "price_cents": 1999, "in_stock": true },
+  { "title": "Foundation", "price_cents": 1450, "in_stock": false },
+  { "title": "Hyperion", "price_cents": 500, "in_stock": true }
+]
