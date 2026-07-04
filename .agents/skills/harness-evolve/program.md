@@ -242,3 +242,53 @@ never retries a logged dead end. Campaign spec:
   attack a different mechanism entirely (axis-3 sampler; axis-4 tool
   descriptions).** H1 descendants are a logged dead end absent NEW
   trajectory evidence of a different mechanism.
+
+### Iteration 4 (2026-07-03) — H2: verify-before-done exit-gate SKILL (axis 2, Tier A′) — REJECTED BY GUARD SWEEP (non-improvement 4/6)
+
+- **Seam discoveries (before designing):** (1) `build_skills` registers the
+  four skill tools UNCONDITIONALLY and `SKILLS_AWARENESS` is appended to every
+  system prompt — the champion has always paid the skill-machinery tax, so a
+  preset's marginal always-on cost is its body only. (2) Observed discovery
+  base rate of on-demand loading: **0 list_skills calls in ~40 runs** across
+  iterations 1–3 — advertise-only `skills_dirs` delivery is a no-op at this
+  window/model; preload (`active_skills`) is the only viable Tier-A′ delivery.
+  (3) Skill tools declare Access::Read with no paths → auto-Allow (never hit
+  the eval approval channel); create_skill is Write → denied. (4) A missing
+  preset drops SILENTLY from the prompt (warn only) — smoke-run for "active
+  skill not found" before any batch, or a bad path yields a champion clone.
+- **Hypothesis:** the stop-early failure is an EXIT problem; a lean exit-gate
+  checklist (~100 tok body), preloaded as a skill, converts prose exits into
+  write+verify WITHOUT the H1 family's taxes (no restate ritual, no
+  "immediately", no gather clause).
+- **Change (Tier A′):** skill at `artifacts/agent-skills/verify-before-done-v1/
+  verify-before-done/SKILL.md` (exit gate: 1. files written this turn? 2.
+  requested verification run? 3. green, else fix+re-run; only then reply).
+  cand = champion_v0 + `skills_dirs=[<abs variant root>]` +
+  `active_skills=["verify-before-done"]`. Smoke run confirmed preset resolves.
+- **Paired batch (interleaved, N=5, web-multipage @ 3000):** champ 2/5
+  (passing 83,152/85,665; median 84,409); cand 2/5 (passing 74,053/84,613;
+  median 79,333). `eval_gate` → **Promote** (equal passes, −6% median —
+  THIN margin, N=2 passing each). Shape: the gate CONTENT WORKED — every cand
+  run wrote AND attempted verification (champ: 2 failures wrote but executed
+  NOTHING). New pathology: **deny-amplified unbounded verify loops** — failing
+  cand runs hit 56/58 turns / 196–214K tok reaching for deny-listed `npm test`/
+  `npm install` (instead of the task's npx vitest/tsc), getting denied,
+  find/ls-reorienting, retrying. "Fix and re-run" has no budget bound and no
+  command guidance.
+- **Guard sweep (H2 genome overlaid; roster FIRST, fail-fast):**
+  **mem-roster 5/10** (ceiling ≥9/10) → sweep aborted, nothing else run.
+  Failure signature IDENTICAL to H1's kill: 4/5 failures miss exactly RV-219
+  (one missed 3 codes); 8/8 stored, 2–3 generic recalls, write, stop.
+- **Verdict: REJECT.** Champion stays v0. **Learning: completion-oriented
+  directives in the ALWAYS-ON context (H1's restate-act paragraph, H2's
+  exit-gate checklist — different content, same effect) displace a task's own
+  embedded completeness criterion ("ALL 8 codes") — the checklist becomes the
+  salient definition of done and k=5-bounded recall stops one short,
+  deterministically. Roster has now killed BOTH act-discipline candidates;
+  roster-first fail-fast is validated (saved ~45 min).** Open control
+  question for a future diagnostic spike: size-vs-content — does an INERT
+  preload of equal size also depress roster (window squeeze), or is it the
+  completion semantics? Queued next: (a) verify-loop budget + allowed-command
+  guidance if any exit-gate descendant is tried (must also solve roster);
+  (b) axis-3 sampler (temperature — provably curation-inert, reduced sweep);
+  (c) the size-vs-content control spike.
