@@ -618,3 +618,32 @@ every one **0/5** (== champion). Diffs archived in `attic/2026-07-02-overflow-fo
   Paired N=6: champion **0/6** vs candidate **3/6**. `gate` → `Reject: no passing runs…`
   (token artifact); **PROMOTED on correctness** (3 > 0). New unit test
   `maintain_keeps_user_instructions_verbatim_through_compaction`; stress test updated. **Kept.**
+
+## Guard-config clarification (2026-07-03 night / 07-04) — roster "ceiling drift" RESOLVED: config mismatch, ceilings STAND
+
+- **Suspicion (harness-evolve iteration 6, 2026-07-04):** an "unmodified
+  baseline" memory-roster batch scored 5/10 against the recorded ≥9/10 ceiling
+  → both campaigns flagged GUARD-CEILING DRIFT and queued a server-restart
+  re-baseline of all admitted rates.
+- **Resolution (this record, after a fresh `llama-agent` restart, same night,
+  N=10 each):** roster @ `tasks/memory-roster/realistic.json` = **2/10**;
+  roster @ champion params (`realistic.json` + `default_k=10`) = **10/10**
+  (storage 8/8 every run in both; Fisher p≈7e-5). **There was no drift.**
+  `realistic.json` is FROZEN at its admit-time `default_k=5`, whose documented
+  rate is 1/5 (#M1: "1/5 at k=5 … 5/5 at k=10"); every roster ceiling (9/10,
+  5/5) was recorded under champion k=10. harness-evolve's guard sweeps
+  (iterations 1–6) ran roster @ `realistic.json` — an admission red-side
+  config — and compared against the champion-config ceiling. The iteration-6
+  arms (5/10, 3/10, 3/10) and tonight's 2/10 are ordinary draws from the k=5
+  config's ~0.2–0.35 true rate.
+- **Consequences:** (1) THIS campaign's admitted ceilings are all VALID —
+  nothing to correct; the queued full re-baseline is cancelled. (2) New file
+  `tasks/memory-roster/champion_k10.json` (= realistic.json + `default_k=10`,
+  dedup 0.99 kept — construction necessity) is the canonical roster GUARD
+  config; sweeps must never grade roster on `realistic.json`. (3) The paired
+  guard protocol adopted 2026-07-04 (interleaved baseline+candidate arms,
+  relative criterion) STAYS — it is exactly what catches both real drift and
+  this class of config error. (4) General learning: **a guard ceiling is a
+  (config, rate) pair — a task id is not enough.** Admission configs are
+  deliberately red-side and must never be reused as guard configs after the
+  champion moves past them.

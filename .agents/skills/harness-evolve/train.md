@@ -17,12 +17,21 @@ after K=6 consecutive non-improvements; then run the locked task once.
 5. **Gate:** `eval_gate gate champ.jsonl cand.jsonl`. Known artifacts: 0-pass
    champion → token-artifact Reject (read passes() directly; strictly-more-
    passes = promote); passes-increased → token Reject artifact (same rule).
-6. **GUARD SWEEP — NOT OPTIONAL.** Before any promotion:
+6. **GUARD SWEEP — NOT OPTIONAL, and PAIRED (protocol since 2026-07-04).**
+   Before any promotion, run interleaved baseline+candidate arms the same
+   night on:
    - harness-evolve held-outs (as they accrue), AND
    - **context-evolve's admitted set** at its v4 ceilings: longhaul-manifest
      5/5 (20/20 entries), locked-portmap 10/10, drift-ledger ≥11/12,
      longhaul-codename 5/5, offload-recall 5/5, memory-recall 5/5 (REAL
      embeddings), memory-roster ≥9/10 (~5–10%/batch storage-slip noise).
+   The criterion is RELATIVE no-regression vs the paired baseline arm;
+   historical absolute ceilings are sanity references only.
+   **A guard ceiling is a (config, rate) pair.** memory-roster's ceiling holds
+   at `tasks/memory-roster/champion_k10.json` (champion params, default_k=10)
+   — NEVER at `realistic.json` (admit-time red-side, default_k=5, true rate
+   ~0.2–0.35; grading a sweep on it manufactured the 2026-07-04 phantom-drift
+   episode). Roster runs FIRST with fail-fast on the paired comparison.
    Tier-A changes provably inert to curation (e.g. sampler-only) may run a
    reduced sweep; Tier B / prompt / skills / tools changes run it ALL. When in
    doubt, full sweep.
