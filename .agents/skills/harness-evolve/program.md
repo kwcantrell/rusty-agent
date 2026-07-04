@@ -331,3 +331,57 @@ never retries a logged dead end. Campaign spec:
   (convention decision, not unilateral); (ii) the size-vs-content control
   spike is now three-ways motivated. K=5/6 — the NEXT non-improvement
   triggers mandatory stop + the one-shot locked-task run.
+
+### Iteration 6 (2026-07-03) — size-vs-content roster CONTROL SPIKE — ANOMALY: THE BASELINE ITSELF DRIFTED; K=6/6, TRAINING PHASE STOPPED
+
+- **Design (pre-registered before running):** 3 arms, same-night, interleaved
+  ×10 rounds, all memory-roster @ realistic.json + real embeddings:
+  B = unmodified baseline; A = inert size-matched preload
+  (`artifacts/agent-skills/inert-control-v1/workspace-notes/`, ~115 tok,
+  numbered-list structure mirroring H2's, zero action/completion/gather
+  semantics); C = H2's verify-before-done preload re-run. Pre-registered
+  readings included: "B < 9/10 → the ceiling itself drifted; all prior roster
+  attributions get an asterisk; escalate + stop."
+- **Result: B 5/10, A 3/10, C 3/10.** Within-night arm differences are NOT
+  significant (B vs A Fisher p≈0.65) — no detectable size effect, no
+  detectable content effect. THE ANOMALY BRANCH FIRED: the unmodified
+  champion-v4 roster config scored 5/10 against its recorded 9/10 ceiling.
+  Tonight's pooled rate 11/30 ≈ 0.37 vs the v4-era 9/10s — baseline drift far
+  beyond the documented 5–10% storage-slip noise. All arms' failures still
+  pivot on RV-219 (B: 5/5 failures miss exactly it).
+- **Eval-bug hypothesis KILLED at source:** memory.db is created inside a
+  fresh per-run tempdir (eval_context.rs:176,202) and scope is per-run —
+  cross-run store accumulation is impossible. Remaining suspects: llama-server
+  state after 4 days uptime + hundreds of runs tonight (KV/--cache-ram
+  fragmentation), or the true roster rate was always ~0.6–0.75 and the
+  recorded 9/10s were favorable draws. A server-restart re-baseline (Tier-C
+  re-baselining event by definition) is the next diagnostic.
+- **EVIDENTIARY CASCADE (re-adjudication of iterations 1–5's roster kills):**
+  - **H2 (exit-gate skill): roster 5/10 == tonight's same-night baseline
+    5/10 → the kill is UNSUPPORTED.** H2's training-gate Promote (thin) now
+    lacks a valid guard rejection. NOT auto-resurrected: re-adjudication
+    needs a PAIRED sweep under a re-baselined server.
+  - **H3 (temp 0.6): roster 3/10 == arms A/C tonight → indistinguishable
+    from drifted baseline; kill UNSUPPORTED** (its training margin was
+    noise-level anyway).
+  - **H1 (restate+act-now prompt): 0/10 stays likely-real** (p≈0.03 even vs
+    tonight's depressed 5/10; mechanistically coherent RV-219+immediate-write
+    story) — but carries the asterisk.
+  - The gather-loop-dynamics "structural tension" learning from iteration 5
+    is DOWNGRADED to hypothesis: the three "different mechanisms, one kill"
+    may have been one drifting baseline observed three times.
+- **METHODOLOGICAL FINDING (applies to BOTH campaigns): the guard sweep
+  design violated the campaigns' own same-night-pairing rule.** Training
+  batches were always paired; guard sweeps compared candidate-overlay runs
+  against HISTORICAL absolute ceilings. Under baseline drift this
+  manufactures phantom kills (H2, H3) and could equally mask real ones.
+  **New protocol from here: guard sweeps run PAIRED — interleaved baseline
+  arm + candidate arm, same night, relative no-regression criterion (e.g.
+  candidate within Fisher-noise of its paired baseline) instead of absolute
+  ceilings.** Roster-first fail-fast stays, applied to the PAIRED comparison.
+- **Verdict: no promotion attempted (diagnostic spike). K=6/6 by the literal
+  train.md count → TRAINING PHASE STOPPED.** Next steps are owner-level:
+  (1) server restart + re-baseline of BOTH campaigns' guard rates (paired
+  protocol); (2) re-adjudicate H2 (and optionally H3) under the paired
+  protocol if desired; (3) author + run the locked task per prepare.md (the
+  campaign-end honest metric) — noting the champion is still v0.
