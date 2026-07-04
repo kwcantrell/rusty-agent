@@ -90,3 +90,68 @@ never retries a logged dead end. Campaign spec:
 ## Iteration log
 
 <!-- one entry per hypothesis: change | N results | gate verdict | kept? -->
+
+### Iteration 1 (2026-07-03) — H1 system-prompt: restate-then-act discipline — REJECTED BY GUARD SWEEP (non-improvement 1/6)
+
+- **Diagnosis (admit_realistic.jsonl trajectories, before designing):** the three
+  admission failures split two ways. (a) Runs 2/3 STOPPED EARLY — 16/18 turns of
+  25, zero write_file, zero execute_command: after eight "read noise.txt →
+  one-sentence ack, no code yet" turns, the implement turn imitates the ack
+  TEMPLATE instead of the instruction (roster's template-imitation mode,
+  resurfacing at act time). (b) Run 0 implemented (edit_file ×2), ran vitest
+  once, then re-orientation churn (30+ reads, noise.txt ×5 more) instead of
+  read-failure→fix. No failing run restated requirements at implement time. The
+  eval default prompt's "then give a short final reply" legitimizes the early
+  prose exit; nothing anchors the plan at act time.
+- **Hypothesis:** the implement turn has no plan anchor and no completion
+  criterion; adding restate-requirements-first → write-immediately →
+  verify-and-fix discipline to `system_prompt` converts prose-exit/read-churn
+  turns into write-then-verify turns.
+- **Change (Tier A, one field):** cand.json = champion_v0 + `system_prompt` =
+  eval default + this paragraph (verbatim, for never-retry):
+  > Discipline for implementation requests: when asked to implement or modify
+  > code, START your turn by restating every requirement collected so far as one
+  > numbered list (pull them from the entire conversation and any pinned
+  > context, without re-reading workspace files), then write the code
+  > immediately with write_file or edit_file, then run the requested
+  > verification commands and fix what fails. An implementation request is
+  > complete only after the files are written and verification has run — never
+  > finish with prose alone, and never substitute re-reading already-read files
+  > for writing code.
+- **Paired batch (interleaved, same session, N=5, web-multipage @ window 3000):**
+  champ 3/5 (passing 60,240/103,516/115,283; median 103,516); cand 3/5 (passing
+  83,536/85,979/89,272; median 85,979). `eval_gate` → **Promote** (equal passes,
+  −17% median; passes() read directly). Champion's 3/5 vs admission's 2/5 is
+  cross-night drift — trust same-night pairs only.
+- **Failure-shape shift (mechanism confirmed on the training task):** both cand
+  failures WROTE code and RAN verification (one died mid-fix at turn cap; one
+  over-acted — rebuilt the whole scaffold from scratch, own package.json/
+  vite.config over the seed, then hit the offline npm wall). The never-write
+  prose-exit mode was absent from the cand batch; both champ failures were
+  classic churn.
+- **Guard sweep (candidate prompt OVERLAID on each guard task's champion/
+  realistic config — sweep convention for prompt axes; untouched guard configs
+  would make the sweep vacuous):** portmap **10/10** ✓, manifest **5/5** ✓
+  (check.sh enforces 20/20), codename **5/5** ✓, offload **5/5** ✓, mem-recall
+  **5/5** ✓, drift **10/12** ✗ (ceiling ≥11/12; directionally consistent, not
+  independently attributed), **mem-roster 0/10** ✗✗ (ceiling ≥9/10).
+- **Roster 0/10 mechanism (from remember/recall args):** storage PERFECT — 8/8
+  codes stored verbatim every run. Retrieval-side kill: recall queries are
+  generic ("registry token"/"token"/"registry"); k=5 over eight near-identical
+  texts ranks deterministically, so the SAME code (RV-219) misses in 8/10 runs
+  (the other two wrote exactly one k=5 recall's worth). The prompt's
+  "restate what you have, then write immediately" makes the model treat its
+  restated subset as the full inventory and write facts.txt at once; it cannot
+  targeted-query an unknown-unknown (run 5: 10 recalls, all anchored on codes it
+  already had, still missed RV-219). Baseline behavior keeps gathering until the
+  count matches → 9/10.
+- **Verdict: REJECT.** Champion stays v0. **Learning (general): an
+  act-to-completion prompt discipline is ANTI-RETRIEVAL — "write immediately"
+  truncates iterative gather loops on inventory/recall tasks. Any future prompt
+  candidate must scope the discipline (e.g. "once every stated requirement is
+  in the list" / gather-until-inventory-matches-count before acting) rather
+  than command unconditional immediate writes.** Queued refinement (H1b, one
+  new hypothesis): keep restate-first + verify-before-done, drop "immediately",
+  add an explicit completeness check ("if the task states a count or list,
+  confirm your restatement covers ALL of it; gather what is missing first").
+  Watch the new over-scaffolding pathology (cand run 1) in any H1 descendant.
