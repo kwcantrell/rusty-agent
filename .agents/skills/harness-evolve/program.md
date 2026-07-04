@@ -385,3 +385,47 @@ never retries a logged dead end. Campaign spec:
   protocol); (2) re-adjudicate H2 (and optionally H3) under the paired
   protocol if desired; (3) author + run the locked task per prepare.md (the
   campaign-end honest metric) — noting the champion is still v0.
+
+### RE-BASELINE (2026-07-03 night, post-iteration-6) — Tier-C server restart; iteration-6 "drift" RESOLVED as GUARD-CONFIG MISMATCH; all ceilings STAND
+
+- **Event:** `llama-agent` stopped/removed/re-run (exact command in the
+  local-llama-server memory; healthy in ~5 s). All batches below are fresh
+  post-restart, same night, N=10 each.
+- **memory-roster @ `realistic.json` (k=5, real emb): 2/10** — storage perfect
+  8/8 every run, 1–3 recall rounds, one write; the documented k=5 rank-cutoff
+  shape. Restart did NOT restore 9/10 → the server-state hypothesis is DEAD.
+- **Decisive check — memory-roster @ champion params
+  (`context-evolve/tasks/memory-roster/champion_k10.json` = realistic.json +
+  `default_k=10`): 10/10**, median 71,986 tok (2/10 vs 10/10 same night:
+  Fisher p≈7e-5).
+- **Resolution: there was never any ceiling drift.** The roster ≥9/10 ceiling
+  was recorded under champion k=10 (context-evolve program.md: "9/10 real-emb
+  k=10"; #M1: "1/5 at k=5"); `realistic.json` is the admission RED-SIDE config,
+  frozen at k=5 precisely so the 1/5 admit verdict stays reproducible. This
+  campaign's guard sweeps (iterations 1–6) graded roster on `realistic.json`
+  against the k=10 ceiling. Iteration 6's arms (B 5/10, A 3/10, C 3/10) and
+  tonight's 2/10 are ordinary draws from the k=5 config's ~0.2–0.35 true rate.
+  Iteration 6's label "unmodified champion-v4 roster config" was WRONG —
+  realistic.json was never the champion config.
+- **Evidentiary re-cascade (supersedes iteration 6's):**
+  - H2 (roster 5/10) and H3 (roster 3/10) guard kills: measured on the wrong
+    config — uninformative about champion-config regression. Kills remain
+    UNSUPPORTED; H2 re-adjudication proceeds under the paired protocol at
+    champion_k10.
+  - H1's roster 0/10: vs pooled same-config k=5 baseline 7/20 (iter-6 B +
+    tonight), Fisher p≈0.04 — stays likely-real with the asterisk. The H1
+    family stays CLOSED regardless (iteration-3 structural token findings).
+  - Iteration 5's "gather-loop dynamics structural tension" stays DOWNGRADED:
+    the three "identical roster kills" were three draws from a ~0.2–0.35-rate
+    config, no perturbation needed to explain them.
+  - context-evolve's admitted ceilings are all VALID (clarification appended
+    to its program.md); its queued full re-baseline is cancelled.
+- **web-multipage @ champion_v0 (N=10): 5/10**, median passing 95,703 tok
+  (79–114K passing; 86–154K failing) — inside the historical same-night band
+  (admission 2/5; iteration champ arms 2/5–3/5). Baseline re-confirmed; no
+  correction needed.
+- **Protocol going forward:** the paired-guard protocol (iteration 6) STAYS —
+  it catches real drift AND this error class. New rule added to train.md: **a
+  guard ceiling is a (config, rate) pair** — roster's guard config is
+  `champion_k10.json`, never `realistic.json`; admission red-side configs are
+  never guard configs once the champion moves past them.
