@@ -199,3 +199,46 @@ never retries a logged dead end. Campaign spec:
   EXPLICITLY to conversation/pinned-context/recall tools ("requirements never
   come from searching workspace files; read a file only to see the code you
   are changing"), completeness check retained, "immediately" stays dropped.
+
+### Iteration 3 (2026-07-03) — H1c: bounded-gather prompt — REJECTED AT TRAINING GATE (non-improvement 3/6)
+
+- **Hypothesis:** combining the two pinned mechanisms (restate-then-act helps;
+  gathering must name a bounded source) yields the win without the collateral:
+  requirements domain = conversation/pinned-context/recall ONLY, files only for
+  the code being changed, "immediately" dropped, completeness check kept.
+- **Change (Tier A, one field):** cand = champion_v0 + `system_prompt` = eval
+  default + (verbatim, for never-retry):
+  > Discipline for implementation requests: when asked to implement or modify
+  > code, START your turn by restating every requirement collected so far as
+  > one numbered list. Requirements come from the conversation, pinned context,
+  > and your recall tools — never from searching workspace files; read a
+  > workspace file only to see the code you are changing. If the task stated a
+  > count or delivered items one at a time, confirm your list covers ALL of
+  > them, and retrieve anything missing with your recall tools before
+  > proceeding. Then write the files with write_file or edit_file, run the
+  > requested verification commands, and fix what fails. The request is
+  > complete only after the files are written and verification has run — never
+  > finish with prose alone, and never substitute re-reading already-read
+  > files for writing code.
+- **Paired batch (interleaved, same session, N=5, web-multipage @ 3000):**
+  champ 3/5 (passing 79,034/96,750/107,770; median 96,750); cand 3/5 (passing
+  99,871/117,530/132,487; median 117,530). `eval_gate` → **Reject: tokens not
+  improved (117,530 ≥ 96,750)** — equal passes, genuine +21% token regression,
+  not an artifact. No sweep run.
+- **Shape (the bound WORKED, the tax didn't pay):** workspace-fishing is gone
+  (zero phantom/nonexistent-path reads across all 10 runs; the one gathering
+  failure did 6 context_recall instead of file hunting — right domain, still
+  no write). But every cand pass cost more than its champ counterpart; the
+  paragraph taxes ALL runs.
+- **Verdict: REJECT.** Champion stays v0. **Learning (structural, closes the
+  H1 prompt family): at a realistic window an always-on system-prompt
+  discipline is paid EVERY turn — ~200 extra prompt tokens inside a
+  3000-token window (~7%) squeeze the curated context and raise total tokens
+  even when behavior improves. Three variants (act-now / gather-unbounded /
+  gather-bounded) each fixed their predecessor's pathology and introduced or
+  kept a cost: the axis oscillates around the gate, it does not cross it.
+  Next prompt-shaped intervention should be DELIVERED ON-DEMAND (axis-2 SDLC
+  skill via skills_dirs/active_skills — loaded at act time, not resident) or
+  attack a different mechanism entirely (axis-3 sampler; axis-4 tool
+  descriptions).** H1 descendants are a logged dead end absent NEW
+  trajectory evidence of a different mechanism.
