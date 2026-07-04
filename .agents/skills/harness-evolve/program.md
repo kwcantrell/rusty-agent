@@ -429,3 +429,25 @@ never retries a logged dead end. Campaign spec:
   guard ceiling is a (config, rate) pair** — roster's guard config is
   `champion_k10.json`, never `realistic.json`; admission red-side configs are
   never guard configs once the champion moves past them.
+
+### H2 RE-ADJUDICATION (2026-07-03 night, post-re-baseline) — verify-before-done skill REJECTED at the training gate; H2 CLOSED
+
+- **Why re-adjudicated:** the RE-BASELINE record voided H2's iteration-4 guard
+  kill (roster graded on the wrong config), leaving its thin training Promote
+  (−6%, N=2 passing per arm) unresolved.
+- **Setup:** same recipe as iteration 4 (cand = champion_v0 + `skills_dirs` =
+  abs path to `artifacts/agent-skills/verify-before-done-v1` +
+  `active_skills=["verify-before-done"]`). Preset resolution verified
+  statically (scan rule: dir name + SKILL.md under the passed root) and
+  behaviorally (every cand run attempted execute_command verification).
+- **Fresh paired batch (interleaved, same night, N=5, web-multipage @ 3000,
+  post-restart server):** champ **3/5** (passing 72,877/75,553/87,340; median
+  75,553); cand **3/5** (passing 67,291/93,891/104,515; median 93,891).
+  `eval_gate` → **Reject: tokens not improved (93,891 ≥ 75,553)** — equal
+  passes, +24% median. The iteration-4 −6% margin did not replicate; with
+  N=2–3 passing per arm it was noise.
+- **Verdict: REJECT — H2 is CLOSED cleanly on its own training merits**, no
+  phantom guard evidence needed and no sweep run (gate-fail short-circuits).
+  Consistent with the iteration-3 structural learning: an always-on ~100-tok
+  body inside a 3000-tok window taxes every run; the exit-gate content helps
+  the failure shape but not the gate. Champion stays **v0**; no champion_v1.
