@@ -292,3 +292,42 @@ never retries a logged dead end. Campaign spec:
   guidance if any exit-gate descendant is tried (must also solve roster);
   (b) axis-3 sampler (temperature — provably curation-inert, reduced sweep);
   (c) the size-vs-content control spike.
+
+### Iteration 5 (2026-07-03) — H3: temperature 0.6 (axis 3, Tier A) — REJECTED BY GUARD SWEEP (non-improvement 5/6)
+
+- **Diagnosis (before designing):** champion (temp 0.2, the runtime default —
+  runtime_config.rs:252) shows pervasive repetition: mean re-read fraction
+  0.44 (pass) / 0.48 (fail), max 0.75, literal 4× read-cycles in the worst
+  runs. Qwen3-family guidance recommends temp 0.6 (thinking) and warns
+  low-temp decoding causes repetitive degeneration.
+- **Hypothesis:** 0.2 is below the model's designed sampling range; the
+  read-churn is partly a low-temperature repetition attractor that temp 0.6
+  breaks. Change (ONE field): cand = champion_v0 + `temperature: 0.6`.
+- **Paired batch (interleaved, N=5, web-multipage @ 3000):** champ 3/5
+  (median passing 88,466); cand 3/5 (median 86,577). `eval_gate` → **Promote**
+  (equal passes, −2.1% — inside same-night noise). Mechanism metric FLAT:
+  re-read fraction ~0.46 vs ~0.49 — the attractor did NOT break. Failure tail
+  did improve (cand failures 74–101K vs champ 100–136K, no mega-churn).
+  Honest read: the Promote was a noise-level margin; the hypothesis's
+  mechanism was unconfirmed. Sweep proceeded per the mechanical rule.
+- **Guard sweep (temp 0.6 overlaid; roster first, fail-fast): mem-roster
+  3/10** (ceiling ≥9/10; WORST yet) → aborted. Storage perfect 8/8 every run
+  (one run double-stored 4 — harmless). All 7 failures miss RV-219 (+
+  QW-882/CF-528 in the 1–2-recall runs). Failing runs did 1–2 recall rounds;
+  passing 2–4: **temp 0.6 randomizes gather-loop length**, half the runs stop
+  below the k=5 cutoff.
+- **Verdict: REJECT.** Champion stays v0. **Learning (supersedes iteration
+  4's displacement theory as the sole account): three DIFFERENT mechanisms —
+  H1 semantic "act now", H2 semantic "checklist done", H3 pure sampling
+  variance, the last with ZERO context content — all produce the identical
+  roster kill (deterministic RV-219 rank-cutoff miss). The invariant is
+  gather-loop DYNAMICS: roster at default_k=5 over 8 near-identical items
+  passes only when the model reliably iterates recall ≥3 rounds; ANY champion
+  perturbation that shortens or destabilizes that loop fails the ceiling.
+  The campaign's training pressure (act decisively) and roster's requirement
+  (gather exhaustively) are in STRUCTURAL tension at this guard.** Open
+  questions for the owner/next session: (i) is roster-under-overlay the right
+  gate for sampler axes, or should sampler promotions be web-task-scoped
+  (convention decision, not unilateral); (ii) the size-vs-content control
+  spike is now three-ways motivated. K=5/6 — the NEXT non-improvement
+  triggers mandatory stop + the one-shot locked-task run.
