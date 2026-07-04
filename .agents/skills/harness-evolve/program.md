@@ -451,3 +451,32 @@ never retries a logged dead end. Campaign spec:
   Consistent with the iteration-3 structural learning: an always-on ~100-tok
   body inside a 3000-tok window taxes every run; the exit-gate content helps
   the failure shape but not the gate. Champion stays **v0**; no champion_v1.
+
+### LOCKED TASK (2026-07-03 night) — locked-website authored + one-shot run; CAMPAIGN-END HONEST METRIC: 2/5 @ champion_v0 (favorable 5/5)
+
+- **Authored per prepare.md §locked-task** (`tasks/locked-website/`, frozen at
+  0dce6fe BEFORE any eval run): canonical end-to-end build — seed is config
+  files only (package/tsconfig/vite/index.html + catalog.json fixture +
+  noise.txt), **no src/ at all**; the agent authors src/main.ts (hash render +
+  fetch-and-format on /catalog), src/router.ts (routeFor), src/catalog.ts
+  (formatBook: cents→"$19.99", stock→availability) AND its own vitest spec
+  src/catalog.test.ts; 8 requirement turns behind noise reads, implement turn
+  last; node-offline profile, node_modules copied from the web-multipage seed
+  (identical devDeps), seed.sh canonical. Grading: tsc + own-spec presence
+  (`expect(` grep) + hidden spec + vitest run src + vite build + dist greps.
+  A golden solution greened check.sh in-container before freezing.
+- **Favorable sanity (N=5, window 196608): 5/5** (76,695–239,828 tok; median
+  205,227) — the task is harness-bound, not mud.
+- **ONE-SHOT honest run @ champion_v0 (window 3000, N=5, fresh-restart
+  server, run ONCE, no retries): 2/5.** Passing 75,723 / 103,156 tok (21/24
+  turns). Failing 73,150 (1 write, stopped early) / 88,995 (4 writes, ZERO
+  verification runs) / 134,513 (48 reads / 31 turns / 1 write / 0 execs —
+  the canonical goal-drift read-churn). No champion_v1 exists (H2 rejected),
+  so this is the campaign's only locked number.
+- **Campaign-end statement:** training closed at K=6/6 with zero promotions;
+  champion = v0 = the config the campaign started with. The locked metric
+  quantifies the standing gap on a never-before-seen task: **favorable 5/5 vs
+  realistic 2/5**, failure mass in goal-drift churn and missing verify
+  discipline — the exact weaknesses the H1/H2 families attacked and failed to
+  fix within budget. These numbers are the honest baseline any future phase
+  must beat, under the paired protocol and the corrected guard configs.
