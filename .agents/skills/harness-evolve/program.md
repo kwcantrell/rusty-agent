@@ -155,3 +155,47 @@ never retries a logged dead end. Campaign spec:
   add an explicit completeness check ("if the task states a count or list,
   confirm your restatement covers ALL of it; gather what is missing first").
   Watch the new over-scaffolding pathology (cand run 1) in any H1 descendant.
+
+### Iteration 2 (2026-07-03) — H1b: gather-until-count prompt — REJECTED AT TRAINING GATE (non-improvement 2/6)
+
+- **Hypothesis:** H1's discipline minus "immediately", plus a completeness
+  check, keeps the plan anchor (H1's training win) while un-truncating the
+  gather loop that killed mem-roster.
+- **Change (Tier A, one field):** cand = champion_v0 + `system_prompt` = eval
+  default + H1's paragraph with two edits (verbatim, for never-retry):
+  > Discipline for implementation requests: when asked to implement or modify
+  > code, START your turn by restating every requirement collected so far as
+  > one numbered list (pull them from the entire conversation and any pinned
+  > context, without re-reading workspace files). If the task states a count or
+  > a list of items, confirm your restatement covers ALL of them; gather what
+  > is missing first. Then write the code with write_file or edit_file, then
+  > run the requested verification commands and fix what fails. An
+  > implementation request is complete only after the files are written and
+  > verification has run — never finish with prose alone, and never substitute
+  > re-reading already-read files for writing code.
+- **Paired batch (interleaved, same session, N=5, web-multipage @ 3000):**
+  champ 3/5 (passing 57,155/57,556/75,824; median 57,556); cand 2/5 (passing
+  96,546/110,758; median 103,652). `eval_gate` → **Reject: correctness
+  regressed (2 < 3)**. No sweep run. Champion's median moved 103.5K→57.6K
+  across same-night batches — cross-batch comparison stays banned.
+- **Mechanism (pinned from cand trajectories): WRONG-DOMAIN GATHERING.** The
+  completeness clause names no bounded source of truth, so the model hunts for
+  the "missing" requirements in the WORKSPACE: cand run 2 = 122 read_file over
+  47 turns / 168,936 tok, including ~20 NONEXISTENT paths
+  (src/components/Header.tsx, App.tsx, … — fishing for requirement-bearing
+  files the seed never had), implements only at the bitter end (and via the
+  deny-listed `npm test` instead of npx vitest). Run 1: pure read churn +
+  2 context_recall, zero writes. Run 4: implemented, turn cap hit mid-verify.
+  Both cand PASSES cost 96–111K vs champ's 57–76K — the clause taxes every
+  run. H1's over-scaffolding pathology did NOT recur (no scaffold rebuilds);
+  the pathology moved from over-acting to over-gathering.
+- **Verdict: REJECT.** Champion stays v0. **Learning (general): a completeness
+  directive MUST name its bounded source of truth. "Gather what is missing"
+  without saying WHERE sends the model to the wrong domain (workspace files —
+  including invented paths) instead of conversation/pinned-context/recall.
+  Roster needed recall-domain gathering; web needs conversation-domain; files
+  are never the requirements domain in either.** Queued (H1c, the two pinned
+  mechanisms combined): restate-first + act + verify, gathering scoped
+  EXPLICITLY to conversation/pinned-context/recall tools ("requirements never
+  come from searching workspace files; read a file only to see the code you
+  are changing"), completeness check retained, "immediately" stays dropped.
