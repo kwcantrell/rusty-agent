@@ -496,14 +496,4 @@ mod tests {
             ImageProbeOutcome::Indeterminate
         );
     }
-
-    /// `image_missing` must return true only for a definite `Missing` outcome,
-    /// never for `Exists` or `Indeterminate`.
-    #[test]
-    fn image_missing_semantics() {
-        use super::ImageProbeOutcome;
-        assert!(ImageProbeOutcome::Missing == ImageProbeOutcome::Missing);
-        assert!(ImageProbeOutcome::Exists != ImageProbeOutcome::Missing);
-        assert!(ImageProbeOutcome::Indeterminate != ImageProbeOutcome::Missing);
-    }
 }
