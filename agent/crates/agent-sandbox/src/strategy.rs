@@ -83,6 +83,18 @@ impl DockerSandbox {
         Self::wait_bounded(cmd, PROBE_TIMEOUT)
     }
 
+    /// Bounded check that `image` exists in the local Docker image store.
+    /// `docker image inspect` exits non-zero when the image is missing — and
+    /// the probe also fails when the daemon is unreachable; both map to
+    /// `false`, which callers treat as "don't rely on this image".
+    pub fn image_exists(image: &str) -> bool {
+        let mut cmd = std::process::Command::new("docker");
+        cmd.args(["image", "inspect", image])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        Self::wait_bounded(cmd, PROBE_TIMEOUT) == Availability::Available
+    }
+
     /// Run `cmd` to completion with a hard deadline: poll `try_wait` in a
     /// short sleep loop; on deadline, kill + reap the child and report the
     /// timeout as `Unavailable`. Std-only so the probe stays runnable outside
@@ -407,5 +419,14 @@ mod tests {
             0,
             "describe() must stay a cached read"
         );
+    }
+
+    #[test]
+    fn image_exists_is_false_for_a_missing_image() {
+        // Hermetic in both environments: daemon up → inspect of a garbage tag
+        // exits non-zero; daemon absent → spawn/exit failure. Never true.
+        assert!(!DockerSandbox::image_exists(
+            "agent-sbx-test-no-such-image:none"
+        ));
     }
 }
