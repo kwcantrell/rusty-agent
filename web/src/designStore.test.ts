@@ -111,4 +111,15 @@ describe("useDesignStore", () => {
       expect(h.result.current.designs).toHaveLength(1); // in-memory still works
     } finally { Storage.prototype.setItem = orig; }
   });
+
+  it("re-seeds sent pins when sessionId changes while mounted", () => {
+    const h = renderHook(({ sid }) => useDesignStore([], sid), { initialProps: { sid: "sess-a" } });
+    act(() => h.result.current.recordSent("design:x", 1, [{ x_pct: 0.1, y_pct: 0.1, comment: "a" }]));
+    h.rerender({ sid: "sess-b" });
+    expect(h.result.current.sentPins("design:x", 1)).toEqual([]); // no bleed into sess-b
+    const backA = JSON.parse(localStorage.getItem("agent.designs.sess-a")!);
+    expect(backA.sent["design:x@1"]).toHaveLength(1); // sess-a data intact
+    const rawB = localStorage.getItem("agent.designs.sess-b");
+    if (rawB) expect(JSON.parse(rawB).sent["design:x@1"] ?? []).toEqual([]); // sess-b never got sess-a pins
+  });
 });

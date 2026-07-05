@@ -85,9 +85,14 @@ export interface DesignStoreApi {
  * The B migration swaps this hook's internals for a server-backed store.
  */
 export function useDesignStore(items: Item[], sessionId: string): DesignStoreApi {
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- frozen-at-mount by design
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- blob frozen per (mount, sessionId)
   const stored = useMemo(() => loadBlob(sessionId), [sessionId]);
+  const [seededFor, setSeededFor] = useState(sessionId);
   const [sent, setSent] = useState<Record<string, Pin[]>>(stored.sent);
+  if (seededFor !== sessionId) {
+    setSeededFor(sessionId);
+    setSent(stored.sent);
+  }
   const designs = useMemo(() => mergeDesigns(stored.designs, designsFrom(items)), [stored, items]);
 
   useEffect(() => { saveBlob(sessionId, { designs, sent }); }, [sessionId, designs, sent]);
