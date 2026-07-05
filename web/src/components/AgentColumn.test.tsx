@@ -30,11 +30,13 @@ describe("AgentColumn", () => {
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("hello");
   });
-  it("renders the context dashboard gauge above the composer", () => {
+  it("renders the status line with a block meter", () => {
     render(<AgentColumn {...base} usage={{ promptTokens: 4000, contextLimit: 8000, turn: 1, maxTurns: 20 }} />);
     expect(screen.getByLabelText("context usage")).toBeInTheDocument();
     expect(screen.getByText(/4k\s*\/\s*8k/)).toBeInTheDocument();
+    expect(screen.getByText("▂▂▂▂▂░░░░░")).toBeInTheDocument();
     expect(screen.getByText(/50%/)).toBeInTheDocument();
+    expect(screen.getByText(/turn 1\/20/)).toBeInTheDocument();
   });
   it("shows the busy line while a turn is in flight", () => {
     render(<AgentColumn {...base} busy turn={0} />);

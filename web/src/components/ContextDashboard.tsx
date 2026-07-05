@@ -2,11 +2,15 @@ import { useState } from "react";
 import type { RuntimeSettings, SessionStats } from "../wire";
 import { loadDashExpanded, saveDashExpanded } from "../storage";
 import { StatsPanel } from "./StatsPanel";
+import { blockMeter } from "./cliFormat";
 
 function fmt(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : `${n}`;
 }
 
+// Claude Code-style status line under the prompt box:
+//   12.4k / 196k ▂▂▂░░░░░░░ 6% · qwen3.6 · turn 3/40        ▸
+// Clicking toggles the expanded detail (model/temp, counts, skills, stats).
 export function ContextDashboard(
   { usage, settings, toolCount, artifactCount, stats }:
   { usage: { promptTokens: number; contextLimit: number; turn: number; maxTurns: number } | null;
@@ -18,30 +22,24 @@ export function ContextDashboard(
 
   const pct = usage ? Math.min(100, Math.round((usage.promptTokens / usage.contextLimit) * 100)) : 0;
   const over = pct >= 80;
-  const fill = over ? "var(--state-error)" : "var(--accent)";
 
   return (
-    <div style={{ background: "var(--surface-base)", borderTop: "1px solid var(--border)" }}>
+    <div>
       <button onClick={toggle} aria-label="context usage" aria-expanded={expanded}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left">
-        <span className="h-2 w-2 shrink-0 rounded-full"
-          style={{ background: usage ? fill : "var(--text-muted)" }} />
-        <span className="font-mono text-xs shrink-0" style={{ color: "var(--text-strong)" }}>
-          {usage ? `${fmt(usage.promptTokens)} / ${fmt(usage.contextLimit)}` : "— / —"}
+        className="flex w-full items-center gap-2 px-3 pb-2 text-left"
+        style={{ color: "var(--cli-dim)" }}>
+        <span className="shrink-0">{usage ? `${fmt(usage.promptTokens)} / ${fmt(usage.contextLimit)}` : "— / —"}</span>
+        <span aria-hidden className="shrink-0" style={{ color: over ? "var(--cli-err)" : "var(--cli-dim)" }}>
+          {blockMeter(pct)}
         </span>
-        <span className="relative h-1.5 flex-1 overflow-hidden rounded-full"
-          style={{ background: "var(--surface-overlay)" }}>
-          <span className="absolute inset-y-0 left-0 rounded-full"
-            style={{ width: `${pct}%`, background: fill }} />
-        </span>
-        <span className="font-mono text-xs shrink-0" style={{ color: "var(--text-muted)" }}>
-          {usage ? `${pct}%` : ""}
-        </span>
-        <span className="shrink-0 text-xs" style={{ color: "var(--text-muted)" }}>{expanded ? "▾" : "▸"}</span>
+        <span className="shrink-0">{usage ? `${pct}%` : ""}</span>
+        {settings && <span className="truncate">· {settings.model}</span>}
+        {usage && <span className="shrink-0">· turn {usage.turn}/{usage.maxTurns}</span>}
+        <span className="ml-auto shrink-0">{expanded ? "▾" : "▸"}</span>
       </button>
 
       {expanded && (
-        <div className="space-y-1 px-3 pb-2 font-mono text-xs" style={{ color: "var(--text-muted)" }}>
+        <div className="space-y-1 px-3 pb-2" style={{ color: "var(--cli-dim)" }}>
           {settings && (
             <div>model {settings.model} · temp {settings.temperature}</div>
           )}

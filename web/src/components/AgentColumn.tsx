@@ -24,8 +24,8 @@ export function AgentColumn({ items, activeArtifactKey, onSelectArtifact, projec
         {busy && <BusyLine turn={turn} />}
       </div>
       {pendingApproval && <ApprovalPrompt approval={pendingApproval} onDecide={onDecide} />}
-      <ContextDashboard usage={usage} settings={settings} toolCount={toolCount} artifactCount={artifactCount} stats={stats} />
       <Composer disabled={composerDisabled} onSend={onSend} history={history} />
+      <ContextDashboard usage={usage} settings={settings} toolCount={toolCount} artifactCount={artifactCount} stats={stats} />
     </div>
   );
 }
