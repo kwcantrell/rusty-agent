@@ -19,6 +19,20 @@ pub enum Availability {
     Unavailable(String),
 }
 
+/// Outcome of a `docker image inspect` probe, distinct from the daemon
+/// availability probe.  Three states are necessary because "inspect failed"
+/// conflates two very different situations.
+#[derive(Debug, Clone, PartialEq)]
+enum ImageProbeOutcome {
+    /// `docker image inspect` exited 0 — the image is present.
+    Exists,
+    /// `docker image inspect` ran and exited non-zero — definitively absent.
+    Missing,
+    /// Spawn failed or the probe timed out — daemon unreachable or wedged;
+    /// cannot determine whether the image exists.
+    Indeterminate,
+}
+
 pub struct DockerSandbox {
     policy: SandboxPolicy,
     uid_gid: String,
@@ -81,6 +95,54 @@ impl DockerSandbox {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         Self::wait_bounded(cmd, PROBE_TIMEOUT)
+    }
+
+    /// Classify a raw image-probe result from the three observable signals.
+    /// This pure function is the testable core of the image-missing logic.
+    fn classify_image_probe(spawn_ok: bool, exited: Option<bool>) -> ImageProbeOutcome {
+        match (spawn_ok, exited) {
+            (false, _) | (_, None) => ImageProbeOutcome::Indeterminate,
+            (_, Some(true)) => ImageProbeOutcome::Exists,
+            (_, Some(false)) => ImageProbeOutcome::Missing,
+        }
+    }
+
+    /// Run `docker image inspect` and classify the result.
+    fn probe_image(image: &str) -> ImageProbeOutcome {
+        let mut cmd = std::process::Command::new("docker");
+        cmd.args(["image", "inspect", image])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => return ImageProbeOutcome::Indeterminate,
+        };
+        let deadline = Instant::now() + PROBE_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(s)) => return Self::classify_image_probe(true, Some(s.success())),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return ImageProbeOutcome::Indeterminate;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return ImageProbeOutcome::Indeterminate,
+            }
+        }
+    }
+
+    /// Returns `true` only when `docker image inspect` ran to completion
+    /// *within the deadline* and exited non-zero — i.e. the image is
+    /// definitively absent from the local store.
+    ///
+    /// Spawn failures and timeouts — both signal a daemon issue rather than
+    /// a missing image — return `false`, so the caller keeps the configured
+    /// image rather than silently substituting a fallback.
+    pub fn image_missing(image: &str) -> bool {
+        Self::probe_image(image) == ImageProbeOutcome::Missing
     }
 
     /// Run `cmd` to completion with a hard deadline: poll `try_wait` in a
@@ -406,6 +468,32 @@ mod tests {
             count.load(AtomicOrdering::SeqCst),
             0,
             "describe() must stay a cached read"
+        );
+    }
+
+    /// Pure unit tests of the classification logic — no Docker daemon needed.
+    #[test]
+    fn classify_image_probe_covers_all_outcomes() {
+        use super::ImageProbeOutcome;
+        // completed-success → Exists
+        assert_eq!(
+            DockerSandbox::classify_image_probe(true, Some(true)),
+            ImageProbeOutcome::Exists
+        );
+        // completed-failure → Missing (the only case that triggers a fallback)
+        assert_eq!(
+            DockerSandbox::classify_image_probe(true, Some(false)),
+            ImageProbeOutcome::Missing
+        );
+        // spawn failed → Indeterminate (daemon down, not a missing-image verdict)
+        assert_eq!(
+            DockerSandbox::classify_image_probe(false, None),
+            ImageProbeOutcome::Indeterminate
+        );
+        // timed out → Indeterminate
+        assert_eq!(
+            DockerSandbox::classify_image_probe(true, None),
+            ImageProbeOutcome::Indeterminate
         );
     }
 }

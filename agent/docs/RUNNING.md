@@ -278,3 +278,36 @@ Preload a skill as a **preset** (its body injected into the system prompt from t
   Reasoning is on by default and shown dimmed in the terminal.
 - `--preserve-thinking` — keep prior `<think>` reasoning in history across turns
   (default: stripped, per Qwen3 multi-turn guidance). Ignored by the `claude-cli` backend.
+
+## Sandbox image
+
+Sandboxed commands (`sandbox_mode` `"auto"`/`"enforce"`) run inside Docker. The
+default image is `agent-sandbox-dev:latest` — a locally built polyglot dev
+environment: Node 22 (+ npm/corepack), Python 3.12 + uv, Playwright + Chromium,
+Rust stable, Go, gcc/cmake, and ripgrep/fd/jq/git/sqlite3. Build it once:
+
+```bash
+sandbox-image/build.sh   # ~4–5 GB image; the first build takes a while
+sandbox-image/smoke.sh   # optional: verify every toolchain under the real sandbox flags
+```
+
+If the image hasn't been built, the runtime warns at startup and falls back to
+`debian:stable-slim` (minimal tooling). An explicitly configured `sandbox_image`
+is never substituted — if it's missing, the launch fails like any other
+`docker run` error.
+
+Notes:
+
+- Playwright's Chromium runs without its own sandbox (`chromiumSandbox: false`
+  is Playwright's default) — the Docker container is the security boundary
+  (`--cap-drop ALL` would break Chromium's sandbox anyway).
+- Browsers live at the baked `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`,
+  which is read-only at run time: `npx playwright install` inside a session
+  fails loudly instead of re-downloading per session. Use the preinstalled
+  Playwright (`require("playwright")` resolves globally via `NODE_PATH`).
+- Heavy builds or browser work may need bigger limits: `sandbox_memory`
+  (default `2g`), `sandbox_tmp_size` (default `1g` — caches live on the `/tmp`
+  tmpfs because `HOME=/tmp`), `sandbox_pids` (default `512`).
+- The `/tmp` tmpfs is mounted noexec (Docker default): binaries written under
+  `/tmp` (e.g. `cargo install` output, `go build` artifacts placed there) cannot
+  be executed — build and run executables in `/workspace` instead.

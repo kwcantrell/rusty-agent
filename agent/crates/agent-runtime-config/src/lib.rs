@@ -2,7 +2,7 @@
 //! used by both the CLI (`agent-cli`) and the daemon (`agent-server`).
 
 mod runtime_config;
-pub use runtime_config::{ModelRef, RuntimeConfig, HARD_FLOOR_DENYLIST};
+pub use runtime_config::{ModelRef, RuntimeConfig, DEFAULT_SANDBOX_IMAGE, HARD_FLOOR_DENYLIST};
 
 mod assemble;
 pub use assemble::{assemble_loop, loop_config_from, BuiltLoop, LoopParts};
@@ -262,6 +262,22 @@ pub fn default_denylist() -> Vec<String> {
         .collect()
 }
 
+/// Pick the sandbox image: the built-in default falls back to
+/// [`FALLBACK_SANDBOX_IMAGE`] when it hasn't been built locally; an image the
+/// user configured explicitly is NEVER substituted (a missing explicit image
+/// stays a launch-time `docker run` error).
+fn resolve_sandbox_image(configured: &str, image_missing: impl Fn(&str) -> bool) -> String {
+    use crate::runtime_config::{DEFAULT_SANDBOX_IMAGE, FALLBACK_SANDBOX_IMAGE};
+    if configured == DEFAULT_SANDBOX_IMAGE && image_missing(configured) {
+        tracing::warn!(target: "sandbox",
+            "default sandbox image {DEFAULT_SANDBOX_IMAGE} not found locally; \
+             falling back to {FALLBACK_SANDBOX_IMAGE} — build the dev image with \
+             sandbox-image/build.sh");
+        return FALLBACK_SANDBOX_IMAGE.to_string();
+    }
+    configured.to_string()
+}
+
 /// Map a `RuntimeConfig` to a `SandboxStrategy`:
 /// - `sandbox_mode == "off"` → `HostExecutor` (no Docker overhead).
 /// - `"enforce"` → `DockerSandbox` in `Mode::Enforce` (fails if Docker absent).
@@ -291,7 +307,7 @@ pub fn build_sandbox(cfg: &RuntimeConfig) -> Arc<dyn SandboxStrategy> {
 
     let policy = SandboxPolicy {
         mode,
-        image: cfg.sandbox_image.clone(),
+        image: resolve_sandbox_image(&cfg.sandbox_image, DockerSandbox::image_missing),
         network: cfg.sandbox_network,
         limits: Limits {
             memory: cfg.sandbox_memory.clone(),
@@ -413,9 +429,12 @@ mod tests {
     fn build_sandbox_auto_is_docker_descriptor() {
         let mut cfg = base_cfg();
         cfg.sandbox_mode = "auto".into();
+        // Explicit image: hermetic — resolve_sandbox_image never probes Docker
+        // for a non-default name.
+        cfg.sandbox_image = "explicit-img:1".into();
         let d = build_sandbox(&cfg).describe();
         assert_eq!(d.mechanism, "docker");
-        assert_eq!(d.image.as_deref(), Some("debian:stable-slim"));
+        assert_eq!(d.image.as_deref(), Some("explicit-img:1"));
     }
 
     #[test]
@@ -492,6 +511,34 @@ mod tests {
         assert!(mb.tools.is_empty());
         assert!(mb.retriever.is_none());
         assert_eq!(mb.recall_token_budget, 512);
+    }
+
+    #[test]
+    fn resolve_sandbox_image_falls_back_only_for_missing_default() {
+        use crate::runtime_config::{DEFAULT_SANDBOX_IMAGE, FALLBACK_SANDBOX_IMAGE};
+        // default + definitely missing (image_missing=true) → fallback
+        assert_eq!(
+            resolve_sandbox_image(DEFAULT_SANDBOX_IMAGE, |_| true),
+            FALLBACK_SANDBOX_IMAGE
+        );
+        // default + present (image_missing=false) → keep default
+        assert_eq!(
+            resolve_sandbox_image(DEFAULT_SANDBOX_IMAGE, |_| false),
+            DEFAULT_SANDBOX_IMAGE
+        );
+        // default + daemon-down/indeterminate (image_missing=false) → keep default
+        // (same signal as "present"; daemon issues must not trigger fallback)
+        assert_eq!(
+            resolve_sandbox_image(DEFAULT_SANDBOX_IMAGE, |_| false),
+            DEFAULT_SANDBOX_IMAGE
+        );
+        // explicit + definitely missing → kept verbatim (never silently substituted)
+        assert_eq!(resolve_sandbox_image("my-img:1", |_| true), "my-img:1");
+        // explicit image: the probe must never run
+        assert_eq!(
+            resolve_sandbox_image("my-img:1", |_| panic!("explicit image must not probe")),
+            "my-img:1"
+        );
     }
 
     #[test]
