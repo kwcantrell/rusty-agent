@@ -24,6 +24,7 @@ describe("AnimatedToolCall", () => {
     render(<AnimatedToolCall item={item} />);
     expect(screen.getByText(/read_file/)).toBeInTheDocument();
     expect(screen.getByText("⏺")).toBeInTheDocument();
+    expect(screen.getByText(/⎿/)).toBeInTheDocument();
   });
 
   it("shows a failure badge with status and duration for a non-ok result", () => {
