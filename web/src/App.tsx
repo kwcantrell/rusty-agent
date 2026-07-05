@@ -161,6 +161,7 @@ export default function App() {
             projectLabel={projectLabel} model={model}
             pendingApproval={state.pendingApproval} onDecide={decide}
             composerDisabled={!connected} onSend={send}
+            history={() => loadUserMsgs(sessionId)}
             usage={state.usage} settings={state.settings}
             toolCount={toolCount} artifactCount={artifacts.length} stats={state.stats}
             busy={state.inTurn} turn={state.turnIndex} />

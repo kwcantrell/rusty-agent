@@ -9,12 +9,14 @@ const base = {
   usage: null as null | { promptTokens: number; contextLimit: number; turn: number; maxTurns: number },
   settings: null, toolCount: 0, artifactCount: 0, stats: null,
   busy: false, turn: 0,
+  history: () => [],
 };
 
 describe("AgentColumn", () => {
-  it("renders the session banner (project + model)", () => {
+  it("renders the session banner (project + model) and an enabled composer", () => {
     render(<AgentColumn {...base} />);
     expect(screen.getByText(/studio-x · qwen3/)).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "prompt" })).toBeEnabled();
   });
   it("disables the composer when asked", () => {
     render(<AgentColumn {...base} composerDisabled />);
@@ -23,7 +25,7 @@ describe("AgentColumn", () => {
   it("sends a message", () => {
     const onSend = vi.fn();
     render(<AgentColumn {...base} onSend={onSend} />);
-    const ta = screen.getByPlaceholderText(/Message the agent/);
+    const ta = screen.getByRole("textbox", { name: "prompt" });
     fireEvent.change(ta, { target: { value: "hello" } });
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("hello");
