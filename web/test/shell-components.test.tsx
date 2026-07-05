@@ -10,8 +10,7 @@ describe("shell components", () => {
   it("ApprovalPrompt emits the chosen decision", async () => {
     const onDecide = vi.fn();
     render(<ApprovalPrompt approval={{ id: "c0", summary: "run x", command: "x" }} onDecide={onDecide} />);
-    const buttons = screen.getAllByRole("button");
-    await userEvent.click(buttons[0]); // First button is "1. Yes" (approve)
+    await userEvent.click(screen.getByRole("button", { name: /^1\. yes$/i }));
     expect(onDecide).toHaveBeenCalledWith("approve");
   });
 
