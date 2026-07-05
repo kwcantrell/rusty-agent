@@ -2,7 +2,7 @@
 //! used by both the CLI (`agent-cli`) and the daemon (`agent-server`).
 
 mod runtime_config;
-pub use runtime_config::{ModelRef, RuntimeConfig, HARD_FLOOR_DENYLIST};
+pub use runtime_config::{ModelRef, RuntimeConfig, DEFAULT_SANDBOX_IMAGE, HARD_FLOOR_DENYLIST};
 
 mod assemble;
 pub use assemble::{assemble_loop, loop_config_from, BuiltLoop, LoopParts};

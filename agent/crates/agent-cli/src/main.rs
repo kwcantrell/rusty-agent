@@ -6,6 +6,7 @@ use agent_model::Message;
 use agent_runtime_config::{
     assemble_loop, backend_name_is_valid, build_memory_full, build_model, build_sandbox,
     default_allowlist, default_denylist, LoopParts, RuntimeConfig, BASE_SYSTEM_PROMPT,
+    DEFAULT_SANDBOX_IMAGE,
 };
 use approval::TerminalApproval;
 use clap::Parser;
@@ -127,7 +128,7 @@ struct Cli {
     #[arg(long, default_value = "auto")]
     sandbox_mode: String,
     /// Docker image used for sandboxed execution
-    #[arg(long, default_value = "debian:stable-slim")]
+    #[arg(long, default_value = DEFAULT_SANDBOX_IMAGE)]
     sandbox_image: String,
     /// Allow network access inside the sandbox
     #[arg(long, default_value_t = false)]
@@ -144,8 +145,8 @@ struct Cli {
     /// Max file size for writes inside the sandbox (e.g. "512m"); unset = no limit
     #[arg(long)]
     sandbox_fsize: Option<String>,
-    /// Size of the tmpfs mounted at /tmp inside the sandbox (e.g. "256m")
-    #[arg(long, default_value = "256m")]
+    /// Size of the tmpfs mounted at /tmp inside the sandbox (e.g. "1g")
+    #[arg(long, default_value = "1g")]
     sandbox_tmp_size: String,
     /// Extra read-write bind-mount path inside the sandbox (repeatable)
     #[arg(long = "sandbox-extra-rw")]
@@ -331,13 +332,13 @@ mod tests {
     fn sandbox_defaults() {
         let cli = Cli::parse_from(["agent-cli"]);
         assert_eq!(cli.sandbox_mode, "auto");
-        assert_eq!(cli.sandbox_image, "debian:stable-slim");
+        assert_eq!(cli.sandbox_image, DEFAULT_SANDBOX_IMAGE);
         assert!(!cli.sandbox_network);
         assert_eq!(cli.sandbox_memory, "2g");
         assert_eq!(cli.sandbox_cpus, "2");
         assert_eq!(cli.sandbox_pids, 512u32);
         assert!(cli.sandbox_fsize.is_none());
-        assert_eq!(cli.sandbox_tmp_size, "256m");
+        assert_eq!(cli.sandbox_tmp_size, "1g");
         assert!(cli.sandbox_extra_rw.is_empty());
         assert!(cli.sandbox_extra_ro.is_empty());
     }
