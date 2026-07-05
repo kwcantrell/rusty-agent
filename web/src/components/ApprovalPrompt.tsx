@@ -16,6 +16,7 @@ export function ApprovalPrompt({ approval, onDecide }: { approval: PendingApprov
     const onKey = (e: KeyboardEvent) => {
       const t = e.target;
       if (t instanceof HTMLElement && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable)) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       const opt = OPTIONS.find((o) => o.key === e.key);
       if (opt) onDecide(opt.decision);
     };

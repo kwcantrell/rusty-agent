@@ -164,7 +164,7 @@ export default function App() {
             history={() => loadUserMsgs(sessionId)}
             usage={state.usage} settings={state.settings}
             toolCount={toolCount} artifactCount={artifacts.length} stats={state.stats}
-            busy={state.inTurn} turn={state.turnIndex} />
+            busy={state.inTurn && connected} turn={state.turnIndex} />
         </div>
         {!narrow && (
           <div className="min-w-0 flex-1">

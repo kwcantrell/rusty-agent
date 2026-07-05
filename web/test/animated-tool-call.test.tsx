@@ -73,7 +73,7 @@ describe("AnimatedToolCall", () => {
     expect(screen.getByText(/viewing/)).toBeInTheDocument();
   });
 
-  it("renders a non-clickable chip when there is no artifact", () => {
+  it("shows no view affordance when there is no artifact", () => {
     const item = {
       kind: "tool", name: "read_file", args: { path: "a.txt" }, status: "done", content: "file contents",
       ts: Date.now(), streaming: false, progress: 1,
