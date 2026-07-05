@@ -565,7 +565,7 @@ export function DesignCanvas(props: {
 `web/src/components/design/DesignCanvas.test.tsx`:
 
 ```tsx
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { DesignCanvas } from "./DesignCanvas";
 import type { Design } from "../../designStore";
@@ -620,14 +620,6 @@ describe("DesignCanvas", () => {
     d.versions[0] = { display: { Frob: { x: 1 } } as never, renderable: false };
     render(<DesignCanvas design={d} sentPins={noPins} onSendFeedback={() => {}} sendDisabled={false} />);
     expect(screen.getByText(/unsupported/)).toBeInTheDocument();
-  });
-
-  it("passes 1-based version numbers to feedback", () => {
-    const sent = vi.fn();
-    render(<DesignCanvas design={design(2)} sentPins={noPins} onSendFeedback={sent} sendDisabled={false} />);
-    // AnnotationOverlay is exercised in its own test; here we only pin the wiring
-    // by checking the sentPins accessor version (asserted via the overlay's sent markers).
-    expect(sent).not.toHaveBeenCalled();
   });
 });
 ```
@@ -758,7 +750,7 @@ export function AnnotationOverlay(props: {
 `web/src/components/design/AnnotationOverlay.test.tsx`:
 
 ```tsx
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { AnnotationOverlay } from "./AnnotationOverlay";
 
@@ -1486,7 +1478,7 @@ Run `npm run typecheck` — fix any fixture objects that construct a full `Runti
 `web/src/components/design/ConfigPanel.test.tsx`:
 
 ```tsx
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { ConfigPanel } from "./ConfigPanel";
 import type { RuntimeSettings } from "../../wire";
