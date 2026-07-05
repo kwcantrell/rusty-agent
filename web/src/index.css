@@ -86,3 +86,6 @@ body {
   color: var(--cli-text);
 }
 .cli-promptbox:focus-within { border-color: var(--cli-accent) !important; }
+/* MarkdownText sizes code at text-sm (14px) for the right pane; inside the
+   13px terminal panel that inverts the usual code-vs-body relationship. */
+.cli code, .cli pre { font-size: inherit; }
