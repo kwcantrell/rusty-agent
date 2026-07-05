@@ -140,6 +140,10 @@ pub struct RuntimeConfig {
     pub trace_dir: Option<String>,
     #[serde(default = "default_trace_max_mb")]
     pub trace_max_mb: u64,
+    /// When set, replaces the built-in base system prompt. Active skills and
+    /// preset text still append on top. Blank strings normalize to None.
+    #[serde(default)]
+    pub system_prompt_override: Option<String>,
 }
 
 /// All-optional mirror used only for on-disk merge: a file written by an older
@@ -190,6 +194,7 @@ struct PartialRuntimeConfig {
     trace: Option<bool>,
     trace_dir: Option<String>,
     trace_max_mb: Option<u64>,
+    system_prompt_override: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -298,6 +303,7 @@ impl RuntimeConfig {
             trace: true,
             trace_dir: None,
             trace_max_mb: default_trace_max_mb(),
+            system_prompt_override: None,
         }
     }
 
@@ -305,6 +311,13 @@ impl RuntimeConfig {
     pub fn normalized(mut self) -> Self {
         if self.backend == "claude-cli" {
             self.protocol = "prompted".into();
+        }
+        if self
+            .system_prompt_override
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            self.system_prompt_override = None;
         }
         self
     }
@@ -522,6 +535,9 @@ impl RuntimeConfig {
         }
         if let Some(v) = p.trace_max_mb {
             self.trace_max_mb = v;
+        }
+        if let Some(v) = p.system_prompt_override {
+            self.system_prompt_override = Some(v);
         }
         self
     }
@@ -855,6 +871,7 @@ mod tests {
             trace: false,
             trace_dir: Some("/tmp/traces".into()),
             trace_max_mb: 8,
+            system_prompt_override: Some("DESIGN ASSISTANT".into()),
         };
         c.save(&path).unwrap();
         let loaded = RuntimeConfig::load_over(base(), &path);
@@ -1220,6 +1237,28 @@ mod tests {
         assert!(!agent_policy::is_auto_allowed("git commit -m x", &al));
         assert!(!agent_policy::is_auto_allowed("cargo publish", &al));
         assert!(!agent_policy::is_auto_allowed("cargo install evil", &al));
+    }
+
+    #[test]
+    fn system_prompt_override_round_trips_and_merges() {
+        let mut cfg = base();
+        cfg.system_prompt_override = Some("You are a design assistant.".into());
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: RuntimeConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.system_prompt_override.as_deref(), Some("You are a design assistant."));
+
+        // old on-disk config without the field → None
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("system_prompt_override");
+        let old: RuntimeConfig = serde_json::from_value(v).unwrap();
+        assert!(old.system_prompt_override.is_none());
+    }
+
+    #[test]
+    fn normalized_maps_blank_override_to_none() {
+        let mut cfg = base();
+        cfg.system_prompt_override = Some("   \n".into());
+        assert!(cfg.normalized().system_prompt_override.is_none());
     }
 
     #[test]

@@ -162,15 +162,15 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
             unknown_presets.push(name.clone());
         }
     }
-    let system_prompt = match compose_system_prompt(
-        &parts.base_system_prompt,
-        &skill_registry,
-        &presets,
-    ) {
+    let base: &str = cfg
+        .system_prompt_override
+        .as_deref()
+        .unwrap_or(&parts.base_system_prompt);
+    let system_prompt = match compose_system_prompt(base, &skill_registry, &presets) {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "compose_system_prompt failed unexpectedly; using base prompt");
-            parts.base_system_prompt.clone()
+            base.to_string()
         }
     };
 
@@ -681,6 +681,16 @@ mod tests {
                 s.name
             );
         }
+    }
+
+    #[test]
+    fn system_prompt_override_replaces_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.system_prompt_override = Some("OVERRIDE PROMPT".into());
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        assert!(built.system_prompt.starts_with("OVERRIDE PROMPT"));
+        assert!(!built.system_prompt.contains("BASE"));
     }
 
     #[test]
