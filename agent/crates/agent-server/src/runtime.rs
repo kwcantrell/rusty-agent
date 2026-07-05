@@ -136,6 +136,8 @@ impl RuntimeState {
         let cfg = incoming.normalized();
         cfg.validate()?;
         {
+            // Guard against external edits since our last read/write. A TOCTOU window exists:
+            // an external edit landing between this check and the save below is clobbered (single-daemon semantics, accepted).
             let seen = self.persisted_file.lock().unwrap();
             let on_disk = std::fs::read_to_string(&self.config_path).ok();
             if on_disk != *seen {
@@ -170,8 +172,12 @@ impl RuntimeState {
         }
         cfg.save(&self.config_path)
             .map_err(|e| format!("persist failed: {e}"))?;
-        *self.persisted_file.lock().unwrap() =
-            std::fs::read_to_string(&self.config_path).ok();
+        // Record what save() just wrote. If the re-read transiently fails, fall back
+        // to the serialization we know it wrote — a None here would make the next
+        // apply() spuriously refuse as "changed externally".
+        *self.persisted_file.lock().unwrap() = std::fs::read_to_string(&self.config_path)
+            .ok()
+            .or_else(|| serde_json::to_string_pretty(&cfg).ok());
         *self.loop_cell.lock().unwrap() = built.loop_;
         *self.system_prompt.lock().unwrap() = built.system_prompt;
         *self.config.lock().unwrap() = cfg;
