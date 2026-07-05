@@ -1,6 +1,6 @@
 import type { AnimatedItem, PendingApproval } from "../state";
 import type { Decision, RuntimeSettings, SessionStats } from "../wire";
-import { AgentHeader } from "./AgentHeader";
+import { SessionBanner } from "./SessionBanner";
 import { MessageList } from "./MessageList";
 import { ApprovalPrompt } from "./ApprovalPrompt";
 import { ContextDashboard } from "./ContextDashboard";
@@ -15,9 +15,9 @@ export function AgentColumn({ items, activeArtifactKey, onSelectArtifact, projec
     settings: RuntimeSettings | null; toolCount: number; artifactCount: number;
     stats: SessionStats | null }) {
   return (
-    <div className="flex h-full min-h-0 flex-col" style={{ background: "var(--surface-base)" }}>
-      <AgentHeader projectLabel={projectLabel} model={model} />
+    <div className="cli flex h-full min-h-0 flex-col">
       <div className="min-h-0 flex-1 overflow-y-auto py-2">
+        <SessionBanner projectLabel={projectLabel} model={model} />
         <MessageList items={items} activeArtifactKey={activeArtifactKey} onSelectArtifact={onSelectArtifact} />
       </div>
       {pendingApproval && <ApprovalPrompt approval={pendingApproval} onDecide={onDecide} />}

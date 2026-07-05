@@ -11,11 +11,9 @@ const base = {
 };
 
 describe("AgentColumn", () => {
-  it("renders the header (project + model) and an enabled composer", () => {
+  it("renders the session banner (project + model)", () => {
     render(<AgentColumn {...base} />);
-    expect(screen.getByText("studio-x")).toBeInTheDocument();
-    expect(screen.getByText(/model qwen3/)).toBeInTheDocument();
-    expect(screen.getByPlaceholderText(/Message the agent/)).toBeEnabled();
+    expect(screen.getByText(/studio-x · qwen3/)).toBeInTheDocument();
   });
   it("disables the composer when asked", () => {
     render(<AgentColumn {...base} composerDisabled />);
