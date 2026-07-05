@@ -37,6 +37,9 @@ pub struct RuntimeState {
     /// `{epoch}-{pid}` session id and interleave two writers into one file.
     stats: Arc<std::sync::RwLock<agent_core::SessionStats>>,
     trace: Option<Arc<agent_runtime_config::TraceWriter>>,
+    /// On-disk config content as of our last read/write. `apply` refuses to
+    /// clobber a file some other process (CLI, editor) changed since.
+    persisted_file: Mutex<Option<String>>,
 }
 
 impl RuntimeState {
@@ -60,6 +63,7 @@ impl RuntimeState {
         let compact_flag = Arc::new(AtomicBool::new(false));
         let stats: Arc<std::sync::RwLock<agent_core::SessionStats>> = Arc::default();
         let trace = agent_runtime_config::build_trace(&config);
+        let persisted_file = Mutex::new(std::fs::read_to_string(&config_path).ok());
         let built = build_loop(
             &config,
             &sink,
@@ -96,6 +100,7 @@ impl RuntimeState {
             compact_flag,
             stats,
             trace,
+            persisted_file,
         }
     }
 
@@ -130,6 +135,16 @@ impl RuntimeState {
     pub fn apply(&self, incoming: RuntimeConfig) -> Result<(), String> {
         let cfg = incoming.normalized();
         cfg.validate()?;
+        {
+            let seen = self.persisted_file.lock().unwrap();
+            let on_disk = std::fs::read_to_string(&self.config_path).ok();
+            if on_disk != *seen {
+                return Err(
+                    "config file changed externally — restart the daemon or re-save from the CLI"
+                        .into(),
+                );
+            }
+        }
         let built = build_loop(
             &cfg,
             &self.sink,
@@ -155,6 +170,8 @@ impl RuntimeState {
         }
         cfg.save(&self.config_path)
             .map_err(|e| format!("persist failed: {e}"))?;
+        *self.persisted_file.lock().unwrap() =
+            std::fs::read_to_string(&self.config_path).ok();
         *self.loop_cell.lock().unwrap() = built.loop_;
         *self.system_prompt.lock().unwrap() = built.system_prompt;
         *self.config.lock().unwrap() = cfg;
@@ -486,6 +503,27 @@ mod tests {
         );
         // If we get here without panic/error the strategy was constructed OK.
         let _loop = result.loop_; // just confirm it's built
+    }
+
+    #[test]
+    fn apply_refuses_when_config_file_changed_externally() {
+        let (rs, dir) = make();
+        let next = rs.settings_state().settings;
+        rs.apply(next.clone()).unwrap(); // first apply persists and records content
+
+        // simulate a CLI edit behind the daemon's back
+        std::fs::write(dir.path().join("rt.json"), "{\"model\":\"other\"}").unwrap();
+
+        let err = rs.apply(next).unwrap_err();
+        assert!(err.contains("changed externally"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_twice_without_external_edits_is_fine() {
+        let (rs, _dir) = make();
+        let next = rs.settings_state().settings;
+        rs.apply(next.clone()).unwrap();
+        rs.apply(next).unwrap();
     }
 
     #[test]
