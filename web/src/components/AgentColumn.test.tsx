@@ -8,6 +8,7 @@ const base = {
   onDecide: () => {}, composerDisabled: false, onSend: vi.fn(),
   usage: null as null | { promptTokens: number; contextLimit: number; turn: number; maxTurns: number },
   settings: null, toolCount: 0, artifactCount: 0, stats: null,
+  busy: false, turn: 0,
 };
 
 describe("AgentColumn", () => {
@@ -32,5 +33,13 @@ describe("AgentColumn", () => {
     expect(screen.getByLabelText("context usage")).toBeInTheDocument();
     expect(screen.getByText(/4k\s*\/\s*8k/)).toBeInTheDocument();
     expect(screen.getByText(/50%/)).toBeInTheDocument();
+  });
+  it("shows the busy line while a turn is in flight", () => {
+    render(<AgentColumn {...base} busy turn={0} />);
+    expect(screen.getByText(/Thinking… \(0s\)/)).toBeInTheDocument();
+  });
+  it("hides the busy line when idle", () => {
+    render(<AgentColumn {...base} />);
+    expect(screen.queryByText("✳")).not.toBeInTheDocument();
   });
 });

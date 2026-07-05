@@ -162,7 +162,8 @@ export default function App() {
             pendingApproval={state.pendingApproval} onDecide={decide}
             composerDisabled={!connected} onSend={send}
             usage={state.usage} settings={state.settings}
-            toolCount={toolCount} artifactCount={artifacts.length} stats={state.stats} />
+            toolCount={toolCount} artifactCount={artifacts.length} stats={state.stats}
+            busy={state.inTurn} turn={state.turnIndex} />
         </div>
         {!narrow && (
           <div className="min-w-0 flex-1">
