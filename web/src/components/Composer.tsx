@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 const MAX_ROWS = 6;
 const ROW_PX = 22; // 13px * 1.65 line-height, rounded
@@ -11,6 +11,7 @@ export function Composer({ disabled, onSend, history }:
   // null = editing a fresh draft; otherwise an index into history().
   const cursor = useRef<number | null>(null);
   const draft = useRef("");
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
 
   const submit = () => {
     const t = text.trim();
@@ -24,6 +25,10 @@ export function Composer({ disabled, onSend, history }:
     ta.style.height = "auto";
     ta.style.height = `${Math.min(ta.scrollHeight, MAX_ROWS * ROW_PX)}px`;
   };
+
+  useLayoutEffect(() => {
+    if (taRef.current) autogrow(taRef.current);
+  }, [text]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); return; }
@@ -50,13 +55,14 @@ export function Composer({ disabled, onSend, history }:
         style={{ border: "1px solid var(--cli-border)", opacity: disabled ? 0.5 : 1 }}>
         <span aria-hidden style={{ color: "var(--cli-dim)" }}>&gt;</span>
         <textarea
+          ref={taRef}
           aria-label="prompt"
-          className="flex-1 resize-none bg-transparent outline-none disabled:opacity-50"
+          className="flex-1 resize-none bg-transparent outline-none"
           style={{ color: "var(--cli-text)", font: "inherit", height: `${ROW_PX}px` }}
           rows={1}
           value={text}
           disabled={disabled}
-          onChange={(e) => { setText(e.target.value); cursor.current = null; autogrow(e.target); }}
+          onChange={(e) => { setText(e.target.value); cursor.current = null; }}
           onKeyDown={onKeyDown}
           placeholder={disabled ? "disconnected…" : ""}
         />
