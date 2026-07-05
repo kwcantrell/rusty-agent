@@ -213,8 +213,15 @@ fn default_subagent_max_depth() -> usize {
 fn default_sandbox_mode() -> String {
     "auto".into()
 }
+/// Built-in default sandbox image: the locally built dev image
+/// (`sandbox-image/build.sh`). Falls back to [`FALLBACK_SANDBOX_IMAGE`] at
+/// startup when it hasn't been built — see `resolve_sandbox_image` in lib.rs.
+pub const DEFAULT_SANDBOX_IMAGE: &str = "agent-sandbox-dev:latest";
+/// Substitute when the default image is absent locally (always pullable).
+pub const FALLBACK_SANDBOX_IMAGE: &str = "debian:stable-slim";
+
 fn default_sandbox_image() -> String {
-    "debian:stable-slim".into()
+    DEFAULT_SANDBOX_IMAGE.into()
 }
 fn default_sandbox_memory() -> String {
     "2g".into()
@@ -226,7 +233,9 @@ fn default_sandbox_pids() -> u32 {
     512
 }
 fn default_sandbox_tmp_size() -> String {
-    "256m".into()
+    // HOME=/tmp inside the sandbox: npm/uv/cargo caches and Chromium scratch
+    // all land on this tmpfs; 256m wedged real builds.
+    "1g".into()
 }
 fn default_trace_max_mb() -> u64 {
     64
@@ -1078,13 +1087,13 @@ mod tests {
     fn sandbox_defaults_and_round_trip() {
         let b = base();
         assert_eq!(b.sandbox_mode, "auto");
-        assert_eq!(b.sandbox_image, "debian:stable-slim");
+        assert_eq!(b.sandbox_image, DEFAULT_SANDBOX_IMAGE);
         assert!(!b.sandbox_network);
         assert_eq!(b.sandbox_memory, "2g");
         assert_eq!(b.sandbox_cpus, "2");
         assert_eq!(b.sandbox_pids, 512);
         assert!(b.sandbox_fsize.is_none());
-        assert_eq!(b.sandbox_tmp_size, "256m");
+        assert_eq!(b.sandbox_tmp_size, "1g");
         assert!(b.sandbox_extra_rw.is_empty());
         assert!(b.sandbox_extra_ro.is_empty());
     }
@@ -1138,7 +1147,7 @@ mod tests {
         let loaded = RuntimeConfig::load_over(base(), &path);
         // Sandbox fields must fall back to base defaults, not wipe to empty
         assert_eq!(loaded.sandbox_mode, "auto");
-        assert_eq!(loaded.sandbox_image, "debian:stable-slim");
+        assert_eq!(loaded.sandbox_image, DEFAULT_SANDBOX_IMAGE);
         assert!(!loaded.sandbox_network);
         assert_eq!(loaded.sandbox_pids, 512);
         assert!(loaded.sandbox_fsize.is_none());

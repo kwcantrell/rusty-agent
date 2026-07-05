@@ -267,6 +267,22 @@ pub fn default_denylist() -> Vec<String> {
 /// - `"enforce"` → `DockerSandbox` in `Mode::Enforce` (fails if Docker absent).
 /// - anything else (e.g. `"auto"`) → `DockerSandbox` in `Mode::Auto` (degrades to host).
 ///
+/// Pick the sandbox image: the built-in default falls back to
+/// [`FALLBACK_SANDBOX_IMAGE`] when it hasn't been built locally; an image the
+/// user configured explicitly is NEVER substituted (a missing explicit image
+/// stays a launch-time `docker run` error).
+fn resolve_sandbox_image(configured: &str, image_exists: impl Fn(&str) -> bool) -> String {
+    use crate::runtime_config::{DEFAULT_SANDBOX_IMAGE, FALLBACK_SANDBOX_IMAGE};
+    if configured == DEFAULT_SANDBOX_IMAGE && !image_exists(configured) {
+        tracing::warn!(target: "sandbox",
+            "default sandbox image {DEFAULT_SANDBOX_IMAGE} not found locally; \
+             falling back to {FALLBACK_SANDBOX_IMAGE} — build the dev image with \
+             sandbox-image/build.sh");
+        return FALLBACK_SANDBOX_IMAGE.to_string();
+    }
+    configured.to_string()
+}
+
 /// Invalid mount paths in `sandbox_extra_rw`/`sandbox_extra_ro` are dropped with a
 /// `tracing::warn!` rather than panicking.
 pub fn build_sandbox(cfg: &RuntimeConfig) -> Arc<dyn SandboxStrategy> {
@@ -291,7 +307,7 @@ pub fn build_sandbox(cfg: &RuntimeConfig) -> Arc<dyn SandboxStrategy> {
 
     let policy = SandboxPolicy {
         mode,
-        image: cfg.sandbox_image.clone(),
+        image: resolve_sandbox_image(&cfg.sandbox_image, DockerSandbox::image_exists),
         network: cfg.sandbox_network,
         limits: Limits {
             memory: cfg.sandbox_memory.clone(),
@@ -413,9 +429,12 @@ mod tests {
     fn build_sandbox_auto_is_docker_descriptor() {
         let mut cfg = base_cfg();
         cfg.sandbox_mode = "auto".into();
+        // Explicit image: hermetic — resolve_sandbox_image never probes Docker
+        // for a non-default name.
+        cfg.sandbox_image = "explicit-img:1".into();
         let d = build_sandbox(&cfg).describe();
         assert_eq!(d.mechanism, "docker");
-        assert_eq!(d.image.as_deref(), Some("debian:stable-slim"));
+        assert_eq!(d.image.as_deref(), Some("explicit-img:1"));
     }
 
     #[test]
@@ -492,6 +511,28 @@ mod tests {
         assert!(mb.tools.is_empty());
         assert!(mb.retriever.is_none());
         assert_eq!(mb.recall_token_budget, 512);
+    }
+
+    #[test]
+    fn resolve_sandbox_image_falls_back_only_for_missing_default() {
+        use crate::runtime_config::{DEFAULT_SANDBOX_IMAGE, FALLBACK_SANDBOX_IMAGE};
+        // default + present locally → default
+        assert_eq!(
+            resolve_sandbox_image(DEFAULT_SANDBOX_IMAGE, |_| true),
+            DEFAULT_SANDBOX_IMAGE
+        );
+        // default + missing → fallback
+        assert_eq!(
+            resolve_sandbox_image(DEFAULT_SANDBOX_IMAGE, |_| false),
+            FALLBACK_SANDBOX_IMAGE
+        );
+        // explicit + missing → kept verbatim (never silently substituted)
+        assert_eq!(resolve_sandbox_image("my-img:1", |_| false), "my-img:1");
+        // explicit + present → kept, and the probe must not even run
+        assert_eq!(
+            resolve_sandbox_image("my-img:1", |_| panic!("explicit image must not probe")),
+            "my-img:1"
+        );
     }
 
     #[test]
