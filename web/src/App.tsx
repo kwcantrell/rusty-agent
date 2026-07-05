@@ -13,6 +13,7 @@ import type { RightTab } from "./storage";
 import { ContextExplorer } from "./explorer/ContextExplorer";
 import { RightPaneTabs } from "./components/RightPaneTabs";
 import { SandboxBanner } from "./components/SandboxBanner";
+import { DesignPane } from "./components/design/DesignPane";
 
 export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(loadSessionId());
@@ -135,6 +136,23 @@ export default function App() {
     if (it.kind === "user") { lastQuery = it.text; break; }
   }
 
+  const rightPane = (
+    <div className="flex h-full flex-col">
+      <RightPaneTabs rightTab={rightTab} setRightTab={setRightTab} />
+      <div className="min-h-0 flex-1">
+        {rightTab === "workspace"
+          ? <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />
+          : rightTab === "context"
+            ? <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex}
+                skills={state.settingsMeta?.discoveredSkills ?? []} lastQuery={lastQuery} />
+            : <DesignPane items={state.items} sessionId={sessionId} onSend={send} sendDisabled={!connected}
+                settings={state.settings} settingsMeta={state.settingsMeta} settingsError={state.settingsError}
+                onSaveSettings={saveSettings}
+                onLoadSettings={() => sock.current?.send({ kind: "settings_get" })} />}
+      </div>
+    </div>
+  );
+
   return (
     <div className="flex h-screen flex-col" style={{ background: "var(--surface-base)" }}>
       <TopBar projectLabel={projectLabel} online={state.online} status={state.status}
@@ -168,14 +186,7 @@ export default function App() {
         </div>
         {!narrow && (
           <div className="min-w-0 flex-1">
-            <div className="flex h-full flex-col">
-              <RightPaneTabs rightTab={rightTab} setRightTab={setRightTab} />
-              <div className="min-h-0 flex-1">
-                {rightTab === "workspace"
-                  ? <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />
-                  : <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex} skills={state.settingsMeta?.discoveredSkills ?? []} lastQuery={lastQuery} />}
-              </div>
-            </div>
+            {rightPane}
           </div>
         )}
         {narrow && workspaceOpen && (
@@ -185,14 +196,7 @@ export default function App() {
                 className="px-2 text-sm" style={{ color: "var(--text-muted)" }}>✕</button>
             </div>
             <div className="h-[calc(100%-2.5rem)]">
-              <div className="flex h-full flex-col">
-                <RightPaneTabs rightTab={rightTab} setRightTab={setRightTab} />
-                <div className="min-h-0 flex-1">
-                  {rightTab === "workspace"
-                    ? <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />
-                    : <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex} skills={state.settingsMeta?.discoveredSkills ?? []} lastQuery={lastQuery} />}
-                </div>
-              </div>
+              {rightPane}
             </div>
           </div>
         )}
