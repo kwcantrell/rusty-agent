@@ -20,6 +20,14 @@
   --ring: #4f7a52;
   --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-display: "Fraunces Variable", ui-serif, Georgia, "Times New Roman", serif;
+  --cli-bg: #faf9f5;
+  --cli-text: #3d3d38;
+  --cli-dim: #8a877c;
+  --cli-accent: #c15f3c;
+  --cli-ok: #4f7a52;
+  --cli-err: #b3402e;
+  --cli-border: #e3e0d5;
+  --font-cli: "JetBrains Mono Variable", ui-monospace, "SF Mono", monospace;
 }
 
 :root[data-theme="dark"] {
@@ -42,6 +50,14 @@
   --ring: #6fae72;
   --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-display: "Fraunces Variable", ui-serif, Georgia, "Times New Roman", serif;
+  --cli-bg: #1a1915;
+  --cli-text: #e8e6dc;
+  --cli-dim: #8c8a7d;
+  --cli-accent: #d97757;
+  --cli-ok: #6fae72;
+  --cli-err: #e0654f;
+  --cli-border: #35332c;
+  --font-cli: "JetBrains Mono Variable", ui-monospace, "SF Mono", monospace;
 }
 
 /* default before JS applies a theme: match light */
@@ -60,3 +76,13 @@ body {
 }
 
 .font-display { font-family: var(--font-display); }
+
+/* Claude Code-style terminal panel: everything inside .cli is mono, 13px. */
+.cli {
+  font-family: var(--font-cli);
+  font-size: 13px;
+  line-height: 1.65;
+  background: var(--cli-bg);
+  color: var(--cli-text);
+}
+.cli-promptbox:focus-within { border-color: var(--cli-accent) !important; }
