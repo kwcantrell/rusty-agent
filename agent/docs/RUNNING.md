@@ -308,3 +308,6 @@ Notes:
 - Heavy builds or browser work may need bigger limits: `sandbox_memory`
   (default `2g`), `sandbox_tmp_size` (default `1g` — caches live on the `/tmp`
   tmpfs because `HOME=/tmp`), `sandbox_pids` (default `512`).
+- The `/tmp` tmpfs is mounted noexec (Docker default): binaries written under
+  `/tmp` (e.g. `cargo install` output, `go build` artifacts placed there) cannot
+  be executed — build and run executables in `/workspace` instead.
