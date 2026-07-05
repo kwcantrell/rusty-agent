@@ -13,14 +13,17 @@ export function AnimatedAssistantMessage({ item }: Props) {
 
   return (
     <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, height: 0 }}
-      className="whitespace-pre-wrap py-2"
-      style={{ color: "var(--text)" }}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="flex gap-2 py-1.5"
+      style={{ color: "var(--cli-text)" }}
     >
-      <MarkdownText text={visibleText} />
-      {streaming && <span className="inline-block h-4 w-[1ch] animate-pulse" style={{ color: "var(--accent)" }}>|</span>}
+      <span aria-hidden>⏺</span>
+      <div className="min-w-0 flex-1 whitespace-pre-wrap">
+        <MarkdownText text={visibleText} />
+        {streaming && <span className="inline-block h-4 w-[1ch] animate-pulse" style={{ color: "var(--cli-accent)" }}>|</span>}
+      </div>
     </motion.div>
   );
 }
