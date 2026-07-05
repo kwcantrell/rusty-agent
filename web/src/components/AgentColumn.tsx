@@ -1,5 +1,6 @@
 import type { AnimatedItem, PendingApproval } from "../state";
 import type { Decision, RuntimeSettings, SessionStats } from "../wire";
+import { useAutoScroll } from "../hooks/useAutoScroll";
 import { SessionBanner } from "./SessionBanner";
 import { MessageList } from "./MessageList";
 import { BusyLine } from "./BusyLine";
@@ -16,12 +17,15 @@ export function AgentColumn({ items, activeArtifactKey, onSelectArtifact, projec
     usage: { promptTokens: number; contextLimit: number; turn: number; maxTurns: number } | null;
     settings: RuntimeSettings | null; toolCount: number; artifactCount: number;
     stats: SessionStats | null; busy: boolean; turn: number; history: () => string[] }) {
+  const { containerRef, contentRef, onScroll } = useAutoScroll<HTMLDivElement, HTMLDivElement>();
   return (
     <div className="cli flex h-full min-h-0 flex-col">
-      <div className="min-h-0 flex-1 overflow-y-auto py-2">
-        <SessionBanner projectLabel={projectLabel} model={model} />
-        <MessageList items={items} activeArtifactKey={activeArtifactKey} onSelectArtifact={onSelectArtifact} />
-        {busy && <BusyLine turn={turn} />}
+      <div ref={containerRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto py-2">
+        <div ref={contentRef}>
+          <SessionBanner projectLabel={projectLabel} model={model} />
+          <MessageList items={items} activeArtifactKey={activeArtifactKey} onSelectArtifact={onSelectArtifact} />
+          {busy && <BusyLine turn={turn} />}
+        </div>
       </div>
       {pendingApproval && <ApprovalPrompt approval={pendingApproval} onDecide={onDecide} />}
       <Composer disabled={composerDisabled} onSend={onSend} history={history} />
