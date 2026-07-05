@@ -23,7 +23,7 @@ describe("ContextDashboard", () => {
   it("expands to reveal config and session stats", () => {
     render(<ContextDashboard usage={usage} settings={settings} toolCount={5} artifactCount={2} stats={null} />);
     fireEvent.click(screen.getByRole("button", { name: /context/i }));
-    expect(screen.getByText(/qwen3/)).toBeInTheDocument();
+    expect(screen.getByText(/model qwen3/)).toBeInTheDocument();
     expect(screen.getByText(/turns 3\/20/)).toBeInTheDocument();
     expect(screen.getByText(/5 tools/)).toBeInTheDocument();
     expect(screen.getByText(/2 art/)).toBeInTheDocument();

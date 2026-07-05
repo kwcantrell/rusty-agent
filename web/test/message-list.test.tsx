@@ -23,7 +23,7 @@ describe("MessageList", () => {
   it("renders reasoning items with animated component", () => {
     const items: AnimatedItem[] = [makeAnimated("reasoning", { text: "thinking" })];
     render(<MessageList items={items} />);
-    expect(screen.getByText("▸ Thinking")).toBeInTheDocument();
+    expect(screen.getByText(/✻ Thinking…/)).toBeInTheDocument();
   });
 
   it("renders tool items with animated component", () => {
@@ -41,8 +41,8 @@ describe("MessageList", () => {
   it("renders error items with animated component", () => {
     const items: AnimatedItem[] = [makeAnimated("error", { message: "fail" })];
     render(<MessageList items={items} />);
-    expect(screen.getByText(/✗/)).toBeInTheDocument();
-    // message shares a text container with the "✗ " glyph, so match as a substring
+    expect(screen.getByText(/⏺/)).toBeInTheDocument();
+    // message is in a separate container from the "⏺" glyph, so match as a substring
     expect(screen.getByText(/fail/)).toBeInTheDocument();
   });
 });

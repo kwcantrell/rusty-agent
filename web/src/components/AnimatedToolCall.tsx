@@ -1,5 +1,7 @@
+import { useState } from "react";
 import { motion } from "framer-motion";
 import type { AnimatedItem } from "../state";
+import { argSummary, resultSummary } from "./cliFormat";
 
 interface Props {
   item: Extract<AnimatedItem, { kind: "tool" }>;
@@ -10,9 +12,15 @@ interface Props {
   onSelect?: (key: string) => void;
 }
 
-// A tool call renders as a compact chip in the conversation. Rich output
-// (diff/terminal/etc.) lives in the Inspector; clicking the chip focuses it.
+const EXPAND_LINES = 20;
+
+// A tool call renders as a Claude Code-style transcript group:
+//   ⏺ Name(arg-summary)
+//     ⎿ result-summary        view →
+// Clicking the ⎿ line toggles a raw-content preview (≤20 lines). `view →`
+// focuses the Inspector artifact when the tool produced a display.
 export function AnimatedToolCall({ item, artifactKey, active, onSelect }: Props) {
+  const [expanded, setExpanded] = useState(false);
   const isRunning = item.status === "running";
   const failed = !!item.resultStatus && item.resultStatus !== "ok";
   const clickable = !!artifactKey && !!onSelect;
@@ -20,43 +28,50 @@ export function AnimatedToolCall({ item, artifactKey, active, onSelect }: Props)
   // prefix a ↳, and strip the `sub:` display prefix from the tool name.
   const nested = !!item.parentId;
   const displayName = nested && item.name.startsWith("sub:") ? item.name.slice(4) : item.name;
+  const arg = argSummary(item.args);
+  const dot = isRunning ? "var(--cli-accent)" : failed ? "var(--cli-err)" : "var(--cli-ok)";
+  const preview = (item.content ?? "").split("\n").slice(0, EXPAND_LINES).join("\n");
+
   return (
     <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, height: 0 }}
-      className="my-1"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="my-1.5"
       style={{ marginLeft: nested ? "1.25rem" : undefined }}
     >
-      <button
-        type="button"
-        onClick={clickable ? () => onSelect!(artifactKey!) : undefined}
-        disabled={!clickable}
-        className="inline-flex items-center gap-2 rounded-md px-2 py-1 font-mono text-xs"
-        style={{
-          background: "var(--surface-raised)",
-          border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
-          color: "var(--text)",
-          cursor: clickable ? "pointer" : "default",
-        }}
-      >
-        {nested && <span style={{ color: "var(--text-muted)" }}>↳</span>}
-        <span className="rounded-full px-1.5 text-[10px]"
-          style={{ background: "var(--accent)", color: "var(--accent-fg)" }}>{displayName}</span>
+      <div className="flex items-baseline gap-2">
+        {nested && <span style={{ color: "var(--cli-dim)" }}>↳</span>}
         {isRunning ? (
-          <motion.span animate={{ scale: [1, 1.15, 1] }} transition={{ repeat: Infinity, duration: 1.5 }}
-            style={{ color: "var(--state-run)" }}>…</motion.span>
+          <motion.span animate={{ opacity: [1, 0.3, 1] }} transition={{ repeat: Infinity, duration: 1.2 }}
+            style={{ color: dot }}>⏺</motion.span>
         ) : (
-          <span style={{ color: "var(--state-done)" }}>✓</span>
+          <span style={{ color: dot }}>⏺</span>
         )}
-        {failed && (
-          <span className="rounded-full px-1.5 text-[10px]"
-            style={{ border: "1px solid var(--state-error)", color: "var(--state-error)" }}>
-            {item.resultStatus} · {item.durationMs}ms
-          </span>
-        )}
-        {clickable && <span style={{ color: "var(--accent)" }}>{active ? "viewing →" : "view →"}</span>}
-      </button>
+        <span style={{ color: "var(--cli-text)" }}>
+          {displayName}
+          {arg && <span style={{ color: "var(--cli-dim)" }}>({arg})</span>}
+        </span>
+      </div>
+      {!isRunning && (
+        <div className="flex items-baseline gap-2 pl-5">
+          <button type="button" onClick={() => setExpanded((e) => !e)} className="text-left"
+            style={{ color: failed ? "var(--cli-err)" : "var(--cli-dim)" }}>
+            ⎿ {resultSummary(item.content, item.resultStatus)}
+            {failed && ` · ${item.resultStatus} · ${item.durationMs}ms`}
+          </button>
+          {clickable && (
+            <button type="button" onClick={() => onSelect!(artifactKey!)}
+              style={{ color: "var(--cli-accent)" }}>
+              {active ? "viewing →" : "view →"}
+            </button>
+          )}
+        </div>
+      )}
+      {expanded && preview && (
+        <pre className="mt-1 overflow-x-auto whitespace-pre-wrap pl-5"
+          style={{ color: "var(--cli-dim)" }}>{preview}</pre>
+      )}
     </motion.div>
   );
 }

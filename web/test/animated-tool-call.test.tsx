@@ -13,7 +13,7 @@ describe("AnimatedToolCall", () => {
     } as ToolItem;
     render(<AnimatedToolCall item={item} />);
     expect(screen.getByText(/read_file/)).toBeInTheDocument();
-    expect(screen.getByText("…")).toBeInTheDocument();
+    expect(screen.getByText("⏺")).toBeInTheDocument();
   });
 
   it("renders tool name and done status", () => {
@@ -23,7 +23,8 @@ describe("AnimatedToolCall", () => {
     } as ToolItem;
     render(<AnimatedToolCall item={item} />);
     expect(screen.getByText(/read_file/)).toBeInTheDocument();
-    expect(screen.getByText("✓")).toBeInTheDocument();
+    expect(screen.getByText("⏺")).toBeInTheDocument();
+    expect(screen.getByText(/⎿/)).toBeInTheDocument();
   });
 
   it("shows a failure badge with status and duration for a non-ok result", () => {
@@ -57,7 +58,7 @@ describe("AnimatedToolCall", () => {
     expect(screen.getByText(/write_file/)).toBeInTheDocument();
     // diff content is shown in the Inspector, not inline:
     expect(screen.queryByText(/-\s*bar/)).not.toBeInTheDocument();
-    screen.getByRole("button").click();
+    screen.getByText("view →").click();
     expect(onSelect).toHaveBeenCalledWith("art-3");
   });
 
@@ -72,7 +73,7 @@ describe("AnimatedToolCall", () => {
     expect(screen.getByText(/viewing/)).toBeInTheDocument();
   });
 
-  it("renders a non-clickable chip when there is no artifact", () => {
+  it("shows no view affordance when there is no artifact", () => {
     const item = {
       kind: "tool", name: "read_file", args: { path: "a.txt" }, status: "done", content: "file contents",
       ts: Date.now(), streaming: false, progress: 1,
@@ -81,6 +82,7 @@ describe("AnimatedToolCall", () => {
     expect(screen.getByText(/read_file/)).toBeInTheDocument();
     // raw content is not dumped into the conversation:
     expect(screen.queryByText("file contents")).not.toBeInTheDocument();
-    expect(screen.getByRole("button")).toBeDisabled();
+    // view → button is not shown without an artifact key
+    expect(screen.queryByText("view →")).not.toBeInTheDocument();
   });
 });

@@ -130,8 +130,12 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
     return { ...state, pendingApproval: { id: frame.id, summary: frame.summary, command: frame.command, display: frame.display } };
   }
   // frame.kind === "event"
-  const s = startTurn(state);
   const p = frame.payload;
+  // Session stats arrive after `done`; they must not open a new turn.
+  if (p.type === "session_stats") {
+    return { ...state, stats: p.stats };
+  }
+  const s = startTurn(state);
   switch (p.type) {
     case "usage":
       return { ...s, usage: { promptTokens: p.prompt_tokens, contextLimit: p.context_limit, turn: p.turn, maxTurns: p.max_turns } };
@@ -183,8 +187,6 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
     }
     case "context":
       return { ...s, items: [...s.items, { kind: "context", text: describeContext(p.kind, p.detail) }] };
-    case "session_stats":
-      return { ...s, stats: p.stats };
     case "sandbox_degraded":
       return { ...s, sandboxDegraded: { mechanism: p.mechanism, reason: p.reason } };
     case "stream_retry": {
@@ -199,7 +201,7 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
       return { ...s, items };
     }
     case "error":
-      return { ...s, items: [...s.items, { kind: "error", message: p.message }] };
+      return { ...s, inTurn: false, items: [...s.items, { kind: "error", message: p.message }] };
     case "done": {
       const items = [...s.items];
       const last = items[items.length - 1];

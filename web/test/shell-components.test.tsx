@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ApprovalPrompt } from "../src/components/ApprovalPrompt";
 import { Composer } from "../src/components/Composer";
@@ -10,25 +10,25 @@ describe("shell components", () => {
   it("ApprovalPrompt emits the chosen decision", async () => {
     const onDecide = vi.fn();
     render(<ApprovalPrompt approval={{ id: "c0", summary: "run x", command: "x" }} onDecide={onDecide} />);
-    await userEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^1\. yes$/i }));
     expect(onDecide).toHaveBeenCalledWith("approve");
   });
 
   it("Composer sends text and is disabled when offline", async () => {
     const onSend = vi.fn();
-    const { rerender } = render(<Composer disabled={false} onSend={onSend} />);
-    await userEvent.type(screen.getByRole("textbox"), "do it");
-    await userEvent.click(screen.getByRole("button", { name: /send/i }));
+    const { rerender } = render(<Composer disabled={false} onSend={onSend} history={() => []} />);
+    const ta = screen.getByRole("textbox", { name: "prompt" });
+    fireEvent.change(ta, { target: { value: "do it" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("do it");
-    rerender(<Composer disabled={true} onSend={onSend} />);
-    expect(screen.getByRole("button", { name: /send/i })).toBeDisabled();
-    expect(screen.getByRole("textbox")).toBeDisabled();
+    rerender(<Composer disabled={true} onSend={onSend} history={() => []} />);
+    expect(screen.getByPlaceholderText(/disconnected/)).toBeDisabled();
   });
 
   it("Composer submits on Enter but not on Shift+Enter", async () => {
     const onSend = vi.fn();
-    render(<Composer disabled={false} onSend={onSend} />);
-    const box = screen.getByRole("textbox");
+    render(<Composer disabled={false} onSend={onSend} history={() => []} />);
+    const box = screen.getByRole("textbox", { name: "prompt" });
     await userEvent.type(box, "via enter{Enter}");
     expect(onSend).toHaveBeenCalledWith("via enter");
     onSend.mockClear();
@@ -38,14 +38,14 @@ describe("shell components", () => {
 
   it("Composer trims text and ignores whitespace-only input", async () => {
     const onSend = vi.fn();
-    render(<Composer disabled={false} onSend={onSend} />);
-    const box = screen.getByRole("textbox");
+    render(<Composer disabled={false} onSend={onSend} history={() => []} />);
+    const box = screen.getByRole("textbox", { name: "prompt" });
     await userEvent.type(box, "  trimmed  ");
-    await userEvent.click(screen.getByRole("button", { name: /send/i }));
+    fireEvent.keyDown(box, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("trimmed");
     onSend.mockClear();
     await userEvent.type(box, "   ");
-    await userEvent.click(screen.getByRole("button", { name: /send/i }));
+    fireEvent.keyDown(box, { key: "Enter" });
     expect(onSend).not.toHaveBeenCalled();
   });
 

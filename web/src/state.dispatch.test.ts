@@ -7,6 +7,40 @@ const frame = (payload: unknown): Inbound =>
 const red = (s: ReturnType<typeof initialState>, p: unknown) =>
   reduce(s, { type: "frame", frame: frame(p) });
 
+describe("session_stats after done", () => {
+  it("leaves inTurn false, does not append a user item, and stores stats", () => {
+    const stats = {
+      turns: 1, prompt_tokens: 100, completion_tokens: 50, reasoning_tokens: 0,
+      cached_tokens: 0, cost_usd: 0.01, tool_calls: 0, tools_ok: 0, tools_denied: 0,
+      tools_error: 0, tools_timeout: 0, tools_panic: 0, tool_time_ms: 0,
+      turn_time_ms: 500, context_events: 0, errors: 0,
+    };
+    // Start a turn, finish it with done, then receive session_stats
+    let s = initialState(["hello"]);
+    s = red(s, { type: "token", text: "hi" });
+    s = red(s, { type: "done", reason: "stop" });
+    expect(s.inTurn).toBe(false);
+    const itemsBefore = s.items.length;
+    s = red(s, { type: "session_stats", stats });
+    expect(s.inTurn).toBe(false);
+    expect(s.items.length).toBe(itemsBefore); // no phantom user item
+    expect(s.stats).toEqual(stats);
+  });
+});
+
+describe("error event closes the turn", () => {
+  it("appends the error item and sets inTurn false", () => {
+    let s = initialState([]);
+    s = red(s, { type: "token", text: "partial" });
+    expect(s.inTurn).toBe(true);
+    s = red(s, { type: "error", message: "model overloaded" });
+    expect(s.inTurn).toBe(false);
+    const errors = s.items.filter((i) => i.kind === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ kind: "error", message: "model overloaded" });
+  });
+});
+
 describe("sub-agent attribution", () => {
   it("correlates tool_result by id when two same-named tools run", () => {
     let s = initialState([]);

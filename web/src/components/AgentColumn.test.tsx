@@ -8,14 +8,15 @@ const base = {
   onDecide: () => {}, composerDisabled: false, onSend: vi.fn(),
   usage: null as null | { promptTokens: number; contextLimit: number; turn: number; maxTurns: number },
   settings: null, toolCount: 0, artifactCount: 0, stats: null,
+  busy: false, turn: 0,
+  history: () => [],
 };
 
 describe("AgentColumn", () => {
-  it("renders the header (project + model) and an enabled composer", () => {
+  it("renders the session banner (project + model) and an enabled composer", () => {
     render(<AgentColumn {...base} />);
-    expect(screen.getByText("studio-x")).toBeInTheDocument();
-    expect(screen.getByText(/model qwen3/)).toBeInTheDocument();
-    expect(screen.getByPlaceholderText(/Message the agent/)).toBeEnabled();
+    expect(screen.getByText(/studio-x · qwen3/)).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "prompt" })).toBeEnabled();
   });
   it("disables the composer when asked", () => {
     render(<AgentColumn {...base} composerDisabled />);
@@ -24,15 +25,25 @@ describe("AgentColumn", () => {
   it("sends a message", () => {
     const onSend = vi.fn();
     render(<AgentColumn {...base} onSend={onSend} />);
-    const ta = screen.getByPlaceholderText(/Message the agent/);
+    const ta = screen.getByRole("textbox", { name: "prompt" });
     fireEvent.change(ta, { target: { value: "hello" } });
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("hello");
   });
-  it("renders the context dashboard gauge above the composer", () => {
+  it("renders the status line with a block meter", () => {
     render(<AgentColumn {...base} usage={{ promptTokens: 4000, contextLimit: 8000, turn: 1, maxTurns: 20 }} />);
     expect(screen.getByLabelText("context usage")).toBeInTheDocument();
     expect(screen.getByText(/4k\s*\/\s*8k/)).toBeInTheDocument();
+    expect(screen.getByText("▂▂▂▂▂░░░░░")).toBeInTheDocument();
     expect(screen.getByText(/50%/)).toBeInTheDocument();
+    expect(screen.getByText(/turn 1\/20/)).toBeInTheDocument();
+  });
+  it("shows the busy line while a turn is in flight", () => {
+    render(<AgentColumn {...base} busy turn={0} />);
+    expect(screen.getByText(/Thinking… \(0s\)/)).toBeInTheDocument();
+  });
+  it("hides the busy line when idle", () => {
+    render(<AgentColumn {...base} />);
+    expect(screen.queryByText("✳")).not.toBeInTheDocument();
   });
 });

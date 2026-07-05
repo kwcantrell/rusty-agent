@@ -10,7 +10,7 @@ describe("AnimatedReasoningMessage", () => {
     // Collapsed by default (like the existing ReasoningMessage), so expand first.
     const item = { kind: "reasoning", text: "let me think about this", ts: Date.now(), streaming: false, progress: 1 } as ReasoningItem;
     render(<AnimatedReasoningMessage item={item} />);
-    fireEvent.click(screen.getByText("▸ Thinking"));
+    fireEvent.click(screen.getByText(/✻ Thinking…/));
     expect(screen.getByText("let me think about this")).toBeInTheDocument();
   });
 
@@ -23,13 +23,13 @@ describe("AnimatedReasoningMessage", () => {
   it("expands when clicked", () => {
     const item = { kind: "reasoning", text: "visible reasoning", ts: Date.now(), streaming: false, progress: 1 } as ReasoningItem;
     render(<AnimatedReasoningMessage item={item} />);
-    fireEvent.click(screen.getByText("▸ Thinking"));
+    fireEvent.click(screen.getByText(/✻ Thinking…/));
     expect(screen.getByText("visible reasoning")).toBeInTheDocument();
   });
 
   it("shows the Thinking label", () => {
     const item = { kind: "reasoning", text: "test", ts: Date.now(), streaming: false, progress: 1 } as ReasoningItem;
     render(<AnimatedReasoningMessage item={item} />);
-    expect(screen.getByText("▸ Thinking")).toBeInTheDocument();
+    expect(screen.getByText(/✻ Thinking…/)).toBeInTheDocument();
   });
 });
