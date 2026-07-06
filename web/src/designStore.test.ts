@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 import {
-  displayDesignId, designsFrom, mergeDesigns, useDesignStore, MAX_VERSIONS,
+  displayDesignId, designsFrom, mergeDesigns, useDesignStore, MAX_VERSIONS, LIVE_PREVIEW_ID,
 } from "./designStore";
 import { artifactsFrom, type Item } from "./state";
 import type { Display } from "./wire";
@@ -146,5 +146,30 @@ describe("useDesignStore", () => {
     expect(backA.sent["design:x@1"]).toHaveLength(1); // sess-a data intact
     const rawB = localStorage.getItem("agent.designs.sess-b");
     if (rawB) expect(JSON.parse(rawB).sent["design:x@1"] ?? []).toEqual([]); // sess-b never got sess-a pins
+  });
+});
+
+describe("useDesignStore.addUrlVersion", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("creates the live-preview design and appends versions", () => {
+    const { result } = renderHook(() => useDesignStore([], "s1"));
+    act(() => result.current.addUrlVersion("http://localhost:5173"));
+    act(() => result.current.addUrlVersion("http://localhost:5173/settings"));
+    const d = result.current.designs.find((x) => x.id === LIVE_PREVIEW_ID);
+    expect(d).toBeDefined();
+    expect(d!.title).toBe("Live preview");
+    expect(d!.versions).toHaveLength(2);
+    expect((d!.versions[1].display as { Url: { url: string } }).Url.url)
+      .toBe("http://localhost:5173/settings");
+  });
+
+  it("persists manual versions across remounts", () => {
+    const first = renderHook(() => useDesignStore([], "s1"));
+    act(() => first.result.current.addUrlVersion("http://localhost:5173"));
+    first.unmount();
+    const second = renderHook(() => useDesignStore([], "s1"));
+    const d = second.result.current.designs.find((x) => x.id === LIVE_PREVIEW_ID);
+    expect(d?.versions).toHaveLength(1);
   });
 });

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Item } from "../../state";
-import { useDesignStore } from "../../designStore";
+import { useDesignStore, LIVE_PREVIEW_ID } from "../../designStore";
+import { isLocalUrl } from "../inspector/urlGuard";
 import { buildFeedbackMessage } from "../../designFeedback";
 import { DesignCanvas } from "./DesignCanvas";
 
@@ -14,6 +15,17 @@ export interface DesignPaneProps {
 export function DesignPane({ items, sessionId, onSend, sendDisabled }: DesignPaneProps) {
   const store = useDesignStore(items, sessionId);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [urlDraft, setUrlDraft] = useState("");
+  const [urlError, setUrlError] = useState<string | null>(null);
+  const preview = () => {
+    if (!isLocalUrl(urlDraft)) {
+      setUrlError("Only localhost URLs (e.g. http://localhost:5173) can be previewed.");
+      return;
+    }
+    store.addUrlVersion(urlDraft);
+    setActiveId(LIVE_PREVIEW_ID);
+    setUrlError(null);
+  };
   const active = store.designs.find((d) => d.id === activeId) ?? store.designs[store.designs.length - 1];
   const sub = (on: boolean) => ({
     color: on ? "var(--text-strong)" : "var(--text-muted)", fontWeight: on ? 600 : 400,
@@ -21,6 +33,20 @@ export function DesignPane({ items, sessionId, onSend, sendDisabled }: DesignPan
 
   return (
     <div className="flex h-full flex-col" style={{ background: "var(--surface-overlay)" }}>
+      <div className="px-2 pt-2">
+        <div className="flex gap-1">
+          <input aria-label="preview url" value={urlDraft} placeholder="http://localhost:5173"
+            onChange={(e) => setUrlDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") preview(); }}
+            className="min-w-0 flex-1 rounded px-2 py-1 text-xs"
+            style={{ background: "var(--surface-base)", color: "var(--text-strong)",
+              border: "1px solid var(--border)" }} />
+          <button onClick={preview} className="rounded px-2 py-1 text-xs"
+            style={{ background: "var(--surface-raised)", color: "var(--text-strong)",
+              border: "1px solid var(--border)" }}>Preview</button>
+        </div>
+        {urlError && <p className="pt-1 text-xs" style={{ color: "var(--text-muted)" }}>{urlError}</p>}
+      </div>
       {!active ? (
         <div className="flex flex-1 items-center justify-center p-6 text-center text-sm"
           style={{ color: "var(--text-muted)" }}>

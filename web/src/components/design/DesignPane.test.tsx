@@ -44,4 +44,21 @@ describe("DesignPane", () => {
     expect(sent[0]).toContain('"design_id": "design:landing"');
     expect(screen.getAllByTestId("pin-sent")).toHaveLength(1); // retained as sent
   });
+
+  it("previews a manually entered localhost url on the canvas", () => {
+    render(<DesignPane {...base} items={[]} />);
+    fireEvent.change(screen.getByLabelText("preview url"), {
+      target: { value: "http://localhost:5173" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect(screen.getByTitle("live preview")).toHaveAttribute("src", "http://localhost:5173");
+  });
+
+  it("rejects a non-localhost manual url with an inline error", () => {
+    render(<DesignPane {...base} items={[]} />);
+    fireEvent.change(screen.getByLabelText("preview url"), {
+      target: { value: "http://evil.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect(screen.queryByTitle("live preview")).not.toBeInTheDocument();
+    expect(screen.getByText(/Only localhost URLs/)).toBeInTheDocument();
+  });
 });

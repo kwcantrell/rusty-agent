@@ -3,6 +3,7 @@ import type { Display } from "./wire";
 import type { Item } from "./state";
 
 export const MAX_VERSIONS = 20;
+export const LIVE_PREVIEW_ID = "design:live-preview";
 
 export interface Pin { x_pct: number; y_pct: number; comment: string }
 export interface DesignVersion { display: Display; renderable: boolean }
@@ -94,21 +95,24 @@ export interface DesignStoreApi {
   designs: Design[];
   sentPins: (designId: string, version: number) => Pin[];
   recordSent: (designId: string, version: number, pins: Pin[]) => void;
+  addUrlVersion: (url: string) => void;
 }
 
 /**
- * DesignStore v1: stored history is FROZEN at mount (so live derivation never
- * double-counts), merged with live items, mirrored back to localStorage.
+ * DesignStore v1: stored blob is loaded once per (mount, sessionId) and extended
+ * only by addUrlVersion — nothing re-reads localStorage mid-session, so the
+ * double-count dedup invariant holds.
  * The B migration swaps this hook's internals for a server-backed store.
  */
 export function useDesignStore(items: Item[], sessionId: string): DesignStoreApi {
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- blob frozen per (mount, sessionId)
-  const stored = useMemo(() => loadBlob(sessionId), [sessionId]);
+  const [stored, setStored] = useState<StoredBlob>(() => loadBlob(sessionId));
   const [seededFor, setSeededFor] = useState(sessionId);
   const [sent, setSent] = useState<Record<string, Pin[]>>(stored.sent);
   if (seededFor !== sessionId) {
     setSeededFor(sessionId);
-    setSent(stored.sent);
+    const fresh = loadBlob(sessionId);
+    setStored(fresh);
+    setSent(fresh.sent);
   }
   const designs = useMemo(() => mergeDesigns(stored.designs, designsFrom(items)), [stored, items]);
 
@@ -119,5 +123,17 @@ export function useDesignStore(items: Item[], sessionId: string): DesignStoreApi
     sentPins: (id, version) => sent[`${id}@${version}`] ?? [],
     recordSent: (id, version, pins) =>
       setSent((s) => ({ ...s, [`${id}@${version}`]: [...(s[`${id}@${version}`] ?? []), ...pins] })),
+    addUrlVersion: (url) => setStored((s) => {
+      const version: DesignVersion = {
+        display: { Url: { url, id: LIVE_PREVIEW_ID, title: "Live preview" } },
+        renderable: true,
+      };
+      const exists = s.designs.some((d) => d.id === LIVE_PREVIEW_ID);
+      const designs = exists
+        ? s.designs.map((d) => d.id === LIVE_PREVIEW_ID
+            ? cap({ ...d, versions: [...d.versions, version] }) : d)
+        : [...s.designs, { id: LIVE_PREVIEW_ID, title: "Live preview", versions: [version] }];
+      return { ...s, designs };
+    }),
   };
 }
