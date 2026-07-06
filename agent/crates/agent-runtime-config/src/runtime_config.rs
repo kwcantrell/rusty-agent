@@ -542,9 +542,17 @@ impl RuntimeConfig {
         self
     }
 
-    /// Persist the full config (pretty JSON).
+    /// Persist the full config (pretty JSON) atomically: write to a sibling `.tmp`
+    /// file then rename over the target so the on-disk config is never partially written.
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let content = serde_json::to_string_pretty(self)?;
+        let tmp = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".tmp");
+            std::path::PathBuf::from(s)
+        };
+        std::fs::write(&tmp, &content)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -876,6 +884,25 @@ mod tests {
         c.save(&path).unwrap();
         let loaded = RuntimeConfig::load_over(base(), &path);
         assert_eq!(loaded, c);
+    }
+
+    #[test]
+    fn save_is_atomic_no_tmp_leftover_and_content_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = base();
+        cfg.save(&path).unwrap();
+        // No .tmp file must remain after a successful save.
+        let tmp = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".tmp");
+            std::path::PathBuf::from(s)
+        };
+        assert!(!tmp.exists(), ".tmp file must not exist after save");
+        // Content must round-trip correctly.
+        let loaded = RuntimeConfig::load_over(base(), &path);
+        assert_eq!(loaded.model, cfg.model);
+        assert_eq!(loaded.backend, cfg.backend);
     }
 
     #[test]
