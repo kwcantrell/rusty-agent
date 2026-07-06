@@ -17,6 +17,12 @@ describe("ArchDiagram", () => {
     expect(screen.getByText("memory on")).toBeInTheDocument();
     expect(screen.queryByText("degraded")).not.toBeInTheDocument();
     expect(screen.queryByText("override")).not.toBeInTheDocument();
+    expect(screen.getByText("subagents")).toBeInTheDocument();
+  });
+
+  it("3-tool fixture sub-label has no ellipsis", () => {
+    render(<ArchDiagram snapshot={fixture} selected={null} onSelect={() => {}} />);
+    expect(screen.getByRole("button", { name: /Tools/ }).textContent).not.toContain("…");
   });
 
   it("shows degraded and override badges when present", () => {

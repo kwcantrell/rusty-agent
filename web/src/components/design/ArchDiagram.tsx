@@ -12,7 +12,10 @@ const BLOCKS: BlockDef[] = [
     badge: (s) => (s.context.memory_enabled ? "memory on" : "memory off") },
   { id: "loop", label: "Agent Loop", sub: (s) => `${s.loop.max_turns} turns max`,
     badge: (s) => (s.loop.subagents_enabled ? "subagents" : null) },
-  { id: "tools", label: "Tools", sub: (s) => s.tools.map((t) => t.name).slice(0, 3).join(", ") + "…",
+  { id: "tools", label: "Tools",
+    sub: (s) => s.tools.length === 0
+      ? "none"
+      : s.tools.map((t) => t.name).slice(0, 3).join(", ") + (s.tools.length > 3 ? "…" : ""),
     badge: (s) => `${s.tools.length} tools` },
   { id: "policy", label: "Policy", sub: (s) => `${s.policy.allowlist.length} allowed / ${s.policy.denylist.length} denied` },
   { id: "sandbox", label: "Sandbox", sub: (s) => s.sandbox.image ?? s.sandbox.mechanism,
