@@ -5,7 +5,7 @@ pub mod workspace;
 
 use agent_runtime_config::RuntimeConfig;
 use agent_server::session::{SendOutcome, Session};
-use agent_server::wire::{ContextSnapshot, Decision, ServerEvent, SettingsState};
+use agent_server::wire::{ArchitectureSnapshot, ContextSnapshot, Decision, ServerEvent, SettingsState};
 use channel_out::ChannelOut;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,6 +59,11 @@ fn cancel(state: tauri::State<'_, AppState>) {
 #[tauri::command]
 fn settings_get(state: tauri::State<'_, AppState>) -> SettingsState {
     session(&state).settings_get()
+}
+
+#[tauri::command]
+fn architecture_get(state: tauri::State<'_, AppState>) -> ArchitectureSnapshot {
+    session(&state).architecture()
 }
 
 #[tauri::command]
@@ -161,6 +166,7 @@ macro_rules! all_handlers {
             approve,
             cancel,
             settings_get,
+            architecture_get,
             session_stats,
             settings_update,
             context_get,
@@ -289,5 +295,33 @@ mod cmd_tests {
             snap.segments.iter().any(|s| s.category == "system"),
             "snapshot must contain a system segment"
         );
+    }
+
+    /// Smoke test: `architecture_get` resolves over the mock IPC and the payload
+    /// contains the seven architecture block keys: model, tools, policy, sandbox,
+    /// context, loop, prompt.
+    #[test]
+    fn architecture_get_returns_snapshot_over_ipc() {
+        let app = app();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "arch", Default::default())
+            .build()
+            .unwrap();
+        let res = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "architecture_get".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::default(),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        );
+        assert!(res.is_ok(), "architecture_get should resolve: {res:?}");
+        let v: serde_json::Value = res.unwrap().deserialize().unwrap();
+        for key in ["model", "tools", "policy", "sandbox", "context", "loop", "prompt"] {
+            assert!(v.get(key).is_some(), "missing block {key}: {v}");
+        }
     }
 }
