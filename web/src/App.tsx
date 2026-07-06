@@ -23,7 +23,7 @@ export default function App() {
     resolveInitialTheme(loadTheme(), window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false));
   const [activeArtifactKey, setActiveArtifactKey] = useState<string | null>(null);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
-  const [rightTab, setRightTab] = useState<RightTab>(loadRightTab);
+  const [rightTab, setRightTab] = useState<RightTab>(() => loadRightTab(isTauri()));
   const sock = useRef<ReturnType<typeof connect> | null>(null);
   const [workspace, setWorkspace] = useState<string | undefined>(undefined);
   const [llama, setLlama] = useState<{ ok: boolean; model?: string } | null>(null);

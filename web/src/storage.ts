@@ -79,11 +79,15 @@ export function saveDashExpanded(v: boolean): void {
 }
 
 const RIGHT_TAB = "rightTab";
-export type RightTab = "workspace" | "context" | "design";
-export function loadRightTab(): RightTab {
+export type RightTab = "workspace" | "context" | "design" | "architecture" | "config";
+const ALL_TABS: readonly RightTab[] = ["workspace", "context", "design", "architecture", "config"];
+const TAURI_ONLY: readonly RightTab[] = ["architecture", "config"];
+
+export function loadRightTab(tauri: boolean): RightTab {
   try {
-    const v = localStorage.getItem(RIGHT_TAB);
-    return v === "context" || v === "design" ? v : "workspace";
+    const v = localStorage.getItem(RIGHT_TAB) as RightTab | null;
+    if (!v || !ALL_TABS.includes(v)) return "workspace";
+    return !tauri && TAURI_ONLY.includes(v) ? "workspace" : v;
   } catch { return "workspace"; }
 }
 export function saveRightTab(t: RightTab): void {
