@@ -1,5 +1,6 @@
 pub mod bridge;
 mod channel_out;
+pub mod devserver;
 pub mod llama;
 pub mod workspace;
 
