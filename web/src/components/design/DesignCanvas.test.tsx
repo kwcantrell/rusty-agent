@@ -80,4 +80,24 @@ describe("DesignCanvas", () => {
       onSendFeedback={() => {}} sendDisabled={false} />);
     expect(screen.queryByRole("button", { name: "Interact" })).not.toBeInTheDocument();
   });
+
+  it("holding Shift lets you pin while interacting with a live URL", () => {
+    // Render a Url design in Interact mode.
+    render(<DesignCanvas design={urlDesign()} sentPins={noPins}
+      onSendFeedback={() => {}} sendDisabled={false} />);
+    fireEvent.click(screen.getByRole("button", { name: /interact/i }));
+    const layer = screen.getByTestId("pin-layer");
+    // Interact mode: overlay passes through (pointer-events: none).
+    expect(layer).toHaveStyle({ pointerEvents: "none" });
+    // Hold Shift: overlay re-captures clicks.
+    fireEvent.keyDown(window, { key: "Shift" });
+    expect(layer).not.toHaveStyle({ pointerEvents: "none" });
+    // Release Shift: back to passthrough.
+    fireEvent.keyUp(window, { key: "Shift" });
+    expect(layer).toHaveStyle({ pointerEvents: "none" });
+    // Window blur clears a stuck Shift.
+    fireEvent.keyDown(window, { key: "Shift" });
+    fireEvent(window, new Event("blur"));
+    expect(layer).toHaveStyle({ pointerEvents: "none" });
+  });
 });
