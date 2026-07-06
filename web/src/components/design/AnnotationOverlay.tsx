@@ -7,8 +7,9 @@ import type { Pin } from "../../designStore";
  * pane resizes. The layer sits ABOVE iframe-hosted HTML, so no cross-frame
  * event wrangling (and mockups are intentionally non-interactive).
  */
-export function AnnotationOverlay({ children, sent, disabled, onSend }: {
+export function AnnotationOverlay({ children, sent, disabled, onSend, passthrough = false }: {
   children: ReactNode; sent: Pin[]; disabled: boolean; onSend: (pins: Pin[]) => void;
+  passthrough?: boolean;
 }) {
   const [drafts, setDrafts] = useState<Pin[]>([]);
   const box = useRef<HTMLDivElement>(null);
@@ -30,7 +31,8 @@ export function AnnotationOverlay({ children, sent, disabled, onSend }: {
     <div className="flex h-full flex-col">
       <div ref={box} className="relative min-h-0 flex-1">
         {children}
-        <div data-testid="pin-layer" className="absolute inset-0 cursor-crosshair" onClick={addPin}>
+        <div data-testid="pin-layer" className="absolute inset-0 cursor-crosshair" onClick={addPin}
+          style={passthrough ? { pointerEvents: "none" } : undefined}>
           {sent.map((p, i) => <Marker key={`s${i}`} pin={p} kind="sent" n={i + 1} />)}
           {drafts.map((p, i) => <Marker key={`d${i}`} pin={p} kind="draft" n={sent.length + i + 1} />)}
         </div>

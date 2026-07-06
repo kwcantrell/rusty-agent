@@ -64,4 +64,11 @@ describe("AnnotationOverlay", () => {
     expect(screen.getByLabelText("pin 3 comment")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "delete pin 3" })).toBeInTheDocument();
   });
+
+  it("lets clicks pass through to the artifact when passthrough is set", () => {
+    render(<AnnotationOverlay sent={[]} disabled={false} onSend={() => {}} passthrough>
+      <div>content</div>
+    </AnnotationOverlay>);
+    expect(screen.getByTestId("pin-layer")).toHaveStyle({ pointerEvents: "none" });
+  });
 });

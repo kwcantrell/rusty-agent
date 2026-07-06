@@ -100,6 +100,13 @@ pub enum Display {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
+    Url {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]

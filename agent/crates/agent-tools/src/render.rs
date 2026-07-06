@@ -2,6 +2,36 @@ use crate::{Access, Display, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, T
 use async_trait::async_trait;
 use serde_json::json;
 
+/// `kind=url` targets must be the user's own dev server: http(s) with host exactly
+/// `localhost`, `127.0.0.1`, or `[::1]` (any port). Exact-matching the authority up
+/// to the port fails closed on userinfo tricks (`http://localhost@evil.com`).
+fn validate_local_url(url: &str) -> Result<(), ToolError> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| ToolError::InvalidArgs(format!("url must be http(s): `{url}`")))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return Err(ToolError::InvalidArgs(format!(
+            "url must not contain userinfo: `{url}`"
+        )));
+    }
+    let host = if authority.starts_with('[') {
+        match authority.split_once(']') {
+            Some((h, tail)) if tail.is_empty() || tail.starts_with(':') => format!("{h}]"),
+            _ => return Err(ToolError::InvalidArgs(format!("malformed url: `{url}`"))),
+        }
+    } else {
+        authority.split(':').next().unwrap_or("").to_string()
+    };
+    match host.to_ascii_lowercase().as_str() {
+        "localhost" | "127.0.0.1" | "[::1]" => Ok(()),
+        other => Err(ToolError::InvalidArgs(format!(
+            "url host must be localhost, 127.0.0.1, or [::1] — got `{other}`"
+        ))),
+    }
+}
+
 fn str_arg(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -22,11 +52,14 @@ impl Tool for RenderArtifact {
         "render"
     }
     fn description(&self) -> &str {
-        "Render an artifact (markdown, code, html, mermaid diagram, table, or image) into the user's \
-         Inspector panel. For iterative visual design, use an id starting with `design:` (e.g. \
-         `design:landing-page`): each re-render of that id adds a new version to the user's Design \
-         canvas, where they can step through versions, compare them, and pin feedback that comes \
-         back to you as a `design-feedback` message."
+        "Render an artifact (markdown, code, html, mermaid diagram, table, image, or a live \
+         localhost url) into the user's Inspector panel. When a dev server is already running \
+         (e.g. Vite), prefer `kind=url` with its address (content=\"http://localhost:5173\") so \
+         the user sees the real app and their feedback maps to the actual code; use `kind=html` \
+         only for one-off static mockups when no dev server exists. For iterative visual design, \
+         use an id starting with `design:` (e.g. `design:landing-page`): each re-render of that \
+         id adds a new version to the user's Design canvas, where they can step through versions, \
+         compare them, and pin feedback that comes back to you as a `design-feedback` message."
     }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -36,12 +69,12 @@ impl Tool for RenderArtifact {
                 "type": "object",
                 "properties": {
                     "kind": {"type": "string",
-                        "enum": ["markdown","code","html","mermaid","table","image"],
+                        "enum": ["markdown","code","html","mermaid","table","image","url"],
                         "description": "Which artifact kind to render; one of the allowed enum values."},
                     "title": {"type": "string"},
                     "id": {"type": "string", "description": "stable id; re-rendering the same id replaces the artifact. Ids starting with `design:` version on the Design canvas instead of replacing."},
                     "content": {"type": "string",
-                        "description": "primary payload: markdown/html/mermaid source, code text, or base64 image data"},
+                        "description": "primary payload: markdown/html/mermaid source, code text, base64 image data, or the localhost dev-server address (kind=url)"},
                     "lang": {"type": "string", "description": "code language (kind=code)"},
                     "filename": {"type": "string", "description": "code filename (kind=code)"},
                     "mime": {"type": "string", "description": "image mime type (kind=image)"},
@@ -109,6 +142,15 @@ impl Tool for RenderArtifact {
                 Display::Table {
                     columns,
                     rows,
+                    title: title.clone(),
+                    id,
+                }
+            }
+            "url" => {
+                let url = str_arg(&args, "content")?;
+                validate_local_url(&url)?;
+                Display::Url {
+                    url,
                     title: title.clone(),
                     id,
                 }
@@ -221,5 +263,76 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("design:"));
+    }
+
+    #[tokio::test]
+    async fn render_url_localhost_emits_url_display() {
+        let out = RenderArtifact
+            .execute(
+                json!({"kind":"url","title":"App","content":"http://localhost:5173/app"}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        match out.display {
+            Some(Display::Url { url, title, .. }) => {
+                assert_eq!(url, "http://localhost:5173/app");
+                assert_eq!(title.as_deref(), Some("App"));
+            }
+            other => panic!("expected Url, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn render_url_accepts_all_loopback_hosts() {
+        for u in [
+            "http://localhost:5173",
+            "https://localhost/",
+            "http://127.0.0.1:3000/x?y=1",
+            "http://[::1]:8080/x",
+            "http://LOCALHOST:80",
+        ] {
+            RenderArtifact
+                .execute(json!({"kind":"url","content":u}), &ctx())
+                .await
+                .unwrap_or_else(|e| panic!("{u} should be accepted: {e:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn render_url_rejects_non_local_targets() {
+        for u in [
+            "http://evil.com",
+            "http://localhost.evil.com:5173",
+            "http://localhost@evil.com/",
+            "http://user@localhost:5173/",
+            "ftp://localhost/",
+            "localhost:5173",
+            "http://[::1/x",
+            // colon-in-userinfo bypass: authority splits on `:` giving "localhost", but
+            // the real host is evil.com — must be caught by an `@` presence check
+            "http://localhost:5173@evil.com",
+            "https://127.0.0.1:8080@evil.com/",
+        ] {
+            let err = RenderArtifact
+                .execute(json!({"kind":"url","content":u}), &ctx())
+                .await
+                .expect_err(&format!("{u} should be rejected"));
+            assert!(matches!(err, ToolError::InvalidArgs(_)));
+        }
+    }
+
+    #[test]
+    fn description_steers_url_over_standalone_html() {
+        let t = RenderArtifact;
+        assert!(
+            t.description().contains("kind=url") && t.description().contains("dev server"),
+            "agents must learn to prefer the live dev server over standalone html"
+        );
+        let kinds = t.schema().parameters["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(kinds.iter().any(|k| k == "url"));
     }
 }

@@ -1,30 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import type { Item } from "../../state";
-
-const tauriMock = vi.hoisted(() => ({ value: true }));
-vi.mock("../../transport", () => ({ isTauri: () => tauriMock.value }));
-// Never let the real tauri invoke run in jsdom: its promise can settle after
-// this file's environment is torn down and reject unhandled.
-vi.mock("./architecture", async (importOriginal) => ({
-  ...(await importOriginal<object>()),
-  fetchArchitecture: () => new Promise(() => {}),
-}));
-
 import { DesignPane } from "./DesignPane";
 
 const designItem = (html: string): Item =>
   ({ kind: "tool", name: "render", args: {}, status: "done",
      display: { Html: { html, id: "design:landing", title: "Landing" } } });
 
-const base = {
-  sessionId: "s1", onSend: () => {}, sendDisabled: false,
-  settings: null, settingsMeta: null, settingsError: null,
-  onSaveSettings: () => {}, onLoadSettings: () => {},
-};
+const base = { sessionId: "s1", onSend: () => {}, sendDisabled: false };
 
 describe("DesignPane", () => {
-  beforeEach(() => { localStorage.clear(); tauriMock.value = true; });
+  beforeEach(() => { localStorage.clear(); });
 
   it("shows an empty state with no designs", () => {
     render(<DesignPane {...base} items={[]} />);
@@ -34,6 +20,13 @@ describe("DesignPane", () => {
   it("renders the latest design version in the canvas", () => {
     render(<DesignPane {...base} items={[designItem("<p>v1</p>"), designItem("<p>v2</p>")]} />);
     expect(screen.getByText("v2 / 2")).toBeInTheDocument();
+  });
+
+  it("has no Config or Architecture sub-tabs", () => {
+    render(<DesignPane {...base} items={[]} />);
+    expect(screen.queryByRole("tab", { name: "Config" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Architecture" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Canvas" })).not.toBeInTheDocument();
   });
 
   it("sends structured feedback and records sent pins", () => {
@@ -52,28 +45,20 @@ describe("DesignPane", () => {
     expect(screen.getAllByTestId("pin-sent")).toHaveLength(1); // retained as sent
   });
 
-  it("shows the Config sub-tab under Tauri and loads settings on open", () => {
-    const onLoad = vi.fn();
-    render(<DesignPane {...base} items={[]} onLoadSettings={onLoad} />);
-    fireEvent.click(screen.getByRole("tab", { name: "Config" }));
-    expect(onLoad).toHaveBeenCalled();
+  it("previews a manually entered localhost url on the canvas", () => {
+    render(<DesignPane {...base} items={[]} />);
+    fireEvent.change(screen.getByLabelText("preview url"), {
+      target: { value: "http://localhost:5173" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect(screen.getByTitle("live preview")).toHaveAttribute("src", "http://localhost:5173");
   });
 
-  it("hides the Config sub-tab entirely outside Tauri", () => {
-    tauriMock.value = false;
+  it("rejects a non-localhost manual url with an inline error", () => {
     render(<DesignPane {...base} items={[]} />);
-    expect(screen.queryByRole("tab", { name: "Config" })).not.toBeInTheDocument();
-  });
-
-  it("shows the Architecture sub-tab under Tauri and renders the pane", () => {
-    render(<DesignPane {...base} items={[]} />);
-    fireEvent.click(screen.getByRole("tab", { name: "Architecture" }));
-    expect(screen.getByText(/Loading architecture/)).toBeInTheDocument();
-  });
-
-  it("hides the Architecture sub-tab outside Tauri", () => {
-    tauriMock.value = false;
-    render(<DesignPane {...base} items={[]} />);
-    expect(screen.queryByRole("tab", { name: "Architecture" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("preview url"), {
+      target: { value: "http://evil.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect(screen.queryByTitle("live preview")).not.toBeInTheDocument();
+    expect(screen.getByText(/Only localhost URLs/)).toBeInTheDocument();
   });
 });

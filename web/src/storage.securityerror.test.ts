@@ -6,7 +6,7 @@ describe("storage load helpers under a blocked localStorage", () => {
 
   it("loadRightTab falls back to 'workspace' when getItem throws", () => {
     vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new DOMException("blocked", "SecurityError"); });
-    expect(loadRightTab()).toBe("workspace");
+    expect(loadRightTab(false)).toBe("workspace");
   });
 
   it("loadTheme falls back to null when getItem throws", () => {

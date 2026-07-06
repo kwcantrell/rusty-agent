@@ -4,6 +4,7 @@ import { TerminalBlock } from "../TerminalBlock";
 import { MarkdownText } from "../MarkdownText";
 import { HtmlArtifact } from "./HtmlArtifact";
 import { MermaidArtifact } from "./MermaidArtifact";
+import { UrlArtifact } from "./UrlArtifact";
 
 export function ArtifactRenderer({ display }: { display: Display }) {
   if ("Text" in display) {
@@ -63,6 +64,9 @@ export function ArtifactRenderer({ display }: { display: Display }) {
   }
   if ("Mermaid" in display) {
     return <MermaidArtifact source={display.Mermaid.source} />;
+  }
+  if ("Url" in display) {
+    return <UrlArtifact url={display.Url.url} />;
   }
   return null;
 }

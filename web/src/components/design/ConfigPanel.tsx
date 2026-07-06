@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import type { RuntimeSettings } from "../../wire";
 import { SettingsForm, type SettingsMeta } from "../SettingsForm";
 
@@ -7,9 +8,13 @@ export interface ConfigPanelProps {
   error: string | null;
   disabled: boolean;
   onSave: (s: RuntimeSettings) => void;
+  onLoad?: () => void;
 }
 
-export function ConfigPanel({ settings, meta, error, disabled, onSave }: ConfigPanelProps) {
+export function ConfigPanel({ settings, meta, error, disabled, onSave, onLoad }: ConfigPanelProps) {
+  // Fetch fresh settings once when the panel opens (was the subtab's click handler).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { onLoad?.(); }, []);
   if (!settings) {
     return <p className="p-4 text-sm" style={{ color: "var(--text-muted)" }}>Loading settings…</p>;
   }
