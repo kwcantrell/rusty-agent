@@ -1,7 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import type { Item } from "../../state";
+
+// ── dev-server mocks (vi.hoisted so factory can reference them without TDZ) ──
+const detectDevScripts = vi.hoisted(() => vi.fn());
+const startDevServer   = vi.hoisted(() => vi.fn());
+const stopDevServer    = vi.hoisted(() => vi.fn());
+vi.mock("./devServer", () => ({ detectDevScripts, startDevServer, stopDevServer }));
+vi.mock("../../transport", async (orig) => ({ ...(await orig()), isTauri: () => true }));
+
 import { DesignPane } from "./DesignPane";
+
+// Safe default: 0 candidates → launcher renders nothing → existing tests unaffected.
+beforeEach(() => { detectDevScripts.mockResolvedValue([]); });
 
 const designItem = (html: string): Item =>
   ({ kind: "tool", name: "render", args: {}, status: "done",
@@ -60,5 +71,30 @@ describe("DesignPane", () => {
     fireEvent.click(screen.getByRole("button", { name: "Preview" }));
     expect(screen.queryByTitle("live preview")).not.toBeInTheDocument();
     expect(screen.getByText(/Only localhost URLs/)).toBeInTheDocument();
+  });
+});
+
+// ── Dev-server launcher tests ─────────────────────────────────────────────────
+const cand = { dir: "/w/web", script: "dev", package_manager: "pnpm", label: "web — dev" };
+
+describe("DesignPane dev-server launcher", () => {
+  beforeEach(() => {
+    detectDevScripts.mockReset(); startDevServer.mockReset(); stopDevServer.mockReset();
+    detectDevScripts.mockResolvedValue([cand]);
+  });
+
+  it("starting a detected server renders it in the canvas", async () => {
+    startDevServer.mockResolvedValue({ url: "http://localhost:5173/", candidate: cand });
+    render(<DesignPane items={[]} sessionId="s1" onSend={() => {}} sendDisabled={false} />);
+
+    const btn = await screen.findByRole("button", { name: /start dev server/i });
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(startDevServer).toHaveBeenCalledWith(cand));
+    // The live-preview iframe now exists (guard lets localhost through).
+    await waitFor(() =>
+      expect(screen.getByTitle(/live preview/i)).toBeInTheDocument());
+    // Stop control appears once running.
+    expect(screen.getByRole("button", { name: /stop/i })).toBeInTheDocument();
   });
 });
