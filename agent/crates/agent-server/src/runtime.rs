@@ -142,7 +142,7 @@ impl RuntimeState {
             let on_disk = std::fs::read_to_string(&self.config_path).ok();
             if on_disk != *seen {
                 return Err(
-                    "config file changed externally — restart the daemon or re-save from the CLI"
+                    "config file changed externally — restart the daemon to pick it up"
                         .into(),
                 );
             }
