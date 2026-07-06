@@ -87,6 +87,42 @@ pub fn detect(root: &Path) -> Vec<DevScriptCandidate> {
     out
 }
 
+/// Remove CSI escape sequences (`ESC [ ... <final>`), e.g. color codes.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            // Skip until the final byte (0x40..=0x7E), e.g. 'm'.
+            while let Some(&n) = chars.peek() {
+                chars.next();
+                if ('\u{40}'..='\u{7e}').contains(&n) { break; }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// First `http(s)://localhost|127.0.0.1` URL on the line, or None.
+pub fn parse_url(line: &str) -> Option<String> {
+    let clean = strip_ansi(line);
+    for scheme in ["http://", "https://"] {
+        let Some(start) = clean.find(scheme) else { continue };
+        let rest = &clean[start..];
+        // URL ends at the first whitespace.
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let url = rest[..end].trim_end_matches(['.', ',', ')', '"', '\'']);
+        let host = &url[scheme.len()..];
+        if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +166,27 @@ mod tests {
         write(tmp.path(), "package.json",
             r#"{"scripts":{"build":"vite build","test":"vitest","lint":"eslint ."}}"#);
         assert!(detect(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn parse_url_handles_vite_ansi_colored_line() {
+        // Vite splits the port out of the URL with a bold ANSI code.
+        let line = "  \u{1b}[32m➜\u{1b}[39m  \u{1b}[1mLocal\u{1b}[22m:   \
+                    \u{1b}[36mhttp://localhost:\u{1b}[1m5173\u{1b}[22m\u{1b}[36m/\u{1b}[39m";
+        assert_eq!(parse_url(line).as_deref(), Some("http://localhost:5173/"));
+    }
+
+    #[test]
+    fn parse_url_matches_plain_and_loopback() {
+        assert_eq!(parse_url("Local:   http://localhost:3000").as_deref(),
+                   Some("http://localhost:3000"));
+        assert_eq!(parse_url("On Your Network: http://127.0.0.1:8080/app").as_deref(),
+                   Some("http://127.0.0.1:8080/app"));
+    }
+
+    #[test]
+    fn parse_url_ignores_non_local_and_noise() {
+        assert_eq!(parse_url("VITE ready in 240 ms"), None);
+        assert_eq!(parse_url("Network: http://192.168.1.5:5173/"), None);
     }
 }
