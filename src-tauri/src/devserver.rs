@@ -195,25 +195,36 @@ impl DevServerManager {
         let (tx, rx) = oneshot::channel::<String>();
 
         // Reader task owns both pipes for the child's whole life.
+        // Track per-stream EOF so we only exit once BOTH are drained.
+        // Exiting early (on the first EOF) would leave the other pipe's buffer
+        // filling up and deadlock/orphan the child, and would miss URLs printed
+        // on the still-open stream.
         let tail_r = tail.clone();
         tokio::spawn(async move {
             let mut out = BufReader::new(stdout).lines();
             let mut err = BufReader::new(stderr).lines();
+            let mut out_done = false;
+            let mut err_done = false;
             let mut tx = Some(tx);
+            let mut push = |line: String| {
+                if let Some(url) = parse_url(&line) {
+                    if let Some(s) = tx.take() { let _ = s.send(url); }
+                }
+                let mut t = tail_r.lock().unwrap();
+                if t.len() == TAIL_LINES { t.pop_front(); }
+                t.push_back(line);
+            };
             loop {
-                let line = tokio::select! {
-                    l = out.next_line() => l, l = err.next_line() => l,
-                };
-                match line {
-                    Ok(Some(l)) => {
-                        if let Some(url) = parse_url(&l) {
-                            if let Some(tx) = tx.take() { let _ = tx.send(url); }
-                        }
-                        let mut t = tail_r.lock().unwrap();
-                        if t.len() == TAIL_LINES { t.pop_front(); }
-                        t.push_back(l);
-                    }
-                    _ => break, // EOF or error on both streams
+                tokio::select! {
+                    l = out.next_line(), if !out_done => match l {
+                        Ok(Some(line)) => push(line),
+                        _ => out_done = true,
+                    },
+                    l = err.next_line(), if !err_done => match l {
+                        Ok(Some(line)) => push(line),
+                        _ => err_done = true,
+                    },
+                    else => break,
                 }
             }
         });
@@ -341,6 +352,36 @@ mod tests {
         let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
         assert!(!alive, "process group should be dead after stop()");
         mgr.stop(); // idempotent
+    }
+
+    /// Regression test: URL is printed to STDERR *after* stdout has already closed.
+    ///
+    /// The old `_ => break` loop exited as soon as stdout sent Ok(None), so the
+    /// still-open stderr was never drained and the 30-second timeout fired instead.
+    /// The fixed loop disables each branch independently and only breaks via `else`
+    /// once BOTH streams are drained, so it catches the stderr URL correctly.
+    #[tokio::test]
+    async fn start_discovers_url_from_stderr_after_stdout_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        // stdout ends immediately; 50 ms later stderr prints the URL and then the
+        // node process keeps itself alive so stop() can kill it.
+        write(tmp.path(), "package.json", r#"{"scripts":{"dev":"node stderr_url.js"}}"#);
+        write(tmp.path(), "stderr_url.js", "\
+process.stdout.end();\n\
+setTimeout(() => {\n\
+  console.error('  Local:   http://localhost:5298/');\n\
+  setInterval(() => {}, 100000);\n\
+}, 50);\n");
+        let cand = DevScriptCandidate {
+            dir: tmp.path().to_string_lossy().into_owned(),
+            script: "dev".into(),
+            package_manager: "npm".into(),
+            label: "stderr-after-stdout-eof — dev".into(),
+        };
+        let mgr = DevServerManager::new();
+        let status = mgr.start(cand).await.expect("should discover URL from stderr");
+        assert_eq!(status.url, "http://localhost:5298/");
+        mgr.stop();
     }
 
     #[tokio::test]
