@@ -54,4 +54,12 @@ describe("ArchDiagram", () => {
     expect(picked).toEqual(["policy"]);
     expect(screen.getByRole("button", { name: /Tools/ })).toHaveAttribute("aria-pressed", "true");
   });
+
+  it("arrows sit between rows, not inside them", () => {
+    render(<ArchDiagram snapshot={fixture} selected={null} onSelect={() => {}} />);
+    const loopBtn = screen.getByRole("button", { name: /Agent Loop/ });
+    const arrows = screen.getAllByText("↓");
+    expect(arrows).toHaveLength(2);
+    for (const a of arrows) expect(a.closest("div")).not.toBe(loopBtn.parentElement);
+  });
 });

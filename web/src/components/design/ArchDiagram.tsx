@@ -1,3 +1,4 @@
+import { Fragment } from "react";
 import type { ArchitectureSnapshot, BlockId } from "./architecture";
 
 interface BlockDef { id: BlockId; label: string; sub: (s: ArchitectureSnapshot) => string;
@@ -21,48 +22,51 @@ const BLOCKS: BlockDef[] = [
 /** Row layout: [prompt model context] feed [loop]; [tools policy sandbox] execute below. */
 const ROWS: BlockId[][] = [["prompt", "model", "context"], ["loop"], ["tools", "policy", "sandbox"]];
 
+/** Block lookup by id (hoisted to avoid rebuild on every render). */
+const BY_ID = Object.fromEntries(BLOCKS.map((b) => [b.id, b])) as Record<BlockId, BlockDef>;
+
 export function ArchDiagram({ snapshot, selected, onSelect }: {
   snapshot: ArchitectureSnapshot; selected: BlockId | null; onSelect: (b: BlockId) => void;
 }) {
-  const byId = Object.fromEntries(BLOCKS.map((b) => [b.id, b])) as Record<BlockId, BlockDef>;
   return (
     <div className="relative flex flex-col gap-2 p-3" data-testid="arch-diagram">
       {ROWS.map((row, ri) => (
-        <div key={ri} className="flex justify-center gap-2">
-          {ri > 0 && <ArrowRow />}
-          {row.map((id) => {
-            const b = byId[id];
-            const on = selected === id;
-            const badge = b.badge?.(snapshot);
-            return (
-              <button key={id} aria-pressed={on} onClick={() => onSelect(id)}
-                className="min-w-0 flex-1 rounded-lg px-3 py-2 text-left"
-                style={{ maxWidth: "14rem", border: `1px solid ${on ? "var(--accent)" : "var(--border)"}`,
-                  background: on ? "var(--surface-raised)" : "var(--surface-overlay)" }}>
-                <span className="block text-xs font-semibold" style={{ color: "var(--text-strong)" }}>
-                  {b.label}
-                </span>
-                <span className="block truncate text-[11px]" style={{ color: "var(--text-muted)" }}>
-                  {b.sub(snapshot)}
-                </span>
-                {badge && (
-                  <span className="mt-1 inline-block rounded-full px-1.5 text-[10px]"
-                    style={{ background: badge === "degraded" ? "var(--state-error)" : "var(--surface-base)",
-                      color: badge === "degraded" ? "var(--accent-fg)" : "var(--text-muted)",
-                      border: "1px solid var(--border)" }}>
-                    {badge}
+        <Fragment key={ri}>
+          {ri > 0 && (
+            <div className="flex justify-center" aria-hidden>
+              <span className="text-sm" style={{ color: "var(--text-muted)" }}>↓</span>
+            </div>
+          )}
+          <div className="flex justify-center gap-2">
+            {row.map((id) => {
+              const b = BY_ID[id];
+              const on = selected === id;
+              const badge = b.badge?.(snapshot);
+              return (
+                <button key={id} aria-pressed={on} onClick={() => onSelect(id)}
+                  className="min-w-0 flex-1 rounded-lg px-3 py-2 text-left"
+                  style={{ maxWidth: "14rem", border: `1px solid ${on ? "var(--accent)" : "var(--border)"}`,
+                    background: on ? "var(--surface-raised)" : "var(--surface-overlay)" }}>
+                  <span className="block text-xs font-semibold" style={{ color: "var(--text-strong)" }}>
+                    {b.label}
                   </span>
-                )}
-              </button>
-            );
-          })}
-        </div>
+                  <span className="block truncate text-[11px]" style={{ color: "var(--text-muted)" }}>
+                    {b.sub(snapshot)}
+                  </span>
+                  {badge && (
+                    <span className="mt-1 inline-block rounded-full px-1.5 text-[10px]"
+                      style={{ background: badge === "degraded" ? "var(--state-error)" : "var(--surface-base)",
+                        color: badge === "degraded" ? "var(--accent-fg)" : "var(--text-muted)",
+                        border: "1px solid var(--border)" }}>
+                      {badge}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </Fragment>
       ))}
     </div>
   );
-}
-
-/** Downward arrow between rows (pure decoration). */
-function ArrowRow() {
-  return <span aria-hidden className="self-center text-sm" style={{ color: "var(--text-muted)" }}>↓</span>;
 }
