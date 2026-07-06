@@ -6080,6 +6080,9 @@ mod tests {
             },
         );
         let names: Vec<String> = l.tool_schemas().into_iter().map(|s| s.name).collect();
-        assert!(!names.is_empty(), "fixture loop registers at least one tool");
+        assert!(
+            !names.is_empty(),
+            "fixture loop registers at least one tool"
+        );
     }
 }
