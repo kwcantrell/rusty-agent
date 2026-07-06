@@ -50,4 +50,18 @@ describe("AnnotationOverlay", () => {
     fireEvent.change(screen.getByLabelText("pin 1 comment"), { target: { value: "x" } });
     expect(screen.getByRole("button", { name: /Send feedback/ })).toBeDisabled();
   });
+
+  it("aria-label numbering accounts for existing sent pins", () => {
+    const sent = [
+      { x_pct: 0.1, y_pct: 0.1, comment: "first" },
+      { x_pct: 0.2, y_pct: 0.2, comment: "second" },
+    ];
+    render(<AnnotationOverlay sent={sent} disabled={false} onSend={() => {}}><p>art</p></AnnotationOverlay>);
+    const layer = screen.getByTestId("pin-layer");
+    mockBox(layer.parentElement as HTMLElement);
+    fireEvent.click(layer, { clientX: 10, clientY: 10 });
+    // draft is pin #3 because two sent pins already exist
+    expect(screen.getByLabelText("pin 3 comment")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "delete pin 3" })).toBeInTheDocument();
+  });
 });

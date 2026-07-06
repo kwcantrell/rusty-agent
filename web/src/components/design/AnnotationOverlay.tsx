@@ -39,13 +39,13 @@ export function AnnotationOverlay({ children, sent, disabled, onSend }: {
         {drafts.map((p, i) => (
           <div key={i} className="flex items-center gap-2">
             <span className="text-xs" style={{ color: "var(--text-muted)" }}>#{sent.length + i + 1}</span>
-            <input aria-label={`pin ${i + 1} comment`} value={p.comment}
+            <input aria-label={`pin ${sent.length + i + 1} comment`} value={p.comment}
               placeholder="what should change here?"
               className="min-w-0 flex-1 rounded px-2 py-1 text-xs"
               style={{ background: "var(--surface-base)", color: "var(--text-strong)",
                 border: "1px solid var(--border)" }}
               onChange={(e) => setComment(i, e.target.value)} />
-            <button aria-label={`delete pin ${i + 1}`} onClick={() => remove(i)}
+            <button aria-label={`delete pin ${sent.length + i + 1}`} onClick={() => remove(i)}
               className="text-xs" style={{ color: "var(--text-muted)" }}>✕</button>
           </div>
         ))}
