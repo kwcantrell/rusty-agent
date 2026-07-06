@@ -9,7 +9,7 @@ export interface DesignVersion { display: Display; renderable: boolean }
 export interface Design { id: string; title: string; versions: DesignVersion[] }
 
 /** Variant keys ArtifactRenderer knows how to draw (mirror of its branches). */
-const RENDERABLE = new Set(["Text", "Markdown", "Code", "Diff", "Terminal", "Table", "Image", "Html", "Mermaid"]);
+const RENDERABLE = new Set(["Text", "Markdown", "Code", "Diff", "Terminal", "Table", "Image", "Html", "Mermaid", "Url"]);
 
 /** The design id ("design:<name>") when this display targets the canvas, else null. */
 export function displayDesignId(d: Display): string | null {

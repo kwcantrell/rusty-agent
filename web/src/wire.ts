@@ -9,7 +9,8 @@ export type Display =
   | { Html: { html: string; title?: string; id?: string } }
   | { Mermaid: { source: string; title?: string; id?: string } }
   | { Table: { columns: string[]; rows: string[][]; title?: string; id?: string } }
-  | { Image: { mime: string; data: string; title?: string; id?: string } };
+  | { Image: { mime: string; data: string; title?: string; id?: string } }
+  | { Url: { url: string; title?: string; id?: string } };
 
 export interface RuntimeSettings {
   backend: string;

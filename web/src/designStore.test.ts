@@ -51,6 +51,12 @@ describe("designsFrom", () => {
     const [d] = designsFrom([toolItem(html("design:x", "<p/>"))]);
     expect(d.title).toBe("design:x");
   });
+
+  it("treats Url displays as renderable design versions", () => {
+    const [d] = designsFrom([toolItem({ Url: { url: "http://localhost:5173", id: "design:app" } })]);
+    expect(d.id).toBe("design:app");
+    expect(d.versions[0].renderable).toBe(true);
+  });
 });
 
 describe("artifactsFrom interception", () => {
