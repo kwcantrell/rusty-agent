@@ -190,6 +190,11 @@ impl AgentLoop {
         self.config.sandbox.describe()
     }
 
+    /// The registered tool schemas (read-only; the architecture viewer's tool list).
+    pub fn tool_schemas(&self) -> Vec<agent_tools::ToolSchema> {
+        self.tools.schemas()
+    }
+
     /// Attach a memory retriever. When set, each turn auto-retrieves relevant
     /// memories and injects them into the context before the model runs.
     pub fn with_retriever(mut self, retriever: Arc<dyn Retriever>) -> Self {
@@ -6050,5 +6055,31 @@ mod tests {
                 }
             ),
         }
+    }
+
+    #[test]
+    fn tool_schemas_exposes_registered_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let l = AgentLoop::new(
+            Arc::new(ScriptedModel::new(vec![])),
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            Arc::new(CollectingSink::default()),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 1,
+                max_retries: 0,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let names: Vec<String> = l.tool_schemas().into_iter().map(|s| s.name).collect();
+        assert!(!names.is_empty(), "fixture loop registers at least one tool");
     }
 }

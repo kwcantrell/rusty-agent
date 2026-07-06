@@ -136,6 +136,97 @@ pub struct DiscoveredSkill {
     pub description: String,
 }
 
+/// Full read-only architecture snapshot for the Design tab's Architecture Viewer.
+/// Serializes as a flat JSON object; `loop_info` is renamed `"loop"` on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchitectureSnapshot {
+    pub model: ModelInfo,
+    pub tools: Vec<ToolEntry>,
+    pub policy: PolicyInfo,
+    pub sandbox: SandboxInfo,
+    pub context: ContextInfo,
+    #[serde(rename = "loop")]
+    pub loop_info: LoopInfo,
+    pub prompt: PromptInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub backend: String,
+    pub base_url_host: String,
+    pub model: String,
+    pub protocol: String,
+    pub temperature: f32,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub enable_thinking: bool,
+    pub preserve_thinking: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolEntry {
+    pub name: String,
+    pub summary: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyInfo {
+    pub allowlist: Vec<String>,
+    pub denylist: Vec<String>,
+    pub hard_floor: Vec<String>,
+    pub http_allow_hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxInfo {
+    pub mode: String,
+    pub mechanism: String,
+    pub image: Option<String>,
+    pub network: bool,
+    pub degraded: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextInfo {
+    pub context_limit: usize,
+    pub max_tool_result_bytes: usize,
+    pub memory_enabled: bool,
+    pub recall_budget: usize,
+    pub compaction_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopInfo {
+    pub max_turns: usize,
+    pub max_parallel_tools: usize,
+    pub subagents_enabled: bool,
+    pub subagent_max_depth: usize,
+    pub subagent_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptInfo {
+    pub est_tokens: usize,
+    pub override_active: bool,
+    pub override_chars: Option<usize>,
+}
+
+/// Scheme+host(+port) only — no path, query, or userinfo. The snapshot must be
+/// safe to screenshot/share, and base_url may carry credentials or key params.
+pub fn redact_base_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (Some(s), r),
+        None => (None, url),
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host);
+    match scheme {
+        Some(s) => format!("{s}://{host}"),
+        None => host.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
@@ -290,6 +381,40 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
 mod tests {
     use super::*;
     use agent_core::AgentEvent;
+
+    #[test]
+    fn redact_base_url_keeps_scheme_and_host_only() {
+        assert_eq!(redact_base_url("http://localhost:8080/v1"), "http://localhost:8080");
+        assert_eq!(redact_base_url("https://user:pw@api.example.com/v1?key=s3cret"),
+            "https://api.example.com");
+        assert_eq!(redact_base_url("localhost:8080"), "localhost:8080");
+        assert_eq!(redact_base_url(""), "");
+    }
+
+    #[test]
+    fn architecture_snapshot_serializes_loop_under_the_loop_key() {
+        let snap = ArchitectureSnapshot {
+            model: ModelInfo { backend: "openai".into(), base_url_host: "http://x".into(),
+                model: "m".into(), protocol: "native".into(), temperature: 0.6,
+                top_p: None, top_k: None, enable_thinking: true, preserve_thinking: false },
+            tools: vec![ToolEntry { name: "render".into(), summary: "Render an artifact".into(),
+                kind: "builtin".into() }],
+            policy: PolicyInfo { allowlist: vec![], denylist: vec![], hard_floor: vec![],
+                http_allow_hosts: vec![] },
+            sandbox: SandboxInfo { mode: "auto".into(), mechanism: "docker".into(),
+                image: Some("img".into()), network: false, degraded: None },
+            context: ContextInfo { context_limit: 32768, max_tool_result_bytes: 1,
+                memory_enabled: false, recall_budget: 0, compaction_model: None },
+            loop_info: LoopInfo { max_turns: 40, max_parallel_tools: 4,
+                subagents_enabled: false, subagent_max_depth: 1, subagent_model: None },
+            prompt: PromptInfo { est_tokens: 97, override_active: false, override_chars: None },
+        };
+        let j = serde_json::to_value(&snap).unwrap();
+        assert!(j.get("loop").is_some(), "loop_info must serialize as \"loop\": {j}");
+        assert_eq!(j["tools"][0]["kind"], "builtin");
+        let back: ArchitectureSnapshot = serde_json::from_value(j).unwrap();
+        assert_eq!(back.loop_info.max_turns, 40);
+    }
 
     #[test]
     fn parent_id_absent_from_json_when_none_and_present_when_some() {
