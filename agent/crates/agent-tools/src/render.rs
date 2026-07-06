@@ -11,6 +11,11 @@ fn validate_local_url(url: &str) -> Result<(), ToolError> {
         .or_else(|| url.strip_prefix("https://"))
         .ok_or_else(|| ToolError::InvalidArgs(format!("url must be http(s): `{url}`")))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return Err(ToolError::InvalidArgs(format!(
+            "url must not contain userinfo: `{url}`"
+        )));
+    }
     let host = if authority.starts_with('[') {
         match authority.split_once(']') {
             Some((h, tail)) if tail.is_empty() || tail.starts_with(':') => format!("{h}]"),
@@ -304,6 +309,10 @@ mod tests {
             "ftp://localhost/",
             "localhost:5173",
             "http://[::1/x",
+            // colon-in-userinfo bypass: authority splits on `:` giving "localhost", but
+            // the real host is evil.com — must be caught by an `@` presence check
+            "http://localhost:5173@evil.com",
+            "https://127.0.0.1:8080@evil.com/",
         ] {
             let err = RenderArtifact
                 .execute(json!({"kind":"url","content":u}), &ctx())

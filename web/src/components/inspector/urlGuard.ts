@@ -1,5 +1,14 @@
-/** True only for http(s) URLs whose host is the local machine. Mirrors the Rust
- *  tool-side guard (render.rs validate_local_url); both must hold — fail closed. */
+/**
+ * True only for http(s) URLs whose host is the local machine.
+ *
+ * Guard-parity note: this JS guard is the authoritative one — it uses the WHATWG
+ * `URL` parser (the same engine the browser uses to actually connect), which
+ * strips userinfo and normalises the host before we read `hostname`.  The Rust
+ * `validate_local_url` (render.rs) is a coarser literal-string matcher that acts
+ * as a first line of defence on the agent side; it rejects obvious non-local
+ * targets (including userinfo) but cannot replicate full WHATWG normalisation.
+ * Both guards must pass — fail closed.
+ */
 export function isLocalUrl(raw: string): boolean {
   try {
     const u = new URL(raw);
