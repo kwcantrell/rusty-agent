@@ -7,7 +7,7 @@ import { AnnotationOverlay } from "./AnnotationOverlay";
 export function DesignCanvas({ design, sentPins, onSendFeedback, sendDisabled }: {
   design: Design;
   sentPins: (version: number) => Pin[];
-  onSendFeedback: (version: number, pins: Pin[]) => void;
+  onSendFeedback: (version: number, pins: Pin[], url?: string) => void;
   sendDisabled: boolean;
 }) {
   const [viewed, setViewed] = useState<number | null>(null); // null = follow latest
@@ -58,7 +58,7 @@ export function DesignCanvas({ design, sentPins, onSendFeedback, sendDisabled }:
         ) : (
           <AnnotationOverlay sent={sentPins(cur + 1)} disabled={sendDisabled}
             passthrough={!!liveUrl && interact}
-            onSend={(pins) => onSendFeedback(cur + 1, pins)}>
+            onSend={(pins) => onSendFeedback(cur + 1, pins, liveUrl ?? undefined)}>
             <ArtifactRenderer display={design.versions[cur].display} />
           </AnnotationOverlay>
         )}

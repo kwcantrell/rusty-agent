@@ -41,8 +41,8 @@ export function DesignPane({ items, sessionId, onSend, sendDisabled }: DesignPan
           )}
           <DesignCanvas key={active.id} design={active}
             sentPins={(v) => store.sentPins(active.id, v)}
-            onSendFeedback={(v, pins) => {
-              onSend(buildFeedbackMessage(active.id, v, pins));
+            onSendFeedback={(v, pins, url) => {
+              onSend(buildFeedbackMessage(active.id, v, pins, undefined, url));
               store.recordSent(active.id, v, pins);
             }}
             sendDisabled={sendDisabled} />
