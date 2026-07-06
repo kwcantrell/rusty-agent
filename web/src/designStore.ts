@@ -47,12 +47,29 @@ export function designsFrom(items: Item[]): Design[] {
   return [...map.values()].map(cap);
 }
 
-/** Stored history (frozen at mount) followed by live-derived versions, capped. */
+/** Stored history (frozen at mount) followed by live-derived versions, capped.
+ *  Uses multiset dedup: each stored version "consumes" one identical live version
+ *  (by JSON-serialized display key), so remounting with the same items never
+ *  duplicates the stack, but legitimately repeated identical renders are preserved. */
 export function mergeDesigns(stored: Design[], live: Design[]): Design[] {
   const out = new Map<string, Design>(stored.map((d) => [d.id, d]));
   for (const l of live) {
     const s = out.get(l.id);
-    out.set(l.id, s ? cap({ ...l, versions: [...s.versions, ...l.versions] }) : l);
+    if (!s) { out.set(l.id, l); continue; }
+    // Build a multiset occurrence count of stored versions by serialized display.
+    const counts = new Map<string, number>();
+    for (const v of s.versions) {
+      const key = JSON.stringify(v.display);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    // Append only live versions not already covered by a stored occurrence.
+    const novel: DesignVersion[] = [];
+    for (const v of l.versions) {
+      const key = JSON.stringify(v.display);
+      const n = counts.get(key) ?? 0;
+      if (n > 0) { counts.set(key, n - 1); } else { novel.push(v); }
+    }
+    out.set(l.id, cap({ ...s, versions: [...s.versions, ...novel] }));
   }
   return [...out.values()];
 }

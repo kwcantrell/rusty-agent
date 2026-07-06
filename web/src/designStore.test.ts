@@ -78,6 +78,12 @@ describe("mergeDesigns", () => {
     const live = designsFrom([toolItem(html("design:b", "<p/>"))]);
     expect(mergeDesigns(stored, live).map((d) => d.id)).toEqual(["design:a", "design:b"]);
   });
+  it("mergeDesigns keeps legitimately repeated identical renders (multiset dedup)", () => {
+    const twice = [toolItem(html("design:x", "<p>same</p>")), toolItem(html("design:x", "<p>same</p>"))];
+    const stored = designsFrom(twice);
+    const [d] = mergeDesigns(stored, designsFrom(twice)); // remount case
+    expect(d.versions).toHaveLength(2); // not 4, not 1
+  });
 });
 
 describe("useDesignStore", () => {
@@ -110,6 +116,19 @@ describe("useDesignStore", () => {
       const h = renderHook(() => useDesignStore([toolItem(html("design:x", "<p/>"))], "sess-1"));
       expect(h.result.current.designs).toHaveLength(1); // in-memory still works
     } finally { Storage.prototype.setItem = orig; }
+  });
+
+  it("does not duplicate versions when remounted mid-session with live items", () => {
+    const items = [toolItem(html("design:x", "<p>v1</p>"))];
+    const first = renderHook(() => useDesignStore(items, "sess-1"));
+    expect(first.result.current.designs[0].versions).toHaveLength(1);
+    first.unmount();
+    const second = renderHook(() => useDesignStore(items, "sess-1")); // same non-empty items
+    expect(second.result.current.designs[0].versions).toHaveLength(1);
+    second.unmount();
+    const third = renderHook(() => useDesignStore(
+      [...items, toolItem(html("design:x", "<p>v2</p>"))], "sess-1")); // one new render
+    expect(third.result.current.designs[0].versions).toHaveLength(2);
   });
 
   it("re-seeds sent pins when sessionId changes while mounted", () => {
