@@ -137,7 +137,7 @@ pub struct DiscoveredSkill {
 }
 
 /// Full read-only architecture snapshot for the Design tab's Architecture Viewer.
-/// Serializes as a flat JSON object; `loop_info` is renamed `"loop"` on the wire.
+/// Serializes as a JSON object (not envelope-wrapped); `loop_info` is renamed `"loop"` on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchitectureSnapshot {
     pub model: ModelInfo,
@@ -203,6 +203,7 @@ pub struct LoopInfo {
     pub subagents_enabled: bool,
     pub subagent_max_depth: usize,
     pub subagent_model: Option<String>,
+    pub stream_idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,9 +385,14 @@ mod tests {
 
     #[test]
     fn redact_base_url_keeps_scheme_and_host_only() {
-        assert_eq!(redact_base_url("http://localhost:8080/v1"), "http://localhost:8080");
-        assert_eq!(redact_base_url("https://user:pw@api.example.com/v1?key=s3cret"),
-            "https://api.example.com");
+        assert_eq!(
+            redact_base_url("http://localhost:8080/v1"),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            redact_base_url("https://user:pw@api.example.com/v1?key=s3cret"),
+            "https://api.example.com"
+        );
         assert_eq!(redact_base_url("localhost:8080"), "localhost:8080");
         assert_eq!(redact_base_url(""), "");
     }
@@ -394,26 +400,65 @@ mod tests {
     #[test]
     fn architecture_snapshot_serializes_loop_under_the_loop_key() {
         let snap = ArchitectureSnapshot {
-            model: ModelInfo { backend: "openai".into(), base_url_host: "http://x".into(),
-                model: "m".into(), protocol: "native".into(), temperature: 0.6,
-                top_p: None, top_k: None, enable_thinking: true, preserve_thinking: false },
-            tools: vec![ToolEntry { name: "render".into(), summary: "Render an artifact".into(),
-                kind: "builtin".into() }],
-            policy: PolicyInfo { allowlist: vec![], denylist: vec![], hard_floor: vec![],
-                http_allow_hosts: vec![] },
-            sandbox: SandboxInfo { mode: "auto".into(), mechanism: "docker".into(),
-                image: Some("img".into()), network: false, degraded: None },
-            context: ContextInfo { context_limit: 32768, max_tool_result_bytes: 1,
-                memory_enabled: false, recall_budget: 0, compaction_model: None },
-            loop_info: LoopInfo { max_turns: 40, max_parallel_tools: 4,
-                subagents_enabled: false, subagent_max_depth: 1, subagent_model: None },
-            prompt: PromptInfo { est_tokens: 97, override_active: false, override_chars: None },
+            model: ModelInfo {
+                backend: "openai".into(),
+                base_url_host: "http://x".into(),
+                model: "m".into(),
+                protocol: "native".into(),
+                temperature: 0.6,
+                top_p: None,
+                top_k: None,
+                enable_thinking: true,
+                preserve_thinking: false,
+            },
+            tools: vec![ToolEntry {
+                name: "render".into(),
+                summary: "Render an artifact".into(),
+                kind: "builtin".into(),
+            }],
+            policy: PolicyInfo {
+                allowlist: vec![],
+                denylist: vec![],
+                hard_floor: vec![],
+                http_allow_hosts: vec![],
+            },
+            sandbox: SandboxInfo {
+                mode: "auto".into(),
+                mechanism: "docker".into(),
+                image: Some("img".into()),
+                network: false,
+                degraded: None,
+            },
+            context: ContextInfo {
+                context_limit: 32768,
+                max_tool_result_bytes: 1,
+                memory_enabled: false,
+                recall_budget: 0,
+                compaction_model: None,
+            },
+            loop_info: LoopInfo {
+                max_turns: 40,
+                max_parallel_tools: 4,
+                subagents_enabled: false,
+                subagent_max_depth: 1,
+                subagent_model: None,
+                stream_idle_timeout_secs: 300,
+            },
+            prompt: PromptInfo {
+                est_tokens: 97,
+                override_active: false,
+                override_chars: None,
+            },
         };
         let j = serde_json::to_value(&snap).unwrap();
-        assert!(j.get("loop").is_some(), "loop_info must serialize as \"loop\": {j}");
+        assert!(
+            j.get("loop").is_some(),
+            "loop_info must serialize as \"loop\": {j}"
+        );
         assert_eq!(j["tools"][0]["kind"], "builtin");
         let back: ArchitectureSnapshot = serde_json::from_value(j).unwrap();
         assert_eq!(back.loop_info.max_turns, 40);
+        assert_eq!(back.loop_info.stream_idle_timeout_secs, 300);
     }
 
     #[test]

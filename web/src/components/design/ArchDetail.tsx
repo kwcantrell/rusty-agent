@@ -97,6 +97,7 @@ export function ArchDetail({ snapshot, block }: { snapshot: ArchitectureSnapshot
           <Row k="Subagents" v={s.loop.subagents_enabled
             ? `on (depth ${s.loop.subagent_max_depth}${s.loop.subagent_model ? `, model ${s.loop.subagent_model}` : ""})`
             : "off"} />
+          <Row k="Stream idle timeout" v={`${s.loop.stream_idle_timeout_secs}s`} />
         </dl>
       )}
       {block === "prompt" && (

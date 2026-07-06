@@ -213,6 +213,9 @@ impl RuntimeState {
 
     /// Read-only self-portrait of the LIVE loop (post-apply). Assembles from state
     /// this struct already holds; never mutates, never exposes the prompt text.
+    // Accepted cfg-vs-loop generation tear: config is read under a separate lock from
+    // the loop/prompt, so a concurrent apply() can produce old-cfg + new-loop values in
+    // one snapshot — read-only, self-heals on refresh (same accepted pattern as settings_state()).
     pub fn architecture(&self, recall_budget: usize) -> ArchitectureSnapshot {
         const CONTEXT_TOOLS: [&str; 2] = ["context_recall", "context_compact"];
         const SKILL_TOOLS: [&str; 4] = [
@@ -307,6 +310,7 @@ impl RuntimeState {
                 subagents_enabled: cfg.subagents,
                 subagent_max_depth: cfg.subagent_max_depth,
                 subagent_model: cfg.subagent_model.as_ref().and_then(|m| m.model.clone()),
+                stream_idle_timeout_secs: DEFAULT_STREAM_IDLE_TIMEOUT.as_secs(),
             },
             prompt: PromptInfo {
                 est_tokens: estimate_tokens(&prompt),
@@ -528,6 +532,12 @@ mod tests {
         );
         // Verify it matches the fixture's configured mode (default is "auto")
         assert_eq!(snap.sandbox.mode, "auto");
+        // DEFAULT_STREAM_IDLE_TIMEOUT is a build-time constant; it must be non-zero.
+        assert!(
+            snap.loop_info.stream_idle_timeout_secs > 0,
+            "stream_idle_timeout_secs must be positive, got {}",
+            snap.loop_info.stream_idle_timeout_secs
+        );
     }
 
     fn make() -> (RuntimeState, tempfile::TempDir) {

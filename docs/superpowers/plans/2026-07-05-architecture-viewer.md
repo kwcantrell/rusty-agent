@@ -997,8 +997,16 @@ Use `superpowers:finishing-a-development-branch`.
 
 ---
 
+## Deviations from the spec
+
+1. **Offload/compaction posture (Context block):** The spec anticipated a separate offload-posture knob. In the implementation, offloading is always-on with no distinct posture field; the Context block instead exposes `max_tool_result_bytes` (the offload threshold) and `compaction_model` (null = primary model). There is no additional posture value to show.
+
+2. **Stream idle timeout (Loop block):** Initially omitted from the snapshot. Restored post-review as `stream_idle_timeout_secs` — a build-time constant (`DEFAULT_STREAM_IDLE_TIMEOUT`), not a config knob — because a self-portrait of the running agent should reflect actual runtime values, not only config-settable ones.
+
+---
+
 ## Self-review (performed at plan-writing time)
 
-- **Spec coverage:** snapshot blocks (T1 types, T2 assembly incl. recall_budget via Session), redaction (T1 golden), tool provenance partitioning + best-effort builtin (T2), degraded propagation (T2 test + T4 badge + T5 detail), command + registration + IPC smoke (T3), diagram + badges + selection (T4), drill-down incl. hard-floor marks and no-prompt-text (T5), fetch-on-entry/refresh/error-retry/no-caching (T6 pane), Tauri gating (T6 DesignPane tests), manual freshness check (T7). Out-of-scope items (telemetry, editing, Worker) have no tasks — correct.
+- **Spec coverage:** snapshot blocks (T1 types, T2 assembly incl. recall_budget via Session), redaction (T1 golden), tool provenance partitioning + best-effort builtin (T2), degraded propagation (T2 test + T4 badge + T5 detail), command + registration + IPC smoke (T3), diagram + badges + selection (T4), drill-down incl. hard-floor marks and no-prompt-text (T5), fetch-on-entry/refresh/error-retry/no-caching (T6 pane), Tauri gating (T6 DesignPane tests), manual freshness check (T7). Out-of-scope items (telemetry, editing, Worker) have no tasks — correct. See "Deviations from the spec" section above for two items where the implementation differs from the original spec: offload posture representation and stream idle timeout.
 - **Type consistency:** `ArchitectureSnapshot` field names identical across Rust serde (snake_case, `loop` rename) and TS mirror; `BlockId` values match ROWS/BLOCKS and ArchDetail branches; `fetchArchitecture` name consistent in mock and pane.
 - **Placeholders:** Task 1's loop fixture and Task 3's IPC harness say "adapt to the module's existing fixture/harness" with binding assertions spelled out — codebase-reading instructions, not gaps. No TBDs.
