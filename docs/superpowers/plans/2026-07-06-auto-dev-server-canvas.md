@@ -364,12 +364,16 @@ Add inside `mod tests`:
         assert_eq!(status.url, "http://localhost:5199/");
         assert!(mgr.status().is_some());
 
-        // Capture the group leader pid, then stop and confirm it's reaped.
+        // Capture the group leader pid, then stop and confirm the group is reaped.
+        let pid = mgr.running_pid().expect("running pid");
         mgr.stop();
         assert!(mgr.status().is_none());
-        // Group leader must be gone: kill(pid, 0) -> ESRCH.
-        // (pid is exposed via status→internal; here we just assert stop() is idempotent.)
-        mgr.stop();
+        // Give the kernel a moment to reap, then confirm the group is gone:
+        // kill(pid, 0) returns 0 while any process in the group lives, -1/ESRCH once dead.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        assert!(!alive, "process group should be dead after stop()");
+        mgr.stop(); // idempotent
     }
 
     #[tokio::test]
@@ -431,6 +435,11 @@ impl DevServerManager {
 
     pub fn status(&self) -> Option<DevServerStatus> {
         self.current.lock().unwrap().as_ref().map(|r| r.status.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn running_pid(&self) -> Option<u32> {
+        self.current.lock().unwrap().as_ref().map(|r| r.pid)
     }
 
     /// SIGTERM the whole process group, then SIGKILL as a backstop.
