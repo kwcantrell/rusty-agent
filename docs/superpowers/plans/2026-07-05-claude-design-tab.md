@@ -12,7 +12,8 @@
 
 1. **No new Tauri commands / no `apply_live`.** The spec proposed `get_runtime_config`/`set_runtime_config`/`apply_live`. Research found `RuntimeState::apply()` (agent-server/src/runtime.rs:130) already does validate → normalize → rebuild loop → persist → atomic swap, applied at the **next turn boundary** ("an in-flight run keeps the Arc it already cloned"), reachable via existing `settings_update`. That is the spec's "live where safe" semantics for ALL fields — strictly better than "next session" for structural ones. The only new backend capability is a `system_prompt_override` config field.
 2. **"Dead-session degrade" for `apply_live` is moot** — there is no separate live path.
-3. **Version stacks derive from reducer items** (like `artifactsFrom`) plus a localStorage mirror frozen at mount; the spec's "store intercepts the stream" is implemented as pure derivation behind the same `DesignStore` seam.
+3. **Version stacks derive from reducer items** (like `artifactsFrom`) plus a localStorage mirror frozen at mount; the spec's "store intercepts the stream" is implemented as pure derivation behind the same `DesignStore` seam. (Final review: the mirror must content-dedup against live items on remount — `mergeDesigns` multiset dedup — or tab switching duplicates versions.)
+4. **The system-prompt override rides the shared settings surface** (`SettingsForm`, used by both the top-bar Settings modal and the Design tab's Config section). This surface is desktop-only in practice: the SPA renders a "launch the desktop app" notice outside Tauri (`App.tsx` early return), so no remote path exists today. If a browser/Worker path is ever re-enabled, the settings surface (which already carries `command_allowlist`/`backend`) — including the prompt override — must be gated or re-reviewed then; the spec's "config is desktop-only" decision is preserved by the app-level gate, not per-field gating.
 
 ## Global Constraints
 
@@ -565,7 +566,7 @@ export function DesignCanvas(props: {
 `web/src/components/design/DesignCanvas.test.tsx`:
 
 ```tsx
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { DesignCanvas } from "./DesignCanvas";
 import type { Design } from "../../designStore";
@@ -620,14 +621,6 @@ describe("DesignCanvas", () => {
     d.versions[0] = { display: { Frob: { x: 1 } } as never, renderable: false };
     render(<DesignCanvas design={d} sentPins={noPins} onSendFeedback={() => {}} sendDisabled={false} />);
     expect(screen.getByText(/unsupported/)).toBeInTheDocument();
-  });
-
-  it("passes 1-based version numbers to feedback", () => {
-    const sent = vi.fn();
-    render(<DesignCanvas design={design(2)} sentPins={noPins} onSendFeedback={sent} sendDisabled={false} />);
-    // AnnotationOverlay is exercised in its own test; here we only pin the wiring
-    // by checking the sentPins accessor version (asserted via the overlay's sent markers).
-    expect(sent).not.toHaveBeenCalled();
   });
 });
 ```
@@ -1486,7 +1479,7 @@ Run `npm run typecheck` — fix any fixture objects that construct a full `Runti
 `web/src/components/design/ConfigPanel.test.tsx`:
 
 ```tsx
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { ConfigPanel } from "./ConfigPanel";
 import type { RuntimeSettings } from "../../wire";

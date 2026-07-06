@@ -22,7 +22,11 @@ impl Tool for RenderArtifact {
         "render"
     }
     fn description(&self) -> &str {
-        "Render an artifact (markdown, code, html, mermaid diagram, table, or image) into the user's Inspector panel."
+        "Render an artifact (markdown, code, html, mermaid diagram, table, or image) into the user's \
+         Inspector panel. For iterative visual design, use an id starting with `design:` (e.g. \
+         `design:landing-page`): each re-render of that id adds a new version to the user's Design \
+         canvas, where they can step through versions, compare them, and pin feedback that comes \
+         back to you as a `design-feedback` message."
     }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -35,7 +39,7 @@ impl Tool for RenderArtifact {
                         "enum": ["markdown","code","html","mermaid","table","image"],
                         "description": "Which artifact kind to render; one of the allowed enum values."},
                     "title": {"type": "string"},
-                    "id": {"type": "string", "description": "stable id; re-rendering the same id replaces the artifact"},
+                    "id": {"type": "string", "description": "stable id; re-rendering the same id replaces the artifact. Ids starting with `design:` version on the Design canvas instead of replacing."},
                     "content": {"type": "string",
                         "description": "primary payload: markdown/html/mermaid source, code text, or base64 image data"},
                     "lang": {"type": "string", "description": "code language (kind=code)"},
@@ -204,5 +208,18 @@ mod tests {
             .intent(&json!({"kind":"markdown","content":"x"}))
             .unwrap();
         assert_eq!(i.access, Access::Read);
+    }
+
+    #[test]
+    fn description_documents_the_design_canvas_convention() {
+        let t = RenderArtifact;
+        assert!(
+            t.description().contains("design:"),
+            "agents must learn the design canvas from the schema"
+        );
+        assert!(t.schema().parameters["properties"]["id"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("design:"));
     }
 }

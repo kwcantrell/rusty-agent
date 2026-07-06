@@ -10,6 +10,7 @@ const settings: RuntimeSettings = {
   enable_thinking: false, preserve_thinking: false, memory: true,
   skills_dirs: [], active_skills: [],
   trace: false, trace_dir: null, trace_max_mb: 64,
+  system_prompt_override: null,
 };
 const meta = { workspace: "/home/me/proj", apiKeySet: true, hardFloor: ["sudo", "rm -rf /"],
   discoveredSkills: [] };

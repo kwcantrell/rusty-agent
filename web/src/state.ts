@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import type { Display, Inbound, RuntimeSettings, SessionStats } from "./wire";
+import { displayDesignId } from "./designStore";
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
 
@@ -322,7 +323,7 @@ export interface InspectorArtifact { key: string; title: string; display: Displa
 export function artifactsFrom(items: Item[]): InspectorArtifact[] {
   const out: InspectorArtifact[] = [];
   items.forEach((it, i) => {
-    if (it.kind === "tool" && it.display) {
+    if (it.kind === "tool" && it.display && displayDesignId(it.display) === null) {
       const title = displayTitle(it.display) ?? it.name;
       out.push({ key: `art-${i}`, title, display: it.display });
     }

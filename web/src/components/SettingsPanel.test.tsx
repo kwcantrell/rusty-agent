@@ -11,6 +11,7 @@ const base: RuntimeSettings = {
   enable_thinking: true, preserve_thinking: false, memory: true,
   skills_dirs: [], active_skills: [],
   trace: false, trace_dir: null, trace_max_mb: 64,
+  system_prompt_override: null,
 };
 
 describe("SettingsPanel skills", () => {

@@ -79,10 +79,12 @@ export function saveDashExpanded(v: boolean): void {
 }
 
 const RIGHT_TAB = "rightTab";
-export type RightTab = "workspace" | "context";
+export type RightTab = "workspace" | "context" | "design";
 export function loadRightTab(): RightTab {
-  try { return localStorage.getItem(RIGHT_TAB) === "context" ? "context" : "workspace"; }
-  catch { return "workspace"; }
+  try {
+    const v = localStorage.getItem(RIGHT_TAB);
+    return v === "context" || v === "design" ? v : "workspace";
+  } catch { return "workspace"; }
 }
 export function saveRightTab(t: RightTab): void {
   try { localStorage.setItem(RIGHT_TAB, t); } catch { /* ignore */ }
