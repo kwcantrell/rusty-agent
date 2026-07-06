@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchArchitecture, type ArchitectureSnapshot, type BlockId } from "./architecture";
 import { ArchDiagram } from "./ArchDiagram";
 import { ArchDetail } from "./ArchDetail";
@@ -9,10 +9,17 @@ export function ArchitecturePane() {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<BlockId>("loop");
 
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => { alive.current = false; };
+  }, []);
   const load = useCallback(() => {
     setError(null);
     setSnapshot(null);
-    fetchArchitecture().then(setSnapshot).catch((e) => setError(String(e)));
+    fetchArchitecture()
+      .then((s) => { if (alive.current) setSnapshot(s); })
+      .catch((e) => { if (alive.current) setError(String(e)); });
   }, []);
   useEffect(() => { load(); }, [load]);
 

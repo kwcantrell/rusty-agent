@@ -46,5 +46,22 @@ describe("ArchitecturePane", () => {
     await waitFor(() => screen.getByTestId("arch-diagram"));
     fireEvent.click(screen.getByRole("button", { name: /Refresh/ }));
     expect(fetchMock.fn).toHaveBeenCalledTimes(2);
+    await waitFor(() => screen.getByTestId("arch-diagram"));
+  });
+
+  it("ignores fetch settlement after unmount (no window access post-teardown)", async () => {
+    let resolve!: (v: unknown) => void;
+    fetchMock.fn.mockReturnValue(new Promise((r) => { resolve = r; }));
+    const { unmount } = render(<ArchitecturePane />);
+    unmount();
+    // Simulate the test environment being torn down before the fetch settles:
+    // any React state dispatch would touch `window` and reject unhandled.
+    vi.stubGlobal("window", undefined);
+    try {
+      resolve(archFixture);
+      await new Promise((r) => setTimeout(r, 0));
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

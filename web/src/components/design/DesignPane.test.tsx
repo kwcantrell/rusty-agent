@@ -4,6 +4,12 @@ import type { Item } from "../../state";
 
 const tauriMock = vi.hoisted(() => ({ value: true }));
 vi.mock("../../transport", () => ({ isTauri: () => tauriMock.value }));
+// Never let the real tauri invoke run in jsdom: its promise can settle after
+// this file's environment is torn down and reject unhandled.
+vi.mock("./architecture", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  fetchArchitecture: () => new Promise(() => {}),
+}));
 
 import { DesignPane } from "./DesignPane";
 
