@@ -14,6 +14,8 @@ import { ContextExplorer } from "./explorer/ContextExplorer";
 import { RightPaneTabs } from "./components/RightPaneTabs";
 import { SandboxBanner } from "./components/SandboxBanner";
 import { DesignPane } from "./components/design/DesignPane";
+import { ConfigPanel } from "./components/design/ConfigPanel";
+import { ArchitecturePane } from "./components/design/ArchitecturePane";
 
 export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(loadSessionId());
@@ -145,10 +147,13 @@ export default function App() {
           : rightTab === "context"
             ? <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex}
                 skills={state.settingsMeta?.discoveredSkills ?? []} lastQuery={lastQuery} />
-            : <DesignPane items={state.items} sessionId={sessionId} onSend={send} sendDisabled={!connected}
-                settings={state.settings} settingsMeta={state.settingsMeta} settingsError={state.settingsError}
-                onSaveSettings={saveSettings}
-                onLoadSettings={() => sock.current?.send({ kind: "settings_get" })} />}
+            : rightTab === "architecture"
+              ? <ArchitecturePane />
+              : rightTab === "config"
+                ? <ConfigPanel settings={state.settings} meta={state.settingsMeta} error={state.settingsError}
+                    disabled={!connected} onSave={saveSettings}
+                    onLoad={() => sock.current?.send({ kind: "settings_get" })} />
+                : <DesignPane items={state.items} sessionId={sessionId} onSend={send} sendDisabled={!connected} />}
       </div>
     </div>
   );

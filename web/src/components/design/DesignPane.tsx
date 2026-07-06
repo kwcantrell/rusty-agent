@@ -1,32 +1,19 @@
 import { useState } from "react";
 import type { Item } from "../../state";
-import type { RuntimeSettings, DiscoveredSkill } from "../../wire";
-import { isTauri } from "../../transport";
 import { useDesignStore } from "../../designStore";
 import { buildFeedbackMessage } from "../../designFeedback";
 import { DesignCanvas } from "./DesignCanvas";
-import { ConfigPanel } from "./ConfigPanel";
-import { ArchitecturePane } from "./ArchitecturePane";
 
 export interface DesignPaneProps {
   items: Item[];
   sessionId: string;
   onSend: (text: string) => void;
   sendDisabled: boolean;
-  settings: RuntimeSettings | null;
-  settingsMeta: { workspace: string; apiKeySet: boolean; hardFloor: string[];
-    discoveredSkills: DiscoveredSkill[] } | null;
-  settingsError: string | null;
-  onSaveSettings: (s: RuntimeSettings) => void;
-  onLoadSettings: () => void;
 }
 
-export function DesignPane({ items, sessionId, onSend, sendDisabled,
-  settings, settingsMeta, settingsError, onSaveSettings, onLoadSettings }: DesignPaneProps) {
-  const [section, setSection] = useState<"canvas" | "config" | "architecture">("canvas");
+export function DesignPane({ items, sessionId, onSend, sendDisabled }: DesignPaneProps) {
   const store = useDesignStore(items, sessionId);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const tauri = isTauri();
   const active = store.designs.find((d) => d.id === activeId) ?? store.designs[store.designs.length - 1];
   const sub = (on: boolean) => ({
     color: on ? "var(--text-strong)" : "var(--text-muted)", fontWeight: on ? 600 : 400,
@@ -34,26 +21,7 @@ export function DesignPane({ items, sessionId, onSend, sendDisabled,
 
   return (
     <div className="flex h-full flex-col" style={{ background: "var(--surface-overlay)" }}>
-      <div className="flex gap-1 px-2 pt-1" role="tablist" style={{ borderBottom: "1px solid var(--border)" }}>
-        <button role="tab" aria-selected={section === "canvas"} onClick={() => setSection("canvas")}
-          className="rounded-t-lg px-3 py-1 text-xs" style={sub(section === "canvas")}>Canvas</button>
-        {tauri && (
-          <button role="tab" aria-selected={section === "config"}
-            onClick={() => { setSection("config"); onLoadSettings(); }}
-            className="rounded-t-lg px-3 py-1 text-xs" style={sub(section === "config")}>Config</button>
-        )}
-        {tauri && (
-          <button role="tab" aria-selected={section === "architecture"}
-            onClick={() => setSection("architecture")}
-            className="rounded-t-lg px-3 py-1 text-xs" style={sub(section === "architecture")}>Architecture</button>
-        )}
-      </div>
-      {section === "config" && tauri ? (
-        <ConfigPanel settings={settings} meta={settingsMeta} error={settingsError}
-          disabled={sendDisabled} onSave={onSaveSettings} />
-      ) : section === "architecture" && tauri ? (
-        <ArchitecturePane />
-      ) : !active ? (
+      {!active ? (
         <div className="flex flex-1 items-center justify-center p-6 text-center text-sm"
           style={{ color: "var(--text-muted)" }}>
           <p>No designs yet. Ask the agent to render one with id &quot;design:&lt;name&gt;&quot;.</p>

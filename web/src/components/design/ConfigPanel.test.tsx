@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { ConfigPanel } from "./ConfigPanel";
 import type { RuntimeSettings } from "../../wire";
@@ -46,5 +46,14 @@ describe("ConfigPanel", () => {
   it("notes next-turn apply semantics", () => {
     render(<ConfigPanel settings={settings} meta={null} error={null} disabled={false} onSave={() => {}} />);
     expect(screen.getByText(/apply from the next turn/i)).toBeInTheDocument();
+  });
+
+  it("calls onLoad once on mount to fetch fresh settings", () => {
+    const onLoad = vi.fn();
+    const { rerender } = render(<ConfigPanel settings={null} meta={null} error={null}
+      disabled={false} onSave={() => {}} onLoad={onLoad} />);
+    rerender(<ConfigPanel settings={settings} meta={null} error={null}
+      disabled={false} onSave={() => {}} onLoad={onLoad} />);
+    expect(onLoad).toHaveBeenCalledTimes(1);
   });
 });
