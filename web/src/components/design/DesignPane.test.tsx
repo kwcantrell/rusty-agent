@@ -58,4 +58,16 @@ describe("DesignPane", () => {
     render(<DesignPane {...base} items={[]} />);
     expect(screen.queryByRole("tab", { name: "Config" })).not.toBeInTheDocument();
   });
+
+  it("shows the Architecture sub-tab under Tauri and renders the pane", () => {
+    render(<DesignPane {...base} items={[]} />);
+    fireEvent.click(screen.getByRole("tab", { name: "Architecture" }));
+    expect(screen.getByText(/Loading architecture/)).toBeInTheDocument();
+  });
+
+  it("hides the Architecture sub-tab outside Tauri", () => {
+    tauriMock.value = false;
+    render(<DesignPane {...base} items={[]} />);
+    expect(screen.queryByRole("tab", { name: "Architecture" })).not.toBeInTheDocument();
+  });
 });

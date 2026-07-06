@@ -6,6 +6,7 @@ import { useDesignStore } from "../../designStore";
 import { buildFeedbackMessage } from "../../designFeedback";
 import { DesignCanvas } from "./DesignCanvas";
 import { ConfigPanel } from "./ConfigPanel";
+import { ArchitecturePane } from "./ArchitecturePane";
 
 export interface DesignPaneProps {
   items: Item[];
@@ -22,7 +23,7 @@ export interface DesignPaneProps {
 
 export function DesignPane({ items, sessionId, onSend, sendDisabled,
   settings, settingsMeta, settingsError, onSaveSettings, onLoadSettings }: DesignPaneProps) {
-  const [section, setSection] = useState<"canvas" | "config">("canvas");
+  const [section, setSection] = useState<"canvas" | "config" | "architecture">("canvas");
   const store = useDesignStore(items, sessionId);
   const [activeId, setActiveId] = useState<string | null>(null);
   const tauri = isTauri();
@@ -41,10 +42,17 @@ export function DesignPane({ items, sessionId, onSend, sendDisabled,
             onClick={() => { setSection("config"); onLoadSettings(); }}
             className="rounded-t-lg px-3 py-1 text-xs" style={sub(section === "config")}>Config</button>
         )}
+        {tauri && (
+          <button role="tab" aria-selected={section === "architecture"}
+            onClick={() => setSection("architecture")}
+            className="rounded-t-lg px-3 py-1 text-xs" style={sub(section === "architecture")}>Architecture</button>
+        )}
       </div>
       {section === "config" && tauri ? (
         <ConfigPanel settings={settings} meta={settingsMeta} error={settingsError}
           disabled={sendDisabled} onSave={onSaveSettings} />
+      ) : section === "architecture" && tauri ? (
+        <ArchitecturePane />
       ) : !active ? (
         <div className="flex flex-1 items-center justify-center p-6 text-center text-sm"
           style={{ color: "var(--text-muted)" }}>

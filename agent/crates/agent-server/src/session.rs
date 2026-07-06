@@ -4,7 +4,7 @@ use crate::approval::IpcApprovalChannel;
 use crate::daemon::DaemonParams;
 use crate::runtime::RuntimeState;
 use crate::sink::{ChannelEventSink, EventSlot};
-use crate::wire::{Decision, EventOut, SettingsState};
+use crate::wire::{ArchitectureSnapshot, Decision, EventOut, SettingsState};
 use agent_core::{ContextManager, CuratedContext};
 use agent_model::Message;
 use agent_runtime_config::RuntimeConfig;
@@ -145,6 +145,11 @@ impl Session {
 
     pub fn settings_get(&self) -> SettingsState {
         self.runtime.settings_state()
+    }
+
+    /// Read-only architecture self-portrait (the `architecture_get` command).
+    pub fn architecture(&self) -> ArchitectureSnapshot {
+        self.runtime.architecture(self.recall_budget)
     }
 
     /// Snapshot of the cumulative per-session counters (the `session_stats` query).
