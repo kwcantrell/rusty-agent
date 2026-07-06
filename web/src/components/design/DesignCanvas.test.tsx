@@ -9,6 +9,11 @@ const design = (n: number): Design => ({
     ({ display: { Html: { html: `<p>v${i + 1}</p>`, id: "design:x" } }, renderable: true })),
 });
 
+const urlDesign = (): Design => ({
+  id: "design:app", title: "App",
+  versions: [{ display: { Url: { url: "http://localhost:5173", id: "design:app" } }, renderable: true }],
+});
+
 const noPins = () => [];
 
 describe("DesignCanvas", () => {
@@ -53,5 +58,26 @@ describe("DesignCanvas", () => {
     d.versions[0] = { display: { Frob: { x: 1 } } as never, renderable: false };
     render(<DesignCanvas design={d} sentPins={noPins} onSendFeedback={() => {}} sendDisabled={false} />);
     expect(screen.getByText(/unsupported/)).toBeInTheDocument();
+  });
+
+  it("offers an interact/pin toggle only for url versions", () => {
+    render(<DesignCanvas design={urlDesign()} sentPins={noPins}
+      onSendFeedback={() => {}} sendDisabled={false} />);
+    expect(screen.getByRole("button", { name: "Interact" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Pin feedback" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("pin-layer")).not.toHaveStyle({ pointerEvents: "none" });
+  });
+
+  it("interact mode disables the pin layer so the live app is usable", () => {
+    render(<DesignCanvas design={urlDesign()} sentPins={noPins}
+      onSendFeedback={() => {}} sendDisabled={false} />);
+    fireEvent.click(screen.getByRole("button", { name: "Interact" }));
+    expect(screen.getByTestId("pin-layer")).toHaveStyle({ pointerEvents: "none" });
+  });
+
+  it("html versions get no toggle", () => {
+    render(<DesignCanvas design={design(1)} sentPins={noPins}
+      onSendFeedback={() => {}} sendDisabled={false} />);
+    expect(screen.queryByRole("button", { name: "Interact" })).not.toBeInTheDocument();
   });
 });
