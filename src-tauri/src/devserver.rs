@@ -174,6 +174,16 @@ impl DevServerManager {
     }
 
     pub async fn start(&self, cand: DevScriptCandidate) -> Result<DevServerStatus, String> {
+        // Validate before touching the running server — a bogus candidate must not
+        // tear down a live server. Package manager and script are whitelisted so a
+        // future XSS cannot escalate to arbitrary-local-binary execution.
+        const ALLOWED_PMS: &[&str] = &["npm", "pnpm", "yarn"];
+        if !ALLOWED_PMS.contains(&cand.package_manager.as_str()) {
+            return Err(format!("refusing to launch: {} is not an allowed package manager", cand.package_manager));
+        }
+        if !SERVER_SCRIPTS.contains(&cand.script.as_str()) {
+            return Err(format!("refusing to launch: {} is not a recognized dev script", cand.script));
+        }
         self.stop(); // one server at a time
 
         let mut cmd = Command::new(&cand.package_manager);
@@ -382,6 +392,36 @@ setTimeout(() => {\n\
         let status = mgr.start(cand).await.expect("should discover URL from stderr");
         assert_eq!(status.url, "http://localhost:5298/");
         mgr.stop();
+    }
+
+    #[tokio::test]
+    async fn start_rejects_disallowed_package_manager() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = DevServerManager::new();
+        let cand = DevScriptCandidate {
+            dir: tmp.path().to_string_lossy().into_owned(),
+            script: "dev".into(),
+            package_manager: "rm".into(),
+            label: "x".into(),
+        };
+        let err = mgr.start(cand).await.unwrap_err();
+        assert!(!err.is_empty(), "error message must be non-empty");
+        assert!(mgr.status().is_none(), "no server should run after rejection");
+    }
+
+    #[tokio::test]
+    async fn start_rejects_unrecognized_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = DevServerManager::new();
+        let cand = DevScriptCandidate {
+            dir: tmp.path().to_string_lossy().into_owned(),
+            script: "evil".into(),
+            package_manager: "npm".into(),
+            label: "x".into(),
+        };
+        let err = mgr.start(cand).await.unwrap_err();
+        assert!(!err.is_empty(), "error message must be non-empty");
+        assert!(mgr.status().is_none(), "no server should run after rejection");
     }
 
     #[tokio::test]
