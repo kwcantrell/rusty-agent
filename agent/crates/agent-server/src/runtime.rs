@@ -4,7 +4,9 @@ use crate::wire::{
     redact_base_url, ArchitectureSnapshot, ContextInfo, DiscoveredSkill, LoopInfo, ModelInfo,
     PolicyInfo, PromptInfo, SandboxInfo, SettingsState, ToolEntry,
 };
-use agent_core::{estimate_tokens, AgentLoop, OffloadStore, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT};
+use agent_core::{
+    estimate_tokens, AgentLoop, OffloadStore, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT,
+};
 use agent_runtime_config::{
     assemble_loop, build_model, BuiltLoop, LoopParts, RuntimeConfig, HARD_FLOOR_DENYLIST,
 };
@@ -213,10 +215,19 @@ impl RuntimeState {
     /// this struct already holds; never mutates, never exposes the prompt text.
     pub fn architecture(&self, recall_budget: usize) -> ArchitectureSnapshot {
         const CONTEXT_TOOLS: [&str; 2] = ["context_recall", "context_compact"];
-        const SKILL_TOOLS: [&str; 4] = ["list_skills", "use_skill", "create_skill", "read_skill_file"];
+        const SKILL_TOOLS: [&str; 4] = [
+            "list_skills",
+            "use_skill",
+            "create_skill",
+            "read_skill_file",
+        ];
         let cfg = self.config.lock().unwrap().clone();
         let loop_ = self.current_loop();
-        let mcp: HashSet<String> = self.mcp_tools.iter().map(|t| t.name().to_string()).collect();
+        let mcp: HashSet<String> = self
+            .mcp_tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
         let mem: HashSet<String> = self
             .memory_tools
             .iter()
@@ -238,7 +249,13 @@ impl RuntimeState {
                     "builtin"
                 };
                 ToolEntry {
-                    summary: s.description.split('.').next().unwrap_or("").trim().to_string(),
+                    summary: s
+                        .description
+                        .split('.')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
                     name: s.name,
                     kind: kind.to_string(),
                 }
@@ -266,7 +283,12 @@ impl RuntimeState {
                 http_allow_hosts: cfg.http_allow_hosts.clone(),
             },
             sandbox: SandboxInfo {
-                mode: cfg.sandbox_mode.clone(),
+                mode: match d.mode {
+                    agent_tools::Mode::Off => "off",
+                    agent_tools::Mode::Auto => "auto",
+                    agent_tools::Mode::Enforce => "enforce",
+                }
+                .to_string(),
                 mechanism: d.mechanism.to_string(),
                 image: d.image,
                 network: d.network,
@@ -289,7 +311,10 @@ impl RuntimeState {
             prompt: PromptInfo {
                 est_tokens: estimate_tokens(&prompt),
                 override_active: cfg.system_prompt_override.is_some(),
-                override_chars: cfg.system_prompt_override.as_ref().map(|s| s.chars().count()),
+                override_chars: cfg
+                    .system_prompt_override
+                    .as_ref()
+                    .map(|s| s.chars().count()),
             },
         }
     }
@@ -441,7 +466,14 @@ mod tests {
         let snap = rs.architecture(512);
         let names: Vec<&str> = snap.tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"mcp_x"));
-        let kind_of = |n: &str| snap.tools.iter().find(|t| t.name == n).unwrap().kind.clone();
+        let kind_of = |n: &str| {
+            snap.tools
+                .iter()
+                .find(|t| t.name == n)
+                .unwrap()
+                .kind
+                .clone()
+        };
         assert_eq!(kind_of("mcp_x"), "mcp");
         assert_eq!(kind_of("remember"), "memory");
         // context tools registered by the loop are classified "context"
@@ -488,6 +520,14 @@ mod tests {
         let snap = rs.architecture(1234);
         assert_eq!(snap.context.recall_budget, 1234);
         assert!(!snap.sandbox.mechanism.is_empty());
+        // Verify sandbox mode is a lowercase string matching one of the valid modes
+        assert!(
+            matches!(snap.sandbox.mode.as_str(), "off" | "auto" | "enforce"),
+            "sandbox mode must be lowercase (off/auto/enforce), got: {}",
+            snap.sandbox.mode
+        );
+        // Verify it matches the fixture's configured mode (default is "auto")
+        assert_eq!(snap.sandbox.mode, "auto");
     }
 
     fn make() -> (RuntimeState, tempfile::TempDir) {
