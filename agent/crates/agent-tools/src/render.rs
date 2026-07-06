@@ -213,8 +213,13 @@ mod tests {
     #[test]
     fn description_documents_the_design_canvas_convention() {
         let t = RenderArtifact;
-        assert!(t.description().contains("design:"), "agents must learn the design canvas from the schema");
+        assert!(
+            t.description().contains("design:"),
+            "agents must learn the design canvas from the schema"
+        );
         assert!(t.schema().parameters["properties"]["id"]["description"]
-            .as_str().unwrap().contains("design:"));
+            .as_str()
+            .unwrap()
+            .contains("design:"));
     }
 }

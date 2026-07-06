@@ -1245,7 +1245,10 @@ mod tests {
         cfg.system_prompt_override = Some("You are a design assistant.".into());
         let json = serde_json::to_string(&cfg).unwrap();
         let back: RuntimeConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.system_prompt_override.as_deref(), Some("You are a design assistant."));
+        assert_eq!(
+            back.system_prompt_override.as_deref(),
+            Some("You are a design assistant.")
+        );
 
         // old on-disk config without the field → None
         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
