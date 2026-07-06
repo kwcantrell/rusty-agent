@@ -95,6 +95,7 @@ describe("reducer", () => {
       enable_thinking: false, preserve_thinking: false, memory: true,
       skills_dirs: [], active_skills: [],
       trace: false, trace_dir: null, trace_max_mb: 64,
+      system_prompt_override: null,
     };
     let st = initialState([]);
     st = reduce(st, { type: "frame", frame: { v: 1, session_id: "x", kind: "settings_error", message: "old" } });

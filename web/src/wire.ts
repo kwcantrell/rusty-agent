@@ -35,6 +35,7 @@ export interface RuntimeSettings {
   trace: boolean;
   trace_dir: string | null;
   trace_max_mb: number;
+  system_prompt_override: string | null;
 }
 
 export interface SessionStats {
