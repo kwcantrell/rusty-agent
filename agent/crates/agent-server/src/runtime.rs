@@ -1,12 +1,16 @@
 use crate::approval::IpcApprovalChannel;
 use crate::sink::ChannelEventSink;
-use crate::wire::{DiscoveredSkill, SettingsState};
-use agent_core::{AgentLoop, OffloadStore, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT};
+use crate::wire::{
+    redact_base_url, ArchitectureSnapshot, ContextInfo, DiscoveredSkill, LoopInfo, ModelInfo,
+    PolicyInfo, PromptInfo, SandboxInfo, SettingsState, ToolEntry,
+};
+use agent_core::{estimate_tokens, AgentLoop, OffloadStore, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT};
 use agent_runtime_config::{
     assemble_loop, build_model, BuiltLoop, LoopParts, RuntimeConfig, HARD_FLOOR_DENYLIST,
 };
 use agent_skills::SkillRegistry;
 use agent_tools::Tool;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -204,6 +208,91 @@ impl RuntimeState {
             sandbox_degraded,
         }
     }
+
+    /// Read-only self-portrait of the LIVE loop (post-apply). Assembles from state
+    /// this struct already holds; never mutates, never exposes the prompt text.
+    pub fn architecture(&self, recall_budget: usize) -> ArchitectureSnapshot {
+        const CONTEXT_TOOLS: [&str; 2] = ["context_recall", "context_compact"];
+        const SKILL_TOOLS: [&str; 4] = ["list_skills", "use_skill", "create_skill", "read_skill_file"];
+        let cfg = self.config.lock().unwrap().clone();
+        let loop_ = self.current_loop();
+        let mcp: HashSet<String> = self.mcp_tools.iter().map(|t| t.name().to_string()).collect();
+        let mem: HashSet<String> = self
+            .memory_tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        let tools = loop_
+            .tool_schemas()
+            .into_iter()
+            .map(|s| {
+                let kind = if mcp.contains(&s.name) {
+                    "mcp"
+                } else if mem.contains(&s.name) {
+                    "memory"
+                } else if CONTEXT_TOOLS.contains(&s.name.as_str()) {
+                    "context"
+                } else if SKILL_TOOLS.contains(&s.name.as_str()) {
+                    "skills"
+                } else {
+                    "builtin"
+                };
+                ToolEntry {
+                    summary: s.description.split('.').next().unwrap_or("").trim().to_string(),
+                    name: s.name,
+                    kind: kind.to_string(),
+                }
+            })
+            .collect();
+        let d = loop_.sandbox_descriptor();
+        let prompt = self.current_system_prompt();
+        ArchitectureSnapshot {
+            model: ModelInfo {
+                backend: cfg.backend.clone(),
+                base_url_host: redact_base_url(&cfg.base_url),
+                model: cfg.model.clone(),
+                protocol: cfg.protocol.clone(),
+                temperature: cfg.temperature,
+                top_p: cfg.top_p,
+                top_k: cfg.top_k,
+                enable_thinking: cfg.enable_thinking,
+                preserve_thinking: cfg.preserve_thinking,
+            },
+            tools,
+            policy: PolicyInfo {
+                allowlist: cfg.command_allowlist.clone(),
+                denylist: cfg.effective_denylist(),
+                hard_floor: HARD_FLOOR_DENYLIST.iter().map(|s| s.to_string()).collect(),
+                http_allow_hosts: cfg.http_allow_hosts.clone(),
+            },
+            sandbox: SandboxInfo {
+                mode: cfg.sandbox_mode.clone(),
+                mechanism: d.mechanism.to_string(),
+                image: d.image,
+                network: d.network,
+                degraded: d.degraded,
+            },
+            context: ContextInfo {
+                context_limit: cfg.context_limit,
+                max_tool_result_bytes: cfg.max_tool_result_bytes,
+                memory_enabled: cfg.memory,
+                recall_budget,
+                compaction_model: cfg.compaction_model.as_ref().and_then(|m| m.model.clone()),
+            },
+            loop_info: LoopInfo {
+                max_turns: cfg.max_turns,
+                max_parallel_tools: cfg.max_parallel_tools,
+                subagents_enabled: cfg.subagents,
+                subagent_max_depth: cfg.subagent_max_depth,
+                subagent_model: cfg.subagent_model.as_ref().and_then(|m| m.model.clone()),
+            },
+            prompt: PromptInfo {
+                est_tokens: estimate_tokens(&prompt),
+                override_active: cfg.system_prompt_override.is_some(),
+                override_chars: cfg.system_prompt_override.as_ref().map(|s| s.chars().count()),
+            },
+        }
+    }
 }
 
 /// Build the loop for the current config. Thin wrapper over the shared
@@ -272,6 +361,133 @@ mod tests {
         let sink = Arc::new(ChannelEventSink::new(s.clone()));
         let approval = Arc::new(IpcApprovalChannel::new(s, Duration::from_secs(1)));
         (sink, approval)
+    }
+
+    /// Minimal stub `Tool` for injecting named tools in architecture tests.
+    struct NamedTool(String);
+
+    #[async_trait::async_trait]
+    impl agent_tools::Tool for NamedTool {
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn description(&self) -> &str {
+            "stub tool. Does stub things."
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: self.0.clone(),
+                description: "stub tool. Does stub things.".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn intent(
+            &self,
+            _a: &serde_json::Value,
+        ) -> Result<agent_tools::ToolIntent, agent_tools::ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: self.0.clone(),
+                access: agent_tools::Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "stub".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &agent_tools::ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, agent_tools::ToolError> {
+            Ok(agent_tools::ToolOutput {
+                content: "ok".into(),
+                display: None,
+            })
+        }
+    }
+
+    /// Like `make()` but injects one MCP tool (`mcp_x`) and one memory tool (`remember`).
+    fn make_with_tools() -> (RuntimeState, tempfile::TempDir) {
+        let (sink, approval) = parts();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.json");
+        let cfg = RuntimeConfig::from_launch(
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m1".into(),
+            "native".into(),
+            8192,
+        );
+        let mcp_tool: Arc<dyn Tool> = Arc::new(NamedTool("mcp_x".into()));
+        let memory_tool: Arc<dyn Tool> = Arc::new(NamedTool("remember".into()));
+        let rs = RuntimeState::new(
+            cfg,
+            sink,
+            approval,
+            dir.path().to_path_buf(),
+            None,
+            "claude".into(),
+            path,
+            Arc::from(vec![mcp_tool]),
+            Arc::from(vec![memory_tool]),
+            None,
+            crate::daemon::SYSTEM_PROMPT.to_string(),
+        );
+        (rs, dir)
+    }
+
+    #[test]
+    fn architecture_lists_registered_tools_with_provenance() {
+        let (rs, _dir) = make_with_tools();
+        let snap = rs.architecture(512);
+        let names: Vec<&str> = snap.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"mcp_x"));
+        let kind_of = |n: &str| snap.tools.iter().find(|t| t.name == n).unwrap().kind.clone();
+        assert_eq!(kind_of("mcp_x"), "mcp");
+        assert_eq!(kind_of("remember"), "memory");
+        // context tools registered by the loop are classified "context"
+        assert!(
+            snap.tools.iter().any(|t| t.kind == "context"),
+            "context_recall/context_compact must be classified context"
+        );
+    }
+
+    #[test]
+    fn architecture_policy_carries_hard_floor_and_redacted_url() {
+        let (rs, _dir) = make();
+        let snap = rs.architecture(0);
+        for f in agent_runtime_config::HARD_FLOOR_DENYLIST {
+            assert!(snap.policy.hard_floor.contains(&f.to_string()));
+            assert!(
+                snap.policy.denylist.contains(&f.to_string()),
+                "effective denylist includes floor"
+            );
+        }
+        assert!(
+            !snap.model.base_url_host.contains("/v1"),
+            "path must be redacted: {}",
+            snap.model.base_url_host
+        );
+    }
+
+    #[test]
+    fn architecture_prompt_flags_track_override() {
+        let (rs, _dir) = make();
+        assert!(!rs.architecture(0).prompt.override_active);
+        let mut cfg = rs.settings_state().settings;
+        cfg.system_prompt_override = Some("OVERRIDE".into());
+        rs.apply(cfg).unwrap();
+        let p = rs.architecture(0).prompt;
+        assert!(p.override_active);
+        assert_eq!(p.override_chars, Some(8));
+        assert!(p.est_tokens > 0);
+    }
+
+    #[test]
+    fn architecture_reflects_sandbox_and_recall_budget() {
+        let (rs, _dir) = make();
+        let snap = rs.architecture(1234);
+        assert_eq!(snap.context.recall_budget, 1234);
+        assert!(!snap.sandbox.mechanism.is_empty());
     }
 
     fn make() -> (RuntimeState, tempfile::TempDir) {
