@@ -11,8 +11,9 @@ vi.mock("../../transport", async (orig) => ({ ...(await orig()), isTauri: () => 
 
 import { DesignPane } from "./DesignPane";
 
-// Safe default: 0 candidates → launcher renders nothing → existing tests unaffected.
-beforeEach(() => { detectDevScripts.mockResolvedValue([]); });
+// Safe default: never-resolving promise → .then(setCandidates) never fires during
+// synchronous test assertions, so there is no out-of-act state update.
+beforeEach(() => { detectDevScripts.mockImplementation(() => new Promise(() => {})); });
 
 const designItem = (html: string): Item =>
   ({ kind: "tool", name: "render", args: {}, status: "done",
