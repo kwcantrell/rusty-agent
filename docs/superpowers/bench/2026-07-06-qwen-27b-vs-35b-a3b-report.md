@@ -77,7 +77,22 @@ Measured via `/v1/completions` probes (TEMP=0.2, greedy-equivalent). See task-3 
 | A3B   | short (24 tok)  | 110.69 | 121.45 |
 | A3B   | long (9027 tok) | 3450.14 | 115.95 |
 
-Generation speed ratio (predicted tok/s): A3B 121.45 / 27B 32.98 = **3.68×** faster. This gap reflects MoE sparse activation (A3B) vs dense computation (27B), compounded by A3B's -np 4 allowing greater GPU utilization across parallel slots.
+Generation speed ratio (predicted tok/s): A3B 121.45 / 27B 32.98 = **3.68×** faster. This gap reflects MoE sparse activation (~3B active parameters) vs dense computation (27B active parameters). Note: the A3B is configured with -np 4 for parallel batch serving, but the eval stream is single-request sequential — -np 4 does not accelerate single-stream generation; the ~3.7× advantage is attributable to the active-parameter asymmetry alone.
+
+### Median Wall-Clock per Run
+
+Computed from all 5 runs per model per task (all runs, not passing-only); median = sorted value at index `floor(N/2)`.
+
+| model | task           | median wall_s |
+|-------|----------------|---------------|
+| 27B   | web-multipage  | 245.2         |
+| 27B   | memory-roster  | 79.2          |
+| 27B   | locked-portmap | 66.2          |
+| A3B   | web-multipage  | 84.1          |
+| A3B   | memory-roster  | 29.2          |
+| A3B   | locked-portmap | 22.5          |
+
+Wall-clock ratio on web (the headline task): 245.2 / 84.1 = 2.9× slower per run for the 27B, consistent with the predicted-tok/s speed ratio weighted by token counts.
 
 ---
 
@@ -90,12 +105,13 @@ Generation speed ratio (predicted tok/s): A3B 121.45 / 27B 32.98 = **3.68×** fa
 **Sampler defaults:** Speed probes used TEMP=0.2 explicitly. Eval harness runs used harness defaults (configured per task — web-multipage and roster use the harness's own sampler config; portmap uses champion_v4.json). No custom temperature overrides were applied during eval runs.
 
 **Caveats:**
-- Web run 5 for the 27B required a single redo: the original Bash client was killed by the 10-minute client-side cap (exit code 143). The server was confirmed healthy immediately after; the redo succeeded in 162s per the redo protocol. The redo result (pass=true, tokens=60,295) is the line of record.
+- Web run 5 for the 27B: the original run-5 attempt was killed by the 10-minute foreground client cap (exit code 143). This was a deviation from the plan's `run_in_background` instruction for runs expected to exceed 10 minutes; no ledger entry was written. The server was confirmed healthy immediately after (docker ps: healthy), and a fresh run replaced the killed attempt — the redo result (pass=true, tokens=60,295, wall=162s) is the line of record. Discarding an unknown-outcome sample on the challenger's headline task can only bias in the 27B's favor: had the killed run been scored a failure, web would stand at 3/5 vs 3/5 rather than 4/5 vs 3/5. The verdict is unaffected because it is already "no defensible call at N=5".
 - Web run 2 for the 27B failed on a latency formatting string ("142ms" vs expected "142 ms"). This is a behavioral quality issue at the code-generation level, not an infrastructure or context issue.
 - A3B roster run 4 failed because the model issued only 7 of 8 required `remember` calls (HX-457 skipped). Server was healthy, config correct (champion_k10.json). Within historical variance.
-- A3B web runs 1 and 4 failed with noise-reading loop / context exhaustion patterns, consistent with A3B's historical ~5/10 web-multipage rate.
+- A3B web runs 1 and 4 failed with noise-reading loop / harness budget and turn exhaustion patterns (the server's 196K context was not exhausted; the model burned its per-run turn budget in noise-reading loops), consistent with A3B's historical ~5/10 web-multipage rate.
 
 **Links:**
 - Raw runs: `docs/superpowers/bench/2026-07-06-qwen-27b-vs-35b-a3b-runs.jsonl`
-- Spec: `.superpowers/sdd/task-6-brief.md` (scoring rules and decision tree)
-- Task reports: `.superpowers/sdd/task-4-report.md` (27B block), `.superpowers/sdd/task-5-report.md` (A3B block)
+- Spec: `docs/superpowers/specs/2026-07-06-qwen-27b-vs-35b-a3b-model-comparison-design.md`
+- Plan: `docs/superpowers/plans/2026-07-06-qwen-27b-vs-35b-a3b-model-comparison.md`
+- Task reports: `.superpowers/sdd/task-4-report.md` (27B block, session-local — not in git), `.superpowers/sdd/task-5-report.md` (A3B block, session-local — not in git)
