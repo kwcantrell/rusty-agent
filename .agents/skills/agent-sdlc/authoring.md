@@ -48,7 +48,7 @@ tags:            # ✗ FAILS okf_check
 ## Citation rule
 
 Every concept under `phases/`, `practices/`, `perspectives/`, or
-`comparisons/` MUST end with a `# Citations` heading containing at least one
+`comparisons/` MUST contain a `# Citations` heading (conventionally placed at the end of the document) with at least one
 link that resolves into `/sources/`. Claims in the body carry `[n]` markers
 pointing at that list.
 
@@ -58,9 +58,14 @@ lacks, add the source node first.
 
 ## Link rule
 
-All intra-bundle links are bundle-root absolute (`/practices/foo.md` =
-`docs/okf/agent-sdlc/practices/foo.md`) and must resolve to an existing file
-inside the bundle. No relative links, no links escaping the bundle.
+Every link must resolve to an existing file inside the bundle — no links
+escaping it. The checker resolves bundle-root-absolute targets
+(`/practices/foo.md` = `docs/okf/agent-sdlc/practices/foo.md`) and relative
+targets (from the linking file's directory); house style is bundle-root
+absolute, so write new links that way. One hard exception: citation links
+MUST literally start with `/sources/` — the checker matches the raw link
+target, not the resolved path, so a relative citation path silently fails
+the citation check even when it resolves.
 
 ## Reserved files
 
