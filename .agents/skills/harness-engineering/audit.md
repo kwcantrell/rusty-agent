@@ -811,6 +811,24 @@ live bundle conformant with zero fixes, and the semantic-drift human duty is doc
 checker docstring + authoring.md. Whole-branch review: READY TO MERGE, zero Critical/Important;
 accepted minors in the cluster ledger (`.superpowers/sdd/progress.md`).
 
+Re-stamp note (2026-07-07, audit-drain cluster 2/6 — MCP seam; merge `0ac6f4a`; spec
+`docs/superpowers/specs/2026-07-07-mcp-seam-design.md`, plan
+`docs/superpowers/plans/2026-07-07-audit-mcp-seam.md`): three findings closed — the audit's
+headline boundary. **Guardrails 5.1** — new `Access::TrustedWrite` tier: MCP `Trust::Allow`
+intents are auto-allowed at the gate exactly as before (Read-arm semantics, pinned both
+directions) but now count as mutations for the post-exec validator trigger, pinned end-to-end
+by a `TrustedStub` loop test. **Tools 2.1** — MCP schemas get a connect-time contract lint
+(empty descriptions + undescribed required params via the shared
+`required_params_missing_description`), warn-don't-reject, surfaced as
+`ServerStatus.schema_warnings` + the mcp summary line. **Sandbox 3.1** — MCP env secrets left
+docker argv: name-only `-e KEY` with values on the docker client process env; client-control
+keys (`DOCKER_HOST`/`DOCKER_CONFIG`/`DOCKER_CERT_PATH`/`DOCKER_TLS_VERIFY`/`DOCKER_CONTEXT`/
+`HOME`/`PATH`) deliberately stay argv-literal (non-secret) so mcp.json env cannot redirect the
+docker CLI's daemon/auth/binary discovery — a final-review finding fixed and re-verified
+pre-merge; note the deliberate spec deviation: spec-set HOME rides argv, not name-only.
+Whole-branch review: READY TO MERGE; accepted minors + two process incidents (subagent commits
+on local main; disk-full ld SIGBUS) in the cluster ledger.
+
 ---
 
 ## Top highest-leverage fixes
