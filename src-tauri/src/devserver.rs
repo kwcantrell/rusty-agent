@@ -112,7 +112,23 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// First `http(s)://localhost|127.0.0.1` URL on the line, or None.
+/// Exact-host check for the authority part (everything up to the first `/?#`):
+/// host must be exactly `localhost` or `127.0.0.1`, optionally `:port` (digits),
+/// and any userinfo (`@`) is refused — prefix matching would accept
+/// `localhost.evil.com` and `localhost:1234@evil.com`.
+fn is_local_authority(rest: &str) -> bool {
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.contains('@') { return false; }
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    (host == "localhost" || host == "127.0.0.1")
+        && port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// First `http(s)` URL on the line whose authority is exactly `localhost`/`127.0.0.1` (optional numeric port), or None.
 pub fn parse_url(line: &str) -> Option<String> {
     let clean = strip_ansi(line);
     for scheme in ["http://", "https://"] {
@@ -122,7 +138,7 @@ pub fn parse_url(line: &str) -> Option<String> {
         let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let url = rest[..end].trim_end_matches(['.', ',', ')', '"', '\'']);
         let host = &url[scheme.len()..];
-        if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+        if is_local_authority(host) {
             return Some(url.to_string());
         }
     }
@@ -337,6 +353,15 @@ mod tests {
     fn parse_url_ignores_non_local_and_noise() {
         assert_eq!(parse_url("VITE ready in 240 ms"), None);
         assert_eq!(parse_url("Network: http://192.168.1.5:5173/"), None);
+    }
+
+    #[test]
+    fn parse_url_rejects_prefix_and_userinfo_lookalike_hosts() {
+        assert_eq!(parse_url("Local: http://localhost.evil.com:5173/"), None);
+        assert_eq!(parse_url("Local: http://127.0.0.1.evil.com:5173/"), None);
+        assert_eq!(parse_url("Local: http://localhost:1234@evil.com/"), None);
+        assert_eq!(parse_url("Local: http://localhost@evil.com/"), None);
+        assert_eq!(parse_url("Local: http://localhost:/"), None); // empty port
     }
 
     // A fake dev server: prints a Local URL, then stays alive so we can kill it.
