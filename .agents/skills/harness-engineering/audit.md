@@ -786,6 +786,16 @@ Carried follow-up discoveries — **both closed 2026-07-02**:
 
 The next audit run starts from a clean slate. Ledger: `.superpowers/sdd/progress.md`.
 
+Re-stamp note (2026-07-06, full harness+SDLC audit): a fresh 11-dimension audit was run — the
+original seven components plus sub-agent orchestration (as a finished whole), the desktop/web
+design-tab harness, the skills/OKF knowledge layer, and a process dimension (the SDLC as run by
+agents, per docs/okf/agent-sdlc/comparisons/two-meanings.md). Every finding was adversarially
+verified before inclusion (44 raised → 41 confirmed: 18 med, 23 low, zero high; no prior-fix
+regression found anywhere). **The current findings snapshot is
+`docs/superpowers/audits/2026-07-06-harness-sdlc-audit.md`** — it supersedes both this section's
+inline list and the 2026-07-01 report. Spec:
+`docs/superpowers/specs/2026-07-06-full-harness-sdlc-audit-design.md`.
+
 ---
 
 ## Top highest-leverage fixes
