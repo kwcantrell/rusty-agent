@@ -829,6 +829,32 @@ pre-merge; note the deliberate spec deviation: spec-set HOME rides argv, not nam
 Whole-branch review: READY TO MERGE; accepted minors + two process incidents (subagent commits
 on local main; disk-full ld SIGBUS) in the cluster ledger.
 
+Re-stamp note (2026-07-07, audit-drain cluster 3/6 — design-tab hardening; merge `686d889`;
+plan `docs/superpowers/plans/2026-07-07-audit-design-tab-hardening.md`, straight-to-plan per
+the triage spec): six findings closed. **Design-tab 8.1** — `DevServerManager::start`
+canonicalizes the SPA-sent dir and requires containment in the current workspace (root
+threaded from `bridge.current_workspace()`), rejecting before any teardown or spawn;
+validate-before-stop preserved and pinned (traversal, nonexistent dir, live-server-survives-
+rejection). **8.4** — `parse_url`'s prefix match replaced by `is_local_authority` (authority
+up to the first `/?#`, `@` refused, exact `localhost`/`127.0.0.1`, numeric-only port) —
+strict Rust first-line parity restored; the JS WHATWG guard stays authoritative at render.
+**8.6** — `stop()` SIGTERMs the group, waits up to `STOP_GRACE` (1500 ms) on the direct child
+with the mutex already released, then group-SIGKILLs as a true backstop; graceful-marker and
+SIGTERM-ignoring tests. **8.2** — `PR_SET_PDEATHSIG(SIGTERM)` via `pre_exec`
+(`cfg(target_os = "linux")`) so the dev server dies with a SIGKILLed/aborted app;
+PR_GET_PDEATHSIG probe test. **8.3** — desktop CSP gains
+`frame-src 'self' http://localhost:* http://127.0.0.1:*` with a conf-parsing regression test,
+and the production CSP was verified LIVE on a bundled-asset build (`tauri/custom-protocol`):
+a remote iframe tripped a `frame-src` securitypolicyviolation while a localhost iframe loaded
+clean — both clauses of the finding closed. **8.5** — ArtifactRenderer's Image branch blocks
+non-local http(s) srcs (`isLocalUrl`; `data:`/localhost only) with a visible notice; 4-case
+vitest. Whole-branch review: READY TO MERGE, zero Critical/Important; accepted residuals in
+the cluster ledger — notable: desktop `img-src` deliberately NOT widened to match 8.5's SPA
+policy (localhost http images stay CSP-blocked on desktop, fail-closed asymmetry), the
+containment canonicalize→spawn TOCTOU is accepted in-threat-model (requires workspace write,
+which already grants in-workspace script execution), and `start()`'s discovery-timeout path
+keeps its graceless SIGKILL by design.
+
 ---
 
 ## Top highest-leverage fixes
