@@ -51,7 +51,7 @@ and **maintain** the agent-sdlc knowledge bundle at `docs/okf/agent-sdlc/`
    every claim cited. Flag the "two meanings" split — the SDLC *for building
    agents* vs the SDLC *run by agents* — and point at
    `comparisons/two-meanings.md` as the orientation read.
-2. **Navigation map.** `phases/` = lifecycle stages; `practices/` = 13 named
+2. **Navigation map.** `phases/` = lifecycle stages; `practices/` = 12 named
    cross-org practices (the most useful entry point for design questions);
    `perspectives/` = per-org syntheses; `comparisons/`; `sources/` = provenance
    nodes. Start from `index.md` files; each concept's `description:` frontmatter
