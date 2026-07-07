@@ -134,7 +134,7 @@ o.set_capability("browserName", "wry")
 d = Remote("http://127.0.0.1:4444", options=o)
 # React tree mounts ~3-5s after session create; wait before interacting.
 WebDriverWait(d, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "button[role='tab']")))
-d.find_element(By.CSS_SELECTOR, "textarea[aria-label='prompt']").send_keys("Reply with: pong")  #  = W3C Enter, submits
+d.find_element(By.CSS_SELECTOR, "textarea[aria-label='prompt']").send_keys("Reply with: pong\ue007")  # \ue007 = W3C Enter, submits
 # Poll d.execute_script("return document.body.innerText") for the reply.
 # Use a unique marker per run (e.g. SQRL<epoch-millis>) so stale transcript
 # state from a previous run cannot fake a reply.
@@ -144,10 +144,10 @@ EOF
 ```
 
 **Useful selectors:** composer `textarea[aria-label='prompt']` (Enter submits —
-there is no send button); tabs `button[role='tab']` — 5 nav tabs at boot
-(Workspace / Context / Design / Architecture / Config), plus 2 Design-canvas
-sub-tabs that appear only when Design is active; always select by text not
-by count or index
+there is no send button); tabs `button[role='tab']` — 7 in total: 5 nav tabs
+(Workspace / Context / Design / Architecture / Config) + 2 Design-canvas
+sub-tabs (the sub-tabs render only when the Design canvas is active, so the
+live count varies by state); always select by text, never by count or index
 (e.g. `By.XPATH, "//button[@role='tab' and normalize-space()='Architecture']"`);
 Architecture and Config tabs are present only under real Tauri IPC — asserting
 their presence confirms you drove the real app, not a plain browser; Context
@@ -232,7 +232,8 @@ present today.
 - `source ~/.cargo/env` → only needed when `cargo` is missing from PATH (normally it isn't here).
 - Hardcoding a bridge port → it's ephemeral; read `bridge.ws_url()`.
 - Asserting on screenshots for L0/L1 → assert on `event` frames
-  (`done`/`error`/`token`); screenshots are only for L2 GUI rendering checks.
+  (`done`/`error`/`token`); screenshots (via WebDriver or spectacle) are only
+  for L2/L3 rendering checks — prefer DOM assertions at L2.
 - Launching the app yourself and then trying to WebDriver it → no attach
   semantics; the session must launch the app. Kill your instance first.
 - Selenium script died without `quit()` → next session hangs at create. Kill
