@@ -119,6 +119,26 @@ pub fn loop_config_from(
     }
 }
 
+/// Fresh claude-cli client with the parent's exact construction parameters.
+/// Distinct instances keep each loop's session pool private (belt-and-
+/// suspenders: the pool in ClaudeCliClient makes Arc-sharing safe, but
+/// separate instances also keep the parent's pool unpolluted by child and
+/// compaction entries). See docs/superpowers/specs/2026-07-07-claude-cli-followups-design.md.
+fn fresh_claude_cli_client(
+    cfg: &RuntimeConfig,
+    claude_binary: &str,
+    api_key: Option<String>,
+) -> Arc<dyn ModelClient> {
+    crate::build_model(
+        &cfg.backend,
+        &cfg.base_url,
+        &cfg.model,
+        claude_binary,
+        api_key,
+        crate::claude_cli_opts(cfg),
+    )
+}
+
 /// The one place a RuntimeConfig + per-frontend `LoopParts` become an `AgentLoop`.
 /// Never panics: a `compose_system_prompt` failure falls back to the base prompt.
 pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
@@ -204,23 +224,20 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
 
     // Dedicated compaction model (spec G3): routed into both the parent loop and
     // child loops. For the openai backend, None inherits the primary model at every
-    // read-site (stateless client — sharing is harmless). For claude-cli, each
-    // ClaudeCliClient owns a Mutex<Option<SessionState>>; sharing the parent instance
-    // with the compaction call would let the compaction call overwrite the parent's
-    // session fingerprints. Build a fresh instance when no explicit override is set.
+    // read-site (stateless client — sharing is harmless). For claude-cli, a distinct
+    // instance keeps the parent's session pool private (the pool itself makes sharing
+    // safe since the checkout-keyed rework — this is belt-and-suspenders isolation).
+    // Build a fresh instance when no explicit override is set.
     let compaction_model: Option<Arc<dyn ModelClient>> = cfg
         .compaction_model
         .as_ref()
         .map(|r| crate::build_routed_model(cfg, r, &parts.claude_binary, parts.api_key.clone()))
         .or_else(|| {
             if cfg.backend == "claude-cli" {
-                Some(crate::build_model(
-                    &cfg.backend,
-                    &cfg.base_url,
-                    &cfg.model,
+                Some(fresh_claude_cli_client(
+                    cfg,
                     &parts.claude_binary,
                     parts.api_key.clone(),
-                    crate::claude_cli_opts(cfg),
                 ))
             } else {
                 None
@@ -247,19 +264,12 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 crate::build_routed_model(cfg, r, &parts.claude_binary, parts.api_key.clone())
             }
             // For the openai backend, cloning the Arc is harmless: the client is
-            // stateless. For claude-cli, each ClaudeCliClient owns a
-            // Mutex<Option<SessionState>>; handing the same Arc to a child means the
-            // child's commits overwrite the parent's fingerprints, so the parent's
-            // next call always re-plans a fresh session (session reuse silently
-            // defeated). Build a distinct instance for claude-cli.
-            None if cfg.backend == "claude-cli" => crate::build_model(
-                &cfg.backend,
-                &cfg.base_url,
-                &cfg.model,
-                &parts.claude_binary,
-                parts.api_key.clone(),
-                crate::claude_cli_opts(cfg),
-            ),
+            // stateless. For claude-cli, a distinct instance keeps the parent's
+            // session pool private (the pool itself makes sharing safe since the
+            // checkout-keyed rework — this is belt-and-suspenders isolation).
+            None if cfg.backend == "claude-cli" => {
+                fresh_claude_cli_client(cfg, &parts.claude_binary, parts.api_key.clone())
+            }
             None => parts.model.clone(),
         };
         #[cfg(test)]
