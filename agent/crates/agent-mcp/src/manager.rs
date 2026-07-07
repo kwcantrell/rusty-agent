@@ -149,7 +149,10 @@ fn schema_lint(tools: &[Arc<dyn Tool>]) -> Vec<String> {
             warnings.push(format!("{}: empty description", s.name));
         }
         for p in agent_tools::required_params_missing_description(&s) {
-            warnings.push(format!("{}: required param `{p}` has no description", s.name));
+            warnings.push(format!(
+                "{}: required param `{p}` has no description",
+                s.name
+            ));
         }
     }
     warnings
@@ -244,8 +247,12 @@ mod tests {
                 "required": ["x"]
             }),
         };
-        let tools: Vec<Arc<dyn Tool>> =
-            vec![Arc::new(McpTool::new("srv", mock_client(), bad, Trust::Ask))];
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(McpTool::new(
+            "srv",
+            mock_client(),
+            bad,
+            Trust::Ask,
+        ))];
         let w = schema_lint(&tools);
         assert_eq!(w.len(), 2, "{w:?}");
         assert!(w.iter().any(|m| m.contains("empty description")), "{w:?}");
@@ -263,8 +270,12 @@ mod tests {
                 "required": ["x"]
             }),
         };
-        let tools: Vec<Arc<dyn Tool>> =
-            vec![Arc::new(McpTool::new("srv", mock_client(), clean, Trust::Ask))];
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(McpTool::new(
+            "srv",
+            mock_client(),
+            clean,
+            Trust::Ask,
+        ))];
         assert!(schema_lint(&tools).is_empty());
     }
 
@@ -280,7 +291,10 @@ mod tests {
                 error: None,
             }],
         );
-        assert_eq!(mgr.summary_line(), "mcp: github \u{2713} (3 tools, 2 schema warnings)");
+        assert_eq!(
+            mgr.summary_line(),
+            "mcp: github \u{2713} (3 tools, 2 schema warnings)"
+        );
     }
 
     #[tokio::test]

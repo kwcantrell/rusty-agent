@@ -5871,7 +5871,8 @@ mod tests {
     async fn passing_validator_emits_event_but_appends_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().to_path_buf();
-        let (agent, sink) = validator_loop(ws, vec!["true".into()], write_stub_registry(), "write_stub");
+        let (agent, sink) =
+            validator_loop(ws, vec!["true".into()], write_stub_registry(), "write_stub");
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
 
@@ -5993,7 +5994,8 @@ mod tests {
         let ws = dir.path().to_path_buf();
         // FailStub declares Access::Write but its execute returns Err; a validator
         // that would always fail ("false") proves nothing fires on a failed mutation.
-        let (agent, sink) = validator_loop(ws, vec!["false".into()], fail_stub_registry(), "write_stub");
+        let (agent, sink) =
+            validator_loop(ws, vec!["false".into()], fail_stub_registry(), "write_stub");
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
 
@@ -6062,7 +6064,12 @@ mod tests {
         // WriteStubSelfCancel succeeds (turn_mutated=true) then cancels the run
         // token. "sleep 30" would hang for 30s if ever launched; a clean skip proves
         // it never is (run_validator short-circuits on the cancelled token).
-        let (agent, sink) = validator_loop(ws, vec!["sleep 30".into()], self_cancel_registry(), "write_stub");
+        let (agent, sink) = validator_loop(
+            ws,
+            vec!["sleep 30".into()],
+            self_cancel_registry(),
+            "write_stub",
+        );
         let mut ctx = WindowContext::new(Message::system("sys"));
         // Returning at all (well under 30s) proves the validator did not block.
         agent.run(&mut ctx, "go".into()).await.unwrap();

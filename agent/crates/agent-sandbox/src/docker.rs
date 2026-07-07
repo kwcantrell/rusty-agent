@@ -186,7 +186,10 @@ mod tests {
         let v = docker_run_args(&policy(false), &spec, "n", "1000:1000");
         let s = v.join(" ");
         assert!(s.contains("-e API_KEY"), "name-only -e for spec env: {s}");
-        assert!(!s.contains("sekret-value"), "value must never reach argv: {s}");
+        assert!(
+            !s.contains("sekret-value"),
+            "value must never reach argv: {s}"
+        );
         assert!(!s.contains("API_KEY="), "no KEY=VALUE form in argv: {s}");
     }
 
