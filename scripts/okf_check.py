@@ -23,6 +23,7 @@ from pathlib import Path
 
 RESERVED = {"index.md", "log.md"}
 CITATION_DIRS = {"phases", "practices", "perspectives", "comparisons"}
+ALLOWED_TYPES = {"Source", "Practice", "Lifecycle Phase", "Perspective", "Comparison"}
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 KV_RE = re.compile(r"^([A-Za-z_][\w-]*):\s*(.*)$")
 CITATIONS_HEADING_RE = re.compile(r"^#{1,3}\s+Citations\s*$", re.MULTILINE)
@@ -92,9 +93,15 @@ def check_bundle(root):
                     errors.append(f"{rel}: unparseable frontmatter")
                 elif not str(fm.get("type", "")).strip():
                     errors.append(f"{rel}: missing or empty `type`")
-                elif (str(fm.get("type")).strip() == "Source"
-                      and not str(fm.get("resource", "")).strip()):
-                    errors.append(f"{rel}: Source node missing `resource` URL")
+                else:
+                    node_type = str(fm.get("type")).strip()
+                    if node_type not in ALLOWED_TYPES:
+                        errors.append(
+                            f"{rel}: unknown `type` {node_type!r} "
+                            f"(allowed: {', '.join(sorted(ALLOWED_TYPES))})")
+                    if (node_type == "Source"
+                            and not str(fm.get("resource", "")).strip()):
+                        errors.append(f"{rel}: Source node missing `resource` URL")
 
         for target in iter_links(body):
             if target.startswith("/"):

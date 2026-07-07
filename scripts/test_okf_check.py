@@ -78,6 +78,13 @@ class OkfCheckTest(unittest.TestCase):
         errs = okf_check.check_bundle(self.root)
         self.assertTrue(any("no_resource.md" in e and "resource" in e for e in errs))
 
+    def test_unknown_type_fails(self):
+        valid_bundle(self.root)
+        write(self.root, "sources/typo.md",
+              "---\ntype: Sorce\nresource: https://example.com/t\n---\nbody\n")
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("typo.md" in e and "Sorce" in e for e in errs))
+
     def test_non_root_index_frontmatter_fails(self):
         valid_bundle(self.root)
         write(self.root, "sources/index.md", "---\ntype: Index\n---\n# Sources\n")
