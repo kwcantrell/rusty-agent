@@ -67,10 +67,11 @@ impl Tool for McpTool {
     }
 
     fn intent(&self, _args: &Value) -> Result<ToolIntent, ToolError> {
-        // Trust is encoded onto the policy's Read/Write axis (zero policy change):
-        // Ask → Write (RulePolicy asks); Allow → Read with empty paths (vacuously true → Allow).
+        // Trust maps onto the policy axis: Ask → Write (RulePolicy asks);
+        // Allow → TrustedWrite (auto-allowed like Read at the gate, but counted
+        // as a mutation by the post-exec validator trigger — audit 5.1).
         let access = match self.trust {
-            Trust::Allow => Access::Read,
+            Trust::Allow => Access::TrustedWrite,
             Trust::Ask => Access::Write,
         };
         Ok(ToolIntent {
@@ -196,10 +197,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_trust_maps_to_policy_allow() {
+    async fn allow_trust_maps_to_trusted_write_and_policy_allow() {
         let tool = McpTool::new("fs", client_that(|_| vec![]), raw(), Trust::Allow);
         let intent = tool.intent(&json!({})).unwrap();
-        assert_eq!(intent.access, Access::Read);
+        assert_eq!(intent.access, Access::TrustedWrite);
         assert!(intent.paths.is_empty());
         assert!(matches!(policy().check(&intent), Decision::Allow));
     }
