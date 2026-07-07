@@ -796,6 +796,21 @@ regression found anywhere). **The current findings snapshot is
 inline list and the 2026-07-01 report. Spec:
 `docs/superpowers/specs/2026-07-06-full-harness-sdlc-audit-design.md`.
 
+Re-stamp note (2026-07-07, audit-drain cluster 1/6 — CI & gates; merge `33cb6fa`; triage spec
+`docs/superpowers/specs/2026-07-07-audit-drain-action-plan-design.md`, plan
+`docs/superpowers/plans/2026-07-07-audit-ci-gates.md`): four findings of the 2026-07-06 report
+closed. **Process 11.1** — ci.sh runs a conditional src-tauri leg (clippy -D warnings + test when
+pkg-config finds gtk+-3.0 + webkit2gtk-4.1, explicit SKIPPED line otherwise; GitHub-runner
+rationale preserved, fmt stays hand-format-excluded). **Skills 9.2 / eval 10.1** — the OKF bundle
+is gated: `test_okf_check.py` + `okf_check.py docs/okf/agent-sdlc` run as ci.sh's first
+(fail-fast) leg. **Eval 10.2** — the coverage job tees the llvm-cov summary and appends
+Filename/TOTAL to `$GITHUB_STEP_SUMMARY` (still continue-on-error, never a gate; confirm the
+Summary tab on first push). **Skills 9.3** — okf_check gained checks 5-8 (`resource:` on Source
+nodes, type vocabulary, `[n]`-marker resolution, directory-index coverage; suite 9→13 tests),
+live bundle conformant with zero fixes, and the semantic-drift human duty is documented in the
+checker docstring + authoring.md. Whole-branch review: READY TO MERGE, zero Critical/Important;
+accepted minors in the cluster ledger (`.superpowers/sdd/progress.md`).
+
 ---
 
 ## Top highest-leverage fixes
