@@ -4,29 +4,33 @@ description: >-
   Use when automating tests or verifying a change end-to-end for THIS repo
   (rust-agent-runtime) on Kalen's machine — the Tauri desktop app, its localhost
   WebSocket bridge, the React web UI, or the live model loop. Covers how to drive
-  the app without a GUI, the bridge wire protocol, prerequisites (llama-server on
-  :8080, cargo on PATH), and — as a last resort — driving the actual window on
-  this KDE/Wayland desktop. Trigger on "verify it works", "automate a test",
-  "drive the app", "run the e2e", "does the change work end to end".
+  the app via WebDriver (DOM-level, primary layer) or the WebSocket bridge, plus
+  xdotool as a native-chrome-only fallback. Trigger on "verify it works",
+  "automate a test", "drive the app", "run the e2e", "does the change work end
+  to end".
 ---
 
 # Driving rust-agent-runtime to automate tests
 
 ## Core principle
 
-**Drive the WebSocket bridge, not the GUI.** The desktop app is a WebKitGTK
-webview whose only job is to open `ws://127.0.0.1:<port>/agent` and exchange JSON
-frames with the embedded Rust runtime (`src-tauri/src/bridge.rs` →
+**Drive the WebSocket bridge or WebDriver — not pixels.** The desktop app is a
+WebKitGTK webview whose only job is to open `ws://127.0.0.1:<port>/agent` and
+exchange JSON frames with the embedded Rust runtime (`src-tauri/src/bridge.rs` →
 `agent_server::daemon::serve`). Everything the UI can do, a WS client can do —
 headlessly, deterministically, with no compositor involved. The existing
-`src-tauri/tests/e2e_live.rs` is the reference: start the bridge, connect, send
-`user_input`, assert on the streamed events.
+`src-tauri/tests/smoke_context_explorer.rs` is the reference bridge test: start
+the bridge, connect, send `user_input`, assert on the streamed events.
 
-Pixel-driving the window is the **last resort** here (see §This machine for why).
+For UX / rendering assertions that require the real webview, use WebDriver
+(§GUI driving — WebDriver) — not pixels. Pixel-driving the window is the
+**last resort**, limited to native GTK chrome the WebDriver cannot reach
+(§Pixel fallback).
 
 **Do not** use this skill for: generic Tauri v2 development (→ `tauri` skill);
 automating GUI apps outside this repo on Wayland (→ `wayland` skill); or
-pixel-driving when a WS-bridge rung is available — the bridge is the point.
+pixel-driving when a WS-bridge or WebDriver rung is available — the bridge and
+WebDriver are the point.
 
 ## Prerequisites (check first)
 
@@ -35,7 +39,7 @@ pixel-driving when a WS-bridge rung is available — the bridge is the point.
   must return `{"status":"ok"}`. Model is `qwen3.6-35b-a3b`, launched `-np 1`
   (no `n>1`). Drive it manually with `agent/scripts/chat.sh`. Note: `:8080` is where the
   server actually runs — some on-disk/CLI defaults say `:30000`; the desktop bridge
-  and `e2e_live.rs` both override to `:8080`, so trust `:8080`.
+  and `smoke_context_explorer.rs` both override to `:8080`, so trust `:8080`.
 - A clean build exists (`agent/`, `src-tauri/`, `web/` all build). First `cargo test`
   after a change recompiles (~1 min cold) before the 120s test window — a slow start
   is the build, not a hang.
@@ -45,8 +49,9 @@ pixel-driving when a WS-bridge rung is available — the bridge is the point.
 | Rung | What it covers | Command | Needs :8080 |
 |------|----------------|---------|-------------|
 | L0 unit/integration | Rust logic, web components | `cd agent && cargo test` · `cd web && npm test` · `cd src-tauri && cargo test` | no |
-| L1 protocol e2e (**default for "does it work end to end"**) | webview→bridge→runtime→model, real token stream | `cd src-tauri && cargo test --test e2e_live -- --ignored --nocapture` | **yes** |
-| L2 GUI driving | the actual rendered webview / UX | see §GUI driving — last resort | yes |
+| L1 protocol e2e (**default for "does it work end to end"**) | webview→bridge→runtime→model, real token stream | `cd src-tauri && cargo test --test smoke_context_explorer -- --ignored --nocapture` (fast no-model gate: `--test llama_health`) | **yes** |
+| L2 GUI driving (WebDriver) | the actual rendered webview / UX, via the DOM | `cd src-tauri && cargo test --test gui_smoke -- --ignored --test-threads=1` or drive interactively — see §GUI driving (WebDriver) | boot: no · turn: yes |
+| L3 pixel fallback | native GTK chrome only (file dialogs, window decorations) | see §Pixel fallback | — |
 
 `src-tauri/tests/bridge.rs` (`bridge_serves_local_runtime`) is an L0/L1 hybrid: it
 exercises the full bridge→serve wiring with a **closed** model port, so it proves
@@ -74,7 +79,7 @@ Connect to `bridge.ws_url()` = `ws://127.0.0.1:<port>/agent`. Text frames, JSON:
 `type:"done"`; treat `type:"error"` as failure; collect `type:"token"` text.
 
 To write a new headless e2e, start the bridge in-process exactly like
-`e2e_live.rs:15`. The signature is `bridge::start(workspace, config_path,
+`smoke_context_explorer.rs`. The signature is `bridge::start(workspace, config_path,
 base_url, model)` — e.g. `rust_agent_runtime_desktop_lib::bridge::start(
 ws_dir.path().to_path_buf(), cfg, "http://localhost:8080".into(),
 "qwen3.6-35b-a3b".into())` where `cfg` is a separate runtime-config path inside
@@ -93,13 +98,85 @@ hardcode.
 | AT-SPI (semantic layer) | bus runs, but **no Python `Atspi` binding**, `toolkit-accessibility=false` | Layer-1 a11y driving is not usable as-is; WebKitGTK web a11y is unreliable anyway |
 | Webview | WebKitGTK 2.52.3 | renders as a Wayland client under this session |
 | Screenshot tool | **`spectacle`** (no `grim`) | use spectacle for captures |
-| XWayland | present (`DISPLAY=:0`) | the one escape hatch for `xdotool` (see below) |
+| XWayland | present (`DISPLAY=:0`) | the one escape hatch for `xdotool` (see §Pixel fallback) |
 
-This is exactly why L0/L1 win: the semantic (AT-SPI) and input-injection (Wayland)
-layers the `wayland` skill prefers are both un-provisioned here, while the app
-hands you a clean protocol socket.
+This is why the driving ladder exists: L1/L2 win for most cases; the semantic
+(AT-SPI) and input-injection (Wayland) layers the `wayland` skill prefers are
+both un-provisioned here, while the app hands you a clean protocol socket and a
+full WebDriver interface.
 
-## GUI driving — last resort (only to validate actual rendering/UX)
+## GUI driving — WebDriver (primary)
+
+Verified 2026-07-06: `tauri-driver` + WebKitGTK WebDriver drives the real app's
+DOM — CSS selectors, real key events, `execute_script`, focus-independent
+screenshots. No coordinates, no KWin consent dialog, no xclip, no focus click.
+
+**Bring-up (order matters):**
+1. Vite on :5173 (`curl -s -o /dev/null -w '%{http_code}' localhost:5173` → 200,
+   else `setsid npm --prefix web run dev` and wait).
+2. Debug binary built (`cd src-tauri && cargo build`).
+3. `setsid ~/.cargo/bin/tauri-driver --port 4444 --native-port 4445 >/tmp/td.log 2>&1 &`
+   then `curl -s 127.0.0.1:4444/status` → `"ready":true`. Do NOT launch the app
+   yourself — the WebDriver session launches (and owns) it.
+
+**Drive with `/usr/bin/python3` (the PATH python is a uv shim without selenium):**
+
+```python
+/usr/bin/python3 - <<'EOF'
+from selenium.webdriver import Remote
+from selenium.webdriver.common.options import ArgOptions
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+o = ArgOptions()
+o.set_capability("tauri:options", {"application": "/home/kalen/rust-agent-runtime/src-tauri/target/debug/rust-agent-runtime-desktop"})
+o.set_capability("browserName", "wry")
+d = Remote("http://127.0.0.1:4444", options=o)
+# React tree mounts ~3-5s after session create; wait before interacting.
+WebDriverWait(d, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "button[role='tab']")))
+d.find_element(By.CSS_SELECTOR, "textarea[aria-label='prompt']").send_keys("Reply with: pong")  #  = W3C Enter, submits
+# Poll d.execute_script("return document.body.innerText") for the reply.
+# Use a unique marker per run (e.g. SQRL<epoch-millis>) so stale transcript
+# state from a previous run cannot fake a reply.
+d.save_screenshot("/tmp/shot.png")   # webview-exact, focus-independent
+d.quit()                             # ALWAYS quit — see session-lifetime note
+EOF
+```
+
+**Useful selectors:** composer `textarea[aria-label='prompt']` (Enter submits —
+there is no send button); tabs `button[role='tab']` — 5 nav tabs at boot
+(Workspace / Context / Design / Architecture / Config), plus 2 Design-canvas
+sub-tabs that appear only when Design is active; always select by text not
+by count or index
+(e.g. `By.XPATH, "//button[@role='tab' and normalize-space()='Architecture']"`);
+Architecture and Config tabs are present only under real Tauri IPC — asserting
+their presence confirms you drove the real app, not a plain browser; Context
+breakdown total `//div[contains(text(),'tokens')]`, legend chips
+`//button[contains(., 'system')]`.
+
+**Session lifetime = app lifetime.** WebKitWebDriver allows ONE session; a
+python process that exits without `quit()` wedges the driver. To reset: kill
+tauri-driver. Note that `setsid ... &` followed by `TD_PID=$!` captures the
+**setsid wrapper's PID**, not tauri-driver's own PID. Kill reliably by port:
+`ss -tlnp | grep 4444` to find the PID, then `kill <pid>`; or kill the wrapper
+AND its child (`kill $TD_PID && kill $(pgrep -P $TD_PID)`). You cannot attach to
+an already-running app — the WebDriver session must launch it. So: plan the
+whole drive sequence, run it as ONE script, always `quit()`.
+
+**Scripted equivalent:** `src-tauri/tests/gui_smoke.rs` (`boot_smoke`,
+`turn_smoke`) with the reusable harness in `src-tauri/tests/e2e_harness/mod.rs`
+— copy its lifecycle pattern for new GUI tests. The harness uses thirtyfour 0.37
+(`Capabilities::set(key, value)` rather than `insert`) and kills by process
+group, never by pattern-match, to avoid the pkill self-match footgun.
+
+**Preflight if the driver misbehaves:** `dpkg -l libwebkit2gtk-4.1-0
+webkitgtk-webdriver | grep ^ii` — the two versions must match.
+
+## Pixel fallback (native GTK chrome only)
+
+WebDriver cannot reach native chrome: the `pick_workspace` GTK file dialog,
+window decorations, or an already-running instance you can't relaunch. Only
+then, fall back to the xdotool recipe below (verified 2026-06-24):
 
 This path **works on this machine** — verified 2026-06-24 end-to-end: typed a prompt
 into the composer, clicked Send, and saw the model's `pong` render in the transcript.
@@ -156,3 +233,10 @@ present today.
 - Hardcoding a bridge port → it's ephemeral; read `bridge.ws_url()`.
 - Asserting on screenshots for L0/L1 → assert on `event` frames
   (`done`/`error`/`token`); screenshots are only for L2 GUI rendering checks.
+- Launching the app yourself and then trying to WebDriver it → no attach
+  semantics; the session must launch the app. Kill your instance first.
+- Selenium script died without `quit()` → next session hangs at create. Kill
+  tauri-driver by PID (or port lookup: `ss -tlnp | grep 4444`) and restart it.
+- Using PATH `python3` for selenium → uv shim, no apt packages. Use `/usr/bin/python3`.
+- Driving pixels for something the DOM can answer → use WebDriver first; pixels
+  are only for native chrome (§Pixel fallback).
