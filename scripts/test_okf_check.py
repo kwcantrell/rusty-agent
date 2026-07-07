@@ -69,7 +69,16 @@ class OkfCheckTest(unittest.TestCase):
         write(self.root, "sources/ext.md",
               "---\ntype: Source\nresource: https://example.com/ext\n---\n"
               "See [site](https://example.com/x) and [anchor](#schema)\n")
+        write(self.root, "sources/index.md",
+              "# Sources\n- [example](/sources/example.md)\n- [ext](/sources/ext.md)\n")
         self.assertEqual(okf_check.check_bundle(self.root), [])
+
+    def test_index_missing_node_fails(self):
+        valid_bundle(self.root)
+        write(self.root, "sources/unlisted.md", VALID_SOURCE)
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("sources/index.md" in e and "unlisted.md" in e
+                            for e in errs))
 
     def test_source_missing_resource_fails(self):
         valid_bundle(self.root)

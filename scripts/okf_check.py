@@ -138,6 +138,23 @@ def check_bundle(root):
                     errors.append(
                         f"{rel}: citation marker(s) with no numbered Citations entry: "
                         + ", ".join(f"[{n}]" for n in missing))
+
+    for idx in md_files:
+        if idx.name != "index.md" or idx.parent == root:
+            continue
+        _, idx_body = split_frontmatter(idx.read_text(encoding="utf-8"))
+        listed = set()
+        for target in iter_links(idx_body):
+            if target.startswith("/"):
+                listed.add((root / target.lstrip("/")).resolve())
+            else:
+                listed.add((idx.parent / target).resolve())
+        for sib in sorted(idx.parent.glob("*.md")):
+            if sib.name in RESERVED:
+                continue
+            if sib.resolve() not in listed:
+                rel = idx.relative_to(root).as_posix()
+                errors.append(f"{rel}: does not list {sib.name}")
     return errors
 
 
