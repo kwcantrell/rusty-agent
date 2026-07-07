@@ -59,7 +59,13 @@ async fn turn_smoke() {
     let gui = Gui::launch().await;
     let d = &gui.driver;
 
-    let marker = "SQUIRREL7";
+    // Unique per run: the WebKit automation profile persists localStorage, so a
+    // fixed marker could be satisfied instantly by a STALE transcript from a
+    // previous run without exercising a live turn.
+    let marker = format!(
+        "SQRL{}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+    );
     let ta = d
         .query(By::Css("textarea[aria-label='prompt']"))
         .wait(Duration::from_secs(30), Duration::from_millis(500))
@@ -79,7 +85,7 @@ async fn turn_smoke() {
             .await
             .expect("read innerText");
         let text = ret.json().as_str().unwrap_or_default().to_string();
-        if text.matches(marker).count() >= 2 {
+        if text.matches(&marker).count() >= 2 {
             break;
         }
         assert!(Instant::now() < deadline, "no assistant reply containing {marker} within 120s");
