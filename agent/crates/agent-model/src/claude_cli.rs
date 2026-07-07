@@ -5,7 +5,10 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -28,13 +31,47 @@ pub struct ClaudeCliOptions {
     pub fallback_model: Option<String>,
 }
 
-/// Session state carried across calls for delta resume (filled by Task 5).
-#[allow(dead_code)] // filled by Task 5 (delta resume)
+/// Session state carried across calls for delta resume.
 #[derive(Debug, Clone)]
 struct SessionState {
+    /// Captured from the init event of a persisted spawn; needed to resume.
     session_id: Option<String>,
+    /// Whether the CLI wrote this session to disk (resumable).
     persisted: bool,
+    /// One hash per transcript message this session has covered.
     fingerprints: Vec<u64>,
+}
+
+/// How to spawn the CLI for a given transcript.
+enum SpawnPlan {
+    /// Full transcript, `--no-session-persistence` (pre-optimization behavior).
+    FreshEphemeral,
+    /// Full transcript, persistence on; the init event's session_id is recorded.
+    /// Costs one extra full send per session so one-shot callers (compaction,
+    /// evals) never write session files to disk.
+    FreshPersisted,
+    /// `--resume <id>`; pipe only `messages[suffix_start..]`, assistant turns
+    /// skipped (the CLI session already holds its own replies).
+    Resume {
+        session_id: String,
+        suffix_start: usize,
+    },
+}
+
+/// Hash a single message by role discriminant, name, content, and reasoning.
+fn fingerprint(m: &Message) -> u64 {
+    let mut h = DefaultHasher::new();
+    std::mem::discriminant(&m.role).hash(&mut h);
+    m.name.hash(&mut h);
+    m.content.hash(&mut h);
+    m.reasoning.hash(&mut h);
+    h.finish()
+}
+
+/// Returns true iff `new` strictly extends `old`: longer, and byte-identical
+/// on the shared prefix.
+fn is_strict_extension(old: &[u64], new: &[u64]) -> bool {
+    new.len() > old.len() && new[..old.len()] == *old
 }
 
 /// Drives the Claude Code CLI as a pure text generator.
@@ -42,8 +79,7 @@ pub struct ClaudeCliClient {
     binary: String,
     model: String,
     opts: ClaudeCliOptions,
-    #[allow(dead_code)] // filled by Task 5 (delta resume)
-    state: std::sync::Arc<std::sync::Mutex<Option<SessionState>>>,
+    state: Arc<Mutex<Option<SessionState>>>,
 }
 
 impl ClaudeCliClient {
@@ -60,7 +96,7 @@ impl ClaudeCliClient {
             binary: binary.into(),
             model: model.into(),
             opts,
-            state: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -101,6 +137,50 @@ impl ClaudeCliClient {
             .kill_on_drop(true);
         cmd
     }
+
+    /// Decide how to spawn for this transcript and produce the pending state to
+    /// commit on success.
+    fn plan_spawn(&self, messages: &[Message]) -> (SpawnPlan, SessionState) {
+        let fps: Vec<u64> = messages.iter().map(fingerprint).collect();
+        let fresh = |persisted: bool| SessionState {
+            session_id: None,
+            persisted,
+            fingerprints: fps.clone(),
+        };
+        if !self.opts.session_reuse {
+            return (SpawnPlan::FreshEphemeral, fresh(false));
+        }
+        let st = self.state.lock().expect("session state lock").clone();
+        match st {
+            Some(s) if is_strict_extension(&s.fingerprints, &fps) => {
+                if !s.persisted {
+                    // First extension: pay one full send to make the session resumable.
+                    return (SpawnPlan::FreshPersisted, fresh(true));
+                }
+                let suffix_start = s.fingerprints.len();
+                let suffix_has_content = messages[suffix_start..]
+                    .iter()
+                    .any(|m| m.role != Role::Assistant);
+                match (s.session_id.clone(), suffix_has_content) {
+                    (Some(id), true) => (
+                        SpawnPlan::Resume {
+                            session_id: id.clone(),
+                            suffix_start,
+                        },
+                        SessionState {
+                            session_id: Some(id),
+                            persisted: true,
+                            fingerprints: fps,
+                        },
+                    ),
+                    // No id captured or assistant-only suffix: degrade safely.
+                    _ => (SpawnPlan::FreshEphemeral, fresh(false)),
+                }
+            }
+            // First call, or history was rewritten (curation/compaction): start over.
+            _ => (SpawnPlan::FreshEphemeral, fresh(false)),
+        }
+    }
 }
 
 #[async_trait]
@@ -109,10 +189,32 @@ impl ModelClient for ClaudeCliClient {
         &self,
         req: CompletionRequest,
     ) -> Result<BoxStream<'static, Result<Chunk, ModelError>>, ModelError> {
-        let prompt = render_transcript(&req.messages);
+        let (plan, mut pending) = self.plan_spawn(&req.messages);
+
+        let prompt = match &plan {
+            SpawnPlan::Resume { suffix_start, .. } => {
+                // The CLI session already holds its own assistant turns.
+                let suffix: Vec<Message> = req.messages[*suffix_start..]
+                    .iter()
+                    .filter(|m| m.role != Role::Assistant)
+                    .cloned()
+                    .collect();
+                render_transcript(&suffix)
+            }
+            _ => render_transcript(&req.messages),
+        };
 
         let mut cmd = self.base_command();
-        cmd.arg("--no-session-persistence"); // Task 5 makes this plan-dependent
+        match &plan {
+            SpawnPlan::FreshEphemeral => {
+                cmd.arg("--no-session-persistence");
+            }
+            SpawnPlan::FreshPersisted => {}
+            SpawnPlan::Resume { session_id, .. } => {
+                cmd.arg("--resume").arg(session_id);
+            }
+        }
+
         let mut child = cmd
             .spawn()
             .map_err(|e| ModelError::Process(format!("spawn {}: {e}", self.binary)))?;
@@ -137,9 +239,12 @@ impl ModelClient for ClaudeCliClient {
             buf
         });
 
+        let state = Arc::clone(&self.state);
+        let track_state = self.opts.session_reuse;
         let stream = async_stream::stream! {
             let mut parser = EventParser::new();
             let mut lines = BufReader::new(stdout).lines();
+            let mut failed = false;
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => match parser.parse_line(&line) {
@@ -149,27 +254,60 @@ impl ModelClient for ClaudeCliClient {
                             }
                         }
                         Err(e) => {
+                            failed = true;
+                            // Reset BEFORE yielding: the consumer may drop the
+                            // stream on the error item (via `?`) and code after
+                            // yield would never run.
+                            if track_state {
+                                *state.lock().expect("session state lock") = None;
+                            }
                             yield Err(e);
-                            return;
+                            break;
                         }
                     },
                     Ok(None) => break, // stdout EOF
                     Err(e) => {
+                        failed = true;
+                        if track_state {
+                            *state.lock().expect("session state lock") = None;
+                        }
                         yield Err(ModelError::Stream(e.to_string()));
-                        return;
+                        break;
                     }
                 }
             }
 
-            // stdout drained; confirm a clean exit, else surface stderr.
-            match child.wait().await {
-                Ok(status) if status.success() => {}
-                Ok(status) => {
-                    let buf = stderr_task.await.unwrap_or_default();
-                    yield Err(ModelError::Process(
-                        format!("claude exited ({status}): {}", buf.trim())));
+            if !failed {
+                // stdout drained; confirm a clean exit, else surface stderr.
+                match child.wait().await {
+                    Ok(status) if status.success() => {
+                        if track_state {
+                            // Prefer the id the CLI just reported (a resume may
+                            // continue under the same id or, with future CLIs, a
+                            // forked one — the init event is authoritative).
+                            pending.session_id =
+                                parser.session_id.take().or(pending.session_id.take());
+                            *state.lock().expect("session state lock") = Some(pending);
+                        }
+                        return;
+                    }
+                    Ok(status) => {
+                        // Reset BEFORE yielding so the consumer sees fresh state
+                        // even if it drops the stream immediately on this error.
+                        if track_state {
+                            *state.lock().expect("session state lock") = None;
+                        }
+                        let buf = stderr_task.await.unwrap_or_default();
+                        yield Err(ModelError::Process(
+                            format!("claude exited ({status}): {}", buf.trim())));
+                    }
+                    Err(e) => {
+                        if track_state {
+                            *state.lock().expect("session state lock") = None;
+                        }
+                        yield Err(ModelError::Process(e.to_string()));
+                    }
                 }
-                Err(e) => yield Err(ModelError::Process(e.to_string())),
             }
         };
         Ok(stream.boxed())
@@ -348,6 +486,40 @@ mod proc_tests {
         path
     }
 
+    /// Fake CLI that records argv/stdin per call into `dir` and emits a canned
+    /// stream with session id "sess-<n>". `fail_call` (0 = never) exits 1 on that call.
+    fn write_recording_fake(dir: &std::path::Path, fail_call: u32) -> tempfile::TempPath {
+        let d = dir.display();
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             n=$(cat {d}/count 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/count\n\
+             printf '%s\\n' \"$*\" > {d}/argv.$n\n\
+             cat > {d}/stdin.$n\n\
+             if [ \"$n\" -eq \"{fail_call}\" ]; then echo boom >&2; exit 1; fi\n\
+             echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-'$n'\"}}'\n\
+             echo '{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"ok'$n'\"}}]}},\"session_id\":\"sess-'$n'\"}}'\n\
+             echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n"
+        );
+        write_fake(&script)
+    }
+
+    async fn drain(client: &ClaudeCliClient, messages: Vec<Message>) -> Result<(), ModelError> {
+        let mut stream = client
+            .stream(CompletionRequest {
+                messages,
+                ..Default::default()
+            })
+            .await?;
+        while let Some(item) = stream.next().await {
+            item?;
+        }
+        Ok(())
+    }
+
+    fn read(dir: &std::path::Path, name: &str) -> String {
+        std::fs::read_to_string(dir.join(name)).unwrap_or_default()
+    }
+
     fn req() -> CompletionRequest {
         CompletionRequest {
             messages: vec![Message::user("hi")],
@@ -503,6 +675,140 @@ mod proc_tests {
         assert!(
             matches!(err, Some(ModelError::Process(_))),
             "expected Process error, got {err:?}"
+        );
+    }
+
+    // ── Task 5: session state machine proc tests ──────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn session_reuse_walks_ephemeral_persisted_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_recording_fake(dir.path(), 0);
+        let client = ClaudeCliClient::with_options(
+            fake.to_str().unwrap(),
+            "sonnet",
+            ClaudeCliOptions {
+                session_reuse: true,
+                ..Default::default()
+            },
+        );
+
+        let base = vec![Message::system("sys"), Message::user("u1")];
+        drain(&client, base.clone()).await.unwrap();
+
+        let mut ext1 = base.clone();
+        ext1.push(Message::assistant("ok1", None));
+        ext1.push(Message::tool("call_0", "read_file", "t1"));
+        drain(&client, ext1.clone()).await.unwrap();
+
+        let mut ext2 = ext1.clone();
+        ext2.push(Message::assistant("ok2", None));
+        ext2.push(Message::user("u2"));
+        drain(&client, ext2).await.unwrap();
+
+        // Call 1: ephemeral full send.
+        let argv1 = read(dir.path(), "argv.1");
+        assert!(argv1.contains("--no-session-persistence"), "argv1: {argv1}");
+        assert!(read(dir.path(), "stdin.1").contains("u1"));
+
+        // Call 2: first extension → persisted full send (no resume yet).
+        let argv2 = read(dir.path(), "argv.2");
+        assert!(
+            !argv2.contains("--no-session-persistence"),
+            "argv2: {argv2}"
+        );
+        assert!(!argv2.contains("--resume"), "argv2: {argv2}");
+        let stdin2 = read(dir.path(), "stdin.2");
+        assert!(
+            stdin2.contains("u1") && stdin2.contains("t1"),
+            "stdin2: {stdin2}"
+        );
+
+        // Call 3: resume with suffix only; assistant turns skipped.
+        let argv3 = read(dir.path(), "argv.3");
+        assert!(argv3.contains("--resume sess-2"), "argv3: {argv3}");
+        let stdin3 = read(dir.path(), "stdin.3");
+        assert!(stdin3.contains("u2"), "stdin3: {stdin3}");
+        assert!(!stdin3.contains("u1"), "stdin3 resent prefix: {stdin3}");
+        assert!(!stdin3.contains("t1"), "stdin3 resent prefix: {stdin3}");
+        assert!(!stdin3.contains("ok2"), "stdin3 resent assistant: {stdin3}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn history_rewrite_resets_to_ephemeral() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_recording_fake(dir.path(), 0);
+        let client = ClaudeCliClient::with_options(
+            fake.to_str().unwrap(),
+            "sonnet",
+            ClaudeCliOptions {
+                session_reuse: true,
+                ..Default::default()
+            },
+        );
+        drain(&client, vec![Message::system("sys"), Message::user("u1")])
+            .await
+            .unwrap();
+        // Not an extension: same length, different content (curation rewrote history).
+        drain(
+            &client,
+            vec![Message::system("sys"), Message::user("rewritten")],
+        )
+        .await
+        .unwrap();
+        let argv2 = read(dir.path(), "argv.2");
+        assert!(argv2.contains("--no-session-persistence"), "argv2: {argv2}");
+        assert!(read(dir.path(), "stdin.2").contains("rewritten"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stream_error_resets_session_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_recording_fake(dir.path(), 2); // call 2 fails
+        let client = ClaudeCliClient::with_options(
+            fake.to_str().unwrap(),
+            "sonnet",
+            ClaudeCliOptions {
+                session_reuse: true,
+                ..Default::default()
+            },
+        );
+        let base = vec![Message::system("sys"), Message::user("u1")];
+        drain(&client, base.clone()).await.unwrap();
+        let mut ext = base.clone();
+        ext.push(Message::assistant("ok1", None));
+        ext.push(Message::user("u2"));
+        assert!(drain(&client, ext.clone()).await.is_err()); // call 2: persisted attempt fails
+                                                             // Retry (as the loop would): state was reset → ephemeral full send again.
+        drain(&client, ext).await.unwrap();
+        let argv3 = read(dir.path(), "argv.3");
+        assert!(argv3.contains("--no-session-persistence"), "argv3: {argv3}");
+        assert!(
+            read(dir.path(), "stdin.3").contains("u1"),
+            "full resend expected"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reuse_off_is_always_ephemeral_full_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_recording_fake(dir.path(), 0);
+        let client = ClaudeCliClient::new(fake.to_str().unwrap(), "sonnet"); // Default: reuse off
+        let base = vec![Message::system("sys"), Message::user("u1")];
+        drain(&client, base.clone()).await.unwrap();
+        let mut ext = base.clone();
+        ext.push(Message::assistant("ok1", None));
+        ext.push(Message::user("u2"));
+        drain(&client, ext).await.unwrap();
+        let argv2 = read(dir.path(), "argv.2");
+        assert!(argv2.contains("--no-session-persistence"), "argv2: {argv2}");
+        assert!(
+            read(dir.path(), "stdin.2").contains("u1"),
+            "full resend expected"
         );
     }
 }
