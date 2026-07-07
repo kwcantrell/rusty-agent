@@ -15,18 +15,91 @@ use tokio::process::Command;
 const BARE_SYSTEM_PROMPT: &str =
     "You are a text generator. Follow the instructions in the message exactly.";
 
+/// Behavior knobs for the claude-cli backend. `Default` reproduces the
+/// pre-optimization behavior exactly (stateless, no knob flags).
+#[derive(Debug, Clone, Default)]
+pub struct ClaudeCliOptions {
+    /// Resume the CLI session across calls when the transcript extends
+    /// append-only (delta resume). Off = stateless full send every call.
+    pub session_reuse: bool,
+    /// `--effort <level>`; validated upstream against the CLI's accepted set.
+    pub effort: Option<String>,
+    /// `--fallback-model <model>` when the primary is unavailable.
+    pub fallback_model: Option<String>,
+}
+
+/// Session state carried across calls for delta resume (filled by Task 5).
+#[allow(dead_code)] // filled by Task 5 (delta resume)
+#[derive(Debug, Clone)]
+struct SessionState {
+    session_id: Option<String>,
+    persisted: bool,
+    fingerprints: Vec<u64>,
+}
+
 /// Drives the Claude Code CLI as a pure text generator.
 pub struct ClaudeCliClient {
     binary: String,
     model: String,
+    opts: ClaudeCliOptions,
+    #[allow(dead_code)] // filled by Task 5 (delta resume)
+    state: std::sync::Arc<std::sync::Mutex<Option<SessionState>>>,
 }
 
 impl ClaudeCliClient {
     pub fn new(binary: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_options(binary, model, ClaudeCliOptions::default())
+    }
+
+    pub fn with_options(
+        binary: impl Into<String>,
+        model: impl Into<String>,
+        opts: ClaudeCliOptions,
+    ) -> Self {
         Self {
             binary: binary.into(),
             model: model.into(),
+            opts,
+            state: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn base_command(&self) -> Command {
+        let mut cmd = Command::new(&self.binary);
+        cmd.arg("-p")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--verbose")
+            // Token-level deltas instead of whole assistant messages.
+            .arg("--include-partial-messages")
+            .arg("--allowedTools")
+            .arg("")
+            .arg("--model")
+            .arg(&self.model)
+            // `--system-prompt` REPLACES the "you are Claude Code" harness prompt
+            // (so it can't compete with the Prompted tool preamble on stdin).
+            .arg("--system-prompt")
+            .arg(BARE_SYSTEM_PROMPT)
+            // Don't load the user's settings — that's where SessionStart hooks live.
+            .arg("--setting-sources")
+            .arg("project")
+            .arg("--strict-mcp-config");
+        if let Some(e) = &self.opts.effort {
+            cmd.arg("--effort").arg(e);
+        }
+        if let Some(f) = &self.opts.fallback_model {
+            cmd.arg("--fallback-model").arg(f);
+        }
+        // The CLI authenticates via its own subscription/OAuth — it must not
+        // inherit the runtime's model API key.
+        // NOTE: do NOT use `--bare` — it forces API-key auth and never reads
+        // OAuth/keychain, defeating the subscription piggyback.
+        cmd.env_remove("AGENT_API_KEY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd
     }
 }
 
@@ -38,39 +111,9 @@ impl ModelClient for ClaudeCliClient {
     ) -> Result<BoxStream<'static, Result<Chunk, ModelError>>, ModelError> {
         let prompt = render_transcript(&req.messages);
 
-        let mut child = Command::new(&self.binary)
-            .arg("-p")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose")
-            .arg("--allowedTools")
-            .arg("")
-            .arg("--model")
-            .arg(&self.model)
-            // Run the CLI as a pure generator without losing subscription auth.
-            // `--system-prompt` REPLACES the "you are Claude Code" harness prompt
-            // (so it can't compete with the Prompted tool preamble on stdin); the
-            // transcript still carries our own instructions in the piped prompt.
-            .arg("--system-prompt")
-            .arg(BARE_SYSTEM_PROMPT)
-            // Don't load the user's settings — that's where SessionStart hooks
-            // live, which otherwise inject the whole skill harness into context.
-            .arg("--setting-sources")
-            .arg("project")
-            // Skip MCP discovery and session-to-disk writes (we're stateless).
-            .arg("--strict-mcp-config")
-            .arg("--no-session-persistence")
-            // The CLI authenticates via its own subscription/OAuth — it must not
-            // inherit the runtime's model API key. This is the last child that
-            // could see it; the rest of the env stays (trusted local backend).
-            .env_remove("AGENT_API_KEY")
-            // NOTE: do NOT use `--bare` — it forces ANTHROPIC_API_KEY/apiKeyHelper
-            // auth and never reads OAuth/keychain, which defeats the whole point
-            // of driving the CLI (piggybacking the Claude subscription).
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true) // kill the CLI if the stream is dropped/cancelled
+        let mut cmd = self.base_command();
+        cmd.arg("--no-session-persistence"); // Task 5 makes this plan-dependent
+        let mut child = cmd
             .spawn()
             .map_err(|e| ModelError::Process(format!("spawn {}: {e}", self.binary)))?;
 
@@ -370,11 +413,9 @@ mod proc_tests {
     #[tokio::test]
     #[serial]
     async fn forwards_bare_generator_flags() {
-        // The fake CLI exits non-zero (→ Process error) unless every flag that
-        // makes it behave as a subscription-auth bare generator is present, so a
-        // future edit that drops one is caught by the clean-stream assertion.
+        // Fails unless every load-bearing bare-generator flag is present.
         let script = "#!/usr/bin/env bash\ncat >/dev/null\n\
-            for f in --system-prompt --setting-sources --strict-mcp-config --no-session-persistence --allowedTools; do\n\
+            for f in --system-prompt --setting-sources --strict-mcp-config --no-session-persistence --allowedTools --include-partial-messages; do\n\
               case \" $* \" in *\" $f \"*) ;; *) echo \"missing $f\" >&2; exit 3;; esac\n\
             done\n\
             echo '{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]},\"session_id\":\"t\"}'\n\
@@ -383,17 +424,57 @@ mod proc_tests {
         let client = ClaudeCliClient::new(fake.to_str().unwrap(), "sonnet");
         let mut stream = client.stream(req()).await.unwrap();
         let mut text = String::new();
-        let mut done = None;
         while let Some(item) = stream.next().await {
-            match item.unwrap() {
-                Chunk::Text(t) => text.push_str(&t),
-                Chunk::Done(r) => done = Some(r),
-                Chunk::ToolCallDelta(_) => {}
-                Chunk::Reasoning(_) => {}
-                Chunk::Usage { .. } => {}
+            if let Chunk::Text(t) = item.unwrap() {
+                text.push_str(&t);
             }
         }
         assert_eq!(text, "ok");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forwards_effort_and_fallback_model_flags() {
+        let script = "#!/usr/bin/env bash\ncat >/dev/null\n\
+            case \" $* \" in *\" --effort high \"*) ;; *) echo 'missing --effort' >&2; exit 3;; esac\n\
+            case \" $* \" in *\" --fallback-model sonnet \"*) ;; *) echo 'missing --fallback-model' >&2; exit 3;; esac\n\
+            echo '{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]},\"session_id\":\"t\"}'\n\
+            echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"t\"}'\n";
+        let fake = write_fake(script);
+        let client = ClaudeCliClient::with_options(
+            fake.to_str().unwrap(),
+            "opus",
+            ClaudeCliOptions {
+                effort: Some("high".into()),
+                fallback_model: Some("sonnet".into()),
+                ..Default::default()
+            },
+        );
+        let mut stream = client.stream(req()).await.unwrap();
+        let mut text = String::new();
+        while let Some(item) = stream.next().await {
+            if let Chunk::Text(t) = item.unwrap() {
+                text.push_str(&t);
+            }
+        }
+        assert_eq!(text, "ok");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn default_options_omit_knob_flags() {
+        let script = "#!/usr/bin/env bash\ncat >/dev/null\n\
+            case \" $* \" in *\" --effort \"*|*\" --fallback-model \"*) echo 'unexpected knob flag' >&2; exit 3;; esac\n\
+            echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n";
+        let fake = write_fake(script);
+        let client = ClaudeCliClient::new(fake.to_str().unwrap(), "sonnet");
+        let mut stream = client.stream(req()).await.unwrap();
+        let mut done = None;
+        while let Some(item) = stream.next().await {
+            if let Chunk::Done(r) = item.unwrap() {
+                done = Some(r);
+            }
+        }
         assert_eq!(done, Some(StopReason::Stop));
     }
 
