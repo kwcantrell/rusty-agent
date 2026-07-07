@@ -8,6 +8,14 @@ Checks:
 3. all intra-bundle markdown links resolve to existing files inside the bundle
 4. every concept under phases/, practices/, perspectives/, comparisons/ has a
    `# Citations` section containing at least one resolving link into /sources/
+5. `type` is one of the authoring vocabulary (Source, Practice, Lifecycle Phase,
+   Perspective, Comparison)
+6. every `type: Source` node carries a non-empty `resource:` URL
+7. body `[n]` citation markers resolve to a numbered entry in # Citations
+8. every non-root directory index.md lists every non-reserved node in its directory
+
+NOT checked (human duty): whether a node's claims still match its live source —
+semantic drift needs periodic human re-verification, recorded as a dated log.md entry.
 
 Frontmatter is parsed with a minimal flat parser: `key: value` and `key: [a, b]`
 lines only (bundles produced by this repo use inline list syntax). This is

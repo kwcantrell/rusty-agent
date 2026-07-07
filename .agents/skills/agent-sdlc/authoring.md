@@ -88,3 +88,10 @@ the citation check even when it resolves.
 
    Require `OK`. It exits 1 with one error per line otherwise — fix every
    line and re-run.
+
+## What the checker does not catch
+
+`okf_check.py` verifies structure only (frontmatter shape, type vocabulary,
+`resource:` on Sources, link/citation/index integrity). Whether a node's claims
+still match its live `resource:` is **semantic drift** — re-verify against the
+source periodically and record the pass as a dated `log.md` entry.
