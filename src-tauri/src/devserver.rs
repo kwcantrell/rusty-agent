@@ -147,6 +147,8 @@ pub fn parse_url(line: &str) -> Option<String> {
 
 const DISCOVERY_TIMEOUT_SECS: u64 = 30;
 const TAIL_LINES: usize = 60;
+/// How long stop() lets the group act on SIGTERM before the SIGKILL backstop.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DevServerStatus {
@@ -177,16 +179,27 @@ impl DevServerManager {
         self.current.lock().unwrap().as_ref().map(|r| r.pid)
     }
 
-    /// SIGTERM the whole process group, then SIGKILL as a backstop.
+    /// SIGTERM the whole process group, wait up to STOP_GRACE for the direct
+    /// child to exit (so servers can flush/remove pidfiles), then SIGKILL the
+    /// group as a backstop — a no-op (ESRCH) if everything already exited.
     pub fn stop(&self) {
-        if let Some(mut r) = self.current.lock().unwrap().take() {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(-(r.pid as i32), libc::SIGTERM);
-                libc::kill(-(r.pid as i32), libc::SIGKILL);
+        let taken = self.current.lock().unwrap().take();
+        let Some(mut r) = taken else { return };
+        #[cfg(unix)]
+        unsafe { libc::kill(-(r.pid as i32), libc::SIGTERM); }
+        // Poll the direct child (try_wait also reaps it); a graceful exit
+        // short-circuits straight to the backstop.
+        let deadline = std::time::Instant::now() + STOP_GRACE;
+        while std::time::Instant::now() < deadline {
+            match r.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
             }
-            let _ = r.child.start_kill();
         }
+        // Group members that ignored SIGTERM (or outlived the leader) die here.
+        #[cfg(unix)]
+        unsafe { libc::kill(-(r.pid as i32), libc::SIGKILL); }
+        let _ = r.child.start_kill();
     }
 
     pub async fn start(&self, cand: DevScriptCandidate, workspace_root: &Path)
@@ -508,5 +521,53 @@ setTimeout(() => {\n\
         };
         assert!(mgr.start(cand, ws.path()).await.is_err());
         assert!(mgr.status().is_none());
+    }
+
+    /// stop() must give the group a grace window: a server that traps SIGTERM
+    /// writes a marker and exits cleanly; the immediate-SIGKILL bug killed it
+    /// before the handler ran.
+    #[tokio::test]
+    async fn stop_gives_sigterm_grace_before_sigkill() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"scripts":{"dev":"node graceful.js"}}"#);
+        write(tmp.path(), "graceful.js", "\
+const fs = require('fs');\n\
+process.on('SIGTERM', () => { fs.writeFileSync('term.marker', ''); process.exit(0); });\n\
+console.log('  Local:   http://localhost:5297/');\n\
+setInterval(() => {}, 100000);\n");
+        let cand = DevScriptCandidate {
+            dir: tmp.path().to_string_lossy().into_owned(),
+            script: "dev".into(), package_manager: "npm".into(), label: "graceful — dev".into(),
+        };
+        let mgr = DevServerManager::new();
+        mgr.start(cand, tmp.path()).await.expect("should discover URL");
+        mgr.stop();
+        // stop() waits for the direct child, which outlives the node process,
+        // so by the time it returns the handler has run.
+        assert!(tmp.path().join("term.marker").exists(),
+            "SIGTERM handler should have run before SIGKILL");
+    }
+
+    /// The SIGKILL backstop still fires for a server that ignores SIGTERM.
+    #[tokio::test]
+    async fn stop_still_kills_a_sigterm_ignoring_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"scripts":{"dev":"node stubborn.js"}}"#);
+        write(tmp.path(), "stubborn.js", "\
+process.on('SIGTERM', () => {});\n\
+console.log('  Local:   http://localhost:5296/');\n\
+setInterval(() => {}, 100000);\n");
+        let cand = DevScriptCandidate {
+            dir: tmp.path().to_string_lossy().into_owned(),
+            script: "dev".into(), package_manager: "npm".into(), label: "stubborn — dev".into(),
+        };
+        let mgr = DevServerManager::new();
+        mgr.start(cand, tmp.path()).await.expect("should discover URL");
+        let pid = mgr.running_pid().expect("running pid");
+        mgr.stop();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // kill(-pgid, 0) probes the whole group; ESRCH once every member is gone.
+        let alive = unsafe { libc::kill(-(pid as i32), 0) } == 0;
+        assert!(!alive, "group should be SIGKILLed after the grace window");
     }
 }
