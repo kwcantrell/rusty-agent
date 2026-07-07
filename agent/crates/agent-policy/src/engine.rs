@@ -58,7 +58,10 @@ impl PolicyEngine for RulePolicy {
         }
         // Otherwise judge by access + path boundary.
         match intent.access {
-            Access::Read => {
+            // TrustedWrite (pre-approved third-party mutation, e.g. MCP Trust::Allow)
+            // shares Read's gate semantics: auto-allow inside the workspace boundary.
+            // Post-exec validation — not this gate — is where its mutations surface.
+            Access::Read | Access::TrustedWrite => {
                 // Decide "inside workspace?" with the SAME resolver execute() uses, so the
                 // approval gate and the execution guard can never disagree (resolve_in_workspace
                 // collapses `.`/`..` before the boundary check). An escaping read -> Ask.
@@ -228,6 +231,22 @@ mod tests {
         assert!(matches!(
             policy().check(&intent(Access::Write, vec![], Some("git status"))),
             Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn trusted_write_auto_allows_with_empty_paths() {
+        assert!(matches!(
+            policy().check(&intent(Access::TrustedWrite, vec![], None)),
+            Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn trusted_write_escaping_path_asks() {
+        assert!(matches!(
+            policy().check(&intent(Access::TrustedWrite, vec!["/etc/passwd"], None)),
+            Decision::Ask
         ));
     }
 

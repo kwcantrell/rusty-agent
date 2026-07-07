@@ -24,6 +24,10 @@ pub struct ToolCall {
 pub enum Access {
     Read,
     Write,
+    /// Third-party mutation pre-approved by config (MCP `Trust::Allow`): the
+    /// approval gate auto-allows it (Read-like, workspace-bounded), but
+    /// post-execution validation counts it as a mutation. Never Destroy-tier.
+    TrustedWrite,
     /// Irreversible destruction (e.g. deleting a stored record). Never auto-allowed:
     /// the policy floor for Destroy is Ask — no allowlist or workspace-boundary rule
     /// may return Allow for it. The hard floor can still Deny it.
