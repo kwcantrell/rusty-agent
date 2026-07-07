@@ -897,7 +897,7 @@ mod proc_tests {
             },
         );
         // MAX + 2 unrelated one-shot transcripts each commit one pool entry.
-        let first = vec![Message::system("sys"), Message::user("task-0")];
+        let first = [Message::system("sys"), Message::user("task-0")];
         let first_fps: Vec<u64> = first.iter().map(fingerprint).collect();
         for i in 0..(MAX_POOLED_SESSIONS + 2) {
             let msgs = vec![Message::system("sys"), Message::user(format!("task-{i}"))];
