@@ -8,7 +8,8 @@ use agent_core::{
     estimate_tokens, AgentLoop, OffloadStore, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT,
 };
 use agent_runtime_config::{
-    assemble_loop, build_model, BuiltLoop, LoopParts, RuntimeConfig, HARD_FLOOR_DENYLIST,
+    assemble_loop, build_model, claude_cli_opts, BuiltLoop, LoopParts, RuntimeConfig,
+    HARD_FLOOR_DENYLIST,
 };
 use agent_skills::SkillRegistry;
 use agent_tools::Tool;
@@ -351,6 +352,7 @@ fn build_loop(
         &cfg.model,
         claude_binary,
         api_key.clone(),
+        claude_cli_opts(cfg),
     );
     assemble_loop(
         cfg,

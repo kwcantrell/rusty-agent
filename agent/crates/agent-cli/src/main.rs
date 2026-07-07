@@ -5,8 +5,8 @@ use agent_core::CuratedContext;
 use agent_model::Message;
 use agent_runtime_config::{
     assemble_loop, backend_name_is_valid, build_memory_full, build_model, build_sandbox,
-    default_allowlist, default_denylist, LoopParts, RuntimeConfig, BASE_SYSTEM_PROMPT,
-    DEFAULT_SANDBOX_IMAGE,
+    claude_cli_opts, default_allowlist, default_denylist, LoopParts, RuntimeConfig,
+    BASE_SYSTEM_PROMPT, DEFAULT_SANDBOX_IMAGE,
 };
 use approval::TerminalApproval;
 use clap::Parser;
@@ -183,13 +183,6 @@ async fn main() {
         std::process::exit(2);
     }
     let api_key = std::env::var("AGENT_API_KEY").ok();
-    let model = build_model(
-        &cli.backend,
-        &cli.base_url,
-        &cli.model,
-        &cli.claude_binary,
-        api_key.clone(),
-    );
     // claude-cli is a pure text generator; tool calls must come via the prompted protocol.
     let protocol_name = if cli.backend == "claude-cli" {
         if cli.protocol != "prompted" {
@@ -202,6 +195,14 @@ async fn main() {
     // Map every loop-relevant flag into one RuntimeConfig, then assemble the loop
     // through the same shared builder the server uses (no duplicated orchestration).
     let rt = runtime_config_from_cli(&cli, protocol_name);
+    let model = build_model(
+        &cli.backend,
+        &cli.base_url,
+        &cli.model,
+        &cli.claude_binary,
+        api_key.clone(),
+        claude_cli_opts(&rt),
+    );
     let sandbox = build_sandbox(&rt);
 
     // MCP servers (if configured): collect tools, keep the manager alive for the session.
