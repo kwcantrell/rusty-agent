@@ -31,6 +31,11 @@ pub struct ClaudeCliOptions {
     pub fallback_model: Option<String>,
 }
 
+/// Upper bound on pooled session states. One-shot callers (compaction, evals
+/// through a reuse-enabled client) commit entries that never match again; the
+/// cap bounds that growth. Eviction is oldest-first by insertion order.
+pub(crate) const MAX_POOLED_SESSIONS: usize = 8;
+
 /// Session state carried across calls for delta resume.
 #[derive(Debug, Clone)]
 struct SessionState {
@@ -79,7 +84,11 @@ pub struct ClaudeCliClient {
     binary: String,
     model: String,
     opts: ClaudeCliOptions,
-    state: Arc<Mutex<Option<SessionState>>>,
+    /// Pool of resumable session states, one per transcript family this client
+    /// has served (parent loop, sibling subagents, compaction one-shots). An
+    /// entry is CHECKED OUT (removed) while a call built on it is in flight and
+    /// re-inserted only on success — see `plan_spawn`.
+    sessions: Arc<Mutex<Vec<SessionState>>>,
 }
 
 impl ClaudeCliClient {
@@ -96,7 +105,7 @@ impl ClaudeCliClient {
             binary: binary.into(),
             model: model.into(),
             opts,
-            state: Arc::new(Mutex::new(None)),
+            sessions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -140,6 +149,13 @@ impl ClaudeCliClient {
 
     /// Decide how to spawn for this transcript and produce the pending state to
     /// commit on success.
+    ///
+    /// Checkout semantics: the longest strict-prefix entry is REMOVED from the
+    /// pool while this call is in flight. A concurrent caller with the same
+    /// prefix then matches nothing and degrades to a fresh send — two callers
+    /// can never resume the same session simultaneously. Success re-inserts the
+    /// updated state (in `stream()`); failure simply never re-inserts, so the
+    /// loop's retry lands on a fresh full send.
     fn plan_spawn(&self, messages: &[Message]) -> (SpawnPlan, SessionState) {
         let fps: Vec<u64> = messages.iter().map(fingerprint).collect();
         let fresh = |persisted: bool| SessionState {
@@ -150,9 +166,18 @@ impl ClaudeCliClient {
         if !self.opts.session_reuse {
             return (SpawnPlan::FreshEphemeral, fresh(false));
         }
-        let st = self.state.lock().expect("session state lock").clone();
-        match st {
-            Some(s) if is_strict_extension(&s.fingerprints, &fps) => {
+        let checked_out = {
+            let mut pool = self.sessions.lock().expect("session pool lock");
+            let best = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| is_strict_extension(&s.fingerprints, &fps))
+                .max_by_key(|(_, s)| s.fingerprints.len())
+                .map(|(i, _)| i);
+            best.map(|i| pool.remove(i))
+        };
+        match checked_out {
+            Some(s) => {
                 if !s.persisted {
                     // First extension: pay one full send to make the session resumable.
                     return (SpawnPlan::FreshPersisted, fresh(true));
@@ -161,7 +186,7 @@ impl ClaudeCliClient {
                 let suffix_has_content = messages[suffix_start..]
                     .iter()
                     .any(|m| m.role != Role::Assistant);
-                match (s.session_id.clone(), suffix_has_content) {
+                match (s.session_id, suffix_has_content) {
                     (Some(id), true) => (
                         SpawnPlan::Resume {
                             session_id: id.clone(),
@@ -177,8 +202,8 @@ impl ClaudeCliClient {
                     _ => (SpawnPlan::FreshEphemeral, fresh(false)),
                 }
             }
-            // First call, or history was rewritten (curation/compaction): start over.
-            _ => (SpawnPlan::FreshEphemeral, fresh(false)),
+            // First call of a family, or history was rewritten: start over.
+            None => (SpawnPlan::FreshEphemeral, fresh(false)),
         }
     }
 }
@@ -239,7 +264,7 @@ impl ModelClient for ClaudeCliClient {
             buf
         });
 
-        let state = Arc::clone(&self.state);
+        let sessions = Arc::clone(&self.sessions);
         let track_state = self.opts.session_reuse;
         let stream = async_stream::stream! {
             let mut parser = EventParser::new();
@@ -255,12 +280,9 @@ impl ModelClient for ClaudeCliClient {
                         }
                         Err(e) => {
                             failed = true;
-                            // Reset BEFORE yielding: the consumer may drop the
-                            // stream on the error item (via `?`) and code after
-                            // yield would never run.
-                            if track_state {
-                                *state.lock().expect("session state lock") = None;
-                            }
+                            // No state reset needed on failure: plan_spawn already
+                            // checked the matched pool entry out, and we only
+                            // re-insert on success.
                             yield Err(e);
                             break;
                         }
@@ -268,9 +290,6 @@ impl ModelClient for ClaudeCliClient {
                     Ok(None) => break, // stdout EOF
                     Err(e) => {
                         failed = true;
-                        if track_state {
-                            *state.lock().expect("session state lock") = None;
-                        }
                         yield Err(ModelError::Stream(e.to_string()));
                         break;
                     }
@@ -287,24 +306,20 @@ impl ModelClient for ClaudeCliClient {
                             // forked one — the init event is authoritative).
                             pending.session_id =
                                 parser.session_id.take().or(pending.session_id.take());
-                            *state.lock().expect("session state lock") = Some(pending);
+                            let mut pool = sessions.lock().expect("session pool lock");
+                            pool.push(pending);
+                            if pool.len() > MAX_POOLED_SESSIONS {
+                                pool.remove(0); // evict oldest
+                            }
                         }
                         return;
                     }
                     Ok(status) => {
-                        // Reset BEFORE yielding so the consumer sees fresh state
-                        // even if it drops the stream immediately on this error.
-                        if track_state {
-                            *state.lock().expect("session state lock") = None;
-                        }
                         let buf = stderr_task.await.unwrap_or_default();
                         yield Err(ModelError::Process(
                             format!("claude exited ({status}): {}", buf.trim())));
                     }
                     Err(e) => {
-                        if track_state {
-                            *state.lock().expect("session state lock") = None;
-                        }
                         yield Err(ModelError::Process(e.to_string()));
                     }
                 }
@@ -810,6 +825,166 @@ mod proc_tests {
             read(dir.path(), "stdin.2").contains("u1"),
             "full resend expected"
         );
+    }
+
+    // ── Task 1: session pool with checkout semantics ──────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn interleaved_transcript_families_each_reach_resume() {
+        // The sibling-subagent pattern: two independent transcript families
+        // through ONE client. The old single state slot made them clobber each
+        // other (every call re-planned fresh); the pool must give each family
+        // its own resume track.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_recording_fake(dir.path(), 0);
+        let client = ClaudeCliClient::with_options(
+            fake.to_str().unwrap(),
+            "sonnet",
+            ClaudeCliOptions {
+                session_reuse: true,
+                ..Default::default()
+            },
+        );
+
+        let a1 = vec![Message::system("sys"), Message::user("task-a")];
+        let b1 = vec![Message::system("sys"), Message::user("task-b")];
+        drain(&client, a1.clone()).await.unwrap(); // call 1: A fresh ephemeral
+        drain(&client, b1.clone()).await.unwrap(); // call 2: B fresh ephemeral
+
+        let mut a2 = a1.clone();
+        a2.push(Message::assistant("ok1", None));
+        a2.push(Message::user("a-next"));
+        let mut b2 = b1.clone();
+        b2.push(Message::assistant("ok2", None));
+        b2.push(Message::user("b-next"));
+        drain(&client, a2.clone()).await.unwrap(); // call 3: A first extension -> persisted (sess-3)
+        drain(&client, b2.clone()).await.unwrap(); // call 4: B first extension -> persisted (sess-4)
+
+        let mut a3 = a2.clone();
+        a3.push(Message::assistant("ok3", None));
+        a3.push(Message::user("a-more"));
+        let mut b3 = b2.clone();
+        b3.push(Message::assistant("ok4", None));
+        b3.push(Message::user("b-more"));
+        drain(&client, a3).await.unwrap(); // call 5: A resumes sess-3
+        drain(&client, b3).await.unwrap(); // call 6: B resumes sess-4
+
+        let argv5 = read(dir.path(), "argv.5");
+        assert!(argv5.contains("--resume sess-3"), "argv5: {argv5}");
+        let stdin5 = read(dir.path(), "stdin.5");
+        assert!(stdin5.contains("a-more"), "stdin5: {stdin5}");
+        assert!(!stdin5.contains("task-a"), "stdin5 resent prefix: {stdin5}");
+
+        let argv6 = read(dir.path(), "argv.6");
+        assert!(argv6.contains("--resume sess-4"), "argv6: {argv6}");
+        let stdin6 = read(dir.path(), "stdin.6");
+        assert!(stdin6.contains("b-more"), "stdin6: {stdin6}");
+        assert!(!stdin6.contains("task-b"), "stdin6 resent prefix: {stdin6}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn session_pool_is_bounded_and_evicts_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_recording_fake(dir.path(), 0);
+        let client = ClaudeCliClient::with_options(
+            fake.to_str().unwrap(),
+            "sonnet",
+            ClaudeCliOptions {
+                session_reuse: true,
+                ..Default::default()
+            },
+        );
+        // MAX + 2 unrelated one-shot transcripts each commit one pool entry.
+        let first = [Message::system("sys"), Message::user("task-0")];
+        let first_fps: Vec<u64> = first.iter().map(fingerprint).collect();
+        for i in 0..(MAX_POOLED_SESSIONS + 2) {
+            let msgs = vec![Message::system("sys"), Message::user(format!("task-{i}"))];
+            drain(&client, msgs).await.unwrap();
+        }
+        let pool = client.sessions.lock().unwrap();
+        assert_eq!(pool.len(), MAX_POOLED_SESSIONS);
+        // The oldest entry (task-0) was evicted.
+        assert!(
+            !pool.iter().any(|s| s.fingerprints == first_fps),
+            "oldest entry should have been evicted"
+        );
+    }
+
+    #[test]
+    fn checkout_prevents_concurrent_resume_of_same_session() {
+        // Two same-prefix planners racing: the first checks the entry out, the
+        // second must find nothing and degrade to a fresh send — never a second
+        // Resume against the same session id.
+        let client = ClaudeCliClient::with_options(
+            "claude",
+            "sonnet",
+            ClaudeCliOptions {
+                session_reuse: true,
+                ..Default::default()
+            },
+        );
+        let base = vec![Message::system("sys"), Message::user("u1")];
+        let base_fps: Vec<u64> = base.iter().map(fingerprint).collect();
+        client.sessions.lock().unwrap().push(SessionState {
+            session_id: Some("sess-x".into()),
+            persisted: true,
+            fingerprints: base_fps,
+        });
+        let mut ext = base.clone();
+        ext.push(Message::assistant("ok", None));
+        ext.push(Message::user("u2"));
+
+        let (plan1, _) = client.plan_spawn(&ext);
+        assert!(matches!(plan1, SpawnPlan::Resume { .. }));
+        let (plan2, _) = client.plan_spawn(&ext);
+        assert!(matches!(plan2, SpawnPlan::FreshEphemeral));
+    }
+
+    #[test]
+    fn checkout_picks_longest_matching_prefix() {
+        let client = ClaudeCliClient::with_options(
+            "claude",
+            "sonnet",
+            ClaudeCliOptions {
+                session_reuse: true,
+                ..Default::default()
+            },
+        );
+        let base = vec![Message::system("sys"), Message::user("u1")];
+        let mut longer = base.clone();
+        longer.push(Message::assistant("ok", None));
+        let base_fps: Vec<u64> = base.iter().map(fingerprint).collect();
+        let longer_fps: Vec<u64> = longer.iter().map(fingerprint).collect();
+        {
+            let mut pool = client.sessions.lock().unwrap();
+            pool.push(SessionState {
+                session_id: Some("sess-short".into()),
+                persisted: true,
+                fingerprints: base_fps,
+            });
+            pool.push(SessionState {
+                session_id: Some("sess-long".into()),
+                persisted: true,
+                fingerprints: longer_fps,
+            });
+        }
+        let mut ext = longer.clone();
+        ext.push(Message::user("u2"));
+        let (plan, _) = client.plan_spawn(&ext);
+        match plan {
+            SpawnPlan::Resume {
+                session_id,
+                suffix_start,
+            } => {
+                assert_eq!(session_id, "sess-long");
+                assert_eq!(suffix_start, 3);
+            }
+            _ => panic!("expected Resume from the longest matching entry"),
+        }
+        // The shorter entry is still in the pool (only the match is checked out).
+        assert_eq!(client.sessions.lock().unwrap().len(), 1);
     }
 }
 
