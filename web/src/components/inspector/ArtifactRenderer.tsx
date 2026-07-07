@@ -5,6 +5,7 @@ import { MarkdownText } from "../MarkdownText";
 import { HtmlArtifact } from "./HtmlArtifact";
 import { MermaidArtifact } from "./MermaidArtifact";
 import { UrlArtifact } from "./UrlArtifact";
+import { isLocalUrl } from "./urlGuard";
 
 export function ArtifactRenderer({ display }: { display: Display }) {
   if ("Text" in display) {
@@ -56,6 +57,16 @@ export function ArtifactRenderer({ display }: { display: Display }) {
   }
   if ("Image" in display) {
     const { mime, data } = display.Image;
+    // Agent-controlled http(s) srcs are an outbound-fetch channel (tracking
+    // pixel / exfil beacon) on the browser path, which ships no CSP — allow
+    // only data: URIs and the same localhost set UrlArtifact accepts.
+    if (data.startsWith("http") && !isLocalUrl(data)) {
+      return (
+        <div className="p-3 text-sm" style={{ color: "var(--text-muted)" }}>
+          Blocked remote image URL — only data: and localhost image sources render here.
+        </div>
+      );
+    }
     const src = data.startsWith("http") || data.startsWith("data:") ? data : `data:${mime};base64,${data}`;
     return <div className="p-3"><img src={src} alt="rendered artifact" className="max-w-full rounded" /></div>;
   }

@@ -112,7 +112,23 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// First `http(s)://localhost|127.0.0.1` URL on the line, or None.
+/// Exact-host check for the authority part (everything up to the first `/?#`):
+/// host must be exactly `localhost` or `127.0.0.1`, optionally `:port` (digits),
+/// and any userinfo (`@`) is refused — prefix matching would accept
+/// `localhost.evil.com` and `localhost:1234@evil.com`.
+fn is_local_authority(rest: &str) -> bool {
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.contains('@') { return false; }
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    (host == "localhost" || host == "127.0.0.1")
+        && port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// First `http(s)` URL on the line whose authority is exactly `localhost`/`127.0.0.1` (optional numeric port), or None.
 pub fn parse_url(line: &str) -> Option<String> {
     let clean = strip_ansi(line);
     for scheme in ["http://", "https://"] {
@@ -122,15 +138,39 @@ pub fn parse_url(line: &str) -> Option<String> {
         let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let url = rest[..end].trim_end_matches(['.', ',', ')', '"', '\'']);
         let host = &url[scheme.len()..];
-        if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+        if is_local_authority(host) {
             return Some(url.to_string());
         }
     }
     None
 }
 
+/// Arm the child to die with the app: kill_on_drop and the Destroyed/Drop
+/// reapers only cover graceful exits, and process_group(0) detaches the child,
+/// so a SIGKILLed/aborted app would orphan the server. PDEATHSIG closes that
+/// path. SIGTERM (not SIGKILL) so the package manager can forward it to the
+/// actual server process. Caveat: the signal fires when the spawning *thread*
+/// dies; tokio's core workers live for the runtime's (= app's) lifetime.
+#[cfg(target_os = "linux")]
+fn harden_child(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The app may have died between fork and prctl; bail if reparented.
+            if libc::getppid() == 1 {
+                return Err(std::io::Error::other("parent died before PDEATHSIG was armed"));
+            }
+            Ok(())
+        });
+    }
+}
+
 const DISCOVERY_TIMEOUT_SECS: u64 = 30;
 const TAIL_LINES: usize = 60;
+/// How long stop() lets the group act on SIGTERM before the SIGKILL backstop.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DevServerStatus {
@@ -161,22 +201,36 @@ impl DevServerManager {
         self.current.lock().unwrap().as_ref().map(|r| r.pid)
     }
 
-    /// SIGTERM the whole process group, then SIGKILL as a backstop.
+    /// SIGTERM the whole process group, wait up to STOP_GRACE for the direct
+    /// child to exit (so servers can flush/remove pidfiles), then SIGKILL the
+    /// group as a backstop — a no-op (ESRCH) if everything already exited.
     pub fn stop(&self) {
-        if let Some(mut r) = self.current.lock().unwrap().take() {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(-(r.pid as i32), libc::SIGTERM);
-                libc::kill(-(r.pid as i32), libc::SIGKILL);
+        let taken = self.current.lock().unwrap().take();
+        let Some(mut r) = taken else { return };
+        #[cfg(unix)]
+        unsafe { libc::kill(-(r.pid as i32), libc::SIGTERM); }
+        // Poll the direct child (try_wait also reaps it); a graceful exit
+        // short-circuits straight to the backstop.
+        let deadline = std::time::Instant::now() + STOP_GRACE;
+        while std::time::Instant::now() < deadline {
+            match r.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
             }
-            let _ = r.child.start_kill();
         }
+        // Group members that ignored SIGTERM (or outlived the leader) die here.
+        #[cfg(unix)]
+        unsafe { libc::kill(-(r.pid as i32), libc::SIGKILL); }
+        let _ = r.child.start_kill();
     }
 
-    pub async fn start(&self, cand: DevScriptCandidate) -> Result<DevServerStatus, String> {
+    pub async fn start(&self, cand: DevScriptCandidate, workspace_root: &Path)
+        -> Result<DevServerStatus, String> {
         // Validate before touching the running server — a bogus candidate must not
-        // tear down a live server. Package manager and script are whitelisted so a
-        // future XSS cannot escalate to arbitrary-local-binary execution.
+        // tear down a live server. Package manager and script are whitelisted, and
+        // the directory must sit inside the current workspace: the SPA picks among
+        // detect()'s candidates, but the IPC boundary must not trust the echoed dir
+        // (a planted package.json elsewhere would run an arbitrary `dev` script).
         const ALLOWED_PMS: &[&str] = &["npm", "pnpm", "yarn"];
         if !ALLOWED_PMS.contains(&cand.package_manager.as_str()) {
             return Err(format!("refusing to launch: {} is not an allowed package manager", cand.package_manager));
@@ -184,16 +238,26 @@ impl DevServerManager {
         if !SERVER_SCRIPTS.contains(&cand.script.as_str()) {
             return Err(format!("refusing to launch: {} is not a recognized dev script", cand.script));
         }
+        let root = workspace_root.canonicalize()
+            .map_err(|e| format!("workspace root {} is not accessible: {e}", workspace_root.display()))?;
+        let dir = Path::new(&cand.dir).canonicalize()
+            .map_err(|e| format!("refusing to launch: {} is not accessible: {e}", cand.dir))?;
+        if !dir.starts_with(&root) {
+            return Err(format!("refusing to launch: {} is outside the workspace {}",
+                dir.display(), root.display()));
+        }
         self.stop(); // one server at a time
 
         let mut cmd = Command::new(&cand.package_manager);
         cmd.arg("run").arg(&cand.script)
-            .current_dir(&cand.dir)
+            .current_dir(&dir)
             .env("NO_COLOR", "1").env("FORCE_COLOR", "0").env("BROWSER", "none")
             .stdout(Stdio::piped()).stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0); // child becomes its own group leader (pgid == pid)
+        #[cfg(target_os = "linux")]
+        harden_child(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|e| format!("failed to launch {} run {}: {e}",
             cand.package_manager, cand.script))?;
@@ -328,6 +392,15 @@ mod tests {
         assert_eq!(parse_url("Network: http://192.168.1.5:5173/"), None);
     }
 
+    #[test]
+    fn parse_url_rejects_prefix_and_userinfo_lookalike_hosts() {
+        assert_eq!(parse_url("Local: http://localhost.evil.com:5173/"), None);
+        assert_eq!(parse_url("Local: http://127.0.0.1.evil.com:5173/"), None);
+        assert_eq!(parse_url("Local: http://localhost:1234@evil.com/"), None);
+        assert_eq!(parse_url("Local: http://localhost@evil.com/"), None);
+        assert_eq!(parse_url("Local: http://localhost:/"), None); // empty port
+    }
+
     // A fake dev server: prints a Local URL, then stays alive so we can kill it.
     fn fake_server_candidate(tmp: &Path) -> DevScriptCandidate {
         // package.json whose `dev` script runs node inline.
@@ -348,7 +421,7 @@ mod tests {
         let cand = fake_server_candidate(tmp.path());
         let mgr = DevServerManager::new();
 
-        let status = mgr.start(cand).await.expect("should discover URL");
+        let status = mgr.start(cand, tmp.path()).await.expect("should discover URL");
         assert_eq!(status.url, "http://localhost:5199/");
         assert!(mgr.status().is_some());
 
@@ -389,7 +462,7 @@ setTimeout(() => {\n\
             label: "stderr-after-stdout-eof — dev".into(),
         };
         let mgr = DevServerManager::new();
-        let status = mgr.start(cand).await.expect("should discover URL from stderr");
+        let status = mgr.start(cand, tmp.path()).await.expect("should discover URL from stderr");
         assert_eq!(status.url, "http://localhost:5298/");
         mgr.stop();
     }
@@ -404,7 +477,7 @@ setTimeout(() => {\n\
             package_manager: "rm".into(),
             label: "x".into(),
         };
-        let err = mgr.start(cand).await.unwrap_err();
+        let err = mgr.start(cand, tmp.path()).await.unwrap_err();
         assert!(!err.is_empty(), "error message must be non-empty");
         assert!(mgr.status().is_none(), "no server should run after rejection");
     }
@@ -419,7 +492,7 @@ setTimeout(() => {\n\
             package_manager: "npm".into(),
             label: "x".into(),
         };
-        let err = mgr.start(cand).await.unwrap_err();
+        let err = mgr.start(cand, tmp.path()).await.unwrap_err();
         assert!(!err.is_empty(), "error message must be non-empty");
         assert!(mgr.status().is_none(), "no server should run after rejection");
     }
@@ -433,8 +506,108 @@ setTimeout(() => {\n\
             script: "dev".into(), package_manager: "npm".into(), label: "x".into(),
         };
         let mgr = DevServerManager::new();
-        let err = mgr.start(cand).await.unwrap_err();
+        let err = mgr.start(cand, tmp.path()).await.unwrap_err();
         assert!(!err.is_empty(), "error should carry a message");
         assert!(mgr.status().is_none());
+    }
+
+    #[tokio::test]
+    async fn start_rejects_dir_outside_workspace_and_keeps_running_server() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mgr = DevServerManager::new();
+
+        // A live server inside the workspace...
+        let cand = fake_server_candidate(ws.path());
+        mgr.start(cand, ws.path()).await.expect("should discover URL");
+
+        // ...must survive a rejected out-of-workspace start (validate-before-stop).
+        let evil = fake_server_candidate(outside.path());
+        let err = mgr.start(evil, ws.path()).await.unwrap_err();
+        assert!(err.contains("outside the workspace"), "err: {err}");
+        assert!(mgr.status().is_some(), "running server must survive a rejected start");
+
+        // Traversal out of the workspace is caught by canonicalization.
+        let mut sneaky = fake_server_candidate(outside.path());
+        sneaky.dir = format!("{}/..", outside.path().display());
+        let err = mgr.start(sneaky, ws.path()).await.unwrap_err();
+        assert!(err.contains("outside the workspace"), "err: {err}");
+        mgr.stop();
+    }
+
+    #[tokio::test]
+    async fn start_rejects_nonexistent_dir() {
+        let ws = tempfile::tempdir().unwrap();
+        let mgr = DevServerManager::new();
+        let cand = DevScriptCandidate {
+            dir: format!("{}/does-not-exist", ws.path().display()),
+            script: "dev".into(), package_manager: "npm".into(), label: "x".into(),
+        };
+        assert!(mgr.start(cand, ws.path()).await.is_err());
+        assert!(mgr.status().is_none());
+    }
+
+    /// stop() must give the group a grace window: a server that traps SIGTERM
+    /// writes a marker and exits cleanly; the immediate-SIGKILL bug killed it
+    /// before the handler ran.
+    #[tokio::test]
+    async fn stop_gives_sigterm_grace_before_sigkill() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"scripts":{"dev":"node graceful.js"}}"#);
+        write(tmp.path(), "graceful.js", "\
+const fs = require('fs');\n\
+process.on('SIGTERM', () => { fs.writeFileSync('term.marker', ''); process.exit(0); });\n\
+console.log('  Local:   http://localhost:5297/');\n\
+setInterval(() => {}, 100000);\n");
+        let cand = DevScriptCandidate {
+            dir: tmp.path().to_string_lossy().into_owned(),
+            script: "dev".into(), package_manager: "npm".into(), label: "graceful — dev".into(),
+        };
+        let mgr = DevServerManager::new();
+        mgr.start(cand, tmp.path()).await.expect("should discover URL");
+        mgr.stop();
+        // stop() waits for the direct child, which outlives the node process,
+        // so by the time it returns the handler has run.
+        assert!(tmp.path().join("term.marker").exists(),
+            "SIGTERM handler should have run before SIGKILL");
+    }
+
+    /// The SIGKILL backstop still fires for a server that ignores SIGTERM.
+    #[tokio::test]
+    async fn stop_still_kills_a_sigterm_ignoring_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"scripts":{"dev":"node stubborn.js"}}"#);
+        write(tmp.path(), "stubborn.js", "\
+process.on('SIGTERM', () => {});\n\
+console.log('  Local:   http://localhost:5296/');\n\
+setInterval(() => {}, 100000);\n");
+        let cand = DevScriptCandidate {
+            dir: tmp.path().to_string_lossy().into_owned(),
+            script: "dev".into(), package_manager: "npm".into(), label: "stubborn — dev".into(),
+        };
+        let mgr = DevServerManager::new();
+        mgr.start(cand, tmp.path()).await.expect("should discover URL");
+        let pid = mgr.running_pid().expect("running pid");
+        mgr.stop();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // kill(-pgid, 0) probes the whole group; ESRCH once every member is gone.
+        let alive = unsafe { libc::kill(-(pid as i32), 0) } == 0;
+        assert!(!alive, "group should be SIGKILLed after the grace window");
+    }
+
+    /// harden_child must arm PR_SET_PDEATHSIG: the child reads its own death
+    /// signal back via PR_GET_PDEATHSIG and reports it on stdout.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn harden_child_sets_pdeathsig_sigterm() {
+        let mut cmd = Command::new("python3");
+        cmd.arg("-c")
+            .arg("import ctypes;v=ctypes.c_int();ctypes.CDLL(None).prctl(2,ctypes.byref(v));print(v.value)")
+            .stdout(Stdio::piped());
+        harden_child(&mut cmd);
+        let out = cmd.output().await.expect("python3 probe");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(),
+                   libc::SIGTERM.to_string(),
+                   "child should see PDEATHSIG=SIGTERM");
     }
 }

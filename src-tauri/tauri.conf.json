@@ -14,7 +14,7 @@
       { "label": "main", "title": "rust-agent-runtime", "width": 1280, "height": 820 }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' ws://127.0.0.1:* ws://localhost:* http://localhost:*; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+      "csp": "default-src 'self'; connect-src 'self' ws://127.0.0.1:* ws://localhost:* http://localhost:*; frame-src 'self' http://localhost:* http://127.0.0.1:*; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
     }
   },
   "bundle": {

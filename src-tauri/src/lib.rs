@@ -81,7 +81,8 @@ async fn dev_server_start(
     state: tauri::State<'_, AppState>,
     candidate: devserver::DevScriptCandidate,
 ) -> Result<devserver::DevServerStatus, String> {
-    state.dev.start(candidate).await
+    let ws = state.bridge.current_workspace().await;
+    state.dev.start(candidate, &ws).await
 }
 
 #[tauri::command]
@@ -386,5 +387,22 @@ mod cmd_tests {
         assert!(res.is_ok(), "dev_scripts_detect should resolve: {res:?}");
         let v: serde_json::Value = res.unwrap().deserialize().unwrap();
         assert!(v.is_array(), "expected an array, got {v}");
+    }
+
+    /// The live-preview iframe (UrlArtifact, http://localhost:*) must be allowed
+    /// by an explicit frame-src — with none, frames fall back to
+    /// default-src 'self' and bundled builds block the Design canvas.
+    #[test]
+    fn csp_declares_frame_src_for_localhost_preview() {
+        let conf = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+            .expect("read tauri.conf.json");
+        let v: serde_json::Value = serde_json::from_str(&conf).expect("parse tauri.conf.json");
+        let csp = v["app"]["security"]["csp"].as_str().expect("csp string");
+        let frame = csp.split(';').map(str::trim)
+            .find(|d| d.starts_with("frame-src"))
+            .expect("csp must declare an explicit frame-src");
+        for src in ["'self'", "http://localhost:*", "http://127.0.0.1:*"] {
+            assert!(frame.contains(src), "frame-src must allow {src}: {frame}");
+        }
     }
 }
