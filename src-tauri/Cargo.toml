@@ -22,6 +22,7 @@ agent-runtime-config = { path = "../agent/crates/agent-runtime-config" }
 agent-tools = { path = "../agent/crates/agent-tools" }
 agent-memory = { path = "../agent/crates/agent-memory" }
 agent-core = { path = "../agent/crates/agent-core" }
+libc = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"

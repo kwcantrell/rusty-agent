@@ -1,5 +1,6 @@
 pub mod bridge;
 mod channel_out;
+pub mod devserver;
 pub mod llama;
 pub mod workspace;
 
@@ -16,6 +17,7 @@ use tauri_plugin_dialog::DialogExt;
 struct AppState {
     bridge: Arc<bridge::Bridge>,
     config_path: PathBuf, // app.json (persisted workspace)
+    dev: devserver::DevServerManager,
 }
 
 fn session(state: &tauri::State<'_, AppState>) -> Arc<Session> {
@@ -67,6 +69,32 @@ fn architecture_get(state: tauri::State<'_, AppState>) -> ArchitectureSnapshot {
 }
 
 #[tauri::command]
+async fn dev_scripts_detect(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<devserver::DevScriptCandidate>, String> {
+    let ws = state.bridge.current_workspace().await;
+    Ok(devserver::detect(&ws))
+}
+
+#[tauri::command]
+async fn dev_server_start(
+    state: tauri::State<'_, AppState>,
+    candidate: devserver::DevScriptCandidate,
+) -> Result<devserver::DevServerStatus, String> {
+    state.dev.start(candidate).await
+}
+
+#[tauri::command]
+fn dev_server_stop(state: tauri::State<'_, AppState>) {
+    state.dev.stop();
+}
+
+#[tauri::command]
+fn dev_server_status(state: tauri::State<'_, AppState>) -> Option<devserver::DevServerStatus> {
+    state.dev.status()
+}
+
+#[tauri::command]
 fn session_stats(state: tauri::State<'_, AppState>) -> agent_core::SessionStats {
     session(&state).session_stats()
 }
@@ -104,6 +132,7 @@ async fn pick_workspace<R: tauri::Runtime>(
     // Persist, then reconnect the runtime to the new dir.
     let cfg = workspace::AppConfig { workspace: Some(dir.clone()) };
     cfg.save(&state.config_path).map_err(|e| e.to_string())?;
+    state.dev.stop(); // old server pointed at the previous workspace
     state.bridge.set_workspace(dir.clone()).await;
     Ok(Some(dir.to_string_lossy().into_owned()))
 }
@@ -167,6 +196,10 @@ macro_rules! all_handlers {
             cancel,
             settings_get,
             architecture_get,
+            dev_scripts_detect,
+            dev_server_start,
+            dev_server_stop,
+            dev_server_status,
             session_stats,
             settings_update,
             context_get,
@@ -207,10 +240,15 @@ pub fn run() {
                 "http://localhost:8080".into(),
                 "qwen3.6-35b-a3b".into(),
             ))?;
-            app.manage(AppState { bridge, config_path });
+            app.manage(AppState { bridge, config_path, dev: devserver::DevServerManager::new() });
             Ok(())
         })
         .invoke_handler(all_handlers!())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                window.state::<AppState>().dev.stop();
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -235,7 +273,7 @@ mod cmd_tests {
         .unwrap();
         std::mem::forget(dir); // keep the temp dir alive for the test process
         mock_builder()
-            .manage(AppState { bridge, config_path: PathBuf::from("/tmp/app.json") })
+            .manage(AppState { bridge, config_path: PathBuf::from("/tmp/app.json"), dev: devserver::DevServerManager::new() })
             .invoke_handler(all_handlers!())
             .build(mock_context(noop_assets()))
             .expect("failed to build mock app")
@@ -323,5 +361,30 @@ mod cmd_tests {
         for key in ["model", "tools", "policy", "sandbox", "context", "loop", "prompt"] {
             assert!(v.get(key).is_some(), "missing block {key}: {v}");
         }
+    }
+
+    /// Smoke test: `dev_scripts_detect` resolves over the mock IPC to a JSON array
+    /// (empty for the temp workspace, which has no package.json).
+    #[test]
+    fn dev_scripts_detect_returns_array_over_ipc() {
+        let app = app();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "dev", Default::default())
+            .build()
+            .unwrap();
+        let res = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "dev_scripts_detect".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::default(),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        );
+        assert!(res.is_ok(), "dev_scripts_detect should resolve: {res:?}");
+        let v: serde_json::Value = res.unwrap().deserialize().unwrap();
+        assert!(v.is_array(), "expected an array, got {v}");
     }
 }

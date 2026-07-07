@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Design, Pin } from "../../designStore";
 import { ArtifactRenderer } from "../inspector/ArtifactRenderer";
 import { VersionBar } from "./VersionBar";
@@ -13,6 +13,20 @@ export function DesignCanvas({ design, sentPins, onSendFeedback, sendDisabled }:
   const [viewed, setViewed] = useState<number | null>(null); // null = follow latest
   const [compare, setCompare] = useState(false);
   const [interact, setInteract] = useState(false);
+  const [shiftHeld, setShiftHeld] = useState(false);
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => { if (e.key === "Shift") setShiftHeld(true); };
+    const up = (e: KeyboardEvent) => { if (e.key === "Shift") setShiftHeld(false); };
+    const clear = () => setShiftHeld(false); // keyup can be swallowed by the iframe
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    window.addEventListener("blur", clear);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", clear);
+    };
+  }, []);
   const total = design.versions.length;
   const cur = Math.min(viewed ?? total - 1, total - 1);
   const behind = viewed !== null && cur < total - 1;
@@ -57,7 +71,7 @@ export function DesignCanvas({ design, sentPins, onSendFeedback, sendDisabled }:
           </div>
         ) : (
           <AnnotationOverlay sent={sentPins(cur + 1)} disabled={sendDisabled}
-            passthrough={!!liveUrl && interact}
+            passthrough={!!liveUrl && interact && !shiftHeld}
             onSend={(pins) => onSendFeedback(cur + 1, pins, liveUrl ?? undefined)}>
             <ArtifactRenderer display={design.versions[cur].display} />
           </AnnotationOverlay>
