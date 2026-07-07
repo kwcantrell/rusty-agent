@@ -47,6 +47,16 @@ fn runtime_config_from_cli(cli: &Cli, protocol_name: &str) -> RuntimeConfig {
     c.repeat_penalty = cli.repeat_penalty;
     c.enable_thinking = !cli.no_thinking;
     c.preserve_thinking = cli.preserve_thinking;
+    // claude-cli knobs: None = leave the runtime-config default untouched; Some overrides.
+    if let Some(v) = cli.claude_session_reuse {
+        c.claude_session_reuse = v;
+    }
+    if let Some(v) = cli.claude_effort.clone() {
+        c.claude_effort = Some(v);
+    }
+    if let Some(v) = cli.claude_fallback_model.clone() {
+        c.claude_fallback_model = Some(v);
+    }
     // Tools / skills / memory / network
     c.http_allow_hosts = cli.allow_host.clone();
     c.skills_dirs = cli.skills_dir.clone();
@@ -164,6 +174,22 @@ struct Cli {
     /// Override the embedding-model cache dir.
     #[arg(long)]
     memory_model_dir: Option<std::path::PathBuf>,
+    // ── claude-cli backend knobs ───────────────────────────────────────────
+    /// Enable or disable session reuse across claude-cli calls (delta resume).
+    /// Omit to use the runtime-config default (on). Pass `false` to force
+    /// stateless mode (useful for evals and CI where reproducibility matters
+    /// more than per-round token savings). Ignored by the openai backend.
+    #[arg(long)]
+    claude_session_reuse: Option<bool>,
+    /// Effort level passed to claude-cli via `--effort`: low | medium | high | xhigh | max.
+    /// Omit to use the CLI default. Ignored by the openai backend.
+    #[arg(long)]
+    claude_effort: Option<String>,
+    /// Fallback model name passed to claude-cli via `--fallback-model` when the
+    /// primary model is unavailable. Omit to use no fallback. Ignored by the
+    /// openai backend.
+    #[arg(long)]
+    claude_fallback_model: Option<String>,
 }
 
 #[tokio::main]
@@ -357,6 +383,38 @@ mod tests {
         ]);
         assert_eq!(cli.sandbox_extra_rw, vec!["/data", "/mnt"]);
         assert_eq!(cli.sandbox_extra_ro, vec!["/etc/config"]);
+    }
+
+    #[test]
+    fn claude_cli_knob_flags_absent_leave_defaults() {
+        // Finding 2: absent flags must not override runtime-config defaults.
+        let cli = Cli::parse_from(["agent-cli"]);
+        let rc = runtime_config_from_cli(&cli, "prompted");
+        // runtime-config default: session reuse on, no effort, no fallback
+        assert!(rc.claude_session_reuse);
+        assert!(rc.claude_effort.is_none());
+        assert!(rc.claude_fallback_model.is_none());
+    }
+
+    #[test]
+    fn claude_cli_knob_flags_present_override() {
+        // Finding 2: present flags must override runtime-config values.
+        let cli = Cli::parse_from([
+            "agent-cli",
+            "--claude-session-reuse",
+            "false",
+            "--claude-effort",
+            "high",
+            "--claude-fallback-model",
+            "claude-haiku-4-5",
+        ]);
+        let rc = runtime_config_from_cli(&cli, "prompted");
+        assert!(!rc.claude_session_reuse);
+        assert_eq!(rc.claude_effort.as_deref(), Some("high"));
+        assert_eq!(
+            rc.claude_fallback_model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
     }
 
     #[test]
