@@ -95,10 +95,11 @@ impl ModelClient for ClaudeCliClient {
         });
 
         let stream = async_stream::stream! {
+            let mut parser = EventParser::new();
             let mut lines = BufReader::new(stdout).lines();
             loop {
                 match lines.next_line().await {
-                    Ok(Some(line)) => match parse_event_line(&line) {
+                    Ok(Some(line)) => match parser.parse_line(&line) {
                         Ok(chunks) => {
                             for c in chunks {
                                 yield Ok(c);
@@ -160,63 +161,123 @@ pub(crate) fn render_transcript(messages: &[Message]) -> String {
     out
 }
 
-pub(crate) fn parse_event_line(line: &str) -> Result<Vec<Chunk>, ModelError> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Ok(vec![]);
+/// Stateful stream-json line parser: one instance per CLI spawn. Tracks the
+/// init event's session_id (for resume) and whether stream_event deltas were
+/// seen (whole assistant messages then duplicate the deltas and are skipped).
+pub(crate) struct EventParser {
+    pub(crate) session_id: Option<String>,
+    saw_stream_deltas: bool,
+}
+
+impl EventParser {
+    pub(crate) fn new() -> Self {
+        Self {
+            session_id: None,
+            saw_stream_deltas: false,
+        }
     }
-    let v: Value = serde_json::from_str(line).map_err(|e| ModelError::Decode(e.to_string()))?;
-    let mut out = Vec::new();
-    match v["type"].as_str() {
-        Some("assistant") => {
-            if let Some(blocks) = v["message"]["content"].as_array() {
-                for b in blocks {
-                    if b["type"] == "text" {
-                        if let Some(t) = b["text"].as_str() {
-                            if !t.is_empty() {
-                                out.push(Chunk::Text(t.to_string()));
+
+    pub(crate) fn parse_line(&mut self, line: &str) -> Result<Vec<Chunk>, ModelError> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(vec![]);
+        }
+        let v: Value = serde_json::from_str(line).map_err(|e| ModelError::Decode(e.to_string()))?;
+        let mut out = Vec::new();
+        match v["type"].as_str() {
+            Some("system") => {
+                if v["subtype"] == "init" {
+                    if let Some(id) = v["session_id"].as_str() {
+                        self.session_id = Some(id.to_string());
+                    }
+                }
+            }
+            Some("stream_event") => {
+                let ev = &v["event"];
+                if ev["type"] == "content_block_delta" {
+                    match ev["delta"]["type"].as_str() {
+                        Some("text_delta") => {
+                            if let Some(t) = ev["delta"]["text"].as_str() {
+                                if !t.is_empty() {
+                                    self.saw_stream_deltas = true;
+                                    out.push(Chunk::Text(t.to_string()));
+                                }
+                            }
+                        }
+                        Some("thinking_delta") => {
+                            if let Some(t) = ev["delta"]["thinking"].as_str() {
+                                if !t.is_empty() {
+                                    self.saw_stream_deltas = true;
+                                    out.push(Chunk::Reasoning(t.to_string()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("assistant") => {
+                // With --include-partial-messages the whole message repeats what
+                // the deltas already streamed — emit only if no deltas were seen
+                // (back-compat with a CLI that ignores the flag).
+                if !self.saw_stream_deltas {
+                    if let Some(blocks) = v["message"]["content"].as_array() {
+                        for b in blocks {
+                            match b["type"].as_str() {
+                                Some("text") => {
+                                    if let Some(t) = b["text"].as_str() {
+                                        if !t.is_empty() {
+                                            out.push(Chunk::Text(t.to_string()));
+                                        }
+                                    }
+                                }
+                                Some("thinking") => {
+                                    if let Some(t) = b["thinking"].as_str() {
+                                        if !t.is_empty() {
+                                            out.push(Chunk::Reasoning(t.to_string()));
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
                 }
             }
-        }
-        Some("result") => {
-            if let Some(u) = v.get("usage").and_then(Value::as_object) {
-                let field = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-                let cache_read = field("cache_read_input_tokens");
-                // Fold cache tokens into prompt_tokens so it reflects the
-                // effective context size (input + cache read + cache creation);
-                // otherwise cluster 3's context calibration is inert here and
-                // the display under-reports. cached_tokens still surfaces the
-                // cache-read portion separately.
-                out.push(Chunk::Usage {
-                    prompt_tokens: (field("input_tokens")
-                        + cache_read
-                        + field("cache_creation_input_tokens"))
-                        as u32,
-                    completion_tokens: field("output_tokens") as u32,
-                    reasoning_tokens: None,
-                    cached_tokens: if cache_read > 0 {
-                        Some(cache_read as u32)
-                    } else {
-                        None
-                    },
-                    cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
-                });
+            Some("result") => {
+                if let Some(u) = v.get("usage").and_then(Value::as_object) {
+                    let field = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    let cache_read = field("cache_read_input_tokens");
+                    // Fold cache tokens into prompt_tokens so it reflects the
+                    // effective context size; cached_tokens still surfaces the
+                    // cache-read portion separately.
+                    out.push(Chunk::Usage {
+                        prompt_tokens: (field("input_tokens")
+                            + cache_read
+                            + field("cache_creation_input_tokens"))
+                            as u32,
+                        completion_tokens: field("output_tokens") as u32,
+                        reasoning_tokens: None,
+                        cached_tokens: if cache_read > 0 {
+                            Some(cache_read as u32)
+                        } else {
+                            None
+                        },
+                        cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+                    });
+                }
+                let truncated = v["subtype"].as_str() == Some("error_max_turns")
+                    || v["stop_reason"].as_str() == Some("max_tokens");
+                out.push(Chunk::Done(if truncated {
+                    StopReason::Length
+                } else {
+                    StopReason::Stop
+                }));
             }
-            // `Length` only when the CLI signals truncation; otherwise a normal stop.
-            let truncated = v["subtype"].as_str() == Some("error_max_turns")
-                || v["stop_reason"].as_str() == Some("max_tokens");
-            out.push(Chunk::Done(if truncated {
-                StopReason::Length
-            } else {
-                StopReason::Stop
-            }));
+            _ => {} // user echoes etc. — nothing to emit.
         }
-        _ => {} // system/init, user echoes, etc. — nothing to emit.
+        Ok(out)
     }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -370,74 +431,119 @@ mod tests {
     use super::*;
     use crate::Message;
 
-    // NOTE: replace these two literals with the verbatim lines captured in
-    // docs/superpowers/context/claude-cli-inference.md (Task 0, Step 5) if the
-    // real shapes differ.
-    const ASSISTANT_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}]},"session_id":"t"}"#;
-    const RESULT_LINE: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"hello world","session_id":"t"}"#;
+    // Fixture lines: verbatim captures from
+    // docs/okf/claude-cli-headless/sources/probe-stream-json-2-1-195.md (claude 2.1.195).
+    const INIT_LINE: &str = r#"{"type":"system","subtype":"init","cwd":"/home/kalen/rust-agent-runtime","session_id":"c33cee68-7fa0-4926-b32e-c1ad457673ea","tools":["Task","Bash","CronCreate","CronDelete","CronList","DesignSync","Edit","EnterWorktree","ExitWorktree","Monitor","NotebookEdit","PushNotification","Read","RemoteTrigger","ScheduleWakeup","SendMessage","Skill","TaskCreate","TaskGet","TaskList","TaskOutput","TaskStop","TaskUpdate","ToolSearch","WebFetch","WebSearch","Workflow","Write"],"mcp_servers":[],"model":"claude-sonnet-4-6","permissionMode":"default","slash_commands":["deep-research","design-sync","update-config","verify","debug","code-review","simplify","batch","fewer-permission-prompts","loop","schedule","claude-api","run","run-skill-generator","clear","compact","config","context","heapdump","init","reload-skills","review","security-review","usage-credits","extra-usage","usage","insights","goal","team-onboarding"],"apiKeySource":"none","claude_code_version":"2.1.195","output_style":"default","agents":["claude","Explore","general-purpose","Plan","statusline-setup"],"skills":["deep-research","design-sync","update-config","verify","debug","code-review","simplify","batch","fewer-permission-prompts","loop","schedule","claude-api","run","run-skill-generator"],"plugins":[],"analytics_disabled":false,"product_feedback_disabled":false,"uuid":"9f605e3a-53d6-431f-a75b-27e396f377be","memory_paths":{"auto":"/home/kalen/.claude/projects/-home-kalen-rust-agent-runtime/memory/"},"fast_mode_state":"off"}"#;
+    const TEXT_DELTA_LINE: &str = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}},"session_id":"c33cee68-7fa0-4926-b32e-c1ad457673ea","parent_tool_use_id":null,"uuid":"f7612ac4-3352-4d69-bdd4-deccecc0ee2b"}"#;
+    // Shape from Anthropic SSE documentation — no thinking was emitted by claude 2.1.195
+    // during the probe run (output_tokens_details.thinking_tokens was 0; see probe file).
+    const THINKING_DELTA_LINE: &str = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}},"session_id":"sess-abc"}"#;
+    const ASSISTANT_LINE: &str = r#"{"type":"assistant","message":{"model":"claude-sonnet-4-6","id":"msg_011CcoMohKeVVbHLgCVVjcDy","type":"message","role":"assistant","content":[{"type":"text","text":"hello"}],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":20333,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":20333},"output_tokens":1,"service_tier":"standard","inference_geo":"not_available"},"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"c33cee68-7fa0-4926-b32e-c1ad457673ea","uuid":"4a79959d-3a36-4656-8d9c-01dd3645f578","request_id":"req_011CcoMogMrNdDwSc8fZCS1c"}"#;
+    // Shape from Anthropic SSE documentation — no thinking was emitted by claude 2.1.195
+    // during the probe run (see probe file).
+    const ASSISTANT_THINKING_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"a plan"},{"type":"text","text":"hello world"}]},"session_id":"sess-abc"}"#;
+    const RESULT_LINE: &str = r#"{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"duration_ms":2118,"duration_api_ms":3091,"ttft_ms":2085,"ttft_stream_ms":2000,"time_to_request_ms":22,"num_turns":1,"result":"hello","stop_reason":"end_turn","session_id":"c33cee68-7fa0-4926-b32e-c1ad457673ea","total_cost_usd":0.122623,"usage":{"input_tokens":2,"cache_creation_input_tokens":20333,"cache_read_input_tokens":0,"output_tokens":4,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":20333,"ephemeral_5m_input_tokens":0},"inference_geo":"not_available","iterations":[{"input_tokens":2,"output_tokens":4,"cache_read_input_tokens":0,"cache_creation_input_tokens":20333,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":20333},"type":"message"}],"speed":"standard"},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":504,"outputTokens":11,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.000559,"contextWindow":200000,"maxOutputTokens":32000},"claude-sonnet-4-6":{"inputTokens":2,"outputTokens":4,"cacheReadInputTokens":0,"cacheCreationInputTokens":20333,"webSearchRequests":0,"costUSD":0.12206399999999999,"contextWindow":200000,"maxOutputTokens":32000}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","uuid":"cf354c70-9f45-4d4c-9192-c87b5149b7bd"}"#;
 
     #[test]
-    fn parses_assistant_text_into_text_chunk() {
-        let chunks = parse_event_line(ASSISTANT_LINE).unwrap();
-        assert_eq!(chunks.len(), 1);
-        match &chunks[0] {
-            Chunk::Text(t) => assert_eq!(t, "hello world"),
-            other => panic!("expected Text, got {other:?}"),
-        }
+    fn init_line_captures_session_id_and_emits_nothing() {
+        let mut p = EventParser::new();
+        assert!(p.parse_line(INIT_LINE).unwrap().is_empty());
+        assert_eq!(
+            p.session_id.as_deref(),
+            Some("c33cee68-7fa0-4926-b32e-c1ad457673ea")
+        );
+    }
+
+    #[test]
+    fn text_delta_emits_text_chunk() {
+        let mut p = EventParser::new();
+        let chunks = p.parse_line(TEXT_DELTA_LINE).unwrap();
+        assert!(matches!(chunks.as_slice(), [Chunk::Text(t)] if t == "hello"));
+    }
+
+    #[test]
+    fn thinking_delta_emits_reasoning_chunk() {
+        let mut p = EventParser::new();
+        let chunks = p.parse_line(THINKING_DELTA_LINE).unwrap();
+        assert!(matches!(chunks.as_slice(), [Chunk::Reasoning(t)] if t == "hmm"));
+    }
+
+    #[test]
+    fn whole_assistant_message_is_skipped_after_deltas() {
+        let mut p = EventParser::new();
+        p.parse_line(TEXT_DELTA_LINE).unwrap();
+        assert!(p.parse_line(ASSISTANT_LINE).unwrap().is_empty());
+    }
+
+    #[test]
+    fn whole_assistant_message_emits_when_no_deltas_seen() {
+        // Back-compat: a CLI that ignores --include-partial-messages still streams.
+        let mut p = EventParser::new();
+        let chunks = p.parse_line(ASSISTANT_LINE).unwrap();
+        assert!(matches!(chunks.as_slice(), [Chunk::Text(t)] if t == "hello"));
+    }
+
+    #[test]
+    fn whole_assistant_thinking_block_emits_reasoning_when_no_deltas() {
+        let mut p = EventParser::new();
+        let chunks = p.parse_line(ASSISTANT_THINKING_LINE).unwrap();
+        assert!(matches!(&chunks[0], Chunk::Reasoning(t) if t == "a plan"));
+        assert!(matches!(&chunks[1], Chunk::Text(t) if t == "hello world"));
     }
 
     #[test]
     fn result_event_emits_done_stop() {
-        let chunks = parse_event_line(RESULT_LINE).unwrap();
-        assert!(matches!(chunks.as_slice(), [Chunk::Done(StopReason::Stop)]));
+        // The real RESULT_LINE carries a usage object, so a Chunk::Usage precedes
+        // the Done. Assert only the last chunk.
+        let mut p = EventParser::new();
+        let chunks = p.parse_line(RESULT_LINE).unwrap();
+        assert!(matches!(chunks.last(), Some(Chunk::Done(StopReason::Stop))));
     }
 
     #[test]
     fn result_event_carries_usage_and_cost() {
         let line = r#"{"type":"result","subtype":"success","total_cost_usd":0.0421,"usage":{"input_tokens":1200,"output_tokens":345}}"#;
-        let chunks = parse_event_line(line).unwrap();
+        let chunks = EventParser::new().parse_line(line).unwrap();
         assert!(chunks.iter().any(|c| matches!(c,
             Chunk::Usage { prompt_tokens: 1200, completion_tokens: 345,
                            cost_usd: Some(c), .. } if (*c - 0.0421).abs() < 1e-9)));
-        // Done must still be emitted after the usage chunk
         assert!(matches!(chunks.last(), Some(Chunk::Done(StopReason::Stop))));
     }
 
     #[test]
     fn result_event_folds_cache_tokens_into_prompt() {
-        // input=1000, cache_read=4000, cache_creation=500 -> prompt = 5500;
-        // cached_tokens reports the cache-read portion separately.
         let line = r#"{"type":"result","subtype":"success","usage":{"input_tokens":1000,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500,"output_tokens":42}}"#;
-        let chunks = parse_event_line(line).unwrap();
-        assert!(
-            chunks.iter().any(|c| matches!(
-                c,
-                Chunk::Usage {
-                    prompt_tokens: 5500,
-                    completion_tokens: 42,
-                    cached_tokens: Some(4000),
-                    ..
-                }
-            )),
-            "expected folded usage, got {chunks:?}"
-        );
+        let chunks = EventParser::new().parse_line(line).unwrap();
+        assert!(chunks.iter().any(|c| matches!(
+            c,
+            Chunk::Usage {
+                prompt_tokens: 5500,
+                completion_tokens: 42,
+                cached_tokens: Some(4000),
+                ..
+            }
+        )));
     }
 
     #[test]
-    fn ignores_system_init_lines() {
-        let line = r#"{"type":"system","subtype":"init","session_id":"t"}"#;
-        assert!(parse_event_line(line).unwrap().is_empty());
+    fn max_turns_result_maps_to_length() {
+        let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#;
+        let chunks = EventParser::new().parse_line(line).unwrap();
+        assert!(matches!(
+            chunks.last(),
+            Some(Chunk::Done(StopReason::Length))
+        ));
     }
 
     #[test]
     fn blank_line_yields_nothing() {
-        assert!(parse_event_line("  ").unwrap().is_empty());
+        assert!(EventParser::new().parse_line("  ").unwrap().is_empty());
     }
 
     #[test]
     fn non_json_line_is_decode_error() {
         assert!(matches!(
-            parse_event_line("not json"),
+            EventParser::new().parse_line("not json"),
             Err(ModelError::Decode(_))
         ));
     }
