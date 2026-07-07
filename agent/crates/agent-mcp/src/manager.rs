@@ -11,6 +11,9 @@ pub struct ServerStatus {
     pub name: String,
     pub connected: bool,
     pub tool_count: usize,
+    /// Contract-lint violations across this server's tools (empty descriptions,
+    /// undescribed required params). Warn-only — the tools still register.
+    pub schema_warnings: usize,
     pub error: Option<String>,
 }
 
@@ -46,10 +49,16 @@ impl McpManager {
         for r in results {
             match r {
                 Ok((name, client, server_tools)) => {
+                    let warnings = schema_lint(&server_tools);
+                    for w in &warnings {
+                        tracing::warn!(target: "mcp", server = %name, violation = %w,
+                            "MCP tool schema fails contract lint (tool still registered)");
+                    }
                     statuses.push(ServerStatus {
                         name,
                         connected: true,
                         tool_count: server_tools.len(),
+                        schema_warnings: warnings.len(),
                         error: None,
                     });
                     tools.extend(server_tools);
@@ -66,6 +75,7 @@ impl McpManager {
                         name,
                         connected: false,
                         tool_count: 0,
+                        schema_warnings: 0,
                         error: Some(e),
                     });
                 }
@@ -101,7 +111,14 @@ impl McpManager {
             .iter()
             .map(|s| {
                 if s.connected {
-                    format!("{} \u{2713} ({} tools)", s.name, s.tool_count)
+                    if s.schema_warnings > 0 {
+                        format!(
+                            "{} \u{2713} ({} tools, {} schema warnings)",
+                            s.name, s.tool_count, s.schema_warnings
+                        )
+                    } else {
+                        format!("{} \u{2713} ({} tools)", s.name, s.tool_count)
+                    }
                 } else {
                     format!(
                         "{} \u{2717} ({})",
@@ -119,6 +136,23 @@ impl McpManager {
             c.close().await;
         }
     }
+}
+
+/// One warning string per contract-lint violation across a server's wrapped
+/// tools: empty description, or a required param with no description
+/// (`agent_tools::required_params_missing_description`). Warn-don't-reject.
+fn schema_lint(tools: &[Arc<dyn Tool>]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for t in tools {
+        let s = t.schema();
+        if s.description.trim().is_empty() {
+            warnings.push(format!("{}: empty description", s.name));
+        }
+        for p in agent_tools::required_params_missing_description(&s) {
+            warnings.push(format!("{}: required param `{p}` has no description", s.name));
+        }
+    }
+    warnings
 }
 
 /// Connect one server: spawn, handshake, discover, wrap tools.
@@ -185,11 +219,68 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::McpServersConfig;
+    use crate::client::{McpClient, RawTool};
+    use crate::config::{McpServersConfig, Trust};
+    use crate::tool::McpTool;
+    use crate::transport::MockTransport;
     use std::time::Duration;
 
     fn host_sandbox() -> std::sync::Arc<dyn agent_tools::SandboxStrategy> {
         std::sync::Arc::new(agent_tools::HostExecutor)
+    }
+
+    fn mock_client() -> Arc<McpClient> {
+        McpClient::new(Arc::new(MockTransport::scripted(|_| vec![])))
+    }
+
+    #[tokio::test]
+    async fn schema_lint_flags_empty_description_and_undescribed_required_param() {
+        let bad = RawTool {
+            name: "create".into(),
+            description: "   ".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "required": ["x"]
+            }),
+        };
+        let tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(McpTool::new("srv", mock_client(), bad, Trust::Ask))];
+        let w = schema_lint(&tools);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w.iter().any(|m| m.contains("empty description")), "{w:?}");
+        assert!(w.iter().any(|m| m.contains("`x`")), "{w:?}");
+    }
+
+    #[tokio::test]
+    async fn schema_lint_clean_schema_yields_no_warnings() {
+        let clean = RawTool {
+            name: "create".into(),
+            description: "Create an issue".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"x": {"type": "string", "description": "the thing"}},
+                "required": ["x"]
+            }),
+        };
+        let tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(McpTool::new("srv", mock_client(), clean, Trust::Ask))];
+        assert!(schema_lint(&tools).is_empty());
+    }
+
+    #[tokio::test]
+    async fn summary_line_shows_schema_warnings_when_nonzero() {
+        let mgr = McpManager::from_parts(
+            vec![],
+            vec![ServerStatus {
+                name: "github".into(),
+                connected: true,
+                tool_count: 3,
+                schema_warnings: 2,
+                error: None,
+            }],
+        );
+        assert_eq!(mgr.summary_line(), "mcp: github \u{2713} (3 tools, 2 schema warnings)");
     }
 
     #[tokio::test]
@@ -265,12 +356,14 @@ mod tests {
                     name: "filesystem".into(),
                     connected: true,
                     tool_count: 3,
+                    schema_warnings: 0,
                     error: None,
                 },
                 ServerStatus {
                     name: "github".into(),
                     connected: false,
                     tool_count: 0,
+                    schema_warnings: 0,
                     error: Some("timeout".into()),
                 },
             ],
