@@ -6,6 +6,10 @@ cd "$(dirname "$0")/.."
 
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 
+echo "==> okf bundle check"
+python3 scripts/test_okf_check.py
+python3 scripts/okf_check.py docs/okf/agent-sdlc
+
 echo "==> cargo fmt --check"
 (cd agent && cargo fmt --all --check)
 
