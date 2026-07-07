@@ -38,7 +38,9 @@ the human holds the judgment gate.
 | "how do I eval this / isolate harness vs model / build trajectory evals" | `eval.md` |
 
 Read only the playbook the task needs (progressive disclosure). The shared
-knowledge base below is common to all four.
+knowledge base below is common to all four. For source-backed research
+evidence behind any playbook, consult the agent-sdlc knowledge bundle
+(`docs/okf/agent-sdlc/`) via the `agent-sdlc` skill.
 
 ## Spine A — Harness Anatomy
 
