@@ -30,7 +30,6 @@ gate — it exists only for the full hypothesize → eval → gate campaign loop
   `http://localhost:8080`) and `AGENT_E2E_MODEL` (e.g. `qwen3.6-35b-a3b`).
 - Build the harness + CLI once:
   `cd agent && cargo build -p agent-runtime-config --tests --bins`
-- If `cargo` isn't on PATH, `source ~/.cargo/env` first (CLAUDE.md's conditional form).
 
 ## The objective (never violate)
 

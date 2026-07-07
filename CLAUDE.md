@@ -55,7 +55,7 @@ skills. Small, obvious fixes can skip ahead, but design-bearing changes get a sp
 
 ## Commands
 
-Rust core (`cd agent` first; `source ~/.cargo/env` if `cargo` isn't on PATH):
+Rust core (`cd agent` first):
 
 ```bash
 cargo build                                  # whole workspace

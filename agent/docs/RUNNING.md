@@ -124,7 +124,6 @@ nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
 ### Drive it with the agent CLI
 
 ```bash
-source "$HOME/.cargo/env"               # cargo is not on PATH by default here
 cd agent
 cargo run -p agent-cli -- \
   --base-url http://localhost:8080 \

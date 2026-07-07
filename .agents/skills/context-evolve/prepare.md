@@ -52,7 +52,7 @@ away → wrong total). Champion v0:
 Always use ABSOLUTE paths (integration tests run with cwd = the crate dir):
 
 ```bash
-source ~/.cargo/env && cd agent
+cd agent
 T=/home/kalen/rust-agent-runtime/.agents/skills/context-evolve/tasks/drift-ledger
 run() { AGENT_E2E_URL=http://localhost:8080 AGENT_E2E_MODEL=qwen3.6-35b-a3b \
   TASK_JSON=$T/task.json CONFIG_JSON="$1" HIDDEN_TESTS_DIR=$T/hidden_tests \

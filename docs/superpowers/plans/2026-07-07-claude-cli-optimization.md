@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Rust work happens in the `agent/` workspace: `cd /home/kalen/rust-agent-runtime/agent`; run `source ~/.cargo/env` first if `cargo` is missing.
+- Rust work happens in the `agent/` workspace: `cd /home/kalen/rust-agent-runtime/agent`.
 - Conventional commits: `type(scope): summary`.
 - No `ModelClient` trait changes. claude-cli stays prompted-only (`normalized()`/`validate()` untouched).
 - New `RuntimeConfig` fields must be `#[serde(default)]`-ed so existing configs parse unchanged.

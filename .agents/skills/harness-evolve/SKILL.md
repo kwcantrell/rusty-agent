@@ -50,7 +50,7 @@ genome. Spec: `docs/superpowers/specs/2026-07-03-harness-evolve-campaign-design.
 - Live server (`llama-server` skill): `AGENT_E2E_URL=http://localhost:8080`,
   `AGENT_E2E_MODEL=qwen3.6-35b-a3b`. `{"passed":false,"tokens":0,"turns":0}`
   on every run ⇒ server down or URL wrong — check `docker ps` first.
-- `source ~/.cargo/env && cd agent && cargo build -p agent-runtime-config --tests --bins`
+- `cd agent && cargo build -p agent-runtime-config --tests --bins`
 - Web tasks: `docker pull node:22-bookworm-slim` once, and the task's `seed.sh`
   run once (builds `seed/node_modules` offline seeds).
 - Memory-mode tasks: `EVAL_REAL_EMBEDDINGS=1 FASTEMBED_CACHE=src-tauri/.fastembed_cache`.
