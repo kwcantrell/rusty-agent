@@ -81,7 +81,8 @@ async fn dev_server_start(
     state: tauri::State<'_, AppState>,
     candidate: devserver::DevScriptCandidate,
 ) -> Result<devserver::DevServerStatus, String> {
-    state.dev.start(candidate).await
+    let ws = state.bridge.current_workspace().await;
+    state.dev.start(candidate, &ws).await
 }
 
 #[tauri::command]

@@ -173,10 +173,13 @@ impl DevServerManager {
         }
     }
 
-    pub async fn start(&self, cand: DevScriptCandidate) -> Result<DevServerStatus, String> {
+    pub async fn start(&self, cand: DevScriptCandidate, workspace_root: &Path)
+        -> Result<DevServerStatus, String> {
         // Validate before touching the running server — a bogus candidate must not
-        // tear down a live server. Package manager and script are whitelisted so a
-        // future XSS cannot escalate to arbitrary-local-binary execution.
+        // tear down a live server. Package manager and script are whitelisted, and
+        // the directory must sit inside the current workspace: the SPA picks among
+        // detect()'s candidates, but the IPC boundary must not trust the echoed dir
+        // (a planted package.json elsewhere would run an arbitrary `dev` script).
         const ALLOWED_PMS: &[&str] = &["npm", "pnpm", "yarn"];
         if !ALLOWED_PMS.contains(&cand.package_manager.as_str()) {
             return Err(format!("refusing to launch: {} is not an allowed package manager", cand.package_manager));
@@ -184,11 +187,19 @@ impl DevServerManager {
         if !SERVER_SCRIPTS.contains(&cand.script.as_str()) {
             return Err(format!("refusing to launch: {} is not a recognized dev script", cand.script));
         }
+        let root = workspace_root.canonicalize()
+            .map_err(|e| format!("workspace root {} is not accessible: {e}", workspace_root.display()))?;
+        let dir = Path::new(&cand.dir).canonicalize()
+            .map_err(|e| format!("refusing to launch: {} is not accessible: {e}", cand.dir))?;
+        if !dir.starts_with(&root) {
+            return Err(format!("refusing to launch: {} is outside the workspace {}",
+                dir.display(), root.display()));
+        }
         self.stop(); // one server at a time
 
         let mut cmd = Command::new(&cand.package_manager);
         cmd.arg("run").arg(&cand.script)
-            .current_dir(&cand.dir)
+            .current_dir(&dir)
             .env("NO_COLOR", "1").env("FORCE_COLOR", "0").env("BROWSER", "none")
             .stdout(Stdio::piped()).stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -348,7 +359,7 @@ mod tests {
         let cand = fake_server_candidate(tmp.path());
         let mgr = DevServerManager::new();
 
-        let status = mgr.start(cand).await.expect("should discover URL");
+        let status = mgr.start(cand, tmp.path()).await.expect("should discover URL");
         assert_eq!(status.url, "http://localhost:5199/");
         assert!(mgr.status().is_some());
 
@@ -389,7 +400,7 @@ setTimeout(() => {\n\
             label: "stderr-after-stdout-eof — dev".into(),
         };
         let mgr = DevServerManager::new();
-        let status = mgr.start(cand).await.expect("should discover URL from stderr");
+        let status = mgr.start(cand, tmp.path()).await.expect("should discover URL from stderr");
         assert_eq!(status.url, "http://localhost:5298/");
         mgr.stop();
     }
@@ -404,7 +415,7 @@ setTimeout(() => {\n\
             package_manager: "rm".into(),
             label: "x".into(),
         };
-        let err = mgr.start(cand).await.unwrap_err();
+        let err = mgr.start(cand, tmp.path()).await.unwrap_err();
         assert!(!err.is_empty(), "error message must be non-empty");
         assert!(mgr.status().is_none(), "no server should run after rejection");
     }
@@ -419,7 +430,7 @@ setTimeout(() => {\n\
             package_manager: "npm".into(),
             label: "x".into(),
         };
-        let err = mgr.start(cand).await.unwrap_err();
+        let err = mgr.start(cand, tmp.path()).await.unwrap_err();
         assert!(!err.is_empty(), "error message must be non-empty");
         assert!(mgr.status().is_none(), "no server should run after rejection");
     }
@@ -433,8 +444,44 @@ setTimeout(() => {\n\
             script: "dev".into(), package_manager: "npm".into(), label: "x".into(),
         };
         let mgr = DevServerManager::new();
-        let err = mgr.start(cand).await.unwrap_err();
+        let err = mgr.start(cand, tmp.path()).await.unwrap_err();
         assert!(!err.is_empty(), "error should carry a message");
+        assert!(mgr.status().is_none());
+    }
+
+    #[tokio::test]
+    async fn start_rejects_dir_outside_workspace_and_keeps_running_server() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mgr = DevServerManager::new();
+
+        // A live server inside the workspace...
+        let cand = fake_server_candidate(ws.path());
+        mgr.start(cand, ws.path()).await.expect("should discover URL");
+
+        // ...must survive a rejected out-of-workspace start (validate-before-stop).
+        let evil = fake_server_candidate(outside.path());
+        let err = mgr.start(evil, ws.path()).await.unwrap_err();
+        assert!(err.contains("outside the workspace"), "err: {err}");
+        assert!(mgr.status().is_some(), "running server must survive a rejected start");
+
+        // Traversal out of the workspace is caught by canonicalization.
+        let mut sneaky = fake_server_candidate(outside.path());
+        sneaky.dir = format!("{}/..", outside.path().display());
+        let err = mgr.start(sneaky, ws.path()).await.unwrap_err();
+        assert!(err.contains("outside the workspace"), "err: {err}");
+        mgr.stop();
+    }
+
+    #[tokio::test]
+    async fn start_rejects_nonexistent_dir() {
+        let ws = tempfile::tempdir().unwrap();
+        let mgr = DevServerManager::new();
+        let cand = DevScriptCandidate {
+            dir: format!("{}/does-not-exist", ws.path().display()),
+            script: "dev".into(), package_manager: "npm".into(), label: "x".into(),
+        };
+        assert!(mgr.start(cand, ws.path()).await.is_err());
         assert!(mgr.status().is_none());
     }
 }
