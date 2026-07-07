@@ -67,8 +67,16 @@ class OkfCheckTest(unittest.TestCase):
     def test_external_links_ignored(self):
         valid_bundle(self.root)
         write(self.root, "sources/ext.md",
-              "---\ntype: Source\n---\nSee [site](https://example.com/x) and [anchor](#schema)\n")
+              "---\ntype: Source\nresource: https://example.com/ext\n---\n"
+              "See [site](https://example.com/x) and [anchor](#schema)\n")
         self.assertEqual(okf_check.check_bundle(self.root), [])
+
+    def test_source_missing_resource_fails(self):
+        valid_bundle(self.root)
+        write(self.root, "sources/no_resource.md",
+              "---\ntype: Source\ntitle: X\n---\n# Summary\nbody\n")
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("no_resource.md" in e and "resource" in e for e in errs))
 
     def test_non_root_index_frontmatter_fails(self):
         valid_bundle(self.root)

@@ -92,6 +92,9 @@ def check_bundle(root):
                     errors.append(f"{rel}: unparseable frontmatter")
                 elif not str(fm.get("type", "")).strip():
                     errors.append(f"{rel}: missing or empty `type`")
+                elif (str(fm.get("type")).strip() == "Source"
+                      and not str(fm.get("resource", "")).strip()):
+                    errors.append(f"{rel}: Source node missing `resource` URL")
 
         for target in iter_links(body):
             if target.startswith("/"):
