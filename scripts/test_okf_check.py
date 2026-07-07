@@ -67,8 +67,32 @@ class OkfCheckTest(unittest.TestCase):
     def test_external_links_ignored(self):
         valid_bundle(self.root)
         write(self.root, "sources/ext.md",
-              "---\ntype: Source\n---\nSee [site](https://example.com/x) and [anchor](#schema)\n")
+              "---\ntype: Source\nresource: https://example.com/ext\n---\n"
+              "See [site](https://example.com/x) and [anchor](#schema)\n")
+        write(self.root, "sources/index.md",
+              "# Sources\n- [example](/sources/example.md)\n- [ext](/sources/ext.md)\n")
         self.assertEqual(okf_check.check_bundle(self.root), [])
+
+    def test_index_missing_node_fails(self):
+        valid_bundle(self.root)
+        write(self.root, "sources/unlisted.md", VALID_SOURCE)
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("sources/index.md" in e and "unlisted.md" in e
+                            for e in errs))
+
+    def test_source_missing_resource_fails(self):
+        valid_bundle(self.root)
+        write(self.root, "sources/no_resource.md",
+              "---\ntype: Source\ntitle: X\n---\n# Summary\nbody\n")
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("no_resource.md" in e and "resource" in e for e in errs))
+
+    def test_unknown_type_fails(self):
+        valid_bundle(self.root)
+        write(self.root, "sources/typo.md",
+              "---\ntype: Sorce\nresource: https://example.com/t\n---\nbody\n")
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("typo.md" in e and "Sorce" in e for e in errs))
 
     def test_non_root_index_frontmatter_fails(self):
         valid_bundle(self.root)
@@ -95,6 +119,14 @@ class OkfCheckTest(unittest.TestCase):
               "---\ntype: Practice\n---\nClaim.\n\n# Citations\n1. [me](/practices/evals.md)\n")
         errs = okf_check.check_bundle(self.root)
         self.assertTrue(any("selfcite.md" in e for e in errs))
+
+    def test_unresolved_citation_marker_fails(self):
+        valid_bundle(self.root)
+        write(self.root, "practices/dangling.md",
+              "---\ntype: Practice\n---\nClaim [1] and claim [2].\n\n"
+              "# Citations\n1. [example](/sources/example.md)\n")
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("dangling.md" in e and "marker" in e for e in errs))
 
 
 if __name__ == "__main__":

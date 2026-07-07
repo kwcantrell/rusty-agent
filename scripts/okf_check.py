@@ -8,6 +8,14 @@ Checks:
 3. all intra-bundle markdown links resolve to existing files inside the bundle
 4. every concept under phases/, practices/, perspectives/, comparisons/ has a
    `# Citations` section containing at least one resolving link into /sources/
+5. `type` is one of the authoring vocabulary (Source, Practice, Lifecycle Phase,
+   Perspective, Comparison)
+6. every `type: Source` node carries a non-empty `resource:` URL
+7. body `[n]` citation markers resolve to a numbered entry in # Citations
+8. every non-root directory index.md lists every non-reserved node in its directory
+
+NOT checked (human duty): whether a node's claims still match its live source —
+semantic drift needs periodic human re-verification, recorded as a dated log.md entry.
 
 Frontmatter is parsed with a minimal flat parser: `key: value` and `key: [a, b]`
 lines only (bundles produced by this repo use inline list syntax). This is
@@ -23,10 +31,13 @@ from pathlib import Path
 
 RESERVED = {"index.md", "log.md"}
 CITATION_DIRS = {"phases", "practices", "perspectives", "comparisons"}
+ALLOWED_TYPES = {"Source", "Practice", "Lifecycle Phase", "Perspective", "Comparison"}
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 KV_RE = re.compile(r"^([A-Za-z_][\w-]*):\s*(.*)$")
 CITATIONS_HEADING_RE = re.compile(r"^#{1,3}\s+Citations\s*$", re.MULTILINE)
 NEXT_HEADING_RE = re.compile(r"^#{1,3}\s+\S", re.MULTILINE)
+MARKER_RE = re.compile(r"\[(\d+)\](?!\()")          # [3] but not [3](link)
+CITATION_ENTRY_RE = re.compile(r"^\s*(\d+)\.\s", re.MULTILINE)
 
 
 def split_frontmatter(text):
@@ -92,6 +103,15 @@ def check_bundle(root):
                     errors.append(f"{rel}: unparseable frontmatter")
                 elif not str(fm.get("type", "")).strip():
                     errors.append(f"{rel}: missing or empty `type`")
+                else:
+                    node_type = str(fm.get("type")).strip()
+                    if node_type not in ALLOWED_TYPES:
+                        errors.append(
+                            f"{rel}: unknown `type` {node_type!r} "
+                            f"(allowed: {', '.join(sorted(ALLOWED_TYPES))})")
+                    if (node_type == "Source"
+                            and not str(fm.get("resource", "")).strip()):
+                        errors.append(f"{rel}: Source node missing `resource` URL")
 
         for target in iter_links(body):
             if target.startswith("/"):
@@ -119,6 +139,30 @@ def check_bundle(root):
                 cites = [t for t in iter_links(section) if t.startswith("/sources/")]
                 if not cites:
                     errors.append(f"{rel}: # Citations has no /sources/ links")
+                markers = set(MARKER_RE.findall(body[:m.start()]))
+                entries = set(CITATION_ENTRY_RE.findall(section))
+                missing = sorted(markers - entries, key=int)
+                if missing:
+                    errors.append(
+                        f"{rel}: citation marker(s) with no numbered Citations entry: "
+                        + ", ".join(f"[{n}]" for n in missing))
+
+    for idx in md_files:
+        if idx.name != "index.md" or idx.parent == root:
+            continue
+        _, idx_body = split_frontmatter(idx.read_text(encoding="utf-8"))
+        listed = set()
+        for target in iter_links(idx_body):
+            if target.startswith("/"):
+                listed.add((root / target.lstrip("/")).resolve())
+            else:
+                listed.add((idx.parent / target).resolve())
+        for sib in sorted(idx.parent.glob("*.md")):
+            if sib.name in RESERVED:
+                continue
+            if sib.resolve() not in listed:
+                rel = idx.relative_to(root).as_posix()
+                errors.append(f"{rel}: does not list {sib.name}")
     return errors
 
 
