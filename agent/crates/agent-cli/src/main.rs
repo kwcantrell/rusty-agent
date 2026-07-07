@@ -221,6 +221,10 @@ async fn main() {
     // Map every loop-relevant flag into one RuntimeConfig, then assemble the loop
     // through the same shared builder the server uses (no duplicated orchestration).
     let rt = runtime_config_from_cli(&cli, protocol_name);
+    if let Err(e) = rt.validate() {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     let model = build_model(
         &cli.backend,
         &cli.base_url,
@@ -383,6 +387,23 @@ mod tests {
         ]);
         assert_eq!(cli.sandbox_extra_rw, vec!["/data", "/mnt"]);
         assert_eq!(cli.sandbox_extra_ro, vec!["/etc/config"]);
+    }
+
+    #[test]
+    fn cli_assembled_config_passes_validate() {
+        // Guards the startup gate: default flags must never trip validate(),
+        // or every plain `agent-cli` run would exit 2.
+        let cli = Cli::parse_from(["agent-cli"]);
+        let rc = runtime_config_from_cli(&cli, "prompted");
+        assert!(rc.validate().is_ok(), "default CLI config must validate");
+    }
+
+    #[test]
+    fn cli_bad_claude_effort_fails_validate() {
+        let cli = Cli::parse_from(["agent-cli", "--claude-effort", "banana"]);
+        let rc = runtime_config_from_cli(&cli, "prompted");
+        let err = rc.validate().unwrap_err();
+        assert!(err.contains("claude_effort"), "got: {err}");
     }
 
     #[test]
