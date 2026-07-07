@@ -48,8 +48,9 @@ tags:            # ✗ FAILS okf_check
 ## Citation rule
 
 Every concept under `phases/`, `practices/`, `perspectives/`, or
-`comparisons/` MUST contain a `# Citations` heading (conventionally placed at the end of the document) with at least one
-link that resolves into `/sources/`. Claims in the body carry `[n]` markers
+`comparisons/` MUST contain a `# Citations` heading (conventionally placed
+at the end of the document) with at least one link whose target starts with
+`/sources/`. Claims in the body carry `[n]` markers
 pointing at that list.
 
 **Verify claims against the source text before writing them into a
