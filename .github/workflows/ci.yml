@@ -37,4 +37,11 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Coverage summary
         working-directory: agent
-        run: cargo llvm-cov --workspace --summary-only
+        run: |
+          cargo llvm-cov --workspace --summary-only | tee /tmp/llvm-cov-summary.txt
+          {
+            echo '### cargo llvm-cov (agent workspace)'
+            echo '```'
+            grep -E '^(Filename|TOTAL)' /tmp/llvm-cov-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
