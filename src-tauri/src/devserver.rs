@@ -145,6 +145,28 @@ pub fn parse_url(line: &str) -> Option<String> {
     None
 }
 
+/// Arm the child to die with the app: kill_on_drop and the Destroyed/Drop
+/// reapers only cover graceful exits, and process_group(0) detaches the child,
+/// so a SIGKILLed/aborted app would orphan the server. PDEATHSIG closes that
+/// path. SIGTERM (not SIGKILL) so the package manager can forward it to the
+/// actual server process. Caveat: the signal fires when the spawning *thread*
+/// dies; tokio's core workers live for the runtime's (= app's) lifetime.
+#[cfg(target_os = "linux")]
+fn harden_child(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The app may have died between fork and prctl; bail if reparented.
+            if libc::getppid() == 1 {
+                return Err(std::io::Error::other("parent died before PDEATHSIG was armed"));
+            }
+            Ok(())
+        });
+    }
+}
+
 const DISCOVERY_TIMEOUT_SECS: u64 = 30;
 const TAIL_LINES: usize = 60;
 /// How long stop() lets the group act on SIGTERM before the SIGKILL backstop.
@@ -234,6 +256,8 @@ impl DevServerManager {
             .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0); // child becomes its own group leader (pgid == pid)
+        #[cfg(target_os = "linux")]
+        harden_child(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|e| format!("failed to launch {} run {}: {e}",
             cand.package_manager, cand.script))?;
@@ -569,5 +593,21 @@ setInterval(() => {}, 100000);\n");
         // kill(-pgid, 0) probes the whole group; ESRCH once every member is gone.
         let alive = unsafe { libc::kill(-(pid as i32), 0) } == 0;
         assert!(!alive, "group should be SIGKILLed after the grace window");
+    }
+
+    /// harden_child must arm PR_SET_PDEATHSIG: the child reads its own death
+    /// signal back via PR_GET_PDEATHSIG and reports it on stdout.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn harden_child_sets_pdeathsig_sigterm() {
+        let mut cmd = Command::new("python3");
+        cmd.arg("-c")
+            .arg("import ctypes;v=ctypes.c_int();ctypes.CDLL(None).prctl(2,ctypes.byref(v));print(v.value)")
+            .stdout(Stdio::piped());
+        harden_child(&mut cmd);
+        let out = cmd.output().await.expect("python3 probe");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(),
+                   libc::SIGTERM.to_string(),
+                   "child should see PDEATHSIG=SIGTERM");
     }
 }
