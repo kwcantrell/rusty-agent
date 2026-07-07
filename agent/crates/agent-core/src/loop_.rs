@@ -822,14 +822,16 @@ impl AgentLoop {
                 .buffer_unordered(cap)
                 .collect()
                 .await;
-            // A mutating turn is one where at least one Write/Destroy call ran to
+            // A mutating turn is one where at least one Write/Destroy/TrustedWrite call ran to
             // an Ok result. Read-only turns and turns whose only mutations failed
             // do NOT trigger post-execution validation.
             let turn_mutated = executed.iter().any(|(_, _, ex, _, _, access)| {
                 matches!(ex, Executed::Ok(_))
                     && matches!(
                         access,
-                        agent_tools::Access::Write | agent_tools::Access::Destroy
+                        agent_tools::Access::Write
+                            | agent_tools::Access::Destroy
+                            | agent_tools::Access::TrustedWrite
                     )
             });
             for (id, name, ex, duration_ms, timeout, _access) in executed {
@@ -5727,21 +5729,62 @@ mod tests {
         }
     }
 
+    /// A TrustedWrite-tier stub (the MCP Trust::Allow encoding): auto-allowed
+    /// at the gate, but a successful call must count as a mutation and trigger
+    /// configured validators (audit 5.1).
+    struct TrustedStub;
+    #[async_trait::async_trait]
+    impl Tool for TrustedStub {
+        fn name(&self) -> &str {
+            "trusted_stub"
+        }
+        fn description(&self) -> &str {
+            "trusted third-party stub"
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: "trusted_stub".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<agent_tools::ToolIntent, ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: "trusted_stub".into(),
+                access: agent_tools::Access::TrustedWrite,
+                paths: vec![],
+                command: None,
+                summary: "trusted mutation".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, ToolError> {
+            Ok(agent_tools::ToolOutput {
+                content: "did".into(),
+                display: None,
+            })
+        }
+    }
+
     fn self_cancel_registry() -> Arc<ToolRegistry> {
         let mut r = ToolRegistry::new();
         r.register(Arc::new(WriteStubSelfCancel));
         Arc::new(r)
     }
 
-    /// Build a loop that scripts one `write_stub` call then finishes, with the
+    /// Build a loop that scripts one call then finishes, with the
     /// given validator list. Returns (agent, sink).
     fn validator_loop(
         ws: std::path::PathBuf,
         validators: Vec<String>,
         registry: Arc<ToolRegistry>,
+        tool_name: &str,
     ) -> (AgentLoop, Arc<DetailSink>) {
         let model = Arc::new(ScriptedModel::new(vec![
-            Scripted::Call("c1".into(), "write_stub".into(), "{}".into()),
+            Scripted::Call("c1".into(), tool_name.into(), "{}".into()),
             Scripted::Text("done".into()),
         ]));
         let sink = Arc::new(DetailSink::default());
@@ -5798,6 +5841,7 @@ mod tests {
             ws,
             vec!["echo boom 1>&2; exit 3".into()],
             write_stub_registry(),
+            "write_stub",
         );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
@@ -5827,7 +5871,7 @@ mod tests {
     async fn passing_validator_emits_event_but_appends_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().to_path_buf();
-        let (agent, sink) = validator_loop(ws, vec!["true".into()], write_stub_registry());
+        let (agent, sink) = validator_loop(ws, vec!["true".into()], write_stub_registry(), "write_stub");
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
 
@@ -5894,13 +5938,35 @@ mod tests {
         assert!(appended_validation_msg(&ctx).is_none());
     }
 
+    /// TrustedWrite success = mutating turn: configured validators must run
+    /// (this is the audit-5.1 regression pin — Trust::Allow MCP mutations were
+    /// invisible to the validator while encoded as Access::Read).
+    #[tokio::test]
+    async fn trusted_write_turn_runs_validators() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(TrustedStub));
+        let (agent, sink) = validator_loop(ws, vec!["true".into()], Arc::new(r), "trusted_stub");
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let ev = validate_events(&sink);
+        assert_eq!(
+            ev.len(),
+            1,
+            "TrustedWrite success must trigger validators: {ev:?}"
+        );
+        assert_eq!(ev[0].1, ToolStatus::Ok);
+    }
+
     /// An empty validator list is a strict no-op: a write-tier call succeeds and
     /// still ZERO validator events fire (regression guard).
     #[tokio::test]
     async fn empty_validators_is_a_noop() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().to_path_buf();
-        let (agent, sink) = validator_loop(ws, vec![], write_stub_registry());
+        let (agent, sink) = validator_loop(ws, vec![], write_stub_registry(), "write_stub");
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
 
@@ -5927,7 +5993,7 @@ mod tests {
         let ws = dir.path().to_path_buf();
         // FailStub declares Access::Write but its execute returns Err; a validator
         // that would always fail ("false") proves nothing fires on a failed mutation.
-        let (agent, sink) = validator_loop(ws, vec!["false".into()], fail_stub_registry());
+        let (agent, sink) = validator_loop(ws, vec!["false".into()], fail_stub_registry(), "write_stub");
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
 
@@ -5951,6 +6017,7 @@ mod tests {
             ws,
             vec!["true".into(), "false".into()],
             write_stub_registry(),
+            "write_stub",
         );
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
@@ -5995,7 +6062,7 @@ mod tests {
         // WriteStubSelfCancel succeeds (turn_mutated=true) then cancels the run
         // token. "sleep 30" would hang for 30s if ever launched; a clean skip proves
         // it never is (run_validator short-circuits on the cancelled token).
-        let (agent, sink) = validator_loop(ws, vec!["sleep 30".into()], self_cancel_registry());
+        let (agent, sink) = validator_loop(ws, vec!["sleep 30".into()], self_cancel_registry(), "write_stub");
         let mut ctx = WindowContext::new(Message::system("sys"));
         // Returning at all (well under 30s) proves the validator did not block.
         agent.run(&mut ctx, "go".into()).await.unwrap();
