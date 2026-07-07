@@ -9,7 +9,7 @@
 
 ## Verdict
 
-The 27B leads 4/5 vs 3/5 on the headline task (web-multipage). Fisher two-sided p=1.0000 on N=5 per arm: this is the "small gap, large p" case. **The honest verdict is: 27B leads on this sample; not statistically defensible at N=5.** No model switch is warranted by these numbers alone. The resident server remains the A3B unless the user explicitly chooses to switch.
+The 27B leads 4/5 vs 3/5 on the headline task (web-multipage). Fisher two-sided p=1.0000 on N=5 per arm: this is the "small gap, large p" case. **The honest verdict is: 27B leads on this sample; no defensible call at N=5.** No model switch is warranted by these numbers alone. The resident server remains the A3B unless the user explicitly chooses to switch.
 
 Trade-off summary: the 27B showed equal-or-better pass rates on every task this night (web 4/5 vs 3/5, roster 5/5 vs 4/5, portmap 5/5 vs 5/5), at approximately 3.7× slower generation (32.98 vs 121.45 predicted tok/s) and one-third the context ceiling (65K vs 196K tokens). If the gap holds at N=10 web-multipage it becomes a defensible lead — a ten-run web extension is the natural next step for anyone who wants a stronger signal before committing to a swap.
 
@@ -17,16 +17,14 @@ Trade-off summary: the 27B showed equal-or-better pass rates on every task this 
 
 ## Score Table
 
-| model | task         | pass/5 | median tokens (passing only) |
-|-------|--------------|--------|------------------------------|
-| 27B   | web-multipage | 4/5   | 83,615                       |
-| 27B   | memory-roster | 5/5   | 70,638                       |
-| 27B   | locked-portmap | 5/5  | 52,632                       |
-| A3B   | web-multipage | 3/5   | 71,688                       |
-| A3B   | memory-roster | 4/5   | 78,897                       |
-| A3B   | locked-portmap | 5/5  | 56,204                       |
-
-Fisher exact (two-sided) on web-multipage: **p=1.0000** (27B 4/5 vs A3B 3/5).
+| model | task           | pass/5 | Fisher p | median tokens (passing only) |
+|-------|----------------|--------|----------|------------------------------|
+| 27B   | web-multipage  | 4/5    | 1.0000   | 83,615                       |
+| 27B   | memory-roster  | 5/5    | —        | 70,638                       |
+| 27B   | locked-portmap | 5/5    | —        | 52,632                       |
+| A3B   | web-multipage  | 3/5    | 1.0000   | 71,688                       |
+| A3B   | memory-roster  | 4/5    | —        | 78,897                       |
+| A3B   | locked-portmap | 5/5    | —        | 56,204                       |
 
 Note on median tokens: the tiebreak rule (lower median among passing runs) applies only when pass counts are equal. Here web pass counts differ (4 vs 3), so the tiebreak is not invoked. The A3B's lower passing-run median (71,688 vs 83,615) is informational only.
 
@@ -62,7 +60,7 @@ docker run -d --name llama-agent --gpus all -p 8080:8080 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --cache-ram 24576 --jinja --metrics --host 0.0.0.0
 ```
-C_FINAL=196608 (3× the challenger). VRAM at runtime: not recorded in ledger (--cache-ram 24576 MiB RAM-side KV budget configured).
+C_FINAL=196608 (3× the challenger). VRAM at runtime: 21,412 / 24,576 MiB (measured post-block from the resident server in the identical config; not captured in the ledger during the block itself). --cache-ram 24576 MiB RAM-side KV budget configured.
 
 **Config asymmetry note:** The A3B runs at -np 4 with a 192K shared context pool; the 27B ran at -np 1 at 64K. This follows the spec's "each at its best" decision — the 27B cannot hold 192K in a single slot at 24 GiB VRAM, and parallelism is meaningless at -np 1 for a single eval stream. The speed comparison below reflects this asymmetry and should be read accordingly.
 
