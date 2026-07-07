@@ -179,6 +179,9 @@ impl DockerSandbox {
     fn spawn_docker(&self, spec: &CommandSpec, name: &str) -> Result<SandboxedChild, SandboxError> {
         let args = docker_run_args(&self.policy, spec, name, &self.uid_gid);
         let mut cmd = tokio::process::Command::new("docker");
+        // Values for the name-only `-e KEY` args in docker_run_args: docker
+        // forwards them from the client process env into the container.
+        cmd.envs(&spec.env);
         cmd.args(&args)
             .kill_on_drop(true)
             .stdout(Stdio::piped())

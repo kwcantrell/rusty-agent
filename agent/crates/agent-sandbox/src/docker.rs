@@ -70,10 +70,12 @@ pub fn docker_run_args(
         a.push("-v".into());
         a.push(format!("{}:{}:ro", p.display(), p.display()));
     }
-    // Env (-e KEY=VAL), sorted for determinism.
-    for (k, v) in &spec.env {
+    // Env: name-only `-e KEY`, sorted for determinism (BTreeMap). Values travel
+    // on the docker CLIENT process env (spawn_docker sets cmd.envs) so secrets
+    // never appear in world-readable argv or `docker inspect` (audit 3.1).
+    for k in spec.env.keys() {
         a.push("-e".into());
-        a.push(format!("{k}={v}"));
+        a.push(k.clone());
     }
     // --user with no passwd entry leaves HOME=/ (read-only) — node/npx tooling
     // needs a writable HOME for caches. Default to the tmpfs unless the spec set one.
@@ -178,6 +180,17 @@ mod tests {
     }
 
     #[test]
+    fn env_values_stay_out_of_argv() {
+        let mut spec = oneshot();
+        spec.env.insert("API_KEY".into(), "sekret-value".into());
+        let v = docker_run_args(&policy(false), &spec, "n", "1000:1000");
+        let s = v.join(" ");
+        assert!(s.contains("-e API_KEY"), "name-only -e for spec env: {s}");
+        assert!(!s.contains("sekret-value"), "value must never reach argv: {s}");
+        assert!(!s.contains("API_KEY="), "no KEY=VALUE form in argv: {s}");
+    }
+
+    #[test]
     fn home_defaults_to_tmp_unless_spec_sets_it() {
         let v = docker_run_args(&policy(false), &oneshot(), "n", "1000:1000");
         assert!(
@@ -187,6 +200,9 @@ mod tests {
         let mut spec = oneshot();
         spec.env.insert("HOME".into(), "/workspace".into());
         let s = docker_run_args(&policy(false), &spec, "n", "1000:1000").join(" ");
-        assert!(s.contains("-e HOME=/workspace") && !s.contains("-e HOME=/tmp"));
+        assert!(
+            s.contains("-e HOME") && !s.contains("HOME=/workspace") && !s.contains("-e HOME=/tmp"),
+            "spec-set HOME is name-only; value travels via client env: {s}"
+        );
     }
 }
