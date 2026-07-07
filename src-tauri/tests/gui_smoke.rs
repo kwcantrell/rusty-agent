@@ -50,7 +50,14 @@ async fn boot_smoke() {
 #[ignore = "live: needs display + tauri-driver + vite + llama-server on :8080 (qwen3.6-35b-a3b)"]
 async fn turn_smoke() {
     // Gate on the model server exactly like smoke_context_explorer.
-    let health = reqwest::get("http://localhost:8080/health").await;
+    // Use a 2s timeout so a black-hole listener cannot hang the gate.
+    let health = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap()
+        .get("http://localhost:8080/health")
+        .send()
+        .await;
     assert!(
         health.map(|r| r.status().is_success()).unwrap_or(false),
         "llama-server not healthy on :8080 — start it before this test"
@@ -64,7 +71,10 @@ async fn turn_smoke() {
     // previous run without exercising a live turn.
     let marker = format!(
         "SQRL{}",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be post-epoch")
+            .as_millis()
     );
     let ta = d
         .query(By::Css("textarea[aria-label='prompt']"))
@@ -101,11 +111,11 @@ async fn turn_smoke() {
         .click()
         .await
         .expect("click Context tab");
-    d.query(By::XPath("//div[contains(., 'tokens')]"))
+    d.query(By::XPath("//div[contains(., ' / ') and contains(., ' tokens')]"))
         .wait(Duration::from_secs(15), Duration::from_millis(500))
         .first()
         .await
-        .expect("breakdown total line ('N / M tokens')");
+        .expect("context breakdown line matching 'N / M tokens' shape");
     d.query(By::XPath("//button[contains(., 'system')]"))
         .wait(Duration::from_secs(10), Duration::from_millis(500))
         .first()

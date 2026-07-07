@@ -17,6 +17,23 @@ use thirtyfour::Capabilities;
 
 const VITE_URL: &str = "http://localhost:5173";
 
+/// Kills the child's whole process group on drop — covers panics between
+/// spawn and Gui construction (Child::drop alone does not kill).
+struct KillOnDrop(Option<Child>);
+impl KillOnDrop {
+    fn into_inner(mut self) -> Child {
+        self.0.take().unwrap()
+    }
+}
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(c) = &mut self.0 {
+            unsafe { libc::kill(-(c.id() as i32), libc::SIGTERM) };
+            let _ = c.wait();
+        }
+    }
+}
+
 pub struct Gui {
     pub driver: WebDriver,
     tauri_driver: Child,
@@ -58,7 +75,8 @@ impl Gui {
         assert!(app_bin.exists(), "debug binary missing — run `cargo build` first");
 
         // 1. Vite: the debug binary renders from the devUrl, not bundled assets.
-        let vite = if http_ok(VITE_URL).await {
+        //    Wrap in KillOnDrop immediately so a panic in wait_http reaps the process.
+        let vite_guard = if http_ok(VITE_URL).await {
             None
         } else {
             let child = Command::new("npm")
@@ -68,12 +86,15 @@ impl Gui {
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn vite (npm --prefix web run dev)");
+            let guard = KillOnDrop(Some(child));
             wait_http(VITE_URL, Duration::from_secs(60), "vite").await;
-            Some(child)
+            Some(guard)
         };
 
         // 2. tauri-driver on free ports; WEBKIT_WEBDRIVER env overrides the
         //    native driver path if WebKitWebDriver isn't on PATH.
+        //    Wrap in KillOnDrop immediately so a panic in wait_http or WebDriver::new
+        //    reaps the process without orphaning it.
         let port = free_port();
         let native_port = free_port();
         let mut cmd = Command::new("tauri-driver");
@@ -84,7 +105,8 @@ impl Gui {
         if let Ok(native) = std::env::var("WEBKIT_WEBDRIVER") {
             cmd.args(["--native-driver", &native]);
         }
-        let tauri_driver = cmd.spawn().expect("spawn tauri-driver (is it on PATH? ~/.cargo/bin)");
+        let tauri_driver_guard =
+            KillOnDrop(Some(cmd.spawn().expect("spawn tauri-driver (is it on PATH? ~/.cargo/bin)")));
         let base = format!("http://127.0.0.1:{port}");
         wait_http(&format!("{base}/status"), Duration::from_secs(15), "tauri-driver").await;
 
@@ -100,6 +122,9 @@ impl Gui {
         caps.set("browserName", serde_json::json!("wry")).expect("set browserName cap");
         let driver = WebDriver::new(&base, caps).await.expect("webdriver session");
 
+        // Session established — transfer ownership out of the guards into Gui.
+        let tauri_driver = tauri_driver_guard.into_inner();
+        let vite = vite_guard.map(|g| g.into_inner());
         Gui { driver, tauri_driver, vite }
     }
 

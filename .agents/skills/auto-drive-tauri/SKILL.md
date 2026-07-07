@@ -144,22 +144,25 @@ EOF
 ```
 
 **Useful selectors:** composer `textarea[aria-label='prompt']` (Enter submits —
-there is no send button); tabs `button[role='tab']` — 7 in total: 5 nav tabs
-(Workspace / Context / Design / Architecture / Config) + 2 Design-canvas
-sub-tabs (the sub-tabs render only when the Design canvas is active, so the
-live count varies by state); always select by text, never by count or index
+there is no send button); tabs `button[role='tab']` — count VARIES: 5 fixed
+nav tabs (Workspace / Context / Design / Architecture / Config) plus per-design
+sub-tabs (one per design when >1 exist) and Workspace artifact tabs (also
+`role='tab'`), so the live total changes with app state; always select by
+text, never by count or index
 (e.g. `By.XPATH, "//button[@role='tab' and normalize-space()='Architecture']"`);
 Architecture and Config tabs are present only under real Tauri IPC — asserting
 their presence confirms you drove the real app, not a plain browser; Context
-breakdown total `//div[contains(text(),'tokens')]`, legend chips
+breakdown total `//div[contains(., ' / ') and contains(., ' tokens')]`, legend chips
 `//button[contains(., 'system')]`.
 
 **Session lifetime = app lifetime.** WebKitWebDriver allows ONE session; a
 python process that exits without `quit()` wedges the driver. To reset: kill
 tauri-driver. Note that `setsid ... &` followed by `TD_PID=$!` captures the
-**setsid wrapper's PID**, not tauri-driver's own PID. Kill reliably by port:
-`ss -tlnp | grep 4444` to find the PID, then `kill <pid>`; or kill the wrapper
-AND its child (`kill $TD_PID && kill $(pgrep -P $TD_PID)`). You cannot attach to
+**setsid wrapper's PID**, not tauri-driver's own PID. Kill reliably by port
+(primary method): `ss -tlnp | grep 4444` to find the PID, then `kill <pid>`.
+If you prefer killing by PID variables, capture the child first before killing
+the wrapper: `TD_CHILD=$(pgrep -P $TD_PID) && kill $TD_CHILD && kill $TD_PID`
+— killing the wrapper first orphans the child. You cannot attach to
 an already-running app — the WebDriver session must launch it. So: plan the
 whole drive sequence, run it as ONE script, always `quit()`.
 
