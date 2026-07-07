@@ -17,6 +17,9 @@ The cache evidence from the resume probe shows `cache_read_input_tokens: 22288`
 on the resumed call, compared to `input_tokens: 2` for the new suffix alone [1].
 For a conversation with many tool rounds this compounds: N rounds after the
 session is warm = N suffix-only sends instead of N full-context sends.
+Latency also improves proportionally: the resume probe measured `duration_api_ms`
+of 2492 on the full first leg versus 1316 on the resumed leg [1], reducing
+time-to-first-token in line with the input reduction.
 
 The cost of a context rewrite (curation or compaction event): two full sends —
 the compaction call itself (one-shot, `--no-session-persistence`) plus the

@@ -14,7 +14,7 @@ the `--resume` call must run from the same directory [2].
 `--resume <id>` reuses the original session ID: the resumed call's `system/init`
 event carries the same `session_id` as the original [1]. The client does not need
 to re-capture a new ID after resuming, though re-capturing is harmless.
-`--no-session-persistence` disables on-disk saving entirely (print mode only);
+`--no-session-persistence` disables on-disk saving entirely (print mode only) [3];
 sessions started with that flag cannot be resumed [2].
 
 Session files are stored at `~/.claude/projects/<cwd-slug>/<session_id>.jsonl`
