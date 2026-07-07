@@ -28,6 +28,8 @@ LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 KV_RE = re.compile(r"^([A-Za-z_][\w-]*):\s*(.*)$")
 CITATIONS_HEADING_RE = re.compile(r"^#{1,3}\s+Citations\s*$", re.MULTILINE)
 NEXT_HEADING_RE = re.compile(r"^#{1,3}\s+\S", re.MULTILINE)
+MARKER_RE = re.compile(r"\[(\d+)\](?!\()")          # [3] but not [3](link)
+CITATION_ENTRY_RE = re.compile(r"^\s*(\d+)\.\s", re.MULTILINE)
 
 
 def split_frontmatter(text):
@@ -129,6 +131,13 @@ def check_bundle(root):
                 cites = [t for t in iter_links(section) if t.startswith("/sources/")]
                 if not cites:
                     errors.append(f"{rel}: # Citations has no /sources/ links")
+                markers = set(MARKER_RE.findall(body[:m.start()]))
+                entries = set(CITATION_ENTRY_RE.findall(section))
+                missing = sorted(markers - entries, key=int)
+                if missing:
+                    errors.append(
+                        f"{rel}: citation marker(s) with no numbered Citations entry: "
+                        + ", ".join(f"[{n}]" for n in missing))
     return errors
 
 

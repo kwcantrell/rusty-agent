@@ -111,6 +111,14 @@ class OkfCheckTest(unittest.TestCase):
         errs = okf_check.check_bundle(self.root)
         self.assertTrue(any("selfcite.md" in e for e in errs))
 
+    def test_unresolved_citation_marker_fails(self):
+        valid_bundle(self.root)
+        write(self.root, "practices/dangling.md",
+              "---\ntype: Practice\n---\nClaim [1] and claim [2].\n\n"
+              "# Citations\n1. [example](/sources/example.md)\n")
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("dangling.md" in e and "marker" in e for e in errs))
+
 
 if __name__ == "__main__":
     unittest.main()
