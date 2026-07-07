@@ -8,7 +8,7 @@ timestamp: 2026-07-06T00:00:00Z
 
 # Tool design as an engineering discipline
 
-Tools are not a peripheral concern in agent systems; they are a primary behavioral lever. Tool definitions and specifications warrant just as much prompt engineering attention as the overall agent prompt, and in practice teams often spend more time optimizing their tools than the prompt itself [2]. This makes tool design an engineering discipline in its own right, closely tied to [prototyping and development](/phases/prototyping-and-development.md).
+Tools are not a peripheral concern in agent systems; they are a primary behavioral lever. Tool definitions and specifications warrant just as much prompt engineering attention as the overall agent prompt, and in practice some teams spend more time optimizing their tools than the prompt itself [2]. This makes tool design an engineering discipline in its own right, closely tied to [prototyping and development](/phases/prototyping-and-development.md).
 
 ## Names and descriptions steer behavior
 

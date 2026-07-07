@@ -13,7 +13,7 @@ building rather than an afterthought. Writing evals is useful at any stage of
 the agent lifecycle [1], but investing early forces product teams to specify
 what success means before the agent can fulfill it [1]. An effective evaluation
 strategy is built on a foundation of clear, unambiguous success criteria [3],
-defined ahead of implementation so they ground the whole strategy [3]. In the
+defined at the outset of the evaluation strategy so they ground the whole approach [3]. In the
 capability-first form of the practice, teams build evals to define planned
 behaviors before agents can meet them, then iterate until performance thresholds
 are reached [1]. See [/phases/evaluation.md](/phases/evaluation.md) for where

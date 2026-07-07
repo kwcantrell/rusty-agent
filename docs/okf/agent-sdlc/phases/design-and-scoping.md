@@ -8,11 +8,11 @@ timestamp: 2026-07-06T00:00:00Z
 
 # Design and scoping
 
-Design and scoping is the phase where you decide *what* to build before writing the loop. Agents behave unlike deterministic code — they reason, act, and adapt, so the patterns that served traditional software do not fully translate, and scoping errors compound downstream [7]. Structured scoping matters directly to reliability: frameless development of LLM agents introduces critical risks including scope creep and open-loop failures [6].
+Design and scoping is the phase where you decide *what* to build before writing the loop. Agents behave unlike deterministic code — they reason, act, and adapt, so the patterns that served traditional software do not fully translate [7]. Structured scoping matters directly to reliability: frameless development of LLM agents introduces critical risks including scope creep and open-loop failures [6].
 
 ## Simple-first bias
 
-The most successful implementations avoid complex frameworks and specialized libraries, building instead with simple, composable patterns [1]. Many patterns can be implemented in a few lines of code by using LLM APIs directly [1], whereas frameworks add abstraction layers that obscure the underlying prompts and responses and make debugging harder [3]. The governing rule is to add complexity only when it demonstrably improves measurable outcomes [1], after optimizing with comprehensive evaluation [1]. This bias is the core of the [start-simple practice](/practices/start-simple.md) and shapes how much you carry into [prototyping and development](/phases/prototyping-and-development.md).
+The most successful implementations avoid complex frameworks and specialized libraries, building instead with simple, composable patterns [1]. Many patterns can be implemented in a few lines of code by using LLM APIs directly [1], whereas frameworks add abstraction layers that obscure the underlying prompts and responses and make debugging harder [1]. The governing rule is to add complexity only when it demonstrably improves outcomes [1], after optimizing with comprehensive evaluation [1]. This bias is the core of the [start-simple practice](/practices/start-simple.md) and shapes how much you carry into [prototyping and development](/phases/prototyping-and-development.md).
 
 ## Workflow or agent
 

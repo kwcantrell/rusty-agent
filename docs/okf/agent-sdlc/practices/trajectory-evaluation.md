@@ -29,7 +29,7 @@ name and description, and unclear choices lead to looping or incorrect actions [
 These are foundational LLM capabilities—planning and tool use—that must be
 systematically evaluated as autonomous systems plan, reason, and use tools while
 interacting with dynamic environments [5]. Standard text-generation metrics such
-as coherence are insufficient here, since they focus on text structure rather than
+as coherence may not be sufficient here, since they focus on text structure rather than
 effectiveness within an environment [1].
 
 ## Matching and scoring over actions

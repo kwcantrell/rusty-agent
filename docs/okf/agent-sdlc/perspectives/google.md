@@ -28,7 +28,7 @@ Evaluation suites integrate into CI/CD as automated quality gates that run on ev
 
 ## SRE agents operating production
 
-Google closes the loop with agentic AI running operations itself. SRE agents detect and auto-address reliability issues before human review [8], use dynamic anomaly detection instead of static SLO thresholds [8], triage and enrich alerts, investigate incidents, and autonomously propose or apply mitigations from observability, topology, and dependency data [8]. Historical incidents are mined via Gemini embeddings and vector databases to drive better investigations [8]. These agents carry strong identity with roles and permissions like human operators, must explain considered-and-rejected options over black-box automation, and are instrumented to track their autonomous levels [8].
+Google closes the loop with agentic AI running operations itself. SRE agents detect and auto-address reliability issues before human review [8], use dynamic anomaly detection instead of static thresholds [8], triage and enrich alerts, investigate incidents, and autonomously propose or apply mitigations from observability, topology, and dependency data [8]. Historical incidents are mined via Gemini embeddings and vector databases to drive better investigations [8]. These agents carry strong identity with roles and permissions like human operators, must explain considered-and-rejected options over black-box automation, and are instrumented to track their autonomous levels [8].
 
 # Citations
 
