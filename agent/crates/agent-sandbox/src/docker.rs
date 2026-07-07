@@ -17,7 +17,9 @@ pub const WORKDIR: &str = "/workspace";
 /// live on the client process they would redirect daemon/auth/config
 /// discovery, so they ride argv as `-e K=V` and are excluded from the
 /// client env in spawn_docker. HOME is here because it moves the CLI's
-/// ~/.docker/config.json discovery (and its value is not a secret).
+/// ~/.docker/config.json discovery (and its value is not a secret); PATH
+/// because a child-env PATH would change binary resolution for the CLI
+/// and its credential helpers.
 pub const DOCKER_CLIENT_CONTROL_KEYS: &[&str] = &[
     "DOCKER_HOST",
     "DOCKER_CONFIG",
@@ -25,6 +27,7 @@ pub const DOCKER_CLIENT_CONTROL_KEYS: &[&str] = &[
     "DOCKER_TLS_VERIFY",
     "DOCKER_CONTEXT",
     "HOME",
+    "PATH",
 ];
 
 /// Build the full `docker run …` argument vector (excluding the leading "docker").
