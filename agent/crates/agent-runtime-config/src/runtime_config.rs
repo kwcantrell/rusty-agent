@@ -2,6 +2,10 @@ use crate::{backend_name_is_valid, default_allowlist, protocol_name_is_valid};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// `--effort` values accepted by claude 2.1.195 (probed; see
+/// docs/okf/claude-cli-headless/sources/probe-model-knobs-2-1-195.md).
+pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 /// Commands ALWAYS denied regardless of user settings — defense-in-depth against
 /// the model (or an injected settings frame), not against the operator. Intersected
 /// into the effective denylist by `RuntimeConfig::effective_denylist`. Bare-program-name
@@ -110,6 +114,16 @@ pub struct RuntimeConfig {
     pub enable_thinking: bool,
     #[serde(default)]
     pub preserve_thinking: bool,
+    /// claude-cli backend: resume the CLI session across calls when the
+    /// transcript extends append-only (delta resume). Ignored by openai.
+    #[serde(default = "default_true")]
+    pub claude_session_reuse: bool,
+    /// claude-cli backend: `--effort` level. None = CLI default.
+    #[serde(default)]
+    pub claude_effort: Option<String>,
+    /// claude-cli backend: `--fallback-model` when the primary is unavailable.
+    #[serde(default)]
+    pub claude_fallback_model: Option<String>,
     #[serde(default)]
     pub skills_dirs: Vec<String>,
     #[serde(default)]
@@ -179,6 +193,9 @@ struct PartialRuntimeConfig {
     repeat_penalty: Option<f32>,
     enable_thinking: Option<bool>,
     preserve_thinking: Option<bool>,
+    claude_session_reuse: Option<bool>,
+    claude_effort: Option<String>,
+    claude_fallback_model: Option<String>,
     skills_dirs: Option<Vec<String>>,
     active_skills: Option<Vec<String>>,
     sandbox_mode: Option<String>,
@@ -288,6 +305,9 @@ impl RuntimeConfig {
             repeat_penalty: None,
             enable_thinking: true,
             preserve_thinking: false,
+            claude_session_reuse: true,
+            claude_effort: None,
+            claude_fallback_model: None,
             skills_dirs: Vec::new(),
             active_skills: Vec::new(),
             sandbox_mode: default_sandbox_mode(),
@@ -380,6 +400,15 @@ impl RuntimeConfig {
         if let Some(v) = self.repeat_penalty {
             if v <= 0.0 {
                 return Err("repeat_penalty must be > 0.0".into());
+            }
+        }
+        if let Some(e) = &self.claude_effort {
+            if !EFFORT_LEVELS.contains(&e.as_str()) {
+                return Err(format!(
+                    "claude_effort '{}' not recognized: use one of {}",
+                    e,
+                    EFFORT_LEVELS.join(" | ")
+                ));
             }
         }
         if !matches!(self.sandbox_mode.as_str(), "off" | "auto" | "enforce") {
@@ -491,6 +520,15 @@ impl RuntimeConfig {
         if let Some(v) = p.preserve_thinking {
             self.preserve_thinking = v;
         }
+        if let Some(v) = p.claude_session_reuse {
+            self.claude_session_reuse = v;
+        }
+        if let Some(v) = p.claude_effort {
+            self.claude_effort = Some(v);
+        }
+        if let Some(v) = p.claude_fallback_model {
+            self.claude_fallback_model = Some(v);
+        }
         if let Some(v) = p.skills_dirs {
             self.skills_dirs = v;
         }
@@ -569,6 +607,20 @@ impl RuntimeConfig {
             );
         }
         cfg
+    }
+}
+
+/// Convenience `Default` for tests and short-lived callers; the canonical way to
+/// build a config in production is `RuntimeConfig::from_launch`.
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self::from_launch(
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "default".into(),
+            "native".into(),
+            8192,
+        )
     }
 }
 
@@ -864,6 +916,9 @@ mod tests {
             repeat_penalty: Some(1.1),
             enable_thinking: false,
             preserve_thinking: true,
+            claude_session_reuse: false,
+            claude_effort: Some("high".into()),
+            claude_fallback_model: Some("claude-opus-4".into()),
             skills_dirs: vec!["/s".into()],
             active_skills: vec!["greeter".into()],
             sandbox_mode: "enforce".into(),
@@ -1282,6 +1337,35 @@ mod tests {
         v.as_object_mut().unwrap().remove("system_prompt_override");
         let old: RuntimeConfig = serde_json::from_value(v).unwrap();
         assert!(old.system_prompt_override.is_none());
+    }
+
+    #[test]
+    fn claude_knobs_default_reuse_on_and_no_flags() {
+        let c = RuntimeConfig::default();
+        assert!(c.claude_session_reuse);
+        assert_eq!(c.claude_effort, None);
+        assert_eq!(c.claude_fallback_model, None);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_claude_effort() {
+        let c = RuntimeConfig {
+            claude_effort: Some("banana".into()),
+            ..Default::default()
+        };
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("claude_effort"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_probed_effort_levels() {
+        for level in EFFORT_LEVELS {
+            let c = RuntimeConfig {
+                claude_effort: Some((*level).into()),
+                ..Default::default()
+            };
+            assert!(c.validate().is_ok(), "level {level} should validate");
+        }
     }
 
     #[test]

@@ -2,7 +2,9 @@
 //! used by both the CLI (`agent-cli`) and the daemon (`agent-server`).
 
 mod runtime_config;
-pub use runtime_config::{ModelRef, RuntimeConfig, DEFAULT_SANDBOX_IMAGE, HARD_FLOOR_DENYLIST};
+pub use runtime_config::{
+    ModelRef, RuntimeConfig, DEFAULT_SANDBOX_IMAGE, EFFORT_LEVELS, HARD_FLOOR_DENYLIST,
+};
 
 mod assemble;
 pub use assemble::{assemble_loop, loop_config_from, BuiltLoop, LoopParts};
@@ -19,8 +21,8 @@ use agent_http::{FetchUrl, NetworkPolicy};
 use agent_mcp::McpServersConfig;
 use agent_memory::{build_tools, build_tools_and_retriever, MemoryConfig};
 use agent_model::{
-    ClaudeCliClient, ModelClient, NativeProtocol, OpenAiCompatClient, PromptedJsonProtocol,
-    ToolCallProtocol,
+    ClaudeCliClient, ClaudeCliOptions, ModelClient, NativeProtocol, OpenAiCompatClient,
+    PromptedJsonProtocol, ToolCallProtocol,
 };
 use agent_sandbox::{validate_mount, DockerSandbox, SandboxPolicy};
 use agent_skills::{CreateSkill, ListSkills, ReadSkillFile, SkillRegistry, UseSkill};
@@ -73,17 +75,27 @@ pub fn backend_name_is_valid(name: &str) -> bool {
     matches!(name, "openai" | "claude-cli")
 }
 
+/// Options for the claude-cli backend derived from config (openai ignores them).
+pub fn claude_cli_opts(cfg: &RuntimeConfig) -> ClaudeCliOptions {
+    ClaudeCliOptions {
+        session_reuse: cfg.claude_session_reuse,
+        effort: cfg.claude_effort.clone(),
+        fallback_model: cfg.claude_fallback_model.clone(),
+    }
+}
+
 /// Build the model client for the selected backend.
-/// `claude-cli` ignores `base_url`/`api_key`; `openai` ignores `claude_binary`.
+/// `claude-cli` ignores `base_url`/`api_key`; `openai` ignores `claude_binary`/`claude`.
 pub fn build_model(
     backend: &str,
     base_url: &str,
     model: &str,
     claude_binary: &str,
     api_key: Option<String>,
+    claude: ClaudeCliOptions,
 ) -> Arc<dyn ModelClient> {
     match backend {
-        "claude-cli" => Arc::new(ClaudeCliClient::new(claude_binary, model)),
+        "claude-cli" => Arc::new(ClaudeCliClient::with_options(claude_binary, model, claude)),
         _ => Arc::new(OpenAiCompatClient::new(
             base_url.to_string(),
             model.to_string(),
@@ -101,7 +113,14 @@ pub fn build_routed_model(
     api_key: Option<String>,
 ) -> Arc<dyn ModelClient> {
     let (backend, base_url, model, bin) = r.resolve(cfg, claude_binary);
-    build_model(&backend, &base_url, &model, &bin, api_key)
+    build_model(
+        &backend,
+        &base_url,
+        &model,
+        &bin,
+        api_key,
+        claude_cli_opts(cfg),
+    )
 }
 
 pub fn build_registry(http_allow_hosts: &[String]) -> ToolRegistry {

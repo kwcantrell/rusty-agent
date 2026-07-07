@@ -203,11 +203,29 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     let loop_config = loop_config_from(cfg, parts.workspace.clone(), parts.stream_idle_timeout);
 
     // Dedicated compaction model (spec G3): routed into both the parent loop and
-    // child loops. None inherits the primary model at every read-site.
-    let compaction_model = cfg
+    // child loops. For the openai backend, None inherits the primary model at every
+    // read-site (stateless client — sharing is harmless). For claude-cli, each
+    // ClaudeCliClient owns a Mutex<Option<SessionState>>; sharing the parent instance
+    // with the compaction call would let the compaction call overwrite the parent's
+    // session fingerprints. Build a fresh instance when no explicit override is set.
+    let compaction_model: Option<Arc<dyn ModelClient>> = cfg
         .compaction_model
         .as_ref()
-        .map(|r| crate::build_routed_model(cfg, r, &parts.claude_binary, parts.api_key.clone()));
+        .map(|r| crate::build_routed_model(cfg, r, &parts.claude_binary, parts.api_key.clone()))
+        .or_else(|| {
+            if cfg.backend == "claude-cli" {
+                Some(crate::build_model(
+                    &cfg.backend,
+                    &cfg.base_url,
+                    &cfg.model,
+                    &parts.claude_binary,
+                    parts.api_key.clone(),
+                    crate::claude_cli_opts(cfg),
+                ))
+            } else {
+                None
+            }
+        });
     #[cfg(test)]
     let compaction_model_routed = compaction_model.is_some();
 
@@ -228,6 +246,20 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
             Some(r) => {
                 crate::build_routed_model(cfg, r, &parts.claude_binary, parts.api_key.clone())
             }
+            // For the openai backend, cloning the Arc is harmless: the client is
+            // stateless. For claude-cli, each ClaudeCliClient owns a
+            // Mutex<Option<SessionState>>; handing the same Arc to a child means the
+            // child's commits overwrite the parent's fingerprints, so the parent's
+            // next call always re-plans a fresh session (session reuse silently
+            // defeated). Build a distinct instance for claude-cli.
+            None if cfg.backend == "claude-cli" => crate::build_model(
+                &cfg.backend,
+                &cfg.base_url,
+                &cfg.model,
+                &parts.claude_binary,
+                parts.api_key.clone(),
+                crate::claude_cli_opts(cfg),
+            ),
             None => parts.model.clone(),
         };
         #[cfg(test)]
@@ -606,6 +638,36 @@ mod tests {
         c.backend = "claude-cli".into();
         assert_eq!(child_protocol_name(&c, None), "native");
         assert_eq!(child_protocol_name(&c, Some(&r)), "native");
+    }
+
+    #[test]
+    fn claude_cli_child_and_compaction_get_distinct_clients_when_none_configured() {
+        // Finding 1 regression pin: for the claude-cli backend with no explicit
+        // subagent_model or compaction_model, the assembled child and compaction
+        // clients must NOT be the same Arc as the parent — each ClaudeCliClient
+        // owns its own session state, and sharing the parent instance causes the
+        // child/compaction call's session fingerprints to overwrite the parent's,
+        // silently defeating session reuse.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.backend = "claude-cli".into();
+        c.protocol = "prompted".into();
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        // subagent_model_routed = Some(true) ↔ child client is a distinct Arc
+        assert_eq!(built.subagent_model_routed, Some(true));
+        // compaction client is also a distinct (fresh) instance
+        assert!(built.compaction_model_routed);
+    }
+
+    #[test]
+    fn openai_child_still_shares_parent_arc_when_none_configured() {
+        // For the openai backend, the stateless client is safe to share; the
+        // clone behavior must remain unchanged so we don't churn a working path.
+        let dir = tempfile::tempdir().unwrap();
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        // cfg() uses backend "openai" — child should share the parent Arc
+        assert_eq!(built.subagent_model_routed, Some(false));
+        assert!(!built.compaction_model_routed);
     }
 
     #[test]
