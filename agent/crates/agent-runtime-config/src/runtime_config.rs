@@ -1349,8 +1349,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_unknown_claude_effort() {
-        let mut c = RuntimeConfig::default();
-        c.claude_effort = Some("banana".into());
+        let c = RuntimeConfig {
+            claude_effort: Some("banana".into()),
+            ..Default::default()
+        };
         let err = c.validate().unwrap_err();
         assert!(err.contains("claude_effort"), "got: {err}");
     }
@@ -1358,8 +1360,10 @@ mod tests {
     #[test]
     fn validate_accepts_probed_effort_levels() {
         for level in EFFORT_LEVELS {
-            let mut c = RuntimeConfig::default();
-            c.claude_effort = Some((*level).into());
+            let c = RuntimeConfig {
+                claude_effort: Some((*level).into()),
+                ..Default::default()
+            };
             assert!(c.validate().is_ok(), "level {level} should validate");
         }
     }
