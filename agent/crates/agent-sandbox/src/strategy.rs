@@ -179,6 +179,17 @@ impl DockerSandbox {
     fn spawn_docker(&self, spec: &CommandSpec, name: &str) -> Result<SandboxedChild, SandboxError> {
         let args = docker_run_args(&self.policy, spec, name, &self.uid_gid);
         let mut cmd = tokio::process::Command::new("docker");
+        // Values for the name-only `-e KEY` args in docker_run_args: docker
+        // forwards them from the client process env into the container.
+        // Client-control keys (DOCKER_*, HOME) are deliberately excluded —
+        // they ride argv as `-e K=V` so they cannot redirect the docker CLI's
+        // own daemon/auth/config discovery. Note envs() ADDS to the inherited
+        // parent env; it does not replace it.
+        cmd.envs(
+            spec.env
+                .iter()
+                .filter(|(k, _)| !crate::docker::DOCKER_CLIENT_CONTROL_KEYS.contains(&k.as_str())),
+        );
         cmd.args(&args)
             .kill_on_drop(true)
             .stdout(Stdio::piped())

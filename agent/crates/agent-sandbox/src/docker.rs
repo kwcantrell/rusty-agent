@@ -13,6 +13,23 @@ pub struct SandboxPolicy {
 
 pub const WORKDIR: &str = "/workspace";
 
+/// Env keys the docker CLI itself interprets (client-control, not secrets):
+/// live on the client process they would redirect daemon/auth/config
+/// discovery, so they ride argv as `-e K=V` and are excluded from the
+/// client env in spawn_docker. HOME is here because it moves the CLI's
+/// ~/.docker/config.json discovery (and its value is not a secret); PATH
+/// because a child-env PATH would change binary resolution for the CLI
+/// and its credential helpers.
+pub const DOCKER_CLIENT_CONTROL_KEYS: &[&str] = &[
+    "DOCKER_HOST",
+    "DOCKER_CONFIG",
+    "DOCKER_CERT_PATH",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CONTEXT",
+    "HOME",
+    "PATH",
+];
+
 /// Build the full `docker run …` argument vector (excluding the leading "docker").
 pub fn docker_run_args(
     policy: &SandboxPolicy,
@@ -70,10 +87,18 @@ pub fn docker_run_args(
         a.push("-v".into());
         a.push(format!("{}:{}:ro", p.display(), p.display()));
     }
-    // Env (-e KEY=VAL), sorted for determinism.
+    // Env: name-only `-e KEY`, sorted for determinism (BTreeMap) — values
+    // travel on the docker CLIENT process env (spawn_docker sets cmd.envs) so
+    // secrets never appear in world-readable argv or `docker inspect`
+    // (audit 3.1). Client-control keys are the exception: they stay in argv
+    // `-e K=V` form (non-secret) and never reach the client env.
     for (k, v) in &spec.env {
         a.push("-e".into());
-        a.push(format!("{k}={v}"));
+        if DOCKER_CLIENT_CONTROL_KEYS.contains(&k.as_str()) {
+            a.push(format!("{k}={v}"));
+        } else {
+            a.push(k.clone());
+        }
     }
     // --user with no passwd entry leaves HOME=/ (read-only) — node/npx tooling
     // needs a writable HOME for caches. Default to the tmpfs unless the spec set one.
@@ -178,6 +203,38 @@ mod tests {
     }
 
     #[test]
+    fn env_values_stay_out_of_argv() {
+        let mut spec = oneshot();
+        spec.env.insert("API_KEY".into(), "sekret-value".into());
+        let v = docker_run_args(&policy(false), &spec, "n", "1000:1000");
+        let s = v.join(" ");
+        assert!(s.contains("-e API_KEY"), "name-only -e for spec env: {s}");
+        assert!(
+            !s.contains("sekret-value"),
+            "value must never reach argv: {s}"
+        );
+        assert!(!s.contains("API_KEY="), "no KEY=VALUE form in argv: {s}");
+    }
+
+    #[test]
+    fn docker_client_control_keys_stay_in_argv() {
+        let mut spec = oneshot();
+        spec.env
+            .insert("DOCKER_HOST".into(), "tcp://evil:2375".into());
+        spec.env.insert("API_KEY".into(), "sekret-value".into());
+        let v = docker_run_args(&policy(false), &spec, "n", "1000:1000");
+        let s = v.join(" ");
+        assert!(
+            s.contains("-e DOCKER_HOST=tcp://evil:2375"),
+            "client-control keys ride argv with their value: {s}"
+        );
+        assert!(
+            s.contains("-e API_KEY") && !s.contains("sekret-value"),
+            "secret keys stay name-only: {s}"
+        );
+    }
+
+    #[test]
     fn home_defaults_to_tmp_unless_spec_sets_it() {
         let v = docker_run_args(&policy(false), &oneshot(), "n", "1000:1000");
         assert!(
@@ -187,6 +244,9 @@ mod tests {
         let mut spec = oneshot();
         spec.env.insert("HOME".into(), "/workspace".into());
         let s = docker_run_args(&policy(false), &spec, "n", "1000:1000").join(" ");
-        assert!(s.contains("-e HOME=/workspace") && !s.contains("-e HOME=/tmp"));
+        assert!(
+            s.contains("-e HOME=/workspace") && !s.contains("-e HOME=/tmp"),
+            "spec-set HOME rides argv (client-control, non-secret): {s}"
+        );
     }
 }
