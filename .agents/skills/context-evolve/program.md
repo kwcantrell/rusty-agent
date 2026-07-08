@@ -647,3 +647,28 @@ every one **0/5** (== champion). Diffs archived in `attic/2026-07-02-overflow-fo
   (config, rate) pair — a task id is not enough.** Admission configs are
   deliberately red-side and must never be reused as guard configs after the
   champion moves past them.
+
+## External-merge guard sweep (2026-07-07) — audit cluster 5 goal-block cap: ALL CEILINGS HOLD
+
+Audit-drain cluster 5 (merge `35a9cea`) capped the pinned goal block at
+`GOAL_MAX_TOKENS = 512` in `set_goal` — a champion-v4 spine touch (the fold
+ledger renders inside the goal block), so the triage spec mandated this sweep.
+
+- **Structural inertness verified first:** every sweep task's FIRST prompt is
+  ≤ 96 est tokens, so the cap cannot fire on this suite — `set_goal` output is
+  byte-identical to pre-merge. The sweep below is the (config, rate) evidence.
+- **Results (champion params; roster @ `champion_k10.json`; recall @ its
+  `realistic.json`; N = recorded-ceiling N):** manifest **5/5** (med 80,397),
+  portmap **10/10** (50,788), codename **5/5** (55,537), offload **5/5**
+  (36,270), mem-recall **5/5** (20,927), mem-roster **10/10** (75,770 — a point
+  ABOVE the 9/10 ceiling), drift **11/12** (59,297 — exactly the ceiling; the
+  miss is the documented model-bound invented-step mode).
+- **INCIDENT (new pairing gotcha, protocol hardened):** the first sweep pass
+  omitted `EVAL_REAL_EMBEDDINGS=1` → eval_context wired the exact-match
+  StubEmbedder → memory-recall **0/5** with a deterministic zero-hit-recall
+  trajectory shape (remember, 4-5 fruitless recalls, writes UNKNOWN). This is
+  the roster-2026-07-03 class again from a new direction: **the env var is part
+  of every memory-task ceiling's (config, rate) pair.** train.md's run()
+  recipe now sets it unconditionally. Diagnostic signature for next time:
+  memory-task collapse where recall returns nothing EVERY run = check the
+  embedder wiring before suspecting the curation code.

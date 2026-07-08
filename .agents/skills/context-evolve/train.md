@@ -25,10 +25,14 @@ K=6 consecutive iterations fail to improve.
    ```bash
    cd agent
    T=/home/kalen/rust-agent-runtime/.agents/skills/context-evolve/tasks/drift-ledger
-   run() { AGENT_E2E_URL=http://localhost:8080 AGENT_E2E_MODEL=qwen3.6-35b-a3b \
+   run() { EVAL_REAL_EMBEDDINGS=1 AGENT_E2E_URL=http://localhost:8080 AGENT_E2E_MODEL=qwen3.6-35b-a3b \
      TASK_JSON=$T/task.json CONFIG_JSON="$1" HIDDEN_TESTS_DIR=$T/hidden_tests \
      cargo test -p agent-runtime-config --test eval_context -- --ignored --nocapture 2>&1 \
      | grep -E '^\{"passed"'; }
+   # EVAL_REAL_EMBEDDINGS=1 is part of every memory-task ceiling's (config, rate)
+   # pair: without it eval_context wires the exact-match StubEmbedder and recall
+   # deterministically zero-hits (memory-recall 0/5 vs 5/5, 2026-07-07 sweep
+   # incident). Harmless for memory-disabled tasks — keep it on unconditionally.
    : > /tmp/champ.jsonl; : > /tmp/cand.jsonl
    for i in $(seq 1 6); do run /tmp/champion.json >> /tmp/champ.jsonl; run /tmp/cand.json >> /tmp/cand.jsonl; done
    ```
