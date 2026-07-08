@@ -176,11 +176,14 @@ impl CuratedContext {
     /// Per-category breakdown of the current context window, for the explorer UI.
     /// Token figures are estimates; the faithful total comes from server usage.
     pub fn snapshot(&self, model_limit: usize, turn: usize) -> crate::ContextSnapshot {
+        let ledger = (!self.folded_facts.is_empty()).then(|| self.folded_block());
         crate::snapshot::build_snapshot(
             turn,
             model_limit,
             &self.system,
             self.goal.as_ref(),
+            ledger.as_ref(),
+            &self.folded_facts,
             &self.recall,
             self.recall_budget,
             self.compaction_summary.as_ref(),
@@ -948,6 +951,24 @@ mod tests {
                 .any(|m| m.content.starts_with("Ledger of earlier user instructions")),
             "no standalone ledger block when a goal exists"
         );
+    }
+
+    #[test]
+    fn snapshot_est_total_includes_the_pinned_ledger() {
+        // Non-empty folded_facts, same setup as ledger_rides_inside_the_goal_block.
+        let mut c = ctx();
+        c.folded_facts = vec!["alpha_timeout = 4831".into(), "bravo_retries = 7207".into()];
+        c.append(Message::user("do the thing"));
+        c.append(Message::assistant("on it", None));
+        let snap = c.snapshot(100_000, 1);
+        let history_tokens: usize = c.history().iter().map(message_tokens).sum();
+        assert_eq!(snap.est_total, c.pinned_tokens() + history_tokens);
+        let ledger = snap
+            .segments
+            .iter()
+            .find(|s| s.category == "ledger")
+            .expect("ledger segment present");
+        assert_eq!(ledger.count, c.folded_facts.len());
     }
 
     #[tokio::test]
