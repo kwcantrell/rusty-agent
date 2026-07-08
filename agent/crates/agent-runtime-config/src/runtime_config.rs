@@ -387,6 +387,9 @@ impl RuntimeConfig {
         if self.max_parallel_tools == 0 {
             return Err("max_parallel_tools must be >= 1".into());
         }
+        if self.max_tool_result_bytes < 1024 {
+            return Err("max_tool_result_bytes must be >= 1024".into());
+        }
         if self.context_limit < 1024 {
             return Err("context_limit must be >= 1024".into());
         }
@@ -791,6 +794,17 @@ mod tests {
         assert!(c.validate().unwrap_err().contains("max_parallel_tools"));
         c.max_parallel_tools = 1;
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_floors_max_tool_result_bytes() {
+        let mut c = base();
+        c.max_tool_result_bytes = 0;
+        assert!(c.validate().unwrap_err().contains("max_tool_result_bytes"));
+        c.max_tool_result_bytes = 1023;
+        assert!(c.validate().is_err(), "1023 is below the floor");
+        c.max_tool_result_bytes = 1024;
+        assert!(c.validate().is_ok(), "1024 is the floor");
     }
 
     #[test]
