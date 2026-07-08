@@ -727,11 +727,15 @@ async fn wall_clock_timeout_cancels_the_child_and_reports_timeout() {
     let mut ctx = tool_ctx();
     ctx.timeout = Duration::from_secs(1);
     let started = tokio::time::Instant::now();
-    let err = tool
+    let out = tool
         .execute(serde_json::json!({"prompt": "p"}), &ctx)
         .await
-        .unwrap_err();
-    assert!(matches!(err, ToolError::Timeout), "{err:?}");
+        .unwrap();
+    assert!(
+        out.content.starts_with("[sub-agent timed out after 1s"),
+        "{}",
+        out.content
+    );
     assert_eq!(started.elapsed(), Duration::from_secs(1)); // virtual time: exactly the budget
 }
 
@@ -1192,4 +1196,142 @@ fn description_is_depth_aware() {
         "{}",
         nested.description()
     );
+}
+
+/// Finding 4.4: a child killed by the wall-clock timeout hands its parent the
+/// captured partial transcript instead of a bare ToolError::Timeout.
+#[tokio::test(start_paused = true)]
+async fn timed_out_child_returns_partial_transcript() {
+    use agent_model::{Chunk, RawToolCall, StopReason as MStop};
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            // Turn 1: streams text (captured as a segment) then a tool call, so
+            // the run continues into turn 2.
+            Scripted::Chunks(vec![
+                Chunk::Text("partial progress note".into()),
+                Chunk::ToolCallDelta(RawToolCall {
+                    index: None,
+                    id: Some("c1".into()),
+                    name: Some("echo".into()),
+                    args_fragment: "{}".into(),
+                }),
+                Chunk::Done(MStop::ToolCalls),
+            ]),
+            // Turn 2: hangs; the wall-clock timeout fires (virtual time).
+            Scripted::Hang,
+        ]),
+        sink,
+        vec![Arc::new(Echo)],
+    );
+    d.subagent_timeout = Duration::from_secs(1);
+    let tool = DispatchAgentTool::new(d);
+    let mut ctx = tool_ctx();
+    ctx.timeout = Duration::from_secs(1);
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        out.content
+            .starts_with("[sub-agent timed out after 1s — partial transcript follows]"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("partial progress note"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("stop: timeout"), "{}", out.content);
+}
+
+/// Finding 4.4 (empty capture): a child that produced nothing still reports the
+/// note + footer, with the no-transcript wording and no misleading "stop: Stop".
+#[tokio::test(start_paused = true)]
+async fn timed_out_child_with_no_capture_reports_note_and_footer() {
+    let tool = DispatchAgentTool::new(deps(
+        ScriptedModel::new(vec![Scripted::Hang]),
+        Arc::new(FullSink::default()),
+        vec![],
+    ));
+    let mut ctx = tool_ctx();
+    ctx.timeout = Duration::from_secs(1);
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        out.content
+            .starts_with("[sub-agent timed out after 1s — no partial transcript captured]"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("stop: timeout"),
+        "no Done was recorded — the footer must not claim a clean Stop: {}",
+        out.content
+    );
+    assert!(
+        !out.content.contains("\n\n"),
+        "no blank-line runs: {}",
+        out.content
+    );
+}
+
+/// Finding 4.4: a child whose model fails fatally still hands the parent the
+/// captured partial transcript, with the failure note.
+#[tokio::test]
+async fn failed_child_returns_partial_transcript() {
+    use agent_model::{Chunk, ModelError, RawToolCall, StopReason as MStop};
+    let sink = Arc::new(FullSink::default());
+    let d = deps(
+        ScriptedModel::new(vec![
+            Scripted::Chunks(vec![
+                Chunk::Text("progress so far".into()),
+                Chunk::ToolCallDelta(RawToolCall {
+                    index: None,
+                    id: Some("c1".into()),
+                    name: Some("echo".into()),
+                    args_fragment: "{}".into(),
+                }),
+                Chunk::Done(MStop::ToolCalls),
+            ]),
+            // Status 401 is Fatal on first sight (types.rs class()); a second
+            // Fail keeps the test robust if classification ever loosens.
+            Scripted::Fail(ModelError::Status {
+                code: 401,
+                body: "no auth".into(),
+                retry_after: None,
+            }),
+            Scripted::Fail(ModelError::Status {
+                code: 401,
+                body: "no auth".into(),
+                retry_after: None,
+            }),
+        ]),
+        sink,
+        vec![Arc::new(Echo)],
+    );
+    let tool = DispatchAgentTool::new(d);
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+    assert!(
+        out.content.starts_with("[sub-agent failed: "),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("— partial transcript follows]"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("progress so far"), "{}", out.content);
+    // The child loop emits Done(StopReason::Error) on a fatal model error before
+    // returning Err (loop_.rs), so the sink records that real stop reason — the
+    // footer honestly reports "stop: Error" rather than the "failed" fallback
+    // (which only fires if the child never recorded any Done at all).
+    assert!(out.content.contains("stop: Error"), "{}", out.content);
 }

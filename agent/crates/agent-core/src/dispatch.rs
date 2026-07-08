@@ -196,6 +196,35 @@ impl EventSink for SubagentSink {
     }
 }
 
+/// Build the tool result for a child that died (wall-clock timeout or fatal
+/// model error) from whatever the sink captured — partial results reach the
+/// coordinator instead of being discarded (finding 4.4; mirrors the
+/// budget-exhaustion posture). `stop_fallback` keeps the footer honest when
+/// the child never emitted Done: "timeout" / "failed", never a clean Stop.
+fn failure_output(sink: &SubagentSink, what: String, stop_fallback: &str) -> ToolOutput {
+    let s = sink.summary();
+    let stop_str = match s.stop {
+        Some(r) => format!("{r:?}"),
+        None => stop_fallback.to_string(),
+    };
+    let footer = format!(
+        "[sub-agent: {} turns, {} tool calls, stop: {stop_str}]",
+        s.turns, s.tool_calls
+    );
+    let content = if s.final_text.is_empty() {
+        format!("[{what} — no partial transcript captured]\n{footer}")
+    } else {
+        format!(
+            "[{what} — partial transcript follows]\n{}\n\n{footer}",
+            s.final_text
+        )
+    };
+    ToolOutput {
+        content,
+        display: None,
+    }
+}
+
 /// Everything `DispatchAgentTool` needs to spawn a child `AgentLoop`.
 #[derive(Clone)]
 pub struct DispatchDeps {
@@ -492,13 +521,18 @@ impl Tool for DispatchAgentTool {
         match tokio::time::timeout(ctx.timeout, run).await {
             Err(_elapsed) => {
                 child_cancel.cancel();
-                return Err(ToolError::Timeout);
+                return Ok(failure_output(
+                    &sink,
+                    format!("sub-agent timed out after {}s", ctx.timeout.as_secs()),
+                    "timeout",
+                ));
             }
             Ok(Err(e)) => {
-                return Err(ToolError::Failed {
-                    message: format!("sub-agent failed: {e}"),
-                    stderr: None,
-                })
+                return Ok(failure_output(
+                    &sink,
+                    format!("sub-agent failed: {e}"),
+                    "failed",
+                ));
             }
             Ok(Ok(())) => {}
         }
