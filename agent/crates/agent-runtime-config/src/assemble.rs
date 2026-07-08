@@ -65,6 +65,10 @@ pub struct BuiltLoop {
     /// Did a dedicated compaction model get built and applied?
     #[cfg(test)]
     pub compaction_model_routed: bool,
+    /// (child model_limit, child max_tokens) captured at DispatchDeps build;
+    /// None when subagents are disabled. Pins ModelRef limit inheritance.
+    #[cfg(test)]
+    pub child_loop_knobs: Option<(usize, Option<u32>)>,
 }
 
 /// Resolve the tool-call protocol name for a routed child loop (spec G5).
@@ -116,6 +120,7 @@ pub fn loop_config_from(
         sandbox: build_sandbox(cfg),
         max_parallel_tools: cfg.max_parallel_tools,
         post_tool_validators: cfg.post_tool_validators.clone(),
+        compaction_model_limit: cfg.compaction_model.as_ref().and_then(|m| m.context_limit),
     }
 }
 
@@ -254,6 +259,8 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         .map(|b| b.iter().map(|t| t.name().to_string()).collect());
     #[cfg(test)]
     let mut subagent_model_routed: Option<bool> = None;
+    #[cfg(test)]
+    let mut child_loop_knobs: Option<(usize, Option<u32>)> = None;
     if let Some(child_base) = child_base {
         // Child protocol resolves through child_protocol_name (spec G5/M-1): a
         // ModelRef that switches the child backend to claude-cli defaults to
@@ -278,6 +285,20 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         }
         let mut child_config = loop_config.clone();
         child_config.max_turns = cfg.subagent_max_turns;
+        // Finding 4.2: a routed subagent model's declared limits travel with it;
+        // None inherits the primary knobs already in the clone.
+        if let Some(r) = &cfg.subagent_model {
+            if let Some(cl) = r.context_limit {
+                child_config.model_limit = cl;
+            }
+            if let Some(mt) = r.max_tokens {
+                child_config.max_tokens = Some(mt);
+            }
+        }
+        #[cfg(test)]
+        {
+            child_loop_knobs = Some((child_config.model_limit, child_config.max_tokens));
+        }
         registry.register(Arc::new(agent_core::DispatchAgentTool::new(
             agent_core::DispatchDeps {
                 model: child_model,
@@ -300,6 +321,7 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 depth: 1,
                 max_depth: cfg.subagent_max_depth.max(1),
                 id_prefix: String::new(),
+                description_overrides: cfg.tool_description_overrides.clone(),
             },
         )));
     }
@@ -343,6 +365,8 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         subagent_model_routed,
         #[cfg(test)]
         compaction_model_routed,
+        #[cfg(test)]
+        child_loop_knobs,
     }
 }
 
@@ -439,6 +463,45 @@ mod tests {
             "native".into(),
             8192,
         )
+    }
+
+    #[test]
+    fn loop_config_maps_compaction_model_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        assert_eq!(
+            loop_config_from(&c, dir.path().to_path_buf(), Duration::from_secs(77))
+                .compaction_model_limit,
+            None
+        );
+        c.compaction_model = Some(crate::ModelRef {
+            context_limit: Some(4096),
+            ..Default::default()
+        });
+        assert_eq!(
+            loop_config_from(&c, dir.path().to_path_buf(), Duration::from_secs(77))
+                .compaction_model_limit,
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn routed_subagent_window_reaches_child_config() {
+        let dir = tempfile::tempdir().unwrap();
+        // Unset: child inherits the primary knobs.
+        let mut c = cfg();
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        let (ml, mt) = built.child_loop_knobs.expect("subagents on by default");
+        assert_eq!(ml, c.context_limit);
+        assert_eq!(mt, Some(c.max_tokens));
+        // Set: the ModelRef limits override the child clone.
+        c.subagent_model = Some(crate::ModelRef {
+            context_limit: Some(2048),
+            max_tokens: Some(256),
+            ..Default::default()
+        });
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        assert_eq!(built.child_loop_knobs, Some((2048, Some(256))));
     }
 
     #[test]
