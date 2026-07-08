@@ -43,9 +43,25 @@ before approving (the opposite of the stock "approve unless broken" reviewers).
 Then **synthesize** (dedup, resolve conflicts, rank by severity) and feed that into
 the user's spec-review gate — the panel *arms* the human gate, it doesn't replace it.
 
+When fanning out sub-agents (here or anywhere), **match model tier to the task**:
+light models (haiku/sonnet) for fetch-and-compare verification and mechanical
+sweeps; heavyweight models for synthesis and adversarial judgment.
+
 Keep plan review as-is (single reviewer: spec coverage, decomposition, buildability).
 Only add a *lighter* adversarial pass on the plan — scoped to architecture/decomposition,
 **not** requirements — if real design decisions leak downstream into the plan.
+
+### Research artifacts feed specs — verify them first
+
+Research/knowledge artifacts a spec will consume (OKF bundles, gap analyses,
+architecture comparisons) get two review shapes **before** they count as spec
+input: an adversarial fact-verification pass (independent skeptics refuting
+claims against primary sources / live code) and a final consistency +
+completeness review. They're complementary — per-claim refuters can't see
+stale copies of corrected claims; a consistency pass can't detect false
+facts. Record both as dated entries in the artifact's log; design judgments
+stay unverified and go to the spec panel. Mechanics:
+`.agents/skills/agent-sdlc/authoring.md`.
 
 ### Docs-only exception
 

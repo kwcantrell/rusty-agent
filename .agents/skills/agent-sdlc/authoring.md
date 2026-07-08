@@ -95,3 +95,29 @@ the citation check even when it resolves.
 `resource:` on Sources, link/citation/index integrity). Whether a node's claims
 still match its live `resource:` is **semantic drift** — re-verify against the
 source periodically and record the pass as a dated `log.md` entry.
+
+## Verification passes for research bundles
+
+Before any bundle counts as spec input (AGENTS.md § How we work), run two
+review shapes — single-pass synthesis ships confident errors — and log each
+as a dated `log.md` entry:
+
+1. **Adversarial fact-verification.** Independent skeptical sub-agents, one
+   per claim domain, prompted to *refute* (not confirm) each factual claim:
+   external claims against live primary sources, repo claims against live
+   code with file:line evidence. Verdicts per claim: CONFIRMED / REFUTED
+   (with correction) / UNVERIFIABLE. Light models (sonnet-tier) suffice —
+   this is fetch-and-compare work.
+2. **Final consistency + completeness review.** After corrections land, one
+   read-only pass over the whole bundle: hunt stale copies of corrected
+   claims and internal contradictions (do tables agree with prose? do
+   numbers match everywhere?); then ask what's *missing* — uncovered
+   capabilities, uncited rows, claims with no upstream support in the
+   bundle, index promises the files don't keep.
+
+The shapes are complementary: per-claim refuters can't see stale copies of
+their own corrections propagated elsewhere; a consistency pass can't detect
+false facts. Design judgments (sequencing, scope calls) are **not** verified
+this way — mark them unvalidated in `log.md` and route them to the
+spec-phase adversarial panel. Worked example: `docs/okf/deepagents-refactor/log.md`
+(2026-07-08 entries).
