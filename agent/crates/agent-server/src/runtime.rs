@@ -142,6 +142,9 @@ impl RuntimeState {
     pub fn apply(&self, incoming: RuntimeConfig) -> Result<(), String> {
         let cfg = incoming.normalized();
         cfg.validate()?;
+        for w in cfg.warnings() {
+            tracing::warn!(target: "config", "{w}");
+        }
         {
             // Guard against external edits since our last read/write. A TOCTOU window exists:
             // an external edit landing between this check and the save below is clobbered (single-daemon semantics, accepted).

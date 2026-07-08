@@ -225,6 +225,9 @@ async fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
+    for w in rt.warnings() {
+        eprintln!("warning: {w}");
+    }
     let model = build_model(
         &cli.backend,
         &cli.base_url,
@@ -404,6 +407,16 @@ mod tests {
         let rc = runtime_config_from_cli(&cli, "prompted");
         let err = rc.validate().unwrap_err();
         assert!(err.contains("claude_effort"), "got: {err}");
+    }
+
+    #[test]
+    fn cli_bad_sandbox_mode_fails_validate() {
+        // Audit 3.3 pin: the gate itself shipped in claude-cli-followups
+        // (rt.validate() + exit 2); this pins that a typo'd mode trips it.
+        let cli = Cli::parse_from(["agent-cli", "--sandbox-mode", "enfore"]);
+        let rc = runtime_config_from_cli(&cli, "prompted");
+        let err = rc.validate().unwrap_err();
+        assert!(err.contains("sandbox_mode"), "got: {err}");
     }
 
     #[test]

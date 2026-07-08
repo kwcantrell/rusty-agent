@@ -14,6 +14,11 @@ pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// the forkbomb signature live here as substring backstop literals.
 pub const HARD_FLOOR_DENYLIST: &[&str] = &["rm -rf /", ":(){", "dd if="];
 
+/// Leading tokens that hollow the hard floor if allowlisted: a quoted wrapper
+/// (`bash -c "sudo …"`) is a single token the command scanner cannot see
+/// (agent-policy command.rs KNOWN LIMITATION).
+const INTERPRETER_TOKENS: [&str; 8] = ["bash", "sh", "zsh", "dash", "ksh", "eval", "xargs", "env"];
+
 /// Partial model override (spec 2026-07-02 sub-spec #3, G1): every `None`
 /// inherits the primary config's value, so `{"model": "haiku"}` just works.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -439,6 +444,27 @@ impl RuntimeConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Advisory config lints (audit 5.2). Non-fatal by owner decision —
+    /// `validate()` stays reject-only; frontends surface these (CLI stderr,
+    /// server tracing::warn).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for entry in &self.command_allowlist {
+            let Some(first) = entry.split_whitespace().next() else {
+                continue;
+            };
+            let base = first.rsplit('/').next().unwrap_or(first);
+            if INTERPRETER_TOKENS.contains(&base) {
+                out.push(format!(
+                    "command_allowlist entry '{entry}' auto-allows a shell interpreter / \
+                     exec vehicle: wrappers like `{base} -c \"…\"` bypass the command \
+                     scanner (command.rs KNOWN LIMITATION) — remove it unless deliberate"
+                ));
+            }
+        }
+        out
     }
 
     /// The denylist actually handed to `RulePolicy`: the immutable hard floor unioned
@@ -1440,6 +1466,41 @@ mod tests {
         let mut cfg = base();
         cfg.system_prompt_override = Some("   \n".into());
         assert!(cfg.normalized().system_prompt_override.is_none());
+    }
+
+    #[test]
+    fn warnings_flag_interpreters_in_command_allowlist() {
+        let mut c = RuntimeConfig::from_launch(
+            "openai".into(),
+            "http://x".into(),
+            "m".into(),
+            "native".into(),
+            8192,
+        );
+        for entry in ["bash", "/bin/bash", "xargs -0"] {
+            c.command_allowlist = vec![entry.to_string()];
+            let w = c.warnings();
+            assert_eq!(w.len(), 1, "'{entry}' must warn");
+            assert!(w[0].contains(entry));
+        }
+        for entry in ["git status", "cargo build", "ls"] {
+            c.command_allowlist = vec![entry.to_string()];
+            assert!(c.warnings().is_empty(), "'{entry}' must not warn");
+        }
+    }
+
+    #[test]
+    fn default_config_is_warning_free() {
+        // Guard against warn fatigue: a plain run must print nothing.
+        let mut c = RuntimeConfig::from_launch(
+            "openai".into(),
+            "http://x".into(),
+            "m".into(),
+            "native".into(),
+            8192,
+        );
+        c.command_allowlist = crate::default_allowlist();
+        assert!(c.warnings().is_empty());
     }
 
     #[test]
