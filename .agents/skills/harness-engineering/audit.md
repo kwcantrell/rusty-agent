@@ -855,6 +855,39 @@ containment canonicalize→spawn TOCTOU is accepted in-threat-model (requires wo
 which already grants in-workspace script execution), and `start()`'s discovery-timeout path
 keeps its graceless SIGKILL by design.
 
+Re-stamp note (2026-07-07, audit-drain cluster 4/6 — sub-agent composition; merge `1c984f5`;
+spec `docs/superpowers/specs/2026-07-07-audit-subagent-composition-design.md`, plan
+`docs/superpowers/plans/2026-07-07-audit-subagent-composition.md`): five findings closed —
+the seams between July's individually-reviewed sub-agent clusters. **4.1** —
+`DispatchDeps.description_overrides` threads `cfg.tool_description_overrides` into every
+child registry (`set_description_overrides` after all child registrations; nested deps clone
+carries it to grandchildren), restoring the override seam's parent/child uniformity claim;
+pinned by a schema-capturing child-request test. **4.2** — `ModelRef` gains additive
+`context_limit`/`max_tokens` (inherit-on-None, ≥1024 validate floor on both routed refs);
+a routed subagent model's limits override the child `LoopConfig` clone, and a routed
+compaction model's window caps the maintenance target via
+`maint_model_limit() = min(effective, compaction window)` at exactly the three `MaintCtx`
+sites — build/request sizing untouched, inert unless configured. **4.3** — the budget
+wrap-up prompt is injected into the request messages only; durable history keeps just the
+assistant summary (two-run pin + failed-wrap-up pin + wire-level request-capture guard).
+Final-review fix `db7de6a`: the build now reserves `built_tokens`-denominated headroom for
+the injected prompt so the single no-recovery wrap-up request cannot overshoot the window
+(RED 449>400 → GREEN pin). **4.4** — timeout and fatal-failure dispatch arms return the
+child's captured partial transcript (`failure_output`: loud note + transcript + honest
+footer; no `unwrap_or(Stop)` — recorded stop or the failure kind; owner-adjudicated Ok
+posture, parent-cancel stays Err). Discovery: a fatally-failed child always records
+`Done(Error)` first, so the footer says `stop: Error` and the `failed` fallback is defensive
+dead code. **2.3≡4.5** — `dispatch_agent`'s description is depth-computed at construction
+("minus dispatch_agent itself" only at the depth floor; nested variant matches the
+tools-param prose), floor text byte-identical. Whole-branch review: READY TO MERGE — all five
+cross-task seams verified clean (override uniformity via the schemas()-only prose path,
+mirrored budget postures, sink still captures wrap-up tokens, clone-after-loop_config
+ordering); accepted residuals in the cluster ledger — notable: per-dispatch warn noise when
+an override names a tool absent from a child registry (e.g. a `dispatch_agent` override at
+`max_depth=1`), `ModelRef.max_tokens` inert for `compaction_model` (doc-scope), duplicated
+footer format string across success/failure paths, no end-to-end child-maintains-at-min()
+test (indirect pin chain accepted).
+
 ---
 
 ## Top highest-leverage fixes
