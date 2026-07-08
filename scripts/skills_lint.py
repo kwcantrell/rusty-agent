@@ -6,14 +6,16 @@ Checks:
      whose `name` is legal (<=64 chars of [a-z0-9-], no "claude"/"anthropic")
      and equals the directory name, and whose `description` is non-empty and
      <=1024 chars (block scalars measured as the space-joined text).
-  2. Every .agents/skills/<name>/ has a symlink .claude/skills/<name> resolving
-     to it; no stray or dangling entries under .claude/skills/.
+  2. Every .agents/skills/<name>/ has a symlink .claude/skills/<name> with the
+     literal relative target '../../.agents/skills/<name>'; no stray or dangling
+     entries under .claude/skills/.
 
 Stdlib-only (no PyYAML on this machine); frontmatter is parsed with regexes that
 cover the plain and block-scalar (>-, >, |, |-) description forms used here.
 
 Usage: python3 scripts/skills_lint.py [repo_root]   # exit 0 clean, 1 violations
 """
+import os
 import re
 import sys
 from pathlib import Path
@@ -70,12 +72,15 @@ def lint(root):
             elif len(desc) > 1024:
                 errors.append(f"{rel}/SKILL.md: description is {len(desc)} chars (max 1024)")
         link = mirror / d.name
+        expected_target = f"../../.agents/skills/{d.name}"
         if not link.is_symlink():
-            errors.append(f".claude/skills/{d.name}: missing symlink -> ../../{rel}")
-        elif link.resolve() != d.resolve():
-            errors.append(
-                f".claude/skills/{d.name}: resolves to {link.resolve()}, expected {d.resolve()}"
-            )
+            errors.append(f".claude/skills/{d.name}: missing symlink -> {expected_target}")
+        else:
+            actual = os.readlink(link)
+            if actual != expected_target:
+                errors.append(
+                    f".claude/skills/{d.name}: target {actual!r}, expected {expected_target!r}"
+                )
 
     if mirror.is_dir():
         expected = {d.name for d in skills}

@@ -86,6 +86,22 @@ class SkillsLintTest(unittest.TestCase):
         self.add_skill("alpha", link=False)
         self.assertTrue(any("directory missing" in e for e in skills_lint.lint(self.root)))
 
+    def test_wrong_target_symlink(self):
+        self.add_skill("alpha", link=False)
+        (self.root / ".claude" / "skills" / "alpha").symlink_to(
+            Path("../../.agents/skills/beta")
+        )
+        errors = skills_lint.lint(self.root)
+        self.assertTrue(any("expected '../../.agents/skills/alpha'" in e for e in errors))
+
+    def test_absolute_target_symlink(self):
+        self.add_skill("alpha", link=False)
+        (self.root / ".claude" / "skills" / "alpha").symlink_to(
+            self.root / ".agents" / "skills" / "alpha"
+        )
+        errors = skills_lint.lint(self.root)
+        self.assertTrue(any("expected '../../.agents/skills/alpha'" in e for e in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

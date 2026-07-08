@@ -2,7 +2,7 @@
 # Single source of truth for the CI gate — run by .githooks/pre-push and
 # .github/workflows/ci.yml. src-tauri runs conditionally: it needs GTK/WebKitGTK
 # dev deps (absent on the GitHub runner, present on dev machines). Its fmt is
-# never checked — src-tauri is hand-formatted by convention (CLAUDE.md).
+# never checked — src-tauri is hand-formatted by convention (src-tauri/AGENTS.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

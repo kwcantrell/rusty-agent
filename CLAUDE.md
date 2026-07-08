@@ -19,3 +19,4 @@ It exists — use it.
 - Full judgment lives in the `graphify-best-practices` skill — reach for it alongside any graph work.
 - **The graph reflects the last build and can be stale.** Read live source before editing;
   `--update` after doc/image changes (code changes re-extract for free).
+- **The SDLC in AGENTS.md § How we work is driven by the superpowers skills** — brainstorm/plan/execute via `superpowers:*`; reach for them at each phase.
