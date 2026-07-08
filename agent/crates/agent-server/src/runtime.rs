@@ -65,6 +65,12 @@ impl RuntimeState {
         base_system_prompt: String,
     ) -> Self {
         let config = config.normalized();
+        // Startup stays lenient (no validate() — an unknown preset is warned + dropped
+        // in build_loop so the daemon always boots), but surface soft warnings so a
+        // no-op-inducing config (e.g. a bash allowlist entry) is visible in the log.
+        for w in config.warnings() {
+            tracing::warn!(target: "config", "{w}");
+        }
         let offload_store: Arc<dyn OffloadStore> =
             Arc::new(agent_core::InMemoryOffloadStore::new());
         let compact_flag = Arc::new(AtomicBool::new(false));
@@ -142,9 +148,6 @@ impl RuntimeState {
     pub fn apply(&self, incoming: RuntimeConfig) -> Result<(), String> {
         let cfg = incoming.normalized();
         cfg.validate()?;
-        for w in cfg.warnings() {
-            tracing::warn!(target: "config", "{w}");
-        }
         {
             // Guard against external edits since our last read/write. A TOCTOU window exists:
             // an external edit landing between this check and the save below is clobbered (single-daemon semantics, accepted).
@@ -181,6 +184,12 @@ impl RuntimeState {
         }
         cfg.save(&self.config_path)
             .map_err(|e| format!("persist failed: {e}"))?;
+        // Warn only now that nothing can fail: a config rejected as validate-bad,
+        // externally-changed, unknown-preset, or persist-failed never logs its soft
+        // warnings (it was never accepted).
+        for w in cfg.warnings() {
+            tracing::warn!(target: "config", "{w}");
+        }
         // Record what save() just wrote. If the re-read transiently fails, fall back
         // to the serialization we know it wrote — a None here would make the next
         // apply() spuriously refuse as "changed externally".
