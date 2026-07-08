@@ -239,6 +239,11 @@ enum TraceEvent<'a> {
         discarded_text_chars: usize,
         discarded_reasoning_chars: usize,
     },
+    RunStart {
+        input: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system: Option<&'a str>,
+    },
 }
 
 fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
@@ -348,6 +353,10 @@ fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
         } => TraceEvent::StreamRetry {
             discarded_text_chars: *discarded_text_chars,
             discarded_reasoning_chars: *discarded_reasoning_chars,
+        },
+        AgentEvent::RunStart { input, system } => TraceEvent::RunStart {
+            input,
+            system: system.as_deref(),
         },
     }
 }
@@ -466,6 +475,46 @@ mod tests {
         assert!(lines[2].contains(r#""parent_id":"d1""#), "{}", lines[2]);
         // seq stays monotonic across both write paths:
         assert!(lines[2].contains(r#""seq":1"#), "{}", lines[2]);
+    }
+
+    #[test]
+    fn run_start_record_carries_input_and_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = TraceWriter::create(dir.path(), 64).unwrap();
+        t.record(&AgentEvent::RunStart {
+            input: "fix the bug".into(),
+            system: Some("SYSTEM PROMPT".into()),
+        });
+        t.record(&AgentEvent::Done(agent_model::StopReason::Stop)); // flushes the BufWriter
+        let content =
+            std::fs::read_to_string(dir.path().join(format!("{}.jsonl", t.session_id()))).unwrap();
+        let line = content.lines().nth(1).expect("record after header");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["event"]["type"], "run_start");
+        assert_eq!(v["event"]["input"], "fix the bug");
+        assert_eq!(v["event"]["system"], "SYSTEM PROMPT");
+    }
+
+    #[test]
+    fn child_run_start_joins_via_parent_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = TraceWriter::create(dir.path(), 64).unwrap();
+        t.record_child(
+            2,
+            "call-7",
+            &AgentEvent::RunStart {
+                input: "child task".into(),
+                system: None,
+            },
+        );
+        t.record(&AgentEvent::Done(agent_model::StopReason::Stop)); // flushes the BufWriter
+        let content =
+            std::fs::read_to_string(dir.path().join(format!("{}.jsonl", t.session_id()))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(v["event"]["type"], "run_start");
+        assert_eq!(v["sub"], 2);
+        assert_eq!(v["parent_id"], "call-7");
+        assert!(v["event"].get("system").is_none(), "None system is omitted");
     }
 
     #[test]

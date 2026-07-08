@@ -203,6 +203,10 @@ impl ContextManager for CuratedContext {
         self.recall = items;
     }
 
+    fn system(&self) -> Option<&Message> {
+        Some(&self.system)
+    }
+
     fn set_goal(&mut self, goal: String) {
         if self.goal.is_none() {
             // Cap the pin at GOAL_MAX_TOKENS estimated tokens (char-prefix via the
@@ -630,6 +634,13 @@ mod tests {
             Arc::new(InMemoryOffloadStore::new()),
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn curated_context_system_getter_returns_the_system_message() {
+        let c = ctx();
+        let sys = c.system().expect("CuratedContext always holds a system");
+        assert_eq!(sys.content, "SYS");
     }
 
     fn parent(id: &str) -> Message {

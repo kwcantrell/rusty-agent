@@ -464,6 +464,14 @@ impl AgentLoop {
             });
         }
 
+        // Record the run's inputs for trace replay / eval harvest (audit 6.1).
+        // Full user input + composed system prompt, every run (owner call — no
+        // dedup). Never a wire frame; ObservedSink writes it to the trace.
+        self.sink.emit(AgentEvent::RunStart {
+            input: user_input.clone(),
+            system: ctx.system().map(|m| m.content.clone()),
+        });
+
         if let Some(retriever) = &self.retriever {
             // Unconditional: an empty retrieval clears the prior run's recall
             // block (contexts persist across runs). set_recall(vec![]) renders
@@ -2176,10 +2184,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Stopped at the turn boundary: only the terminal Done(Cancelled) event, no
-        // Usage / Token events (the model was never consulted).
+        // Stopped at the turn boundary: the run-inputs record (emitted at run
+        // start, audit 6.1) then the terminal Done(Cancelled) — no Usage / Token
+        // events (the model was never consulted).
         let events = sink.events.lock().unwrap().clone();
-        assert_eq!(events, vec!["done".to_string()], "events were: {events:?}");
+        assert_eq!(
+            events,
+            vec![
+                "run_start:go:system_none=false".to_string(),
+                "done".to_string()
+            ],
+            "events were: {events:?}"
+        );
     }
 
     struct HangsUntilCancel {
@@ -4289,6 +4305,66 @@ mod tests {
         assert!(
             events.iter().any(|e| e == "sandbox_degraded:docker"),
             "degraded sandbox must be surfaced even with no tool calls: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_emits_run_start_with_the_exact_input() {
+        // Finding 6.1: the run's inputs land in the event stream (and thus the
+        // trace) before any model output, so a failed top-level turn is
+        // replayable from the trace alone.
+        struct StubCtx(Vec<Message>);
+        #[async_trait::async_trait]
+        impl ContextManager for StubCtx {
+            fn append(&mut self, msg: Message) {
+                self.0.push(msg);
+            }
+            fn build(&self, _model_limit: usize) -> Vec<Message> {
+                self.0.clone()
+            }
+            fn set_system(&mut self, _system: Message) {}
+            // `system()` deliberately left at the trait default (None).
+        }
+
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("hi".into())]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = StubCtx(Vec::new());
+        agent.run(&mut ctx, "hello world".into()).await.unwrap();
+
+        let events = sink.events.lock().unwrap().clone();
+        // Exact input, and system None for a stub context without one.
+        let run_start = events
+            .iter()
+            .position(|e| e == "run_start:hello world:system_none=true")
+            .unwrap_or_else(|| panic!("RunStart with the exact input: {events:?}"));
+        let first_output = events
+            .iter()
+            .position(|e| e.starts_with("token:") || e.starts_with("tool_start:"))
+            .expect("the scripted turn streams a token");
+        assert!(
+            run_start < first_output,
+            "RunStart must precede any Token/ToolStart: {events:?}"
         );
     }
 

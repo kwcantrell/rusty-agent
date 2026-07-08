@@ -116,6 +116,15 @@ pub enum AgentEvent {
         discarded_text_chars: usize,
         discarded_reasoning_chars: usize,
     },
+    /// Emitted once at run start with the run's inputs, so a failed top-level
+    /// turn is replayable from the trace alone and traces can be harvested into
+    /// eval datasets (audit 6.1). `system` is the composed system prompt as the
+    /// context manager holds it at run start (None for managers without one).
+    /// Wire: never forwarded to frontends (server_event_from maps it to None).
+    RunStart {
+        input: String,
+        system: Option<String>,
+    },
 }
 
 pub trait EventSink: Send + Sync {

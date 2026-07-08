@@ -312,6 +312,8 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
             reason: stop_reason_str(&r).into(),
         },
         AgentEvent::Approval(_) => return None,
+        // Trace-only record (audit 6.1); never a wire frame (old-SPA compat).
+        AgentEvent::RunStart { .. } => return None,
         AgentEvent::Context(c) => {
             use agent_core::ContextEvent as CE;
             let (kind, detail) = match c {
@@ -514,6 +516,16 @@ mod tests {
         let ev = server_event_from(AgentEvent::Token("hi".into())).unwrap();
         let j = serde_json::to_string(&ev).unwrap();
         assert_eq!(j, r#"{"type":"token","text":"hi"}"#);
+    }
+
+    #[test]
+    fn run_start_is_not_a_wire_frame() {
+        // Old-SPA compat: RunStart must never reach the browser (audit 6.1).
+        assert!(server_event_from(AgentEvent::RunStart {
+            input: "x".into(),
+            system: None,
+        })
+        .is_none());
     }
 
     #[test]
