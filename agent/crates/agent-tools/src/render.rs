@@ -78,8 +78,10 @@ impl Tool for RenderArtifact {
                     "lang": {"type": "string", "description": "code language (kind=code)"},
                     "filename": {"type": "string", "description": "code filename (kind=code)"},
                     "mime": {"type": "string", "description": "image mime type (kind=image)"},
-                    "columns": {"type": "array", "items": {"type": "string"}},
-                    "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}}
+                    "columns": {"type": "array", "items": {"type": "string"},
+                        "description": "table column headers (kind=table)"},
+                    "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}},
+                        "description": "table rows, one cell string per column (kind=table)"}
                 },
                 "required": ["kind"]
             }),

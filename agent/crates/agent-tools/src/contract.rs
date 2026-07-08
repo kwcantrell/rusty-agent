@@ -24,27 +24,37 @@ pub const CONFUSABLE_TOOLS: &[&str] = &[
 ];
 
 /// Names of `schema`'s required params whose `properties[name].description` is
-/// missing or empty. Empty vec = compliant.
+/// missing or empty, including required params of array-`items` object schemas
+/// (reported as `parent[].child`). Empty vec = compliant.
+/// Scope is deliberately array-items only (audit 2.4): plain object properties
+/// with their own `required` don't occur in our schemas, and recursing into
+/// them would flood the warn-only MCP connect-time lint.
 pub fn required_params_missing_description(schema: &ToolSchema) -> Vec<String> {
-    let params = &schema.parameters;
-    let required = params
-        .get("required")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let props = params.get("properties").and_then(|v| v.as_object());
-    required
-        .iter()
-        .filter_map(|r| r.as_str())
-        .filter(|name| {
+    let mut out = Vec::new();
+    collect_missing(&schema.parameters, "", &mut out);
+    out
+}
+
+fn collect_missing(obj: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+    let props = obj.get("properties").and_then(|v| v.as_object());
+    if let Some(required) = obj.get("required").and_then(|r| r.as_array()) {
+        for name in required.iter().filter_map(|v| v.as_str()) {
             let desc = props
-                .and_then(|o| o.get(*name))
+                .and_then(|o| o.get(name))
                 .and_then(|prop| prop.get("description"))
                 .and_then(|d| d.as_str());
-            desc.map(|s| s.trim().is_empty()).unwrap_or(true)
-        })
-        .map(|s| s.to_string())
-        .collect()
+            if desc.map(|s| s.trim().is_empty()).unwrap_or(true) {
+                out.push(format!("{prefix}{name}"));
+            }
+        }
+    }
+    for (name, prop) in props.into_iter().flatten() {
+        if let Some(items) = prop.get("items") {
+            if items.get("properties").is_some() {
+                collect_missing(items, &format!("{prefix}{name}[]."), out);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +102,49 @@ mod tests {
         let s = schema(json!({"type":"object",
             "properties":{"path":{"type":"string","description":"p"},"k":{"type":"integer"}},
             "required":["path"]}));
+        assert!(required_params_missing_description(&s).is_empty());
+    }
+
+    #[test]
+    fn nested_array_item_required_params_are_flagged() {
+        // Audit 2.4: required params inside array `items` object schemas are
+        // part of the tool contract too.
+        let s = schema(json!({"type":"object",
+            "properties":{
+                "files":{"type":"array","description":"bundled files","items":{
+                    "type":"object",
+                    "properties":{
+                        "path":{"type":"string"},
+                        "content":{"type":"string","description":"file body"}},
+                    "required":["path","content"]}}},
+            "required":[]}));
+        assert_eq!(
+            required_params_missing_description(&s),
+            vec!["files[].path".to_string()]
+        );
+    }
+
+    #[test]
+    fn described_nested_array_item_params_are_compliant() {
+        let s = schema(json!({"type":"object",
+            "properties":{
+                "files":{"type":"array","description":"bundled files","items":{
+                    "type":"object",
+                    "properties":{
+                        "path":{"type":"string","description":"where"},
+                        "content":{"type":"string","description":"what"}},
+                    "required":["path","content"]}}},
+            "required":[]}));
+        assert!(required_params_missing_description(&s).is_empty());
+    }
+
+    #[test]
+    fn string_items_arrays_are_ignored() {
+        // Arrays of scalars (tags, columns) have no nested contract to check.
+        let s = schema(json!({"type":"object",
+            "properties":{"tags":{"type":"array","description":"labels",
+                "items":{"type":"string"}}},
+            "required":[]}));
         assert!(required_params_missing_description(&s).is_empty());
     }
 }
