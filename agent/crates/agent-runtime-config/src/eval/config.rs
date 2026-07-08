@@ -181,8 +181,9 @@ mod tests {
         assert!(f.high_water_pct >= 1.0);
         assert_eq!(f.offload_config().output_min_bytes, usize::MAX);
         assert_eq!(f.offload_config().error_min_bytes, usize::MAX);
-        // Ingestion cap is neutralized for the whole eval harness (not part of
-        // the candidate genome) — otherwise a size-based cap would apply.
+        // Ingestion cap is neutralized by DEFAULT (None = cap off); candidates
+        // may opt into a realistic cap via max_result_bytes (harness-evolve
+        // genome axis 8) — favorable stays cap-off.
         assert_eq!(f.offload_config().max_result_bytes, usize::MAX);
         assert!(f.auto_recall && f.relevance_threshold <= 0.001);
     }
