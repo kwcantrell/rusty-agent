@@ -112,6 +112,10 @@ pub struct LoopConfig {
     pub max_parallel_tools: usize,
     /// Shell commands run after a mutating turn (see RuntimeConfig). Empty = off.
     pub post_tool_validators: Vec<String>,
+    /// Declared context window of a routed compaction model; None = same as
+    /// `model_limit`. Maintenance targets min(model window, this) — a span the
+    /// compactor cannot read cannot be evicted (finding 4.2).
+    pub compaction_model_limit: Option<usize>,
 }
 
 impl Default for LoopConfig {
@@ -139,6 +143,7 @@ impl Default for LoopConfig {
             sandbox: std::sync::Arc::new(agent_tools::HostExecutor),
             max_parallel_tools: 0,
             post_tool_validators: Vec::new(),
+            compaction_model_limit: None,
         }
     }
 }
@@ -224,6 +229,15 @@ impl AgentLoop {
             .load(std::sync::atomic::Ordering::Relaxed) as f64
             / 1e6;
         ((self.config.model_limit as f64 / ratio) as usize).max(1)
+    }
+
+    /// The window maintenance targets: the calibrated loop window, further
+    /// capped by a routed compaction model's declared window (finding 4.2).
+    fn maint_model_limit(&self) -> usize {
+        match self.config.compaction_model_limit {
+            Some(cl) => self.effective_model_limit().min(cl),
+            None => self.effective_model_limit(),
+        }
     }
 
     /// Fold one completed request's ground-truth prompt_tokens against our chars/4
@@ -524,7 +538,7 @@ impl AgentLoop {
                             .emit(AgentEvent::Context(crate::ContextEvent::OverflowRecovery));
                         ctx.request_compaction();
                         let deps = crate::MaintCtx {
-                            model_limit: self.effective_model_limit(),
+                            model_limit: self.maint_model_limit(),
                             model: self.maint_model(),
                             sink: &self.sink,
                             cancel: &cancel,
@@ -711,7 +725,7 @@ impl AgentLoop {
                 // maintain-start-of-turn spec.)
                 if !run_maintained {
                     let deps = crate::MaintCtx {
-                        model_limit: self.effective_model_limit(),
+                        model_limit: self.maint_model_limit(),
                         model: self.maint_model(),
                         sink: &self.sink,
                         cancel: &cancel,
@@ -991,7 +1005,7 @@ impl AgentLoop {
             }
 
             let deps = crate::MaintCtx {
-                model_limit: self.effective_model_limit(),
+                model_limit: self.maint_model_limit(),
                 model: self.maint_model(),
                 sink: &self.sink,
                 cancel: &cancel,
@@ -1459,6 +1473,35 @@ mod tests {
             name: "read_file".into(),
             args: serde_json::json!({}),
         }
+    }
+
+    /// Finding 4.2: the maintenance target is the min of the loop window and a
+    /// routed compaction model's declared window — a span the compactor can't
+    /// read can't be evicted. None = unchanged.
+    #[test]
+    fn maint_model_limit_is_min_of_loop_and_compaction_windows() {
+        let mk = |compaction_model_limit| {
+            AgentLoop::new(
+                Arc::new(ScriptedModel::new(vec![])),
+                Arc::new(PassthroughProtocol),
+                registry(),
+                policy(std::env::temp_dir()),
+                Arc::new(AlwaysApprove),
+                Arc::new(CollectingSink::default()),
+                LoopConfig {
+                    model_limit: 10_000,
+                    compaction_model_limit,
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(mk(None).maint_model_limit(), 10_000);
+        assert_eq!(mk(Some(4_000)).maint_model_limit(), 4_000);
+        assert_eq!(
+            mk(Some(20_000)).maint_model_limit(),
+            10_000,
+            "a larger compaction window never widens the target"
+        );
     }
 
     #[test]

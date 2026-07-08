@@ -30,6 +30,14 @@ pub struct ModelRef {
     /// compaction ignores it (plain completion).
     #[serde(default)]
     pub protocol: Option<String>,
+    /// Context window of the routed model; None inherits the primary's
+    /// `context_limit`. Applied to child loops' `model_limit` (subagent_model)
+    /// and, via min(), to the maintenance target (compaction_model).
+    #[serde(default)]
+    pub context_limit: Option<usize>,
+    /// Per-completion output cap for the routed model; None inherits.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 impl ModelRef {
@@ -382,6 +390,16 @@ impl RuntimeConfig {
         if self.context_limit < 1024 {
             return Err("context_limit must be >= 1024".into());
         }
+        for (name, r) in [
+            ("subagent_model", &self.subagent_model),
+            ("compaction_model", &self.compaction_model),
+        ] {
+            if let Some(cl) = r.as_ref().and_then(|r| r.context_limit) {
+                if cl < 1024 {
+                    return Err(format!("{name}.context_limit must be >= 1024"));
+                }
+            }
+        }
         if let Some(v) = self.top_p {
             if !(0.0..=1.0).contains(&v) {
                 return Err("top_p must be between 0.0 and 1.0".into());
@@ -654,6 +672,41 @@ mod tests {
             "native".into(),
             8192,
         )
+    }
+
+    #[test]
+    fn modelref_window_fields_default_none_and_parse() {
+        // Old JSON (no new fields) parses with None — back-compat.
+        let r: ModelRef = serde_json::from_str(r#"{"model": "mini"}"#).unwrap();
+        assert_eq!(r.context_limit, None);
+        assert_eq!(r.max_tokens, None);
+        let r: ModelRef =
+            serde_json::from_str(r#"{"model": "mini", "context_limit": 8192, "max_tokens": 512}"#)
+                .unwrap();
+        assert_eq!(r.context_limit, Some(8192));
+        assert_eq!(r.max_tokens, Some(512));
+    }
+
+    #[test]
+    fn validate_floors_routed_model_context_limits() {
+        let mut c = base();
+        c.subagent_model = Some(ModelRef {
+            context_limit: Some(1023),
+            ..Default::default()
+        });
+        assert!(c.validate().is_err(), "subagent_model floor");
+        c.subagent_model = Some(ModelRef {
+            context_limit: Some(1024),
+            ..Default::default()
+        });
+        assert!(c.validate().is_ok(), "1024 is the floor, inclusive");
+        c.compaction_model = Some(ModelRef {
+            context_limit: Some(512),
+            ..Default::default()
+        });
+        assert!(c.validate().is_err(), "compaction_model floor");
+        c.compaction_model = Some(ModelRef::default());
+        assert!(c.validate().is_ok(), "None inherits — always valid");
     }
 
     #[test]
