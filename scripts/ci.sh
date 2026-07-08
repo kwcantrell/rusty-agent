@@ -12,6 +12,10 @@ echo "==> okf bundle check"
 python3 scripts/test_okf_check.py
 python3 scripts/okf_check.py docs/okf/agent-sdlc
 
+echo "==> skills lint"
+python3 scripts/test_skills_lint.py
+python3 scripts/skills_lint.py
+
 echo "==> cargo fmt --check"
 (cd agent && cargo fmt --all --check)
 
