@@ -888,6 +888,41 @@ an override names a tool absent from a child registry (e.g. a `dispatch_agent` o
 footer format string across success/failure paths, no end-to-end child-maintains-at-min()
 test (indirect pin chain accepted).
 
+Re-stamp note (2026-07-07, audit-drain cluster 5/6 — context/trace/config guards; merge
+`35a9cea`; spec `docs/superpowers/specs/2026-07-07-audit-context-config-guards-design.md`,
+plan `docs/superpowers/plans/2026-07-07-audit-context-config-guards.md`): eight findings
+closed. **7.1** — `set_goal` caps the pinned goal block at `GOAL_MAX_TOKENS = 512` estimated
+tokens (char-prefix + truncation marker; full input stays in history); the wedge property is
+regression-pinned (`oversized_first_paste_does_not_wedge_the_window`). Champion-spine note:
+the goal block is the champion-v4 attention spine — the paired `champion_k10` guard sweep is
+the post-merge evidence obligation. **7.2** — `validate()` floors
+`max_tool_result_bytes >= 1024` (reject, sibling-guard convention); advisory
+`result_cap_over_budget` warn beside the quarter-window prompt warn (fires once per loop
+assembly, not per dispatch — verified). **6.1** — `AgentEvent::RunStart { input, system }`
+emitted once at run start (before `set_goal`, so the trace carries the un-truncated input);
+full composed system prompt every run (owner call, no dedup); `ContextManager::system()`
+default-None getter; `TraceEvent::RunStart`; wire maps to `None` (old-SPA pin); CLI render
+no-ops; child RunStart reaches the child trace tap via the existing `other =>` forward.
+**6.2** — `TRACE_DISABLED_HEADROOM = 256` reserved in the cap check; best-effort
+`trace_disabled` (reason `cap`|`io_error`) marker + flush before `inner.w = None` on both
+disable paths; io_error path prefixes `\n` so the marker survives a partial line. **7.3** —
+`build_snapshot` gains `ledger`/`ledger_items`; separate `"ledger"` segment mirrors
+`pinned_tokens()`'s separate-message math exactly (`est_total == pinned_tokens() + history`
+pinned); web palette gained `--ctx-ledger` in both themes. **3.3** — found ALREADY CLOSED
+independently by claude-cli-followups (CLI `rt.validate()` gate, exit 2); cluster adds the
+`cli_bad_sandbox_mode_fails_validate` regression pin only. **5.2** — warn-only
+`RuntimeConfig::warnings()` (leading-token basename vs
+bash/sh/zsh/dash/ksh/eval/xargs/env), surfaced at CLI stderr, server startup
+(`RuntimeState::new`, leniency kept), and `apply()` after save; default allowlist pinned
+warning-free. SPEC ERRATUM recorded: the spec assumed a server *startup validate* site that
+does not exist — the final review caught the missing startup surfacing as its one Important.
+**5.3** — five additive `ask` corpus rows pin the documented /dev Ask-not-Deny residuals
+(tee/cp write vehicles, `$DEV` expansion x2, cwd-relative redirect) through the production
+engine wiring; all verified live before commit. Whole-branch review: With fixes → Yes after
+`c3e1d4e`+`b0faf8d`; accepted residuals in the cluster ledger — notable: possible blank line
+before the io_error marker, RunStart volume vs 64MB trace cap accepted (observable via the
+6.2 marker), first in-repo trace reader must skip unknown/blank record types.
+
 ---
 
 ## Top highest-leverage fixes
