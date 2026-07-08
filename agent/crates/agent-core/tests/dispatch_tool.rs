@@ -1152,3 +1152,43 @@ fn description_mentions_concurrent_fanout() {
         tool.description()
     );
 }
+
+/// Findings 2.3/4.5: the "minus dispatch_agent itself" claim is only true at
+/// the depth floor; with nesting allowed the description must say the child
+/// can dispatch its own sub-agents (it gets a nested dispatch_agent by default).
+#[test]
+fn description_is_depth_aware() {
+    let base = deps(
+        ScriptedModel::new(vec![]),
+        Arc::new(FullSink::default()),
+        vec![],
+    );
+    // Depth floor (depth 1, max_depth 1 — the default): child cannot dispatch.
+    let floor = DispatchAgentTool::new(base.clone());
+    assert!(
+        floor.description().contains("minus dispatch_agent itself"),
+        "{}",
+        floor.description()
+    );
+    assert!(
+        floor
+            .schema()
+            .description
+            .contains("minus dispatch_agent itself"),
+        "schema must flow through the stored description"
+    );
+    // Nesting allowed (depth 1 < max_depth 2): the child CAN dispatch.
+    let mut d = base;
+    d.max_depth = 2;
+    let nested = DispatchAgentTool::new(d);
+    assert!(
+        !nested.description().contains("minus dispatch_agent"),
+        "{}",
+        nested.description()
+    );
+    assert!(
+        nested.description().contains("dispatch its own sub-agents"),
+        "{}",
+        nested.description()
+    );
+}

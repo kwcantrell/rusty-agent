@@ -230,11 +230,32 @@ pub struct DispatchDeps {
 
 pub struct DispatchAgentTool {
     deps: DispatchDeps,
+    /// Computed at construction from depth/max_depth: the "minus dispatch_agent"
+    /// claim is only true at the depth floor (findings 2.3/4.5).
+    description: String,
 }
 
 impl DispatchAgentTool {
     pub fn new(deps: DispatchDeps) -> Self {
-        Self { deps }
+        // Matches the child-registry rule in execute(): a child gets a nested
+        // dispatch_agent by default whenever depth < max_depth.
+        let caps = if deps.depth < deps.max_depth {
+            "(including dispatch_agent while nesting depth allows, so it can \
+             dispatch its own sub-agents; the tools allowlist restricts this \
+             transitively)"
+        } else {
+            "(minus dispatch_agent itself)"
+        };
+        let description = format!(
+            "Delegate an independent, multi-step subtask to an isolated sub-agent with \
+             its own fresh context window. The sub-agent has the same permissions and \
+             tools as you {caps}, works autonomously on the \
+             prompt you give it, and its final answer is returned as this tool's \
+             result. Make the prompt self-contained: the sub-agent cannot see this \
+             conversation. You may dispatch several sub-agents in one message by \
+             issuing multiple dispatch_agent calls — they run concurrently."
+        );
+        Self { deps, description }
     }
 }
 
@@ -244,13 +265,7 @@ impl Tool for DispatchAgentTool {
         "dispatch_agent"
     }
     fn description(&self) -> &str {
-        "Delegate an independent, multi-step subtask to an isolated sub-agent with \
-         its own fresh context window. The sub-agent has the same permissions and \
-         tools as you (minus dispatch_agent itself), works autonomously on the \
-         prompt you give it, and its final answer is returned as this tool's \
-         result. Make the prompt self-contained: the sub-agent cannot see this \
-         conversation. You may dispatch several sub-agents in one message by \
-         issuing multiple dispatch_agent calls — they run concurrently."
+        &self.description
     }
     fn when_not_to_call(&self) -> Option<&str> {
         Some(
