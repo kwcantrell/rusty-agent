@@ -1,6 +1,6 @@
 use crate::compactor::{compaction_is_worthwhile, run_compaction, run_extraction};
 use crate::context::{
-    message_tokens, orphaned_tool_positions, plan_retention, recall_block,
+    estimate_tokens, message_tokens, orphaned_tool_positions, plan_retention, recall_block,
     snap_split_to_unit_boundary, turn_unit_ranges, ContextManager, MaintCtx, MaintReport,
     DEFAULT_RECALL_TOKEN_BUDGET,
 };
@@ -205,6 +205,15 @@ impl ContextManager for CuratedContext {
 
     fn set_goal(&mut self, goal: String) {
         if self.goal.is_none() {
+            // Cap the pin at GOAL_MAX_TOKENS estimated tokens (char-prefix via the
+            // chars/4 estimator; char-boundary safe). The marker's own ~15 tokens
+            // ride on top of the cap — bounded, and the cap is order-of-magnitude.
+            let goal = if estimate_tokens(&goal) > GOAL_MAX_TOKENS {
+                let kept: String = goal.chars().take(GOAL_MAX_TOKENS * 4).collect();
+                format!("{kept}{GOAL_TRUNCATION_MARKER}")
+            } else {
+                goal
+            };
             self.goal = Some(Message::system(format!("Original goal: {goal}")));
         }
     }
@@ -287,6 +296,13 @@ const PLACEHOLDER_UNIT_MAX_TOKENS: usize = 160;
 /// their verbatim originals remain in the offload store, so a cap eviction is
 /// strictly no worse than the silent full eviction it replaces.
 const FOLDED_FACTS_MAX_TOKENS: usize = 512;
+
+/// Token cap for the pinned goal block (audit 7.1). Same scale as
+/// `DEFAULT_RECALL_TOKEN_BUDGET` and `FOLDED_FACTS_MAX_TOKENS` — every pinned
+/// block is budgeted. The full input stays in history; only the pin truncates.
+const GOAL_MAX_TOKENS: usize = 512;
+const GOAL_TRUNCATION_MARKER: &str =
+    "… [goal truncated; the full input remains in the conversation history]";
 
 /// Fraction of the effective window that verbatim user units are folded DOWN
 /// to once eviction becomes imminent. Folding to well below the trigger point
@@ -661,6 +677,49 @@ mod tests {
         c.set_goal("second goal".into());
         let built = c.build(100_000);
         assert_eq!(built[1].content, "Original goal: first goal");
+    }
+
+    #[test]
+    fn set_goal_caps_oversized_input_with_marker() {
+        let mut c = ctx(); // match set_goal_is_set_once's constructor
+        let big = "word ".repeat(3000); // ~3750 est. tokens, well over the 512 cap
+        c.set_goal(big);
+        let g = c.goal.clone().expect("goal set");
+        assert!(g.content.contains("[goal truncated"), "marker missing");
+        // cap + marker + "Original goal: " prefix, small slack for overheads
+        assert!(
+            message_tokens(&g) <= GOAL_MAX_TOKENS + 40,
+            "goal block too big: {}",
+            message_tokens(&g)
+        );
+    }
+
+    #[test]
+    fn set_goal_under_cap_is_untouched() {
+        let mut c = ctx();
+        c.set_goal("ship the feature".into());
+        let g = c.goal.clone().unwrap();
+        assert_eq!(g.content, "Original goal: ship the feature");
+        assert!(!g.content.contains("[goal truncated"));
+    }
+
+    #[test]
+    fn oversized_first_paste_does_not_wedge_the_window() {
+        // The audit-7.1 property: an over-window first paste must not make
+        // pinned_tokens() exceed the window forever (budget saturates to 0,
+        // second overflow is fatal → permanently wedged session).
+        let mut c = ctx();
+        let big = "x".repeat(400_000); // ~100k est. tokens >> the 8192 window below
+        c.set_goal(big.clone());
+        c.append(Message::user(big));
+        let model_limit = 8192;
+        assert!(
+            c.pinned_tokens() < model_limit / 2,
+            "pinned blocks must leave a real history budget, got {}",
+            c.pinned_tokens()
+        );
+        let msgs = c.build(model_limit);
+        assert!(!msgs.is_empty(), "build must still produce a request");
     }
 
     #[test]
