@@ -53,9 +53,12 @@ WebDriver are the point.
 | L2 GUI driving (WebDriver) | the actual rendered webview / UX, via the DOM | `cd src-tauri && cargo test --test gui_smoke -- --ignored --test-threads=1` or drive interactively — see §GUI driving (WebDriver) | boot: no · turn: yes |
 | L3 pixel fallback | native GTK chrome only (file dialogs, window decorations) | see §Pixel fallback | — |
 
-`src-tauri/tests/bridge.rs` (`bridge_serves_local_runtime`) is an L0/L1 hybrid: it
-exercises the full bridge→serve wiring with a **closed** model port, so it proves
-the plumbing without needing :8080. Copy its pattern for new protocol tests.
+There is no offline bridge-wiring hybrid test anymore (`src-tauri/tests/bridge.rs`
+was deleted in `474b7af`). For new protocol tests copy the pattern of
+`src-tauri/tests/smoke_context_explorer.rs` (L1: drives the in-process bridge +
+Session exactly like the desktop app's Tauri commands and asserts on the event
+stream; needs :8080), using `src-tauri/tests/llama_health.rs` as the fast
+no-model gate (wiremock-backed, no server required).
 
 ## Bridge wire protocol (what a WS client sends/receives)
 

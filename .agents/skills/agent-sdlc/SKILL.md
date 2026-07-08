@@ -3,12 +3,14 @@ name: agent-sdlc
 description: >-
   Use for any question about how to build, evaluate, deploy, or operate AI
   agents — evals, tool design, context engineering, multi-agent decomposition,
-  memory, human-in-the-loop gates, monitoring, harness design — or how agents
-  should run a software lifecycle (spec-first workflows, verification-first
-  coding). Routes to the source-backed knowledge bundle at docs/okf/agent-sdlc/
-  (36 first-party sources, 23 cited concepts) for evidence behind
-  agent-architecture decisions, specs, and reviews. Also use when extending or
-  fixing that bundle (see authoring.md).
+  memory, human-in-the-loop gates, monitoring — or how agents should run a
+  software lifecycle (spec-first workflows, verification-first coding). Routes
+  to the source-backed knowledge bundle at docs/okf/agent-sdlc/ (36 first-party
+  sources, 23 cited concepts): the EVIDENCE layer behind agent-architecture
+  decisions, specs, and reviews. For hands-on design/build/audit work on THIS
+  repo's harness, use harness-engineering (the playbook layer) and load this
+  bundle alongside it for citations. Also use when extending or fixing the
+  bundle (see authoring.md).
 ---
 
 # agent-sdlc
@@ -20,6 +22,13 @@ research — into **23 concept pages** where every claim carries a citation.
 Use it as the evidence base for any agent-shaped design decision: don't
 re-derive best practices from memory when a cited concept already answers the
 question.
+
+**Do not** use this skill to *do* harness design/build/audit work in this
+repo — that is `harness-engineering`'s playbooks; this bundle is the evidence
+layer behind them. **Do not** edit bundle files without reading
+[authoring.md](authoring.md) and re-running `python3 scripts/okf_check.py
+docs/okf/agent-sdlc` — frontmatter, citation, and link rules are
+machine-checked.
 
 "Agent SDLC" means two things, and the bundle covers both:
 
