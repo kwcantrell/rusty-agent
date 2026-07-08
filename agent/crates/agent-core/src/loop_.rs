@@ -1012,8 +1012,12 @@ impl AgentLoop {
         // completion; it must never fail the run. Single attempt by design: no
         // retry, no overflow recovery, no StreamRetry accounting (spec Part 2).
         if !cancel.is_cancelled() {
-            ctx.append(Message::user(BUDGET_WRAP_UP_PROMPT));
-            let messages = ctx.build(self.effective_model_limit());
+            // Finding 4.3: inject the wrap-up instruction into THIS request only.
+            // Durable history never sees it — appended, it would survive into
+            // later runs of the session as a stale "tools are disabled" claim
+            // (models measurably imitate such visible history patterns).
+            let mut messages = ctx.build(self.effective_model_limit());
+            messages.push(Message::user(BUDGET_WRAP_UP_PROMPT));
             let mut req = self.completion_request(messages, preserve_thinking);
             req.tools = Vec::new();
             let started = std::time::Instant::now();
@@ -1699,6 +1703,140 @@ mod tests {
         );
     }
 
+    /// Finding 4.3: the wrap-up instruction ("tools are disabled...") must never
+    /// enter durable history — it would survive into later runs of the same
+    /// session as a stale, false capability statement models imitate.
+    #[tokio::test]
+    async fn budget_wrap_up_prompt_stays_out_of_durable_history() {
+        use crate::ContextManager;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        std::fs::write(ws.join("f.txt"), "x").unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![
+            // Run 1, turn 1 (budget = 1): a tool call.
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                format!(r#"{{"path":"{}"}}"#, ws.join("f.txt").display()),
+            ),
+            // Run 1: the tools-disabled wrap-up completion.
+            Scripted::Text("wrap-up summary".into()),
+            // Run 2: a plain reply.
+            Scripted::Text("second run reply".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 1,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        // Durable history after run 1: summary yes, instruction no.
+        let msgs = ctx.build(100_000);
+        assert!(
+            msgs.iter().any(|m| m.content.contains("wrap-up summary")),
+            "the assistant summary IS durable"
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.content.contains("turn limit for this run")),
+            "the wrap-up instruction must not be durable: {msgs:?}"
+        );
+        // Run 2 (same session context): still no stale instruction in the build.
+        agent.run(&mut ctx, "next".into()).await.unwrap();
+        let msgs = ctx.build(100_000);
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.content.contains("turn limit for this run")),
+            "no tools-disabled instruction may reach a later run: {msgs:?}"
+        );
+    }
+
+    /// Finding 4.3 (other half): the wrap-up REQUEST must still end with the
+    /// instruction — injection is request-local, not dropped.
+    #[tokio::test]
+    async fn budget_wrap_up_request_still_carries_the_prompt() {
+        struct LastRequestModel {
+            inner: ScriptedModel,
+            last: std::sync::Mutex<Vec<Message>>,
+        }
+        #[async_trait::async_trait]
+        impl agent_model::ModelClient for LastRequestModel {
+            async fn stream(
+                &self,
+                req: agent_model::CompletionRequest,
+            ) -> Result<
+                futures::stream::BoxStream<
+                    'static,
+                    Result<agent_model::Chunk, agent_model::ModelError>,
+                >,
+                agent_model::ModelError,
+            > {
+                *self.last.lock().unwrap() = req.messages.clone();
+                self.inner.stream(req).await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        std::fs::write(ws.join("f.txt"), "x").unwrap();
+        let model = Arc::new(LastRequestModel {
+            inner: ScriptedModel::new(vec![
+                Scripted::Call(
+                    "c1".into(),
+                    "read_file".into(),
+                    format!(r#"{{"path":"{}"}}"#, ws.join("f.txt").display()),
+                ),
+                Scripted::Text("wrap-up summary".into()),
+            ]),
+            last: std::sync::Mutex::new(Vec::new()),
+        });
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model.clone(),
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 1,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let last = model.last.lock().unwrap();
+        let tail = last.last().expect("wrap-up request has messages");
+        assert!(
+            tail.content.contains("turn limit for this run"),
+            "the wrap-up request must end with the instruction: {tail:?}"
+        );
+    }
+
     /// A wrap-up failure is swallowed: no append, still Done(BudgetExhausted).
     #[tokio::test]
     async fn budget_wrap_up_failure_is_best_effort() {
@@ -1740,6 +1878,14 @@ mod tests {
             *sink.done.lock().unwrap(),
             Some(StopReason::BudgetExhausted),
             "a failed wrap-up still lands Done(BudgetExhausted)"
+        );
+        use crate::ContextManager;
+        let msgs = ctx.build(100_000);
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.content.contains("turn limit for this run")),
+            "a failed wrap-up must leave no stale instruction in history: {msgs:?}"
         );
     }
 
