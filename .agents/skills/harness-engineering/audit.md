@@ -923,6 +923,41 @@ engine wiring; all verified live before commit. Whole-branch review: With fixes 
 before the io_error marker, RunStart volume vs 64MB trace cap accepted (observable via the
 6.2 marker), first in-repo trace reader must skip unknown/blank record types.
 
+Re-stamp note (2026-07-07, audit-drain cluster 6/6 — polish sweep; merge `59e61c4`; plan
+`docs/superpowers/plans/2026-07-07-audit-polish-sweep.md`, straight-to-plan per triage):
+thirteen findings closed — **the 2026-07-06 audit drain is COMPLETE (6/6 clusters, all 39
+triaged fixes shipped, zero declines)**. **2.2** — `execute_command` added to
+`CONFUSABLE_TOOLS`; `when_not_to_call` steers to read_file/list_directory/git_status/git_diff
+(Read-tier vs Write-tier friction). Accepted prose nit: "path-policy-aware" is exact only for
+the fs tools — git_status/git_diff intents carry `paths: []`. **2.4** —
+`required_params_missing_description` recurses into array-items object schemas
+(`files[].path` naming; array-items-only scope documented — plain-object recursion would
+flood the warn-only MCP lint); create_skill files[].path/content + render columns/rows now
+described; MCP connect lint gains nested coverage for free (ServerStatus.schema_warnings
+volume may tick up on schema-rich servers — intended). **2.5** — remember/recall/forget
+"Args:" duplicates dropped; no-"Args:" ratchet pins single-source param prose. **3.2** —
+build_sandbox doc now says fail-closed (matches strategy.rs live behavior). **3.4** —
+`cli_sandbox_defaults_match_runtime_config_defaults`: 10 fields, literal-free vs
+`from_launch` (hermetic — from_launch never calls resolve_sandbox_image, so no docker-probe
+flake). **3.5** — one sandbox Arc per frontend: `LoopParts.sandbox` + `loop_config_from`
+4th param; the CLI reuses one Arc for connect_mcp + the loop; child dispatch loops inherit
+via `loop_config.clone()` (single-instance covers the whole loop tree); pin test injects
+HostExecutor against an enforce cfg. Accepted residual: LoopParts.sandbox doc says "per
+frontend" while the server is per-loop-rebuild (cosmetic). **1.1** — agent-sdlc SKILL.md:
+"harness design" removed from the trigger, house-style Do-not block added (was the only
+skill of 10 without one). **9.1** — auto-drive-tauri now points at live tests
+(smoke_context_explorer.rs L1 + llama_health.rs fast gate; bridge.rs deleted in `474b7af`).
+**10.3** — `favorable_disables_curation` comment now matches genome-axis-8 reality.
+**11.4** — AGENTS.md "Docs-only exception" records the docs-on-main practice + compensating
+control (never auto-pushed; whole-campaign review before any push). **11.2/11.3/9.4**
+(controller-side, outside the branch — `.superpowers/` is git-ignored, discovered at
+pre-flight and the plan amended before commit): auto-dev-server-canvas ledger MERGED
+close-out appended (dfec8b7); five completed ledgers stamped + renamed `*.archive.md`
+(tips git-verified ancestors of main); MEMORY.md's four longest index lines trimmed to
+one-sentence pointers (facts verified duplicated in topic files first; guardrail clauses
+kept). Whole-branch review (fable): Ready to merge — Yes, zero Critical/Important; three
+cosmetic Minors accepted as residuals (listed above).
+
 ---
 
 ## Top highest-leverage fixes
@@ -939,6 +974,6 @@ subcommand-aware allowlist, memory re-tiering), and the instructions cluster
 (single-source ratchet-guarded prompt + negative constraints) are **done** — for
 the full current backlog see `docs/superpowers/audits/2026-07-01-harness-deep-audit.md`
 (its Top-10 table; **all ten items are now complete — the Top-10 is closed**).
-**No inline finding remains open.** The 2026-07 residual-backlog drain is in
-progress (see `.superpowers/sdd/progress.md` triage: orchestration robustness,
-context budgeting, git --output arg-scan, eval flywheel, small-residuals sweep).
+**No inline finding remains open.** Both 2026-07 drains are complete: the
+residual-backlog drain (closed 2026-07-02) and the 2026-07-06 audit drain
+(6/6 clusters, closed 2026-07-07 @ `59e61c4`).
