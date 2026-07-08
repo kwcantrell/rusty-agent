@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const TRACE_SCHEMA: u32 = 1;
 const RETAIN_FILES: usize = 50;
+/// Reserved so the terminal `trace_disabled` marker always fits under the cap.
+const TRACE_DISABLED_HEADROOM: u64 = 256;
 
 pub struct TraceWriter {
     session_id: String,
@@ -103,12 +105,12 @@ impl TraceWriter {
             Ok(l) => l,
             Err(_) => return,
         };
-        if inner.written + line.len() as u64 + 1 > self.max_bytes {
+        if inner.written + line.len() as u64 + 1
+            > self.max_bytes.saturating_sub(TRACE_DISABLED_HEADROOM)
+        {
             tracing::warn!(target: "trace", cap_mb = self.max_bytes / (1024 * 1024),
                 "trace size cap reached; tracing disabled for this session");
-            if let Some(w) = inner.w.as_mut() {
-                let _ = w.flush();
-            }
+            write_disabled_marker(&mut inner, "cap", false);
             inner.w = None;
             return;
         }
@@ -119,12 +121,39 @@ impl TraceWriter {
         };
         if failed {
             tracing::warn!(target: "trace", "trace write failed; tracing disabled for this session");
+            write_disabled_marker(&mut inner, "io_error", true);
             inner.w = None;
             return;
         }
         inner.written += line.len() as u64 + 1;
         inner.seq += 1;
     }
+}
+
+/// Best-effort terminal marker so a capped/failed trace is distinguishable
+/// from a mid-turn crash (audit 6.2). Cap-path headroom is pre-reserved; on
+/// the io_error path the write may itself fail — accepted (best-effort by
+/// nature). Must not recurse into the cap check.
+///
+/// `newline_first` guards the io_error path: the failing `writeln!` may have
+/// flushed a partial line, so we lead with a bare `\n` to break off that stub
+/// before the marker record (cost: one possible blank line). The cap path
+/// leaves it false — the record that breached the cap was never written, so no
+/// partial line exists.
+fn write_disabled_marker(inner: &mut Inner, reason: &str, newline_first: bool) {
+    // Read seq BEFORE borrowing w mutably (same borrow-order note as record()).
+    let seq = inner.seq;
+    let Some(w) = inner.w.as_mut() else { return };
+    if newline_first {
+        let _ = writeln!(w);
+    }
+    let rec = serde_json::json!({
+        "seq": seq,
+        "ts_ms": epoch_ms(),
+        "event": { "type": "trace_disabled", "reason": reason },
+    });
+    let _ = writeln!(w, "{rec}");
+    let _ = w.flush();
 }
 
 fn mint_session_id() -> String {
@@ -239,6 +268,11 @@ enum TraceEvent<'a> {
         discarded_text_chars: usize,
         discarded_reasoning_chars: usize,
     },
+    RunStart {
+        input: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system: Option<&'a str>,
+    },
 }
 
 fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
@@ -348,6 +382,10 @@ fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
         } => TraceEvent::StreamRetry {
             discarded_text_chars: *discarded_text_chars,
             discarded_reasoning_chars: *discarded_reasoning_chars,
+        },
+        AgentEvent::RunStart { input, system } => TraceEvent::RunStart {
+            input,
+            system: system.as_deref(),
         },
     }
 }
@@ -469,6 +507,46 @@ mod tests {
     }
 
     #[test]
+    fn run_start_record_carries_input_and_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = TraceWriter::create(dir.path(), 64).unwrap();
+        t.record(&AgentEvent::RunStart {
+            input: "fix the bug".into(),
+            system: Some("SYSTEM PROMPT".into()),
+        });
+        t.record(&AgentEvent::Done(agent_model::StopReason::Stop)); // flushes the BufWriter
+        let content =
+            std::fs::read_to_string(dir.path().join(format!("{}.jsonl", t.session_id()))).unwrap();
+        let line = content.lines().nth(1).expect("record after header");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["event"]["type"], "run_start");
+        assert_eq!(v["event"]["input"], "fix the bug");
+        assert_eq!(v["event"]["system"], "SYSTEM PROMPT");
+    }
+
+    #[test]
+    fn child_run_start_joins_via_parent_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = TraceWriter::create(dir.path(), 64).unwrap();
+        t.record_child(
+            2,
+            "call-7",
+            &AgentEvent::RunStart {
+                input: "child task".into(),
+                system: None,
+            },
+        );
+        t.record(&AgentEvent::Done(agent_model::StopReason::Stop)); // flushes the BufWriter
+        let content =
+            std::fs::read_to_string(dir.path().join(format!("{}.jsonl", t.session_id()))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(v["event"]["type"], "run_start");
+        assert_eq!(v["sub"], 2);
+        assert_eq!(v["parent_id"], "call-7");
+        assert!(v["event"].get("system").is_none(), "None system is omitted");
+    }
+
+    #[test]
     fn trace_writes_parseable_jsonl_with_header() {
         let dir = tempfile::tempdir().unwrap();
         let w = TraceWriter::create(dir.path(), 64).unwrap();
@@ -496,7 +574,12 @@ mod tests {
         w.record(&AgentEvent::Done(agent_model::StopReason::Stop));
         let path = dir.path().join(format!("{}.jsonl", w.session_id()));
         let body = std::fs::read_to_string(path).unwrap();
-        assert_eq!(body.lines().count(), 1); // header only; cap stopped event writes
+        // Header + terminal marker: cap stopped the event writes but the
+        // trace_disabled marker records *why* (audit 6.2).
+        assert_eq!(body.lines().count(), 2);
+        let marker: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(marker["event"]["type"], "trace_disabled");
+        assert_eq!(marker["event"]["reason"], "cap");
     }
 
     #[test]
@@ -519,6 +602,65 @@ mod tests {
         let path = dir.path().join(format!("{}.jsonl", w.session_id()));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "trace file must be owner-only");
+    }
+
+    #[test]
+    fn cap_breach_writes_terminal_trace_disabled_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = TraceWriter::create(dir.path(), 1).unwrap(); // 1 MB cap
+        let big = "x".repeat(64 * 1024);
+        for _ in 0..20 {
+            // 20 × 64KB ≈ 1.25MB — guaranteed breach
+            t.record(&AgentEvent::Token(big.clone()));
+        }
+        let content =
+            std::fs::read_to_string(dir.path().join(format!("{}.jsonl", t.session_id()))).unwrap();
+        let last = content.lines().last().unwrap();
+        let v: serde_json::Value = serde_json::from_str(last).expect("marker is valid JSON");
+        assert_eq!(v["event"]["type"], "trace_disabled");
+        assert_eq!(v["event"]["reason"], "cap");
+        assert!(
+            (last.len() as u64) < TRACE_DISABLED_HEADROOM,
+            "marker must fit the reserved headroom, got {}",
+            last.len()
+        );
+        // Disabled means disabled: a later record must not resurrect the file.
+        let len_before = content.len();
+        t.record(&AgentEvent::Token("after".into()));
+        let after =
+            std::fs::read_to_string(dir.path().join(format!("{}.jsonl", t.session_id()))).unwrap();
+        assert_eq!(after.len(), len_before, "no writes after disable");
+    }
+
+    #[test]
+    fn io_error_marker_survives_a_partial_line() {
+        // On the io_error path a partial (unterminated) line may already sit in the
+        // file. The marker must lead with a newline so it lands on its own line and
+        // stays parseable rather than gluing onto the corrupt stub.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.jsonl");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut w = BufWriter::new(file);
+        // Simulate a partially-flushed corrupt line (no trailing newline).
+        write!(w, "{{\"seq\":0,\"ts_ms\":1,\"eve").unwrap();
+        w.flush().unwrap();
+        let mut inner = Inner {
+            w: Some(w),
+            written: 0,
+            seq: 1,
+        };
+        write_disabled_marker(&mut inner, "io_error", true);
+        inner.w = None; // drop the writer so all bytes are flushed to disk
+        let body = fs::read_to_string(&path).unwrap();
+        // The marker is the last line and parses cleanly despite the partial stub.
+        let last = body.lines().last().unwrap();
+        let v: serde_json::Value = serde_json::from_str(last).expect("marker parses");
+        assert_eq!(v["event"]["type"], "trace_disabled");
+        assert_eq!(v["event"]["reason"], "io_error");
     }
 
     #[test]

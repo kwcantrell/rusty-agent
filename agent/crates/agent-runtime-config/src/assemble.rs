@@ -94,6 +94,14 @@ pub(crate) fn prompt_over_budget(est: usize, limit: usize) -> bool {
     est > limit / 4
 }
 
+/// True when the tool-result ingestion cap's estimated tokens (bytes/4) exceed
+/// a quarter of the context window — a cap that big re-opens the
+/// single-oversized-result overflow path the ingestion cap exists to close.
+/// Advisory only (the caller warns); pure so it can be unit-tested log-free.
+pub(crate) fn result_cap_over_budget(cap_bytes: usize, limit: usize) -> bool {
+    cap_bytes / 4 > limit / 4
+}
+
 /// The single RuntimeConfig → LoopConfig mapping. Constants that are identical on
 /// both front-ends today stay literals here; `stream_idle_timeout` is frontend-supplied.
 pub fn loop_config_from(
@@ -208,6 +216,16 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
             context_limit = cfg.context_limit,
             presets = ?presets,
             "composed system prompt exceeds a quarter of the context window"
+        );
+    }
+
+    // Advisory (audit 7.2): a tool-result cap comparable to the window re-opens
+    // the single-oversized-result overflow path. No behavior change.
+    if result_cap_over_budget(cfg.max_tool_result_bytes, cfg.context_limit) {
+        tracing::warn!(
+            max_tool_result_bytes = cfg.max_tool_result_bytes,
+            context_limit = cfg.context_limit,
+            "max_tool_result_bytes estimated tokens exceed a quarter of the context window"
         );
     }
 
@@ -509,6 +527,16 @@ mod tests {
         assert!(!prompt_over_budget(0, 8192));
         assert!(!prompt_over_budget(2048, 8192)); // exactly a quarter is not over
         assert!(prompt_over_budget(2049, 8192)); // one past the quarter trips
+    }
+
+    #[test]
+    fn result_cap_over_budget_trips_above_a_quarter_of_the_window() {
+        // est tokens = bytes/4; quarter of window = limit/4. Integer division:
+        // the first value that trips is one whole token past, not one byte.
+        assert!(!result_cap_over_budget(8192, 8192)); // exactly at: not over
+        assert!(!result_cap_over_budget(8195, 8192)); // same token bucket (8195/4 == 2048)
+        assert!(result_cap_over_budget(8196, 8192)); // one token past trips (2049 > 2048)
+        assert!(!result_cap_over_budget(16 * 1024, 262_144)); // default cap vs big window: quiet
     }
 
     #[test]

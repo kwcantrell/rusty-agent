@@ -34,6 +34,8 @@ pub(crate) fn build_snapshot(
     model_limit: usize,
     system: &Message,
     goal: Option<&Message>,
+    ledger: Option<&Message>,
+    ledger_items: &[String],
     recall: &[String],
     recall_budget: usize,
     compaction_summary: Option<&Message>,
@@ -55,6 +57,18 @@ pub(crate) fn build_snapshot(
             est_tokens: message_tokens(g),
             items: vec![preview(&g.content, 120)],
             count: 1,
+        });
+    }
+
+    // The folded-facts ledger is pinned (it rides inside the goal block in
+    // pinned()) and charged in pinned_tokens() as its OWN message — a separate
+    // segment here keeps est_total equal to the budget math (audit 7.3).
+    if let Some(l) = ledger {
+        segments.push(ContextSegment {
+            category: "ledger".into(),
+            est_tokens: message_tokens(l),
+            items: ledger_items.iter().map(|f| preview(f, 100)).collect(),
+            count: ledger_items.len(),
         });
     }
 
@@ -113,6 +127,8 @@ mod tests {
             1000,
             &Message::system("SYSTEM PROMPT"),
             None,
+            None,
+            &[],
             &[],
             DEFAULT_RECALL_TOKEN_BUDGET,
             None,
@@ -134,6 +150,57 @@ mod tests {
     }
 
     #[test]
+    fn ledger_block_becomes_ledger_segment() {
+        let ledger = Message::system(
+            "Ledger of earlier user instructions…\n1. port = 8080\n2. name = zephyr",
+        );
+        let facts = vec!["port = 8080".to_string(), "name = zephyr".to_string()];
+        let snap = build_snapshot(
+            1,
+            1000,
+            &Message::system("S"),
+            Some(&Message::system("Original goal: g")),
+            Some(&ledger),
+            &facts,
+            &[],
+            DEFAULT_RECALL_TOKEN_BUDGET,
+            None,
+            &[],
+        );
+        let cats: Vec<&str> = snap.segments.iter().map(|s| s.category.as_str()).collect();
+        assert_eq!(cats, vec!["system", "goal", "ledger", "messages"]);
+        let ledger_seg = snap
+            .segments
+            .iter()
+            .find(|s| s.category == "ledger")
+            .unwrap();
+        assert_eq!(ledger_seg.est_tokens, message_tokens(&ledger));
+        assert_eq!(ledger_seg.count, 2);
+        assert!(ledger_seg.items[0].contains("port = 8080"));
+        assert_eq!(
+            snap.est_total,
+            snap.segments.iter().map(|s| s.est_tokens).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn no_ledger_segment_without_folded_facts() {
+        let snap = build_snapshot(
+            1,
+            1000,
+            &Message::system("S"),
+            None,
+            None,
+            &[],
+            &[],
+            DEFAULT_RECALL_TOKEN_BUDGET,
+            None,
+            &[],
+        );
+        assert!(snap.segments.iter().all(|s| s.category != "ledger"));
+    }
+
+    #[test]
     fn preview_collapses_newlines_and_truncates() {
         assert_eq!(preview("a\nb\nc", 100), "a b c"); // newlines → single spaces
         assert_eq!(preview("hello world", 5), "hello"); // truncates to n chars
@@ -148,6 +215,8 @@ mod tests {
             1000,
             &Message::system("S"),
             None,
+            None,
+            &[],
             &[
                 "user likes rust".to_string(),
                 "deploys on friday".to_string(),
@@ -181,6 +250,8 @@ mod tests {
             100_000,
             &Message::system("S"),
             None,
+            None,
+            &[],
             &lines,
             budget,
             None,

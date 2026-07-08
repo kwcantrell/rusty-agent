@@ -223,6 +223,12 @@ pub trait ContextManager: Send + Sync {
     fn set_recall(&mut self, _items: Vec<String>) {}
     /// Record the original goal for re-grounding. Default no-op; set-once impls.
     fn set_goal(&mut self, _goal: String) {}
+    /// The current system message, when the implementation holds one. Read by
+    /// the loop's run-start trace record; default None so simple/test impls
+    /// are unaffected.
+    fn system(&self) -> Option<&Message> {
+        None
+    }
     /// Best-effort per-turn curation (offload + compaction). Default no-op so
     /// `WindowContext` and other simple impls are unaffected.
     async fn maintain(&mut self, _deps: &MaintCtx<'_>) -> MaintReport {
@@ -281,6 +287,10 @@ impl ContextManager for WindowContext {
         self.recall = items;
     }
 
+    fn system(&self) -> Option<&Message> {
+        Some(&self.system)
+    }
+
     fn build(&self, model_limit: usize) -> Vec<Message> {
         let sys_tokens = message_tokens(&self.system);
         let recall_msg = self.recall_message();
@@ -309,6 +319,13 @@ impl ContextManager for WindowContext {
 mod tests {
     use super::*;
     use agent_model::{Message, Role};
+
+    #[test]
+    fn window_context_system_getter_returns_the_system_message() {
+        let ctx = WindowContext::new(Message::system("S"));
+        let sys = ctx.system().expect("WindowContext always holds a system");
+        assert_eq!(sys.content, "S");
+    }
 
     #[test]
     fn built_tokens_sums_per_message_estimate() {

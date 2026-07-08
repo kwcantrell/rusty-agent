@@ -50,6 +50,11 @@ deny	echo x > /../dev/sda	# leading `..` navigates INTO /dev (POSIX `/..` == `/`
 ask	cmd 2>/dev/null	# stderr to /dev/null is a safe sink; un-allowlisted `cmd` + metachar → Ask
 ask	echo hi > out.txt	# plain-file redirect: floor does NOT fire; `>` metachar → Ask
 ask	echo x > /dev/shm/f	# /dev/shm is a world-writable tmpfs (file, not device) → safe sink; metachar → Ask
+ask	tee /dev/sda	# non-redirect write vehicle: documented dev-redirect residual — reaches Ask, not Deny
+ask	cp /tmp/x /dev/sda	# non-redirect write vehicle (`cp` un-allowlisted → Ask)
+ask	echo x > $DEV/sda	# variable-expansion target: `$` is SHELL_SIGNIFICANT; deny handler sees only unexpanded text → Ask
+ask	dd of=$DEV	# variable-expansion target in dd `of=` → Ask
+ask	cd /dev && echo x > sda	# cwd-relative redirect: target never literally names /dev → Ask
 #
 # ── Class: privilege escalation — sudo / doas / su in program position ──
 deny	sudo reboot

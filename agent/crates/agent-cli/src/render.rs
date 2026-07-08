@@ -171,6 +171,7 @@ impl EventSink for TerminalSink {
                 let _ = writeln!(out, "\x1b[2m{note}\x1b[0m");
             }
             AgentEvent::Approval(_) => {} // the TerminalApproval channel prints its own prompt
+            AgentEvent::RunStart { .. } => {} // trace-only record; nothing to render
             AgentEvent::SandboxDegraded { mechanism, reason } => {
                 let _ = writeln!(
                     out,

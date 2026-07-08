@@ -223,6 +223,9 @@ impl EventSink for CollectingSink {
                 discarded_text_chars,
                 discarded_reasoning_chars,
             } => format!("stream_retry:{discarded_text_chars}:{discarded_reasoning_chars}"),
+            AgentEvent::RunStart { input, system } => {
+                format!("run_start:{input}:system_none={}", system.is_none())
+            }
         };
         self.events.lock().unwrap().push(label);
     }
