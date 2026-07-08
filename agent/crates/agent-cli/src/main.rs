@@ -363,18 +363,29 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_defaults() {
+    fn cli_sandbox_defaults_match_runtime_config_defaults() {
+        // Audit 3.4: clap default_value attrs are hand-written mirrors of
+        // runtime-config's default_sandbox_* fns (the documented clap-shadowing
+        // gotcha class). from_launch is the canonical source; drift here means
+        // a bumped server-side default silently leaves the CLI behind.
         let cli = Cli::parse_from(["agent-cli"]);
-        assert_eq!(cli.sandbox_mode, "auto");
-        assert_eq!(cli.sandbox_image, DEFAULT_SANDBOX_IMAGE);
-        assert!(!cli.sandbox_network);
-        assert_eq!(cli.sandbox_memory, "2g");
-        assert_eq!(cli.sandbox_cpus, "2");
-        assert_eq!(cli.sandbox_pids, 512u32);
-        assert!(cli.sandbox_fsize.is_none());
-        assert_eq!(cli.sandbox_tmp_size, "1g");
-        assert!(cli.sandbox_extra_rw.is_empty());
-        assert!(cli.sandbox_extra_ro.is_empty());
+        let base = RuntimeConfig::from_launch(
+            "openai".into(),
+            "http://x".into(),
+            "m".into(),
+            "native".into(),
+            8192,
+        );
+        assert_eq!(cli.sandbox_mode, base.sandbox_mode);
+        assert_eq!(cli.sandbox_image, base.sandbox_image);
+        assert_eq!(cli.sandbox_network, base.sandbox_network);
+        assert_eq!(cli.sandbox_memory, base.sandbox_memory);
+        assert_eq!(cli.sandbox_cpus, base.sandbox_cpus);
+        assert_eq!(cli.sandbox_pids, base.sandbox_pids);
+        assert_eq!(cli.sandbox_fsize, base.sandbox_fsize);
+        assert_eq!(cli.sandbox_tmp_size, base.sandbox_tmp_size);
+        assert_eq!(cli.sandbox_extra_rw, base.sandbox_extra_rw);
+        assert_eq!(cli.sandbox_extra_ro, base.sandbox_extra_ro);
     }
 
     #[test]
