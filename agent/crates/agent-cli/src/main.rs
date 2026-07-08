@@ -283,6 +283,7 @@ async fn main() {
             base_system_prompt: BASE_SYSTEM_PROMPT.to_string(),
             offload_store: offload_store.clone(),
             compact_flag: compact_flag.clone(),
+            sandbox: sandbox.clone(),
             stats: stats.clone(),
             trace,
             api_key: api_key.clone(),

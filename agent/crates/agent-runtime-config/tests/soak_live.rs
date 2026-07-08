@@ -247,6 +247,7 @@ async fn soak_all_components_live() {
                     .into(),
             offload_store: store.clone(),
             compact_flag: flag.clone(),
+            sandbox: agent_runtime_config::build_sandbox(&cfg),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
             trace: None,
             api_key: None,
