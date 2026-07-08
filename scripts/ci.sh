@@ -2,7 +2,7 @@
 # Single source of truth for the CI gate — run by .githooks/pre-push and
 # .github/workflows/ci.yml. src-tauri runs conditionally: it needs GTK/WebKitGTK
 # dev deps (absent on the GitHub runner, present on dev machines). Its fmt is
-# never checked — src-tauri is hand-formatted by convention (CLAUDE.md).
+# never checked — src-tauri is hand-formatted by convention (src-tauri/AGENTS.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -11,6 +11,10 @@ cd "$(dirname "$0")/.."
 echo "==> okf bundle check"
 python3 scripts/test_okf_check.py
 python3 scripts/okf_check.py docs/okf/agent-sdlc
+
+echo "==> skills lint"
+python3 scripts/test_skills_lint.py
+python3 scripts/skills_lint.py
 
 echo "==> cargo fmt --check"
 (cd agent && cargo fmt --all --check)

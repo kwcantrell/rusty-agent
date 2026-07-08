@@ -1,0 +1,54 @@
+# rust-agent-runtime — agent guide
+
+A local-first LLM agent runtime: a Rust core drives a local model (or the Claude CLI)
+through a tool/policy loop, exposed three ways — a terminal CLI, a Tauri desktop app,
+and a browser SPA that reaches your *local* agent via a Cloudflare Worker.
+
+## Repo map
+
+Three surfaces, one agent core — each surface has its own `AGENTS.md` with commands
+and surface-local gotchas:
+
+- **[`agent/`](agent/AGENTS.md)** — Rust Cargo workspace (the core); crate map inside.
+- **[`src-tauri/`](src-tauri/AGENTS.md)** — Tauri 2 desktop app wrapping `agent-server`.
+  Its own separate Cargo workspace.
+- **[`web/`](web/AGENTS.md)** — React 19 / Vite / Tailwind SPA (the Context Explorer UI).
+- **Cloud path** — `agent-server` dials a Cloudflare Worker so a browser can drive
+  the local agent.
+
+## How we work
+
+Non-trivial work follows the superpowers SDLC — **don't jump straight to code**:
+
+**brainstorm → spec (`docs/superpowers/specs/`) → plan (`docs/superpowers/plans/`) →
+implement.** Small, obvious fixes can skip ahead, but design-bearing changes get a
+spec first.
+
+## Conventions
+
+- **Conventional commits**: `type(scope): summary` (e.g. `fix(memory): …`), matching
+  existing history.
+- **Commit and push only when asked.** Branch off `main` for PRs.
+- **Changes ship with tests.** Run the relevant suite (`cargo test` / `npm test`)
+  before calling it done.
+
+## CI gate
+
+```bash
+bash scripts/ci.sh   # okf check + skills lint + fmt + clippy + cargo test (agent/) + conditional src-tauri + web typecheck/vitest
+```
+
+Also runs as a pre-push hook — enable once per clone with
+`git config core.hooksPath .githooks`.
+
+## Gotchas
+
+- **Two separate Cargo workspaces** — `agent/` and `src-tauri/`. `-p <crate>` must
+  target the right one.
+- **Three skill trees — author in the right one:**
+  - `.agents/skills/` — canonical home of skills for working *on* this repo. Author here.
+  - `.claude/skills/` — relative symlinks into `.agents/skills/` so Claude Code
+    discovers them. Never author here; add a symlink for each new skill
+    (`scripts/skills_lint.py` enforces both).
+  - `<workspace>/.agent/skills` and `~/.agent/skills` — loaded by the runtime's *own*
+    agent (`agent-skills/src/registry.rs`). Unrelated to working on this repo.

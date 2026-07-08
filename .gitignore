@@ -34,3 +34,9 @@ node_modules/
 # tests/runs with the `onnx` feature — never commit model binaries.
 .fastembed_cache/
 __pycache__/
+
+# Claude Code local state. NOTE: .claude/skills/ (symlinks) and
+# .claude/settings.json ARE committed — never ignore .claude/ wholesale.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/worktrees/
