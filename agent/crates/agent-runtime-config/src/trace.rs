@@ -110,7 +110,7 @@ impl TraceWriter {
         {
             tracing::warn!(target: "trace", cap_mb = self.max_bytes / (1024 * 1024),
                 "trace size cap reached; tracing disabled for this session");
-            write_disabled_marker(&mut inner, "cap");
+            write_disabled_marker(&mut inner, "cap", false);
             inner.w = None;
             return;
         }
@@ -121,7 +121,7 @@ impl TraceWriter {
         };
         if failed {
             tracing::warn!(target: "trace", "trace write failed; tracing disabled for this session");
-            write_disabled_marker(&mut inner, "io_error");
+            write_disabled_marker(&mut inner, "io_error", true);
             inner.w = None;
             return;
         }
@@ -134,10 +134,19 @@ impl TraceWriter {
 /// from a mid-turn crash (audit 6.2). Cap-path headroom is pre-reserved; on
 /// the io_error path the write may itself fail — accepted (best-effort by
 /// nature). Must not recurse into the cap check.
-fn write_disabled_marker(inner: &mut Inner, reason: &str) {
+///
+/// `newline_first` guards the io_error path: the failing `writeln!` may have
+/// flushed a partial line, so we lead with a bare `\n` to break off that stub
+/// before the marker record (cost: one possible blank line). The cap path
+/// leaves it false — the record that breached the cap was never written, so no
+/// partial line exists.
+fn write_disabled_marker(inner: &mut Inner, reason: &str, newline_first: bool) {
     // Read seq BEFORE borrowing w mutably (same borrow-order note as record()).
     let seq = inner.seq;
     let Some(w) = inner.w.as_mut() else { return };
+    if newline_first {
+        let _ = writeln!(w);
+    }
     let rec = serde_json::json!({
         "seq": seq,
         "ts_ms": epoch_ms(),
@@ -621,6 +630,37 @@ mod tests {
         let after =
             std::fs::read_to_string(dir.path().join(format!("{}.jsonl", t.session_id()))).unwrap();
         assert_eq!(after.len(), len_before, "no writes after disable");
+    }
+
+    #[test]
+    fn io_error_marker_survives_a_partial_line() {
+        // On the io_error path a partial (unterminated) line may already sit in the
+        // file. The marker must lead with a newline so it lands on its own line and
+        // stays parseable rather than gluing onto the corrupt stub.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.jsonl");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut w = BufWriter::new(file);
+        // Simulate a partially-flushed corrupt line (no trailing newline).
+        write!(w, "{{\"seq\":0,\"ts_ms\":1,\"eve").unwrap();
+        w.flush().unwrap();
+        let mut inner = Inner {
+            w: Some(w),
+            written: 0,
+            seq: 1,
+        };
+        write_disabled_marker(&mut inner, "io_error", true);
+        inner.w = None; // drop the writer so all bytes are flushed to disk
+        let body = fs::read_to_string(&path).unwrap();
+        // The marker is the last line and parses cleanly despite the partial stub.
+        let last = body.lines().last().unwrap();
+        let v: serde_json::Value = serde_json::from_str(last).expect("marker parses");
+        assert_eq!(v["event"]["type"], "trace_disabled");
+        assert_eq!(v["event"]["reason"], "io_error");
     }
 
     #[test]

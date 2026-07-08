@@ -7,7 +7,8 @@ import { SkillSection } from "./SkillSection";
 
 const COLORS: Record<string, string> = {
   system: "var(--accent)", goal: "var(--ctx-goal)", memory: "var(--ctx-memory)",
-  summary: "var(--ctx-summary)", messages: "var(--text-muted)", unattributed: "var(--state-error)",
+  summary: "var(--ctx-summary)", ledger: "var(--ctx-ledger)",
+  messages: "var(--text-muted)", unattributed: "var(--state-error)",
 };
 
 export function ContextExplorer(
