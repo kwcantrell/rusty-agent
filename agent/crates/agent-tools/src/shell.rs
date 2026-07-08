@@ -19,6 +19,15 @@ impl Tool for ExecuteCommand {
     fn description(&self) -> &str {
         "Run a shell command in the workspace directory."
     }
+    fn when_not_to_call(&self) -> Option<&str> {
+        Some(
+            "Not for operations a dedicated tool does directly: use read_file (not \
+             `cat`), list_directory (not `ls`), git_status/git_diff (not `git \
+             status`/`git diff`) — those are Read-tier and path-policy-aware, while \
+             shell commands are Write-tier and may need approval. Use execute_command \
+             for real shell work: builds, tests, pipes, scripts.",
+        )
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: self.name().into(),

@@ -8,7 +8,9 @@ pub const WHEN_NOT_TO_CALL_MARKER: &str = "When NOT to call:";
 /// prose. A maintained ratchet — add a new confusable tool here by hand.
 /// Clusters: recall/context_recall (semantic memory vs offload rehydration),
 /// read_file/read_skill_file (workspace vs skill dir), write_file/edit_file
-/// (create-or-overwrite vs unique-substring replace).
+/// (create-or-overwrite vs unique-substring replace),
+/// execute_command/read_file+list_directory+git_* (a shell subsumes the
+/// dedicated Read-tier tools but at Write-tier friction).
 /// NOTE: `recall` is runtime-injected, so it is enforced in agent-memory's own
 /// test rather than the agent-runtime-config enforcement test.
 pub const CONFUSABLE_TOOLS: &[&str] = &[
@@ -18,6 +20,7 @@ pub const CONFUSABLE_TOOLS: &[&str] = &[
     "read_skill_file",
     "write_file",
     "edit_file",
+    "execute_command",
 ];
 
 /// Names of `schema`'s required params whose `properties[name].description` is
