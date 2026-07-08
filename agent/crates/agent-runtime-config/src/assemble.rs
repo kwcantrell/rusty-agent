@@ -300,6 +300,7 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 depth: 1,
                 max_depth: cfg.subagent_max_depth.max(1),
                 id_prefix: String::new(),
+                description_overrides: cfg.tool_description_overrides.clone(),
             },
         )));
     }

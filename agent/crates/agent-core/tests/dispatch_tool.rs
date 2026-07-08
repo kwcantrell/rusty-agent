@@ -170,6 +170,7 @@ fn deps(model: ScriptedModel, sink: Arc<dyn EventSink>, base: Vec<Arc<dyn Tool>>
         depth: 1,
         max_depth: 1,
         id_prefix: String::new(),
+        description_overrides: Default::default(),
     }
 }
 

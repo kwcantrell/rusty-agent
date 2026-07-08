@@ -226,6 +226,10 @@ pub struct DispatchDeps {
     /// "" at top level; "sub{n}:" for a nested tool so a grandchild's parent_id
     /// is the child row's on-wire visible id (spec G8).
     pub id_prefix: String,
+    /// Parent-configured tool-description overrides, applied to the child
+    /// registry too so the tool vocabulary stays uniform across depths
+    /// (finding 4.1; seam spec 2026-07-02-tool-description-override-seam).
+    pub description_overrides: std::collections::HashMap<String, String>,
 }
 
 pub struct DispatchAgentTool {
@@ -443,6 +447,11 @@ impl Tool for DispatchAgentTool {
         for t in crate::context_tools(store.clone(), flag.clone(), self.deps.max_result_bytes) {
             reg.register(t);
         }
+        // Finding 4.1: apply the parent's description overrides to the child
+        // registry (registry-level, matching assemble.rs's parent application).
+        // Names not in THIS child's registry (e.g. allowlist-filtered tools)
+        // just warn — same posture as the parent path.
+        reg.set_description_overrides(self.deps.description_overrides.clone());
         let system = match &role {
             Some(r) => format!("{}\n\nRole: {r}", self.deps.child_system_prompt),
             None => self.deps.child_system_prompt.clone(),
@@ -867,6 +876,7 @@ mod tests {
             depth: 1,
             max_depth: 1,
             id_prefix: String::new(),
+            description_overrides: Default::default(),
         }
     }
 
@@ -920,5 +930,58 @@ mod tests {
             out.content
         );
         assert!(!out.content.contains("\n\n\n"), "{:?}", out.content);
+    }
+
+    /// Finding 4.1: registry-level description overrides must reach the CHILD
+    /// registry too (the seam spec's uniformity claim). context_recall is
+    /// always-registered for children, so overriding it needs no base tool.
+    #[tokio::test]
+    async fn description_overrides_reach_child_registry() {
+        struct SchemaCapturingModel {
+            inner: ScriptedModel,
+            seen: std::sync::Mutex<Vec<(String, String)>>,
+        }
+        #[async_trait::async_trait]
+        impl agent_model::ModelClient for SchemaCapturingModel {
+            async fn stream(
+                &self,
+                req: agent_model::CompletionRequest,
+            ) -> Result<
+                futures::stream::BoxStream<
+                    'static,
+                    Result<agent_model::Chunk, agent_model::ModelError>,
+                >,
+                agent_model::ModelError,
+            > {
+                self.seen.lock().unwrap().extend(
+                    req.tools
+                        .iter()
+                        .map(|t| (t.name.clone(), t.description.clone())),
+                );
+                self.inner.stream(req).await
+            }
+        }
+        let model = Arc::new(SchemaCapturingModel {
+            inner: ScriptedModel::new(vec![Scripted::Text("x".into())]),
+            seen: Default::default(),
+        });
+        let mut d = exec_deps(ScriptedModel::new(vec![]), 5);
+        d.model = model.clone();
+        d.description_overrides = [("context_recall".to_string(), "OVERRIDDEN".to_string())].into();
+        // Clone-propagation pin: nested deps are self.deps.clone() in execute().
+        assert_eq!(
+            d.clone().description_overrides.get("context_recall"),
+            Some(&"OVERRIDDEN".to_string())
+        );
+        let tool = DispatchAgentTool::new(d);
+        tool.execute(serde_json::json!({"prompt": "p"}), &exec_ctx())
+            .await
+            .unwrap();
+        let seen = model.seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|(n, desc)| n == "context_recall" && desc.starts_with("OVERRIDDEN")),
+            "child request schemas must carry the override: {seen:?}"
+        );
     }
 }
