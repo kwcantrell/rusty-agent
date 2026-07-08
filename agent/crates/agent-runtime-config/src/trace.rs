@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const TRACE_SCHEMA: u32 = 1;
 const RETAIN_FILES: usize = 50;
+/// Reserved so the terminal `trace_disabled` marker always fits under the cap.
+const TRACE_DISABLED_HEADROOM: u64 = 256;
 
 pub struct TraceWriter {
     session_id: String,
@@ -103,12 +105,12 @@ impl TraceWriter {
             Ok(l) => l,
             Err(_) => return,
         };
-        if inner.written + line.len() as u64 + 1 > self.max_bytes {
+        if inner.written + line.len() as u64 + 1
+            > self.max_bytes.saturating_sub(TRACE_DISABLED_HEADROOM)
+        {
             tracing::warn!(target: "trace", cap_mb = self.max_bytes / (1024 * 1024),
                 "trace size cap reached; tracing disabled for this session");
-            if let Some(w) = inner.w.as_mut() {
-                let _ = w.flush();
-            }
+            write_disabled_marker(&mut inner, "cap");
             inner.w = None;
             return;
         }
@@ -119,12 +121,30 @@ impl TraceWriter {
         };
         if failed {
             tracing::warn!(target: "trace", "trace write failed; tracing disabled for this session");
+            write_disabled_marker(&mut inner, "io_error");
             inner.w = None;
             return;
         }
         inner.written += line.len() as u64 + 1;
         inner.seq += 1;
     }
+}
+
+/// Best-effort terminal marker so a capped/failed trace is distinguishable
+/// from a mid-turn crash (audit 6.2). Cap-path headroom is pre-reserved; on
+/// the io_error path the write may itself fail — accepted (best-effort by
+/// nature). Must not recurse into the cap check.
+fn write_disabled_marker(inner: &mut Inner, reason: &str) {
+    // Read seq BEFORE borrowing w mutably (same borrow-order note as record()).
+    let seq = inner.seq;
+    let Some(w) = inner.w.as_mut() else { return };
+    let rec = serde_json::json!({
+        "seq": seq,
+        "ts_ms": epoch_ms(),
+        "event": { "type": "trace_disabled", "reason": reason },
+    });
+    let _ = writeln!(w, "{rec}");
+    let _ = w.flush();
 }
 
 fn mint_session_id() -> String {
@@ -545,7 +565,12 @@ mod tests {
         w.record(&AgentEvent::Done(agent_model::StopReason::Stop));
         let path = dir.path().join(format!("{}.jsonl", w.session_id()));
         let body = std::fs::read_to_string(path).unwrap();
-        assert_eq!(body.lines().count(), 1); // header only; cap stopped event writes
+        // Header + terminal marker: cap stopped the event writes but the
+        // trace_disabled marker records *why* (audit 6.2).
+        assert_eq!(body.lines().count(), 2);
+        let marker: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(marker["event"]["type"], "trace_disabled");
+        assert_eq!(marker["event"]["reason"], "cap");
     }
 
     #[test]
@@ -568,6 +593,34 @@ mod tests {
         let path = dir.path().join(format!("{}.jsonl", w.session_id()));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "trace file must be owner-only");
+    }
+
+    #[test]
+    fn cap_breach_writes_terminal_trace_disabled_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = TraceWriter::create(dir.path(), 1).unwrap(); // 1 MB cap
+        let big = "x".repeat(64 * 1024);
+        for _ in 0..20 {
+            // 20 × 64KB ≈ 1.25MB — guaranteed breach
+            t.record(&AgentEvent::Token(big.clone()));
+        }
+        let content =
+            std::fs::read_to_string(dir.path().join(format!("{}.jsonl", t.session_id()))).unwrap();
+        let last = content.lines().last().unwrap();
+        let v: serde_json::Value = serde_json::from_str(last).expect("marker is valid JSON");
+        assert_eq!(v["event"]["type"], "trace_disabled");
+        assert_eq!(v["event"]["reason"], "cap");
+        assert!(
+            (last.len() as u64) < TRACE_DISABLED_HEADROOM,
+            "marker must fit the reserved headroom, got {}",
+            last.len()
+        );
+        // Disabled means disabled: a later record must not resurrect the file.
+        let len_before = content.len();
+        t.record(&AgentEvent::Token("after".into()));
+        let after =
+            std::fs::read_to_string(dir.path().join(format!("{}.jsonl", t.session_id()))).unwrap();
+        assert_eq!(after.len(), len_before, "no writes after disable");
     }
 
     #[test]
