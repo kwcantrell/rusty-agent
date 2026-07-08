@@ -1030,8 +1030,14 @@ impl AgentLoop {
             // Durable history never sees it — appended, it would survive into
             // later runs of the session as a stale "tools are disabled" claim
             // (models measurably imitate such visible history patterns).
-            let mut messages = ctx.build(self.effective_model_limit());
-            messages.push(Message::user(BUDGET_WRAP_UP_PROMPT));
+            // Reserve headroom for the injected prompt so the single, no-recovery
+            // wrap-up request cannot exceed the window that build() just filled:
+            // build() budgets against message_tokens, the same accounting
+            // built_tokens sums, so the pushed prompt lands within the limit.
+            let wrap_up = Message::user(BUDGET_WRAP_UP_PROMPT);
+            let headroom = built_tokens(std::slice::from_ref(&wrap_up));
+            let mut messages = ctx.build(self.effective_model_limit().saturating_sub(headroom));
+            messages.push(wrap_up);
             let mut req = self.completion_request(messages, preserve_thinking);
             req.tools = Vec::new();
             let started = std::time::Instant::now();
@@ -1877,6 +1883,101 @@ mod tests {
         assert!(
             tail.content.contains("turn limit for this run"),
             "the wrap-up request must end with the instruction: {tail:?}"
+        );
+    }
+
+    /// Review finding: the wrap-up build must reserve headroom for the injected
+    /// prompt. `build()` fills history up to the window; pushing the prompt ON
+    /// TOP then overruns it — and the wrap-up arm has NO overflow recovery, so in
+    /// exactly the budget-exhausted, near-full runs that reach it the overrun
+    /// would error the completion and silently drop the summary. Pin: with a
+    /// small window and history fat enough to saturate it, the wrap-up request
+    /// must fit inside `model_limit` AND still end with the instruction.
+    #[tokio::test]
+    async fn budget_wrap_up_request_fits_the_window() {
+        use crate::ContextManager;
+        struct LastRequestModel {
+            inner: ScriptedModel,
+            last: std::sync::Mutex<Vec<Message>>,
+        }
+        #[async_trait::async_trait]
+        impl agent_model::ModelClient for LastRequestModel {
+            async fn stream(
+                &self,
+                req: agent_model::CompletionRequest,
+            ) -> Result<
+                futures::stream::BoxStream<
+                    'static,
+                    Result<agent_model::Chunk, agent_model::ModelError>,
+                >,
+                agent_model::ModelError,
+            > {
+                *self.last.lock().unwrap() = req.messages.clone();
+                self.inner.stream(req).await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        std::fs::write(ws.join("f.txt"), "x").unwrap();
+        let model = Arc::new(LastRequestModel {
+            inner: ScriptedModel::new(vec![
+                Scripted::Call(
+                    "c1".into(),
+                    "read_file".into(),
+                    format!(r#"{{"path":"{}"}}"#, ws.join("f.txt").display()),
+                ),
+                Scripted::Text("wrap-up summary".into()),
+            ]),
+            last: std::sync::Mutex::new(Vec::new()),
+        });
+        // A small window, and calibration stays at 1.0 (Scripted::Call/Text emit
+        // no server Usage), so effective_model_limit == model_limit == this value.
+        let model_limit = 400usize;
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model.clone(),
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit,
+                max_turns: 1,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        // Fat history: many small units (~24 tokens each, well under the prompt's
+        // ~59-token headroom) that together far exceed the window, so build() packs
+        // right up to the limit and an un-reserved push would overrun it.
+        for i in 0..60 {
+            ctx.append(Message::user(format!(
+                "prior context line {i} carrying a little padding text here"
+            )));
+        }
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let last = model.last.lock().unwrap();
+        assert!(!last.is_empty(), "wrap-up request has messages");
+        // The invariant: the single, no-recovery wrap-up request never exceeds the
+        // window. Pre-fix (build to full limit, then push) this overruns.
+        assert!(
+            built_tokens(&last) <= model_limit,
+            "wrap-up request must fit the window: {} > {model_limit}",
+            built_tokens(&last)
+        );
+        // The headroom reservation must not drop the instruction — it is still last.
+        let tail = last.last().unwrap();
+        assert!(
+            tail.content.contains("turn limit for this run"),
+            "the wrap-up request must still end with the instruction: {tail:?}"
         );
     }
 
