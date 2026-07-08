@@ -300,7 +300,8 @@ fn resolve_sandbox_image(configured: &str, image_missing: impl Fn(&str) -> bool)
 /// Map a `RuntimeConfig` to a `SandboxStrategy`:
 /// - `sandbox_mode == "off"` → `HostExecutor` (no Docker overhead).
 /// - `"enforce"` → `DockerSandbox` in `Mode::Enforce` (fails if Docker absent).
-/// - anything else (e.g. `"auto"`) → `DockerSandbox` in `Mode::Auto` (degrades to host).
+/// - anything else (e.g. `"auto"`) → `DockerSandbox` in `Mode::Auto` (fail-closed:
+///   refuses exec while Docker is unavailable, re-probes on each launch).
 ///
 /// Invalid mount paths in `sandbox_extra_rw`/`sandbox_extra_ro` are dropped with a
 /// `tracing::warn!` rather than panicking.

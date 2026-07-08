@@ -225,8 +225,8 @@ impl Tool for CreateSkill {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "path": { "type": "string" },
-                                "content": { "type": "string" }
+                                "path": { "type": "string", "description": "File path relative to the skill directory (e.g. examples/basic.md)." },
+                                "content": { "type": "string", "description": "Full text content of the file." }
                             },
                             "required": ["path", "content"]
                         }

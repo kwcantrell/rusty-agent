@@ -1,7 +1,7 @@
 //! The single place a `RuntimeConfig` + per-frontend pieces become an `AgentLoop`.
 //! Used by both the CLI (`agent-cli`) and the server (`agent-server`) so loop
 //! assembly cannot diverge between front-ends.
-use crate::{build_registry, build_sandbox, build_skills, pick_protocol, ModelRef, RuntimeConfig};
+use crate::{build_registry, build_skills, pick_protocol, ModelRef, RuntimeConfig};
 use agent_core::{AgentLoop, EventSink, LoopConfig, Retriever};
 use agent_model::ModelClient;
 use agent_policy::{ApprovalChannel, RulePolicy};
@@ -30,6 +30,10 @@ pub struct LoopParts {
     pub offload_store: Arc<dyn agent_core::OffloadStore>,
     /// Flag the `context_compact` tool sets; the caller's `CuratedContext` reads it.
     pub compact_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// The frontend's single sandbox instance — one probe + one availability
+    /// cache per frontend (audit 3.5). Callers that also connect MCP must
+    /// pass the SAME Arc they gave `connect_mcp`.
+    pub sandbox: Arc<dyn agent_tools::SandboxStrategy>,
     /// Session-stable stats handle; caller-owned (survives server loop rebuilds).
     pub stats: Arc<std::sync::RwLock<agent_core::SessionStats>>,
     /// Session-stable trace writer; None = tracing disabled. Caller-owned: create
@@ -108,6 +112,7 @@ pub fn loop_config_from(
     cfg: &RuntimeConfig,
     workspace: PathBuf,
     stream_idle_timeout: Duration,
+    sandbox: Arc<dyn agent_tools::SandboxStrategy>,
 ) -> LoopConfig {
     LoopConfig {
         model_limit: cfg.context_limit,
@@ -125,7 +130,7 @@ pub fn loop_config_from(
         repeat_penalty: cfg.repeat_penalty,
         enable_thinking: cfg.enable_thinking,
         preserve_thinking: cfg.preserve_thinking,
-        sandbox: build_sandbox(cfg),
+        sandbox,
         max_parallel_tools: cfg.max_parallel_tools,
         post_tool_validators: cfg.post_tool_validators.clone(),
         compaction_model_limit: cfg.compaction_model.as_ref().and_then(|m| m.context_limit),
@@ -243,7 +248,12 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         trace: parts.trace.clone(),
     });
 
-    let loop_config = loop_config_from(cfg, parts.workspace.clone(), parts.stream_idle_timeout);
+    let loop_config = loop_config_from(
+        cfg,
+        parts.workspace.clone(),
+        parts.stream_idle_timeout,
+        parts.sandbox.clone(),
+    );
 
     // Dedicated compaction model (spec G3): routed into both the parent loop and
     // child loops. For the openai backend, None inherits the primary model at every
@@ -466,6 +476,7 @@ mod tests {
             base_system_prompt: "BASE".into(),
             offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sandbox: crate::build_sandbox(&cfg()),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
             trace: None,
             api_key: None,
@@ -488,8 +499,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut c = cfg();
         assert_eq!(
-            loop_config_from(&c, dir.path().to_path_buf(), Duration::from_secs(77))
-                .compaction_model_limit,
+            loop_config_from(
+                &c,
+                dir.path().to_path_buf(),
+                Duration::from_secs(77),
+                crate::build_sandbox(&c)
+            )
+            .compaction_model_limit,
             None
         );
         c.compaction_model = Some(crate::ModelRef {
@@ -497,8 +513,13 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            loop_config_from(&c, dir.path().to_path_buf(), Duration::from_secs(77))
-                .compaction_model_limit,
+            loop_config_from(
+                &c,
+                dir.path().to_path_buf(),
+                Duration::from_secs(77),
+                crate::build_sandbox(&c)
+            )
+            .compaction_model_limit,
             Some(4096)
         );
     }
@@ -630,7 +651,12 @@ mod tests {
         c.top_p = Some(0.5);
         c.enable_thinking = false;
         c.preserve_thinking = true;
-        let lc = loop_config_from(&c, dir.path().to_path_buf(), Duration::from_secs(77));
+        let lc = loop_config_from(
+            &c,
+            dir.path().to_path_buf(),
+            Duration::from_secs(77),
+            crate::build_sandbox(&c),
+        );
         assert_eq!(lc.model_limit, 5000);
         assert_eq!(lc.max_turns, 9);
         assert_eq!(lc.max_retries, 3);
@@ -648,16 +674,26 @@ mod tests {
         let mut cfg2 = c.clone();
         cfg2.max_parallel_tools = 2;
         assert_eq!(
-            loop_config_from(&cfg2, dir.path().to_path_buf(), Duration::from_secs(77))
-                .max_parallel_tools,
+            loop_config_from(
+                &cfg2,
+                dir.path().to_path_buf(),
+                Duration::from_secs(77),
+                crate::build_sandbox(&cfg2)
+            )
+            .max_parallel_tools,
             2
         );
 
         let mut cfg3 = c.clone();
         cfg3.post_tool_validators = vec!["cargo check".into()];
         assert_eq!(
-            loop_config_from(&cfg3, dir.path().to_path_buf(), Duration::from_secs(77))
-                .post_tool_validators,
+            loop_config_from(
+                &cfg3,
+                dir.path().to_path_buf(),
+                Duration::from_secs(77),
+                crate::build_sandbox(&cfg3)
+            )
+            .post_tool_validators,
             vec!["cargo check".to_string()]
         );
     }
@@ -889,5 +925,19 @@ mod tests {
             HashSet::from(["recall"]),
             "unexpected confusable tools missing from the assembled registry: {absent:?}"
         );
+    }
+
+    #[test]
+    fn assemble_uses_the_injected_sandbox_not_a_fresh_build() {
+        // Audit 3.5: one isolation boundary, one authoritative instance. If
+        // assemble rebuilt from cfg, enforce-mode would yield mechanism
+        // "docker"; seeing "host" proves the caller's Arc is used.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.sandbox_mode = "enforce".into();
+        let mut p = parts(dir.path().to_path_buf(), vec![]);
+        p.sandbox = Arc::new(agent_tools::HostExecutor);
+        let built = assemble_loop(&c, p);
+        assert_eq!(built.loop_.sandbox_descriptor().mechanism, "host");
     }
 }

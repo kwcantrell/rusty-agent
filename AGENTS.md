@@ -47,6 +47,14 @@ Keep plan review as-is (single reviewer: spec coverage, decomposition, buildabil
 Only add a *lighter* adversarial pass on the plan — scoped to architecture/decomposition,
 **not** requirements — if real design decisions leak downstream into the plan.
 
+### Docs-only exception
+
+Docs/ledger-only campaigns (audits, triage records, campaign ledgers, memory
+bookkeeping) may commit directly to `main` without a feature branch.
+Compensating control: `main` is never pushed automatically, and the
+whole-campaign review must pass before any push — review findings land as fix
+waves on main, not silent history edits. Anything touching code, tests, or CI
+still branches.
 
 ## Conventions
 

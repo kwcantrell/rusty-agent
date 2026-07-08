@@ -294,6 +294,7 @@ async fn eval_context_run() {
                 base_system_prompt: cc.resolved_system_prompt(EVAL_DEFAULT_PROMPT).to_string(),
                 offload_store: offload.clone(),
                 compact_flag: flag.clone(),
+                sandbox: agent_runtime_config::build_sandbox(&cfg),
                 stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
                 trace: None,
                 api_key: None,

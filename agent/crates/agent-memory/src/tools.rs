@@ -104,8 +104,7 @@ impl Tool for Remember {
         "remember"
     }
     fn description(&self) -> &str {
-        "Store a fact in long-term memory for recall in future sessions. \
-         Args: text (required), tags (optional string array), scope ('project'|'global', default project)."
+        "Store a fact in long-term memory for recall in future sessions."
     }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -243,7 +242,7 @@ impl Tool for Recall {
     }
     fn description(&self) -> &str {
         "Search long-term memory for facts relevant to a query. Returns the most similar \
-         stored memories from this project and the global tier. Args: query (required), k (optional)."
+         stored memories from this project and the global tier."
     }
     fn when_not_to_call(&self) -> Option<&str> {
         Some(
@@ -324,8 +323,8 @@ impl Tool for Forget {
         "forget"
     }
     fn description(&self) -> &str {
-        "Remove a memory. Args: either id (exact) or query (deletes the single best match \
-         only if confidently similar). Never mass-deletes."
+        "Remove a single memory, selected by exact id or by a query matched against \
+         stored text. Never mass-deletes."
     }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -778,6 +777,47 @@ mod recall_contract_tests {
             described(&forget.schema(), "query"),
             "forget.query must be described"
         );
+    }
+
+    #[test]
+    fn base_descriptions_do_not_duplicate_arg_lists() {
+        // Audit 2.5: per-param schema descriptions are the single source of
+        // truth for argument prose; an "Args:" sentence in the base
+        // description is a second, drift-prone copy of the same contract.
+        let embedder: std::sync::Arc<dyn crate::embedder::Embedder> =
+            std::sync::Arc::new(StubEmbedder::d384());
+        let store: std::sync::Arc<dyn crate::store::MemoryStore> =
+            std::sync::Arc::new(InMemoryStore::new());
+        let cfg = std::sync::Arc::new(MemoryConfig::default());
+        let descriptions = [
+            Remember {
+                embedder: embedder.clone(),
+                store: store.clone(),
+                cfg: cfg.clone(),
+                project_key: "A".into(),
+            }
+            .description()
+            .to_string(),
+            Recall {
+                embedder: embedder.clone(),
+                store: store.clone(),
+                cfg: cfg.clone(),
+                project_key: "A".into(),
+            }
+            .description()
+            .to_string(),
+            Forget {
+                embedder,
+                store,
+                cfg,
+                project_key: "A".into(),
+            }
+            .description()
+            .to_string(),
+        ];
+        for d in &descriptions {
+            assert!(!d.contains("Args:"), "duplicated arg list in: {d}");
+        }
     }
 }
 
