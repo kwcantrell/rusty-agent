@@ -2,6 +2,18 @@
 
 ## 2026-07-09
 
+**Review** — consistency & completeness pass (Wave 4): all six checks run
+(cross-file contradictions, scope coverage, deep-source citation, citation
+hygiene, index accuracy, stale post-fix language). 0 MAJOR findings; coverage,
+deep-citation (31/31), and citation hygiene all clean; no source additions
+demanded. 3 MINOR fixes applied: windowing.md capability-file format aligned
+to the bundle's verified JSON/TOML statement; duplicated sentence removed in
+comparisons/mock-ipc-vs-webdriver.md; four scraped source descriptions
+corrected (+ sources/index.md regenerated). Bundle verification complete per
+spec two-shape discipline.
+
+## 2026-07-09
+
 **Review** — adversarial fact-verification (Wave 3): 205 claims checked across
 all 20 concept files by 7 independent refuters re-fetching live cited sources.
 Verdicts: 202 CONFIRMED, 3 REFUTED-SYNTHESIS (fixed verbatim: benchmark workload

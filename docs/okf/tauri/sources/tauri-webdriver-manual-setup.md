@@ -1,7 +1,7 @@
 ---
 type: Source
 title: "Manual setup"
-description: "Manual setup"
+description: "Manual tauri-driver WebDriver setup for Windows and Linux"
 resource: https://v2.tauri.app/develop/tests/webdriver/manual-setup/
 tags: [testing]
 timestamp: 2026-07-09T00:00:00Z

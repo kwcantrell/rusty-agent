@@ -1,7 +1,7 @@
 ---
 type: Source
 title: "mocks"
-description: "Section titled “Interfaces”"
+description: "Reference for the @tauri-apps/api/mocks namespace — mockIPC, mockWindows, clearMocks"
 resource: https://v2.tauri.app/reference/javascript/api/namespacemocks/
 tags: [testing]
 timestamp: 2026-07-09T00:00:00Z

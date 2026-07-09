@@ -4,12 +4,12 @@ Snapshotted source material (evidence layer). Provenance: `resource` = live URL,
 
 ## testing
 
-* [mocks](/sources/tauri-js-mocks-reference.md) - Section titled “Interfaces”
+* [mocks](/sources/tauri-js-mocks-reference.md) - Reference for the @tauri-apps/api/mocks namespace — mockIPC, mockWindows, clearMocks
 * [Mock Tauri APIs](/sources/tauri-tests-mocking.md) - Mock Tauri APIs
-* [Tests](/sources/tauri-tests-overview.md) - Tauri offers support for both unit and integration testing utilizing a mock runtime. Under the mock 
+* [Tests](/sources/tauri-tests-overview.md) - Overview of Tauri unit/integration testing under a mock runtime, plus WebDriver E2E
 * [Continuous Integration | Tauri](/sources/tauri-webdriver-ci.md) - GitHub Actions workflow for executing WebDriver tests with tauri-driver on Linux and Windows CI systems.
-* [Manual setup](/sources/tauri-webdriver-manual-setup.md) - Manual setup
-* [WebDriver](/sources/tauri-webdriver-overview.md) - WebdriverIO
+* [Manual setup](/sources/tauri-webdriver-manual-setup.md) - Manual tauri-driver WebDriver setup for Windows and Linux
+* [WebDriver](/sources/tauri-webdriver-overview.md) - Overview of WebDriver E2E testing for Tauri via @wdio/tauri-service and tauri-driver
 * [Selenium | Tauri](/sources/tauri-webdriver-selenium.md) - End-to-end testing guide for Tauri applications using Selenium WebDriver with Mocha and Chai.
 * [WebdriverIO | Tauri](/sources/tauri-webdriver-webdriverio.md) - End-to-end testing setup for Tauri applications using WebdriverIO and tauri-driver integration.
 * [Platform Support | WebdriverIO](/sources/wdio-tauri-service.md) - Platform-specific WebDriver setup and support matrix for Tauri testing on Windows, Linux, and macOS.

@@ -1,7 +1,7 @@
 ---
 type: Source
 title: "WebDriver"
-description: "WebdriverIO"
+description: "Overview of WebDriver E2E testing for Tauri via @wdio/tauri-service and tauri-driver"
 resource: https://v2.tauri.app/develop/tests/webdriver/
 tags: [testing]
 timestamp: 2026-07-09T00:00:00Z

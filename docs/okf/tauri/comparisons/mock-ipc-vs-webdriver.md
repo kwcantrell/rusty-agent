@@ -8,8 +8,6 @@ timestamp: 2026-07-09T00:00:00Z
 
 Tauri supports two testing strategies that sit at different levels of the stack: unit and integration tests against a mock runtime, and end-to-end tests driven over the WebDriver protocol [1]. They catch different failures at different costs, and the sources treat them as complementary rather than substitutes [1].
 
-Under the mock runtime, native webview libraries are not executed [1].
-
 ## Mock IPC: fast frontend unit tests
 
 When you test the frontend in isolation, there is no real Tauri backend, so the `@tauri-apps/api/mocks` module lets you fake the Tauri environment and intercept IPC calls [2]. The core tool is `mockIPC`, which intercepts every IPC request with a handler you supply — enough to "ensure the correct backend calls are made" and to "simulate different results from backend functions" [2]. Under the mock runtime, native webview libraries are never executed [1].

@@ -1,7 +1,7 @@
 ---
 type: Source
 title: "Tests"
-description: "Tauri offers support for both unit and integration testing utilizing a mock runtime. Under the mock "
+description: "Overview of Tauri unit/integration testing under a mock runtime, plus WebDriver E2E"
 resource: https://v2.tauri.app/develop/tests/
 tags: [testing]
 timestamp: 2026-07-09T00:00:00Z
