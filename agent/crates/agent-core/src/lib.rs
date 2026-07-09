@@ -10,6 +10,7 @@ mod loop_;
 mod middleware;
 mod offload_policy;
 mod recall;
+mod response_format;
 mod snapshot;
 pub mod stats;
 #[cfg(any(test, feature = "testkit"))]
@@ -26,6 +27,7 @@ pub use loop_::*;
 pub use middleware::*;
 pub use offload_policy::*;
 pub use recall::*;
+pub use response_format::*;
 pub use snapshot::{ContextSegment, ContextSnapshot};
 pub use stats::SessionStats;
 pub use todos::*;
