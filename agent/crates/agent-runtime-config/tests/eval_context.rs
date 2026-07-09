@@ -37,8 +37,8 @@ impl ApprovalChannel for SafeApproval {
     async fn request(&self, r: ApprovalRequest) -> ApprovalResponse {
         let allow = match r.intent.tool.as_str() {
             "read_file" | "list_directory" | "write_file" | "edit_file" | "render"
-            | "git_status" | "git_diff" | "grep" | "context_compact" | "remember"
-            | "recall" | "forget" => true,
+            | "git_status" | "git_diff" | "grep" | "context_compact" | "remember" | "recall"
+            | "forget" => true,
             "execute_command" => r
                 .intent
                 .command
