@@ -17,12 +17,27 @@ use tokio_util::sync::CancellationToken;
 pub const STUCK_NUDGE_AFTER: usize = 2;
 pub const STUCK_ABORT_AFTER: usize = 4;
 
+/// One re-ask per consecutive parse-failure streak — the current
+/// `protocol_repairs < 1` (spec §5.3). Named so a future knob is one line.
+pub const MAX_REPAIRS: usize = 1;
+
 /// Node-hook outcome. `EndRun` short-circuits remaining hooks at that point;
 /// the loop maps it to `emit(Done(reason)); return Ok(())` (spec §5.2).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Flow {
     Continue,
     EndRun(StopReason),
+}
+
+/// Outcome of consulting the stack on a total tool-call parse failure (spec §5.1).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Repair {
+    /// Append the raw assistant text + this user message, then the loop
+    /// `continue`s (fresh turn iteration; `est_prompt_tokens` recomputed → no
+    /// calibration skew).
+    ReAsk(String),
+    /// Terminal: today's behavior — emit Error + Done(Error), return Ok.
+    GiveUp,
 }
 
 /// A tool a middleware ships at assembly. `child_visible` controls membership
@@ -242,6 +257,21 @@ pub trait Middleware: Send + Sync {
     }
     /// Only on the text-only exit path (loop_.rs:751); see spec §5.1/J5.
     async fn after_final_reply(&self, _cx: &mut RunCx<'_>) {}
+
+    /// The model's output could not be parsed into tool calls at all
+    /// (`protocol.parse` returned `Err`). The loop consults this at the
+    /// total-parse-failure arms, AFTER the Length-truncation short-circuit and
+    /// upstream of the second Length guard. Fires on nothing else: not on
+    /// success, not on partial-invalid turns, not on Length truncation, cancel,
+    /// overflow, or budget. Reverse stack order; the first `ReAsk` wins.
+    async fn on_parse_failure(
+        &self,
+        _cx: &mut RunCx<'_>,
+        _raw: &agent_model::AssistantTurn,
+        _err: &str,
+    ) -> Repair {
+        Repair::GiveUp
+    }
 
     /// Wraps one `completion_with_retry` invocation (spec §5.1/J3, Task 3).
     /// The default is a pure pass-through. Invoked twice, independently,
@@ -468,6 +498,52 @@ impl Middleware for StuckDetectionMiddleware {
     }
 }
 
+/// Malformed-tool-call recovery as a pluggable unit (spec §5.3): reproduces the
+/// loop-resident one-shot re-ask byte-identically. Implements only
+/// `on_parse_failure`; the loop still owns the `continue`/terminal.
+#[derive(Default)]
+pub struct RepairMiddleware;
+
+#[derive(Default)]
+struct RepairState {
+    repairs: usize,
+    /// The last turn index that failed to parse. A gap (an intervening success)
+    /// resets `repairs`, reproducing the loop's reset-on-successful-parse
+    /// (spec §5.3; plan discrepancy S2).
+    last_fail_turn: Option<usize>,
+}
+
+#[async_trait]
+impl Middleware for RepairMiddleware {
+    fn name(&self) -> &str {
+        "repair"
+    }
+    async fn on_parse_failure(
+        &self,
+        cx: &mut RunCx<'_>,
+        _raw: &agent_model::AssistantTurn,
+        err: &str,
+    ) -> Repair {
+        let turn = cx.turn;
+        let s = cx.state.entry::<RepairState>();
+        // Contiguous with the previous failure? (each re-ask `continue`s and
+        // advances `turn`, so consecutive failures have consecutive indices).
+        let contiguous = matches!((s.last_fail_turn, turn), (Some(l), Some(t)) if t == l + 1);
+        if !contiguous {
+            s.repairs = 0;
+        }
+        s.last_fail_turn = turn;
+        if s.repairs < MAX_REPAIRS {
+            s.repairs += 1;
+            Repair::ReAsk(format!(
+                "Your tool call could not be parsed: {err}. Re-emit it correctly."
+            ))
+        } else {
+            Repair::GiveUp
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,5 +642,120 @@ mod tests {
         // (RunCx construction is exercised in loop_ tests; defaults are
         // pure so a unit check of tools() + Flow is enough here.)
         assert_eq!(Flow::Continue, Flow::Continue);
+    }
+
+    // ---- RepairMiddleware unit tests (spec §5.3; A3 brief Step 1) ----------
+    //
+    // These pin the byte-identical default repair policy and the S2
+    // reset-on-non-contiguity reading (reproducing today's
+    // reset-on-successful-parse). They construct a bare `RunCx` directly
+    // (no loop) and drive `on_parse_failure` against a shared `RunState`.
+
+    /// A `RunCx` at `turn`, sharing the caller's `ctx`/`state`/`shared` so a
+    /// streak of failures accumulates in the same `RepairState`.
+    fn parse_fail_cx<'a>(
+        ctx: &'a mut dyn ContextManager,
+        state: &'a mut RunState,
+        shared: &'a RunShared,
+        cancel: &'a CancellationToken,
+        sink: &'a Arc<dyn EventSink>,
+        model: &'a Arc<dyn ModelClient>,
+        turn: usize,
+    ) -> RunCx<'a> {
+        RunCx {
+            ctx,
+            sink,
+            cancel,
+            state,
+            shared,
+            turn: Some(turn),
+            maint: MaintView {
+                maint_model: model,
+                maint_model_limit: 100_000,
+                effective_model_limit: 100_000,
+            },
+        }
+    }
+
+    /// Shared test scaffold: a `WindowContext`, a scripted model, a sink, a
+    /// cancel token, and a `RunShared` — everything a `RunCx` needs.
+    fn repair_harness() -> (
+        crate::WindowContext,
+        Arc<dyn ModelClient>,
+        Arc<dyn EventSink>,
+        RunShared,
+        CancellationToken,
+    ) {
+        let ctx = crate::WindowContext::new(agent_model::Message::system("sys"));
+        let model: Arc<dyn ModelClient> = Arc::new(crate::testkit::ScriptedModel::new(vec![]));
+        let sink: Arc<dyn EventSink> = Arc::new(crate::testkit::CollectingSink::default());
+        (
+            ctx,
+            model,
+            sink,
+            RunShared::default(),
+            CancellationToken::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn repair_default_reasks_once_then_gives_up_on_contiguous_failure() {
+        let raw = agent_model::AssistantTurn {
+            text: "garbage".into(),
+            ..Default::default()
+        };
+        let m = RepairMiddleware;
+        let (mut ctx, model, sink, shared, cancel) = repair_harness();
+        let mut state = RunState::default();
+
+        // Turn 3: first failure of a streak → ReAsk with the exact message.
+        {
+            let mut cx = parse_fail_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, 3);
+            let r = m.on_parse_failure(&mut cx, &raw, "bad json").await;
+            assert_eq!(
+                r,
+                Repair::ReAsk(
+                    "Your tool call could not be parsed: bad json. Re-emit it correctly.".into()
+                )
+            );
+        }
+        // Turn 4 (contiguous): second consecutive failure → terminal GiveUp.
+        {
+            let mut cx = parse_fail_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, 4);
+            let r = m.on_parse_failure(&mut cx, &raw, "bad json").await;
+            assert_eq!(r, Repair::GiveUp);
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_resets_on_non_contiguous_failure() {
+        // Reproduces today's reset-on-successful-parse (loop_.rs Ok-arm): a
+        // failure separated from the prior one by a gap in turn index (an
+        // intervening success) re-asks again (plan discrepancy S2).
+        let raw = agent_model::AssistantTurn {
+            text: "garbage".into(),
+            ..Default::default()
+        };
+        let m = RepairMiddleware;
+        let (mut ctx, model, sink, shared, cancel) = repair_harness();
+        let mut state = RunState::default();
+
+        // Turn 3 fail → ReAsk (repairs 0→1, last_fail=Some(3)).
+        {
+            let mut cx = parse_fail_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, 3);
+            assert!(matches!(
+                m.on_parse_failure(&mut cx, &raw, "e").await,
+                Repair::ReAsk(_)
+            ));
+        }
+        // Turn 7 fail (gap: turns 4..6 parsed OK, no on_parse_failure) →
+        // non-contiguous → repairs reset to 0 → ReAsk again.
+        {
+            let mut cx = parse_fail_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, 7);
+            assert!(matches!(
+                m.on_parse_failure(&mut cx, &raw, "e").await,
+                Repair::ReAsk(_)
+            ));
+        }
     }
 }

@@ -1,7 +1,7 @@
 //! Sub-agent dispatch: sub-agents-as-tools (spec 2026-07-01-subagent-dispatch-core).
 use crate::{
     AgentEvent, AgentLoop, ContextCurationMiddleware, CuratedContext, EventSink, LoopConfig,
-    Middleware, OffloadConfig, SessionArtifacts, StuckDetectionMiddleware,
+    Middleware, OffloadConfig, RepairMiddleware, SessionArtifacts, StuckDetectionMiddleware,
 };
 use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, PolicyEngine};
@@ -540,7 +540,11 @@ impl Tool for DispatchAgentTool {
                 )),
             ));
         let child = child
-            .with_middleware(vec![curation, Arc::new(StuckDetectionMiddleware)])
+            .with_middleware(vec![
+                curation,
+                Arc::new(StuckDetectionMiddleware),
+                Arc::new(RepairMiddleware),
+            ])
             .with_backend(child_backend);
         // Route child-loop compaction through the dedicated model when set.
         let child = match &self.deps.compaction_model {

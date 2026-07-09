@@ -428,6 +428,40 @@ impl AgentLoop {
         }
     }
 
+    /// Reverse order: on a total tool-call parse failure. The FIRST middleware
+    /// returning `ReAsk` wins and short-circuits; all `GiveUp` (or an empty
+    /// stack) yields today's terminal give-up. `raw` is a borrow of the turn
+    /// the loop still holds (consumed only on the branches after this returns).
+    #[allow(clippy::too_many_arguments)]
+    async fn fire_on_parse_failure(
+        &self,
+        ctx: &mut dyn ContextManager,
+        state: &mut crate::RunState,
+        shared: &crate::RunShared,
+        cancel: &CancellationToken,
+        turn: usize,
+        raw: &agent_model::AssistantTurn,
+        err: &str,
+    ) -> crate::Repair {
+        for mw in self.middleware.iter().rev() {
+            let mut cx = crate::RunCx {
+                ctx: &mut *ctx,
+                sink: &self.sink,
+                cancel,
+                state: &mut *state,
+                shared,
+                turn: Some(turn),
+                maint: self.maint_view(),
+            };
+            let r = mw.on_parse_failure(&mut cx, raw, err).await;
+            Self::assert_no_orphans(ctx, mw.name());
+            if let crate::Repair::ReAsk(m) = r {
+                return crate::Repair::ReAsk(m);
+            }
+        }
+        crate::Repair::GiveUp
+    }
+
     /// Fold one completed request's ground-truth prompt_tokens against our chars/4
     /// estimate into the EMA ratio (alpha 0.5), clamped to [1.0, 4.0] so the
     /// effective limit only ever shrinks the configured window (spec §1). A backend
@@ -679,7 +713,6 @@ impl AgentLoop {
 
         ctx.set_goal(user_input.clone());
         ctx.append(Message::user(user_input));
-        let mut protocol_repairs = 0;
 
         // Agentic (tool-bearing) runs auto-preserve reasoning so the model keeps
         // its chain-of-thought across the within-turn tool loop; each backend then
@@ -785,10 +818,7 @@ impl AgentLoop {
             self.record_calibration_sample(assistant.prompt_tokens, est_prompt_tokens);
 
             let mut parsed = match self.protocol.parse(&assistant) {
-                Ok(p) => {
-                    protocol_repairs = 0;
-                    p
-                }
+                Ok(p) => p,
                 // The completion was cut off at `max_tokens` mid-tool-call (e.g.
                 // writing a large file), so the args are incomplete JSON. A
                 // "re-emit it correctly" repair is futile — it truncates again at
@@ -800,18 +830,34 @@ impl AgentLoop {
                     self.sink.emit(AgentEvent::Done(StopReason::Length));
                     return Ok(());
                 }
-                Err(e) if protocol_repairs < 1 => {
-                    protocol_repairs += 1;
-                    ctx.append(Message::assistant(assistant.text.clone(), None));
-                    ctx.append(Message::user(format!(
-                        "Your tool call could not be parsed: {e}. Re-emit it correctly."
-                    )));
-                    continue;
-                }
                 Err(e) => {
-                    self.sink.emit(AgentEvent::Error(e.to_string()));
-                    self.sink.emit(AgentEvent::Done(StopReason::Error));
-                    return Ok(());
+                    // Total parse failure: consult the stack (spec §5.1). The
+                    // Length short-circuit above already handled max_tokens
+                    // truncation; the second Length guard below is downstream.
+                    let err_str = e.to_string();
+                    match self
+                        .fire_on_parse_failure(
+                            ctx,
+                            &mut mw_state,
+                            &run_shared,
+                            &cancel,
+                            turn,
+                            &assistant,
+                            &err_str,
+                        )
+                        .await
+                    {
+                        crate::Repair::ReAsk(msg) => {
+                            ctx.append(Message::assistant(assistant.text.clone(), None));
+                            ctx.append(Message::user(msg));
+                            continue;
+                        }
+                        crate::Repair::GiveUp => {
+                            self.sink.emit(AgentEvent::Error(err_str));
+                            self.sink.emit(AgentEvent::Done(StopReason::Error));
+                            return Ok(());
+                        }
+                    }
                 }
             };
 
@@ -2602,7 +2648,14 @@ mod tests {
         // script >=5 identical calls and none of them override the stack — but any
         // future `counter_agent` caller that BOTH overrides the stack AND scripts
         // repeats must re-add `StuckDetectionMiddleware` itself.
-        let agent = agent.with_middleware(vec![Arc::new(crate::StuckDetectionMiddleware)]);
+        // A3: `RepairMiddleware` joins the helper's stack so callers driving a
+        // malformed turn through `counter_agent` still repair (a bare loop no
+        // longer does). Benign for other callers — `on_parse_failure` is inert
+        // absent a parse failure.
+        let agent = agent.with_middleware(vec![
+            Arc::new(crate::StuckDetectionMiddleware),
+            Arc::new(crate::RepairMiddleware),
+        ]);
         (agent, count)
     }
 
@@ -3089,6 +3142,10 @@ mod tests {
                 ..Default::default()
             },
         );
+        // A3: a bare loop no longer repairs — `RepairMiddleware` in-stack is
+        // what makes turn 1 re-ask and turn 2 exhaust the single budget. Without
+        // it the run would give up on turn 1 and pass for the WRONG reason.
+        let agent = agent.with_middleware(vec![Arc::new(crate::RepairMiddleware)]);
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "read a.txt".into()).await.unwrap();
 
@@ -7273,7 +7330,11 @@ mod tests {
         ]));
         let sink = Arc::new(CollectingSink::default());
         let (agent, _c) = counter_agent(model, sink, 5);
-        let (stack, log) = recording_pair(None);
+        let (mut stack, log) = recording_pair(None);
+        // A3: the malformed turn must re-ask to reach the recovered text turn;
+        // a bare recording stack no longer repairs, so add `RepairMiddleware`.
+        // It only implements `on_parse_failure`, so it adds no after_model rows.
+        stack.push(Arc::new(crate::RepairMiddleware));
         let agent = agent.with_middleware(stack);
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
@@ -7284,6 +7345,218 @@ mod tests {
             l.iter().filter(|e| e.ends_with(":after_model")).count(),
             2,
             "one turn × two middleware; repair turn must not fire after_model: {l:?}"
+        );
+    }
+
+    // --- A3: on_parse_failure firing set + fold semantics -------------------
+
+    /// A recording middleware that logs each `on_parse_failure` call and
+    /// re-asks once per streak (so a run can proceed past a malformed turn),
+    /// then gives up — enough to prove the firing set without depending on
+    /// `RepairMiddleware`.
+    struct ParseFailRecorder {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        seen: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::Middleware for ParseFailRecorder {
+        fn name(&self) -> &str {
+            "parse-fail-recorder"
+        }
+        async fn on_parse_failure(
+            &self,
+            _cx: &mut crate::RunCx<'_>,
+            _raw: &agent_model::AssistantTurn,
+            err: &str,
+        ) -> crate::Repair {
+            self.log.lock().unwrap().push("on_parse_failure".into());
+            // Re-ask on the first observed failure, give up thereafter.
+            if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                crate::Repair::ReAsk(format!(
+                    "Your tool call could not be parsed: {err}. Re-emit it correctly."
+                ))
+            } else {
+                crate::Repair::GiveUp
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn on_parse_failure_fires_only_at_total_parse_failure() {
+        // (a) A malformed turn (Err from parse, stop != Length) followed by a
+        // recovered text turn: on_parse_failure fires exactly once (the
+        // malformed turn), never on the well-formed one.
+        {
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let model = Arc::new(ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "counter".into(), r#"{"k": "#.into()),
+                Scripted::Text("recovered".into()),
+            ]));
+            let sink = Arc::new(CollectingSink::default());
+            let (agent, _c) = counter_agent(model, sink, 5);
+            let agent = agent.with_middleware(vec![Arc::new(ParseFailRecorder {
+                log: log.clone(),
+                seen: seen.clone(),
+            })]);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "go".into()).await.unwrap();
+            assert_eq!(
+                log.lock().unwrap().len(),
+                1,
+                "on_parse_failure fires once on the malformed turn only"
+            );
+        }
+        // (b) A Length-truncated turn: the Length short-circuit fires FIRST, so
+        // on_parse_failure does NOT fire.
+        {
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let ws = std::env::temp_dir();
+            let truncated = r##"{"path":"big.py","content":"#!/usr/bin/env python3\nprint('hi"##;
+            let model = Arc::new(ScriptedModel::new(vec![Scripted::TruncatedCall(
+                "write_file".into(),
+                truncated.into(),
+            )]));
+            let sink = Arc::new(CollectingSink::default());
+            let agent = AgentLoop::new(
+                model,
+                Arc::new(agent_model::NativeProtocol),
+                registry(),
+                policy(ws.clone()),
+                Arc::new(AlwaysApprove),
+                sink,
+                LoopConfig {
+                    model_limit: 100_000,
+                    max_turns: 10,
+                    max_retries: 2,
+                    temperature: 0.0,
+                    max_tokens: Some(2048),
+                    workspace: ws,
+                    tool_timeout: std::time::Duration::from_secs(5),
+                    stream_idle_timeout: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                },
+            );
+            let agent = agent.with_middleware(vec![Arc::new(ParseFailRecorder {
+                log: log.clone(),
+                seen,
+            })]);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "write big".into()).await.unwrap();
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "on_parse_failure must NOT fire on Length-truncation (short-circuited)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn on_parse_failure_reverse_order_first_reask_wins() {
+        // Middleware that always GiveUps, and one that always ReAsks (logging).
+        struct GiveUpMw;
+        #[async_trait::async_trait]
+        impl crate::Middleware for GiveUpMw {
+            fn name(&self) -> &str {
+                "giveup"
+            }
+            async fn on_parse_failure(
+                &self,
+                _cx: &mut crate::RunCx<'_>,
+                _raw: &agent_model::AssistantTurn,
+                _err: &str,
+            ) -> crate::Repair {
+                crate::Repair::GiveUp
+            }
+        }
+        struct ReAskMw;
+        #[async_trait::async_trait]
+        impl crate::Middleware for ReAskMw {
+            fn name(&self) -> &str {
+                "reask"
+            }
+            async fn on_parse_failure(
+                &self,
+                _cx: &mut crate::RunCx<'_>,
+                _raw: &agent_model::AssistantTurn,
+                _err: &str,
+            ) -> crate::Repair {
+                crate::Repair::ReAsk("re-ask please".into())
+            }
+        }
+
+        // Stack [GiveUpMw, ReAskMw]: reverse order consults ReAskMw (stack-last)
+        // first → ReAsk wins → the malformed turn re-asks and the run recovers.
+        {
+            let model = Arc::new(ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "counter".into(), r#"{"k": "#.into()),
+                Scripted::Text("recovered".into()),
+            ]));
+            let sink = Arc::new(CollectingSink::default());
+            let (agent, _c) = counter_agent(model, sink.clone(), 5);
+            let agent = agent.with_middleware(vec![Arc::new(GiveUpMw), Arc::new(ReAskMw)]);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "go".into()).await.unwrap();
+            let events = sink.events.lock().unwrap().clone();
+            // No terminal Error from the malformed turn — the re-ask recovered.
+            assert!(
+                !events.iter().any(|e| e.starts_with("error:")),
+                "reverse order: ReAsk (stack-last) wins, no terminal error: {events:?}"
+            );
+            let built = ctx.build(100_000);
+            assert!(
+                built.iter().any(|m| m.content.contains("re-ask please")),
+                "the winning ReAsk message must be appended: {built:?}"
+            );
+        }
+        // Stack [ReAskMw-as-sole-GiveUp]: a sole member that GiveUps yields
+        // today's terminal give-up.
+        {
+            let model = Arc::new(ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "counter".into(), r#"{"k": "#.into()),
+                Scripted::Text("unreached".into()),
+            ]));
+            let sink = Arc::new(CollectingSink::default());
+            let (agent, _c) = counter_agent(model, sink.clone(), 5);
+            let agent = agent.with_middleware(vec![Arc::new(GiveUpMw)]);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "go".into()).await.unwrap();
+            let events = sink.events.lock().unwrap().clone();
+            assert!(
+                events.iter().any(|e| e.starts_with("error:")),
+                "sole GiveUp yields today's terminal give-up: {events:?}"
+            );
+            assert_eq!(events.last().map(String::as_str), Some("done"));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_text_reask_appends_balanced_message() {
+        use crate::ContextManager;
+        // The common shape: an unparseable tool-call blob with NO prose, so
+        // raw.text is empty. The re-ask appends an empty tool-call-free
+        // assistant message + the user re-ask — balanced, no orphan.
+        let model = Arc::new(ScriptedModel::new(vec![
+            // Malformed args, and the scripted turn carries no assistant prose.
+            Scripted::Call("c1".into(), "counter".into(), r#"{"k": "#.into()),
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        // counter_agent installs RepairMiddleware (A3), which drives the re-ask.
+        let (agent, _c) = counter_agent(model, sink, 5);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let built = ctx.build(100_000);
+        assert!(
+            crate::orphaned_tool_positions(&built).is_empty(),
+            "the re-ask must leave no orphaned tool_calls message: {built:?}"
+        );
+        // The re-ask user message is present verbatim.
+        assert!(
+            built
+                .iter()
+                .any(|m| m.content.contains("Re-emit it correctly")),
+            "the re-ask user message must be appended: {built:?}"
         );
     }
 
