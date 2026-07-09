@@ -206,6 +206,13 @@ impl AgentLoop {
     }
 
     /// Install the middleware stack (spec §5.4 ordering contract).
+    ///
+    /// WARNING: this REPLACES any prior stack — it does not append. An empty
+    /// stack means NO recall injection, NO scheduled curation, and NO stuck
+    /// detection: those behaviors used to live in the loop itself and now
+    /// arrive only via middleware on this stack. Production wiring is
+    /// `assemble_loop`; call sites that build their own stack (tests
+    /// included) must include every middleware they need.
     pub fn with_middleware(mut self, stack: Vec<Arc<dyn crate::Middleware>>) -> Self {
         self.middleware = stack;
         self
@@ -632,7 +639,7 @@ impl AgentLoop {
 
         // Per-run middleware state (spec §5.3): fresh for every invocation so
         // middleware stay stateless `&self` objects. Empty `self.middleware`
-        // makes every fire_hooks call below a no-op loop (behavior unchanged).
+        // makes every `fire_*` hook method below a no-op loop (behavior unchanged).
         let mut mw_state = crate::RunState::default();
         let flow = self
             .fire_run_start(ctx, &mut mw_state, &cancel, &user_input)
@@ -849,7 +856,7 @@ impl AgentLoop {
                 // maintained this run (the Maintained run-state marker).
                 //
                 // Node hook: after_final_reply (spec §5.1) — text-only exit only
-                // (loop_.rs J5); no Flow, the run is already ending.
+                // (spec §6 J5); no Flow, the run is already ending.
                 self.fire_final_reply(ctx, &mut mw_state, &cancel, turn)
                     .await;
 
@@ -7010,9 +7017,11 @@ mod tests {
     /// `assert_no_orphans`'s guarantee holding across the short-circuit, not
     /// any nudge content (this fixture's `counter_agent` replaces the whole
     /// stack via `with_middleware`, so no StuckDetection instance is even
-    /// present here).
+    /// present here). See `end_run_from_after_model_drops_pending_nudge_without_orphans`
+    /// for the sibling case where a real `StuckDetectionMiddleware` instance
+    /// IS present and an `EndRun` fires from `after_model` instead.
     #[tokio::test]
-    async fn end_run_between_after_model_and_after_tools_leaves_no_orphans() {
+    async fn end_run_from_after_tools_leaves_no_orphans() {
         let model = Arc::new(ScriptedModel::new(vec![Scripted::Call(
             "c1".into(),
             "counter".into(),
@@ -7045,6 +7054,133 @@ mod tests {
         assert!(
             crate::orphaned_tool_positions(&built).is_empty(),
             "no orphaned tool_calls message after an after_tools EndRun: {built:?}"
+        );
+    }
+
+    /// EndRuns from `after_model` on a specific 0-based turn index only —
+    /// `Recording::end_at` is unconditional on hook name (it would EndRun on
+    /// turn 1 already), and this test needs to let StuckDetection accumulate
+    /// repeats across several turns before ending the run on the exact turn
+    /// where a nudge goes pending.
+    struct EndAtTurn {
+        turn: usize,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::Middleware for EndAtTurn {
+        fn name(&self) -> &str {
+            "end-at-turn"
+        }
+        async fn on_run_start(&self, _cx: &mut crate::RunCx<'_>, _i: &str) -> crate::Flow {
+            self.log
+                .lock()
+                .unwrap()
+                .push("end_at_turn:run_start".into());
+            crate::Flow::Continue
+        }
+        async fn after_model(
+            &self,
+            cx: &mut crate::RunCx<'_>,
+            _t: &crate::TurnView,
+        ) -> crate::Flow {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("end_at_turn:after_model(turn={:?})", cx.turn));
+            if cx.turn == Some(self.turn) {
+                crate::Flow::EndRun(StopReason::Error)
+            } else {
+                crate::Flow::Continue
+            }
+        }
+    }
+
+    /// Sibling of `end_run_from_after_tools_leaves_no_orphans`: this time a
+    /// real `StuckDetectionMiddleware` is on the stack, and the `EndRun`
+    /// fires one hook earlier — from `after_model` — so the nudge it sets
+    /// pending never gets the chance to flush (that only happens in
+    /// `after_tools`, which the `EndRun` short-circuits).
+    ///
+    /// Firing order note: `after_model` dispatches in REVERSE stack order
+    /// (`fire_after_model` iterates `.iter().rev()`, confirmed by
+    /// `hooks_fire_forward_then_reverse_across_a_tool_turn`). To get
+    /// StuckDetection's `after_model` to run BEFORE the `EndAtTurn` recorder's
+    /// — so the pending-nudge marker is actually set before the run ends —
+    /// StuckDetection must sit DEEPER in the stack vec than the recorder:
+    /// `[recorder, StuckDetection]`. Reverse iteration then visits
+    /// StuckDetection first (sets `nudge_pending`), then the recorder
+    /// (returns `EndRun` on the targeted turn), short-circuiting before
+    /// StuckDetection's `after_tools` would have flushed that pending nudge
+    /// into a `Message::user`.
+    ///
+    /// Four identical `counter` calls are scripted: turns 0-1 build no
+    /// repeats yet; turn 2 (0-based) is the 3rd identical call, where
+    /// StuckDetection's `repeats` counter crosses `STUCK_NUDGE_AFTER` (2) and
+    /// sets the pending-nudge marker — the same threshold
+    /// `stuck_identical_calls_nudged_then_aborted` proves nudges on. The
+    /// recorder is configured to EndRun exactly on turn 2's `after_model`,
+    /// right after StuckDetection has set that marker but before
+    /// `after_tools` (where it would flush) ever runs. A 4th scripted turn
+    /// is never reached, proving the short-circuit actually took effect.
+    #[tokio::test]
+    async fn end_run_from_after_model_drops_pending_nudge_without_orphans() {
+        let one = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into());
+        let model = Arc::new(ScriptedModel::new(vec![one(), one(), one(), one()]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, count) = counter_agent(model.clone(), sink.clone(), 5);
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = EndAtTurn {
+            turn: 2,
+            log: log.clone(),
+        };
+        let stack: Vec<Arc<dyn crate::Middleware>> = vec![
+            Arc::new(recorder),
+            Arc::new(crate::StuckDetectionMiddleware),
+        ];
+        let agent = agent.with_middleware(stack);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        // Turns 0-1 execute the tool normally; turn 2 is consulted (its
+        // identical-call signature is what crosses the nudge threshold) then
+        // the recorder's after_model EndRuns before the tool call for turn 2
+        // ever executes.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "tool executes exactly twice; turn index 2 EndRuns from after_model, pre-exec"
+        );
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![
+                "end_at_turn:run_start",
+                "end_at_turn:after_model(turn=Some(0))",
+                "end_at_turn:after_model(turn=Some(1))",
+                "end_at_turn:after_model(turn=Some(2))",
+            ],
+            "recorder's after_model on turn index 2 ends the run; turn 3 never consulted"
+        );
+        assert_eq!(
+            model.remaining(),
+            1,
+            "the 4th scripted turn must never be consumed"
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.last().unwrap(), "done");
+
+        use crate::ContextManager;
+        let built = ctx.build(100_000);
+        assert!(
+            crate::orphaned_tool_positions(&built).is_empty(),
+            "no orphaned tool_calls message after an after_model EndRun: {built:?}"
+        );
+        let nudge_present = built.iter().any(|m| {
+            matches!(m.role, agent_model::Role::User) && m.content.contains("identical tool call")
+        });
+        assert!(
+            !nudge_present,
+            "the pending nudge must never flush — after_tools (where it's \
+             injected) is short-circuited by the after_model EndRun: {built:?}"
         );
     }
 

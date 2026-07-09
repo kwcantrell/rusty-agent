@@ -275,7 +275,10 @@ core struct. (Panel scope finding, accepted as a conscious trade.)
   example), and a retry middleware may want to sit inside the overflow loop
   rather than outside it (J3/J4). Deliberately NOT done in Phase 1:
   implementing any wrap behavior early just to "use" the hooks — that would
-  violate both the no-behavior-change bar and the phase boundary.
+  violate both the no-behavior-change bar and the phase boundary. Watch item
+  for Phase 3: a `wrap_model_call` that mutates the request will skew
+  `est_prompt_tokens` calibration, which the loop computes pre-chain —
+  revisit the boundary when the first mutating wrapper lands.
 
 ### 5.5 The three migrated middleware (all in `agent-core`)
 
@@ -497,3 +500,12 @@ three migrated behaviors changes.
   (§5.4) — Phase 3's first real wrapper may revise signatures; tests pin
   composition semantics, not signatures; no early wrap behavior just to
   "use" the hooks.
+- 2026-07-08 — implementation note (whole-branch review): §5.7's "DispatchDeps
+  carries a child stack builder" shipped simplified — dispatch builds the
+  child stack inline in `DispatchAgentTool::execute` from deps it already
+  holds; the child-stack invariant `[context-curation, stuck-detection]` is
+  pinned by test.
+- 2026-07-08 — pin refinement (whole-branch review): `on_run_start` fires
+  before the turn-top cancellation check and before a Length exit (it
+  precedes the turn loop), so the §7 "no node hook on cancellation" pin is
+  pinned as observed: run_start fires, all later hooks don't.
