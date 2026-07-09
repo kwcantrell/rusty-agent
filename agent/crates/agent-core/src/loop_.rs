@@ -1,4 +1,4 @@
-use crate::{built_tokens, AgentEvent, ContextManager, EventSink, Retriever, ToolStatus};
+use crate::{built_tokens, AgentEvent, ContextManager, EventSink, ToolStatus};
 use agent_model::{
     AssistantTurn, Chunk, CompletionRequest, ErrorClass, Message, ModelClient, ModelError,
     RawToolCall, StopReason, ToolCallProtocol,
@@ -157,7 +157,6 @@ pub struct AgentLoop {
     approval: Arc<dyn ApprovalChannel>,
     sink: Arc<dyn EventSink>,
     config: LoopConfig,
-    retriever: Option<Arc<dyn Retriever>>,
     compaction_model: Option<Arc<dyn ModelClient>>,
     /// Observed (server prompt_tokens / chars-4 estimate) ratio, EMA-smoothed,
     /// fixed-point micros. 1_000_000 = 1.0 = uncalibrated. Shrink-only: clamped
@@ -189,7 +188,6 @@ impl AgentLoop {
             approval,
             sink,
             config,
-            retriever: None,
             compaction_model: None,
             calib_ratio_micros: std::sync::atomic::AtomicU64::new(1_000_000),
             middleware: Vec::new(),
@@ -204,13 +202,6 @@ impl AgentLoop {
     /// The registered tool schemas (read-only; the architecture viewer's tool list).
     pub fn tool_schemas(&self) -> Vec<agent_tools::ToolSchema> {
         self.tools.schemas()
-    }
-
-    /// Attach a memory retriever. When set, each turn auto-retrieves relevant
-    /// memories and injects them into the context before the model runs.
-    pub fn with_retriever(mut self, retriever: Arc<dyn Retriever>) -> Self {
-        self.retriever = Some(retriever);
-        self
     }
 
     /// Route context compaction to a (typically cheaper) dedicated model
@@ -657,12 +648,6 @@ impl AgentLoop {
             return Ok(());
         }
 
-        if let Some(retriever) = &self.retriever {
-            // Unconditional: an empty retrieval clears the prior run's recall
-            // block (contexts persist across runs). set_recall(vec![]) renders
-            // no block. (spec §2, audit Spine B #4)
-            ctx.set_recall(retriever.retrieve(&user_input).await);
-        }
         ctx.set_goal(user_input.clone());
         ctx.append(Message::user(user_input));
         let mut protocol_repairs = 0;
@@ -2839,10 +2824,13 @@ mod tests {
                 stream_idle_timeout: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
-        )
-        .with_retriever(Arc::new(FakeRetriever(vec![
-            "user prefers rust 2021".into()
-        ])));
+        );
+        let agent = agent.with_middleware(vec![Arc::new(crate::MemoryRecallMiddleware::new(
+            vec![],
+            Some(Arc::new(FakeRetriever(vec![
+                "user prefers rust 2021".into()
+            ]))),
+        ))]);
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "hello".into()).await.unwrap();
 
@@ -2877,8 +2865,11 @@ mod tests {
                 stream_idle_timeout: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
-        )
-        .with_retriever(Arc::new(FakeRetriever(vec![])));
+        );
+        let agent = agent.with_middleware(vec![Arc::new(crate::MemoryRecallMiddleware::new(
+            vec![],
+            Some(Arc::new(FakeRetriever(vec![]))),
+        ))]);
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "hello".into()).await.unwrap();
 
@@ -2931,10 +2922,13 @@ mod tests {
                 stream_idle_timeout: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
-        )
-        .with_retriever(Arc::new(TogglingRetriever(
-            std::sync::atomic::AtomicUsize::new(0),
-        )));
+        );
+        let agent = agent.with_middleware(vec![Arc::new(crate::MemoryRecallMiddleware::new(
+            vec![],
+            Some(Arc::new(TogglingRetriever(
+                std::sync::atomic::AtomicUsize::new(0),
+            ))),
+        ))]);
 
         // Shared real context across two runs (persists like a REPL/server session).
         let mut ctx = WindowContext::new(Message::system("sys"));
