@@ -296,6 +296,7 @@ impl AgentLoop {
         state: &mut crate::RunState,
         cancel: &CancellationToken,
         input: &str,
+        shared: &crate::RunShared,
     ) -> crate::Flow {
         for mw in self.middleware.iter() {
             let mut cx = crate::RunCx {
@@ -305,6 +306,7 @@ impl AgentLoop {
                 state: &mut *state,
                 turn: None,
                 maint: self.maint_view(),
+                shared,
             };
             let flow = mw.on_run_start(&mut cx, input).await;
             Self::assert_no_orphans(ctx, mw.name());
@@ -323,6 +325,7 @@ impl AgentLoop {
         cancel: &CancellationToken,
         turn: usize,
         turn_view: &crate::TurnView,
+        shared: &crate::RunShared,
     ) -> crate::Flow {
         for mw in self.middleware.iter().rev() {
             let mut cx = crate::RunCx {
@@ -332,6 +335,7 @@ impl AgentLoop {
                 state: &mut *state,
                 turn: Some(turn),
                 maint: self.maint_view(),
+                shared,
             };
             let flow = mw.after_model(&mut cx, turn_view).await;
             Self::assert_no_orphans(ctx, mw.name());
@@ -350,6 +354,7 @@ impl AgentLoop {
         state: &mut crate::RunState,
         cancel: &CancellationToken,
         turn: usize,
+        shared: &crate::RunShared,
     ) -> crate::Flow {
         for mw in self.middleware.iter().rev() {
             let mut cx = crate::RunCx {
@@ -359,6 +364,7 @@ impl AgentLoop {
                 state: &mut *state,
                 turn: Some(turn),
                 maint: self.maint_view(),
+                shared,
             };
             let flow = mw.after_tools(&mut cx).await;
             Self::assert_no_orphans(ctx, mw.name());
@@ -376,6 +382,7 @@ impl AgentLoop {
         state: &mut crate::RunState,
         cancel: &CancellationToken,
         turn: usize,
+        shared: &crate::RunShared,
     ) -> crate::Flow {
         for mw in self.middleware.iter().rev() {
             let mut cx = crate::RunCx {
@@ -385,6 +392,7 @@ impl AgentLoop {
                 state: &mut *state,
                 turn: Some(turn),
                 maint: self.maint_view(),
+                shared,
             };
             let flow = mw.on_turn_end(&mut cx).await;
             Self::assert_no_orphans(ctx, mw.name());
@@ -403,6 +411,7 @@ impl AgentLoop {
         state: &mut crate::RunState,
         cancel: &CancellationToken,
         turn: usize,
+        shared: &crate::RunShared,
     ) {
         for mw in self.middleware.iter().rev() {
             let mut cx = crate::RunCx {
@@ -412,10 +421,45 @@ impl AgentLoop {
                 state: &mut *state,
                 turn: Some(turn),
                 maint: self.maint_view(),
+                shared,
             };
             mw.after_final_reply(&mut cx).await;
             Self::assert_no_orphans(ctx, mw.name());
         }
+    }
+
+    /// Reverse order: on a total tool-call parse failure. The FIRST middleware
+    /// returning `ReAsk` wins and short-circuits; all `GiveUp` (or an empty
+    /// stack) yields today's terminal give-up. `raw` is a borrow of the turn
+    /// the loop still holds (consumed only on the branches after this returns).
+    #[allow(clippy::too_many_arguments)]
+    async fn fire_on_parse_failure(
+        &self,
+        ctx: &mut dyn ContextManager,
+        state: &mut crate::RunState,
+        shared: &crate::RunShared,
+        cancel: &CancellationToken,
+        turn: usize,
+        raw: &agent_model::AssistantTurn,
+        err: &str,
+    ) -> crate::Repair {
+        for mw in self.middleware.iter().rev() {
+            let mut cx = crate::RunCx {
+                ctx: &mut *ctx,
+                sink: &self.sink,
+                cancel,
+                state: &mut *state,
+                shared,
+                turn: Some(turn),
+                maint: self.maint_view(),
+            };
+            let r = mw.on_parse_failure(&mut cx, raw, err).await;
+            Self::assert_no_orphans(ctx, mw.name());
+            if let crate::Repair::ReAsk(m) = r {
+                return crate::Repair::ReAsk(m);
+            }
+        }
+        crate::Repair::GiveUp
     }
 
     /// Fold one completed request's ground-truth prompt_tokens against our chars/4
@@ -656,8 +700,11 @@ impl AgentLoop {
         // middleware stay stateless `&self` objects. Empty `self.middleware`
         // makes every `fire_*` hook method below a no-op loop (behavior unchanged).
         let mut mw_state = crate::RunState::default();
+        // Per-run wrap/node shared state (spec §5.2), fresh per invocation so
+        // middleware stay stateless. Empty stacks never touch it.
+        let run_shared = crate::RunShared::default();
         let flow = self
-            .fire_run_start(ctx, &mut mw_state, &cancel, &user_input)
+            .fire_run_start(ctx, &mut mw_state, &cancel, &user_input, &run_shared)
             .await;
         if let crate::Flow::EndRun(reason) = flow {
             self.sink.emit(AgentEvent::Done(reason));
@@ -666,7 +713,6 @@ impl AgentLoop {
 
         ctx.set_goal(user_input.clone());
         ctx.append(Message::user(user_input));
-        let mut protocol_repairs = 0;
 
         // Agentic (tool-bearing) runs auto-preserve reasoning so the model keeps
         // its chain-of-thought across the within-turn tool loop; each backend then
@@ -677,6 +723,20 @@ impl AgentLoop {
         for turn in 0..self.config.max_turns {
             if cancel.is_cancelled() {
                 self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
+                return Ok(());
+            }
+            // Pre-turn ToolCallLimit backstop (spec §5.7): bounds overshoot to at
+            // most one turn's batch. Reads the RunShared tally, which stays 0
+            // unless a counting guardrail is in the stack (so this is inert for
+            // children and any stack without ToolCallLimit). `after_tools` is the
+            // effective bound; this is belt-and-suspenders (plan discrepancy S3).
+            if run_shared.with::<crate::ToolCallCount, _>(|c| c.0) >= crate::TOOL_CALL_LIMIT {
+                self.sink.emit(AgentEvent::Error(
+                    "tool-call guardrail: the run exceeded the maximum number of tool \
+                     calls; aborting"
+                        .into(),
+                ));
+                self.sink.emit(AgentEvent::Done(StopReason::Error));
                 return Ok(());
             }
             let messages = ctx.build(self.effective_model_limit());
@@ -699,6 +759,7 @@ impl AgentLoop {
                     loop_: self,
                     chain: &self.middleware,
                     cancel: &cancel,
+                    shared: &run_shared,
                 }
                 .run(base.clone())
                 .await;
@@ -771,10 +832,7 @@ impl AgentLoop {
             self.record_calibration_sample(assistant.prompt_tokens, est_prompt_tokens);
 
             let mut parsed = match self.protocol.parse(&assistant) {
-                Ok(p) => {
-                    protocol_repairs = 0;
-                    p
-                }
+                Ok(p) => p,
                 // The completion was cut off at `max_tokens` mid-tool-call (e.g.
                 // writing a large file), so the args are incomplete JSON. A
                 // "re-emit it correctly" repair is futile — it truncates again at
@@ -786,18 +844,34 @@ impl AgentLoop {
                     self.sink.emit(AgentEvent::Done(StopReason::Length));
                     return Ok(());
                 }
-                Err(e) if protocol_repairs < 1 => {
-                    protocol_repairs += 1;
-                    ctx.append(Message::assistant(assistant.text.clone(), None));
-                    ctx.append(Message::user(format!(
-                        "Your tool call could not be parsed: {e}. Re-emit it correctly."
-                    )));
-                    continue;
-                }
                 Err(e) => {
-                    self.sink.emit(AgentEvent::Error(e.to_string()));
-                    self.sink.emit(AgentEvent::Done(StopReason::Error));
-                    return Ok(());
+                    // Total parse failure: consult the stack (spec §5.1). The
+                    // Length short-circuit above already handled max_tokens
+                    // truncation; the second Length guard below is downstream.
+                    let err_str = e.to_string();
+                    match self
+                        .fire_on_parse_failure(
+                            ctx,
+                            &mut mw_state,
+                            &run_shared,
+                            &cancel,
+                            turn,
+                            &assistant,
+                            &err_str,
+                        )
+                        .await
+                    {
+                        crate::Repair::ReAsk(msg) => {
+                            ctx.append(Message::assistant(assistant.text.clone(), None));
+                            ctx.append(Message::user(msg));
+                            continue;
+                        }
+                        crate::Repair::GiveUp => {
+                            self.sink.emit(AgentEvent::Error(err_str));
+                            self.sink.emit(AgentEvent::Done(StopReason::Error));
+                            return Ok(());
+                        }
+                    }
                 }
             };
 
@@ -831,7 +905,7 @@ impl AgentLoop {
                     .collect(),
             };
             let flow = self
-                .fire_after_model(ctx, &mut mw_state, &cancel, turn, &turn_view)
+                .fire_after_model(ctx, &mut mw_state, &cancel, turn, &turn_view, &run_shared)
                 .await;
             if let crate::Flow::EndRun(reason) = flow {
                 self.sink.emit(AgentEvent::Done(reason));
@@ -872,7 +946,7 @@ impl AgentLoop {
                 //
                 // Node hook: after_final_reply (spec §5.1) — text-only exit only
                 // (spec §6 J5); no Flow, the run is already ending.
-                self.fire_final_reply(ctx, &mut mw_state, &cancel, turn)
+                self.fire_final_reply(ctx, &mut mw_state, &cancel, turn, &run_shared)
                     .await;
 
                 self.sink.emit(AgentEvent::Done(assistant.stop));
@@ -956,6 +1030,7 @@ impl AgentLoop {
                     // timeout_override, not the loop default) — logged on timeout.
                     let timeout = ctx.timeout;
                     let middleware = &self.middleware;
+                    let shared = &run_shared;
                     async move {
                         let started = std::time::Instant::now();
                         // The gate already ran (Phase 1); this call is the
@@ -971,6 +1046,7 @@ impl AgentLoop {
                             tctx: &ctx,
                             chain: middleware,
                             call: &call,
+                            shared,
                         }
                         .run(args)
                         .await;
@@ -1146,7 +1222,7 @@ impl AgentLoop {
 
             // Node hook: after_tools (spec §5.1).
             let flow = self
-                .fire_after_tools(ctx, &mut mw_state, &cancel, turn)
+                .fire_after_tools(ctx, &mut mw_state, &cancel, turn, &run_shared)
                 .await;
             if let crate::Flow::EndRun(reason) = flow {
                 self.sink.emit(AgentEvent::Done(reason));
@@ -1159,7 +1235,9 @@ impl AgentLoop {
             // text-only-exit maintain in after_final_reply.
             //
             // Node hook: on_turn_end (spec §5.1).
-            let flow = self.fire_turn_end(ctx, &mut mw_state, &cancel, turn).await;
+            let flow = self
+                .fire_turn_end(ctx, &mut mw_state, &cancel, turn, &run_shared)
+                .await;
             if let crate::Flow::EndRun(reason) = flow {
                 self.sink.emit(AgentEvent::Done(reason));
                 return Ok(());
@@ -2584,7 +2662,14 @@ mod tests {
         // script >=5 identical calls and none of them override the stack — but any
         // future `counter_agent` caller that BOTH overrides the stack AND scripts
         // repeats must re-add `StuckDetectionMiddleware` itself.
-        let agent = agent.with_middleware(vec![Arc::new(crate::StuckDetectionMiddleware)]);
+        // A3: `RepairMiddleware` joins the helper's stack so callers driving a
+        // malformed turn through `counter_agent` still repair (a bare loop no
+        // longer does). Benign for other callers — `on_parse_failure` is inert
+        // absent a parse failure.
+        let agent = agent.with_middleware(vec![
+            Arc::new(crate::StuckDetectionMiddleware),
+            Arc::new(crate::RepairMiddleware),
+        ]);
         (agent, count)
     }
 
@@ -2735,6 +2820,50 @@ mod tests {
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 4);
         let events = sink.events.lock().unwrap().clone();
         assert!(events.iter().any(|e| e.contains("5 turns in a row")));
+    }
+
+    /// `RunShared` (spec §5.2) threads from the wrap-tool-call seam
+    /// (`ToolNext::shared`) to the node-hook seam (`RunCx::shared`) through
+    /// the SAME per-run store: a write in `wrap_tool_call` must be visible to
+    /// `after_tools` on that same run.
+    #[tokio::test]
+    async fn run_shared_write_in_wrap_is_readable_in_node_hook() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct WrapCount(usize);
+        // Records what after_tools observed, so the assertion can read it out.
+        struct Probe(Arc<Mutex<Option<usize>>>);
+        #[async_trait::async_trait]
+        impl crate::Middleware for Probe {
+            fn name(&self) -> &str {
+                "probe"
+            }
+            async fn wrap_tool_call(
+                &self,
+                call: agent_tools::ToolCall,
+                next: crate::ToolNext<'_>,
+            ) -> crate::Executed {
+                next.shared().with::<WrapCount, _>(|c| c.0 += 1);
+                next.run(call.args).await
+            }
+            async fn after_tools(&self, cx: &mut crate::RunCx<'_>) -> crate::Flow {
+                let seen = cx.shared().with::<WrapCount, _>(|c| c.0);
+                *self.0.lock().unwrap() = Some(seen);
+                crate::Flow::Continue
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into()),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, _count) = counter_agent(model, sink, 10);
+        let agent = agent.with_middleware(vec![Arc::new(Probe(seen.clone()))]);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), Some(1));
     }
 
     struct FakeRetriever(Vec<String>);
@@ -3027,6 +3156,10 @@ mod tests {
                 ..Default::default()
             },
         );
+        // A3: a bare loop no longer repairs — `RepairMiddleware` in-stack is
+        // what makes turn 1 re-ask and turn 2 exhaust the single budget. Without
+        // it the run would give up on turn 1 and pass for the WRONG reason.
+        let agent = agent.with_middleware(vec![Arc::new(crate::RepairMiddleware)]);
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "read a.txt".into()).await.unwrap();
 
@@ -7211,7 +7344,11 @@ mod tests {
         ]));
         let sink = Arc::new(CollectingSink::default());
         let (agent, _c) = counter_agent(model, sink, 5);
-        let (stack, log) = recording_pair(None);
+        let (mut stack, log) = recording_pair(None);
+        // A3: the malformed turn must re-ask to reach the recovered text turn;
+        // a bare recording stack no longer repairs, so add `RepairMiddleware`.
+        // It only implements `on_parse_failure`, so it adds no after_model rows.
+        stack.push(Arc::new(crate::RepairMiddleware));
         let agent = agent.with_middleware(stack);
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "go".into()).await.unwrap();
@@ -7222,6 +7359,218 @@ mod tests {
             l.iter().filter(|e| e.ends_with(":after_model")).count(),
             2,
             "one turn × two middleware; repair turn must not fire after_model: {l:?}"
+        );
+    }
+
+    // --- A3: on_parse_failure firing set + fold semantics -------------------
+
+    /// A recording middleware that logs each `on_parse_failure` call and
+    /// re-asks once per streak (so a run can proceed past a malformed turn),
+    /// then gives up — enough to prove the firing set without depending on
+    /// `RepairMiddleware`.
+    struct ParseFailRecorder {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        seen: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::Middleware for ParseFailRecorder {
+        fn name(&self) -> &str {
+            "parse-fail-recorder"
+        }
+        async fn on_parse_failure(
+            &self,
+            _cx: &mut crate::RunCx<'_>,
+            _raw: &agent_model::AssistantTurn,
+            err: &str,
+        ) -> crate::Repair {
+            self.log.lock().unwrap().push("on_parse_failure".into());
+            // Re-ask on the first observed failure, give up thereafter.
+            if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                crate::Repair::ReAsk(format!(
+                    "Your tool call could not be parsed: {err}. Re-emit it correctly."
+                ))
+            } else {
+                crate::Repair::GiveUp
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn on_parse_failure_fires_only_at_total_parse_failure() {
+        // (a) A malformed turn (Err from parse, stop != Length) followed by a
+        // recovered text turn: on_parse_failure fires exactly once (the
+        // malformed turn), never on the well-formed one.
+        {
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let model = Arc::new(ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "counter".into(), r#"{"k": "#.into()),
+                Scripted::Text("recovered".into()),
+            ]));
+            let sink = Arc::new(CollectingSink::default());
+            let (agent, _c) = counter_agent(model, sink, 5);
+            let agent = agent.with_middleware(vec![Arc::new(ParseFailRecorder {
+                log: log.clone(),
+                seen: seen.clone(),
+            })]);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "go".into()).await.unwrap();
+            assert_eq!(
+                log.lock().unwrap().len(),
+                1,
+                "on_parse_failure fires once on the malformed turn only"
+            );
+        }
+        // (b) A Length-truncated turn: the Length short-circuit fires FIRST, so
+        // on_parse_failure does NOT fire.
+        {
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let ws = std::env::temp_dir();
+            let truncated = r##"{"path":"big.py","content":"#!/usr/bin/env python3\nprint('hi"##;
+            let model = Arc::new(ScriptedModel::new(vec![Scripted::TruncatedCall(
+                "write_file".into(),
+                truncated.into(),
+            )]));
+            let sink = Arc::new(CollectingSink::default());
+            let agent = AgentLoop::new(
+                model,
+                Arc::new(agent_model::NativeProtocol),
+                registry(),
+                policy(ws.clone()),
+                Arc::new(AlwaysApprove),
+                sink,
+                LoopConfig {
+                    model_limit: 100_000,
+                    max_turns: 10,
+                    max_retries: 2,
+                    temperature: 0.0,
+                    max_tokens: Some(2048),
+                    workspace: ws,
+                    tool_timeout: std::time::Duration::from_secs(5),
+                    stream_idle_timeout: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                },
+            );
+            let agent = agent.with_middleware(vec![Arc::new(ParseFailRecorder {
+                log: log.clone(),
+                seen,
+            })]);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "write big".into()).await.unwrap();
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "on_parse_failure must NOT fire on Length-truncation (short-circuited)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn on_parse_failure_reverse_order_first_reask_wins() {
+        // Middleware that always GiveUps, and one that always ReAsks (logging).
+        struct GiveUpMw;
+        #[async_trait::async_trait]
+        impl crate::Middleware for GiveUpMw {
+            fn name(&self) -> &str {
+                "giveup"
+            }
+            async fn on_parse_failure(
+                &self,
+                _cx: &mut crate::RunCx<'_>,
+                _raw: &agent_model::AssistantTurn,
+                _err: &str,
+            ) -> crate::Repair {
+                crate::Repair::GiveUp
+            }
+        }
+        struct ReAskMw;
+        #[async_trait::async_trait]
+        impl crate::Middleware for ReAskMw {
+            fn name(&self) -> &str {
+                "reask"
+            }
+            async fn on_parse_failure(
+                &self,
+                _cx: &mut crate::RunCx<'_>,
+                _raw: &agent_model::AssistantTurn,
+                _err: &str,
+            ) -> crate::Repair {
+                crate::Repair::ReAsk("re-ask please".into())
+            }
+        }
+
+        // Stack [GiveUpMw, ReAskMw]: reverse order consults ReAskMw (stack-last)
+        // first → ReAsk wins → the malformed turn re-asks and the run recovers.
+        {
+            let model = Arc::new(ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "counter".into(), r#"{"k": "#.into()),
+                Scripted::Text("recovered".into()),
+            ]));
+            let sink = Arc::new(CollectingSink::default());
+            let (agent, _c) = counter_agent(model, sink.clone(), 5);
+            let agent = agent.with_middleware(vec![Arc::new(GiveUpMw), Arc::new(ReAskMw)]);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "go".into()).await.unwrap();
+            let events = sink.events.lock().unwrap().clone();
+            // No terminal Error from the malformed turn — the re-ask recovered.
+            assert!(
+                !events.iter().any(|e| e.starts_with("error:")),
+                "reverse order: ReAsk (stack-last) wins, no terminal error: {events:?}"
+            );
+            let built = ctx.build(100_000);
+            assert!(
+                built.iter().any(|m| m.content.contains("re-ask please")),
+                "the winning ReAsk message must be appended: {built:?}"
+            );
+        }
+        // Stack [ReAskMw-as-sole-GiveUp]: a sole member that GiveUps yields
+        // today's terminal give-up.
+        {
+            let model = Arc::new(ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "counter".into(), r#"{"k": "#.into()),
+                Scripted::Text("unreached".into()),
+            ]));
+            let sink = Arc::new(CollectingSink::default());
+            let (agent, _c) = counter_agent(model, sink.clone(), 5);
+            let agent = agent.with_middleware(vec![Arc::new(GiveUpMw)]);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "go".into()).await.unwrap();
+            let events = sink.events.lock().unwrap().clone();
+            assert!(
+                events.iter().any(|e| e.starts_with("error:")),
+                "sole GiveUp yields today's terminal give-up: {events:?}"
+            );
+            assert_eq!(events.last().map(String::as_str), Some("done"));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_text_reask_appends_balanced_message() {
+        use crate::ContextManager;
+        // The common shape: an unparseable tool-call blob with NO prose, so
+        // raw.text is empty. The re-ask appends an empty tool-call-free
+        // assistant message + the user re-ask — balanced, no orphan.
+        let model = Arc::new(ScriptedModel::new(vec![
+            // Malformed args, and the scripted turn carries no assistant prose.
+            Scripted::Call("c1".into(), "counter".into(), r#"{"k": "#.into()),
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        // counter_agent installs RepairMiddleware (A3), which drives the re-ask.
+        let (agent, _c) = counter_agent(model, sink, 5);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let built = ctx.build(100_000);
+        assert!(
+            crate::orphaned_tool_positions(&built).is_empty(),
+            "the re-ask must leave no orphaned tool_calls message: {built:?}"
+        );
+        // The re-ask user message is present verbatim.
+        assert!(
+            built
+                .iter()
+                .any(|m| m.content.contains("Re-emit it correctly")),
+            "the re-ask user message must be appended: {built:?}"
         );
     }
 
@@ -7483,6 +7832,452 @@ mod tests {
                 "the wrap-up still streamed its text: {events:?}"
             );
             assert_eq!(events.last().map(String::as_str), Some("done"));
+        }
+    }
+
+    // ---- ToolCallLimit / ModelCallLimit guardrail tests (spec §5.5/§5.7; B1 brief) ----
+    //
+    // Mirrors: `counter_agent`/`Counter` (varying-args harness base),
+    // `DetailSink` (precise `Some(StopReason::Error)` capture — see
+    // `budget_wrap_up_failure_is_best_effort`), `FailStub` (an always-erroring
+    // tool — see `fail_stub_registry`), and
+    // `end_run_from_after_tools_leaves_no_orphans` /
+    // `end_run_from_after_model_drops_pending_nudge_without_orphans` (the
+    // nudge-drop-without-orphans co-fire pattern).
+
+    /// A tool that records the JSON args of every call it executes — proves
+    /// the model issued genuinely DISTINCT args each turn (defeats
+    /// `StuckDetection`, whose signature is over `(name, args)`).
+    struct ArgRecorder(Arc<std::sync::Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl Tool for ArgRecorder {
+        fn name(&self) -> &str {
+            "recorder"
+        }
+        fn description(&self) -> &str {
+            "records each call's args"
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: "recorder".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<agent_tools::ToolIntent, ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: "recorder".into(),
+                access: agent_tools::Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "record".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, ToolError> {
+            self.0.lock().unwrap().push(args.to_string());
+            Ok(agent_tools::ToolOutput {
+                content: "ok".into(),
+                display: None,
+            })
+        }
+    }
+
+    /// Build an `AgentLoop` wired to a single `ArgRecorder` tool, no
+    /// middleware installed yet (caller adds the guardrail stack via
+    /// `.with_middleware`). Mirrors `counter_agent`'s shape.
+    fn recorder_agent(
+        model: Arc<ScriptedModel>,
+        sink: Arc<dyn EventSink>,
+        max_turns: usize,
+    ) -> (AgentLoop, Arc<std::sync::Mutex<Vec<String>>>) {
+        let ws = std::env::temp_dir();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ArgRecorder(calls.clone())));
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(reg),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        (agent, calls)
+    }
+
+    /// A model that issues one `recorder` call per turn with DISTINCT args
+    /// each turn — the shape `StuckDetection` cannot catch. With
+    /// `ToolCallLimit::with_cap(5)` and a generous `max_turns`, the run ends
+    /// with `StopReason::Error` (NOT `BudgetExhausted`) once the count
+    /// crosses the cap (spec §5.5, A10/Fa-F2).
+    #[tokio::test]
+    async fn tool_call_limit_ends_run_on_varying_args_runaway() {
+        let calls: Vec<Scripted> = (0..20)
+            .map(|i| Scripted::Call("c1".into(), "recorder".into(), format!(r#"{{"k":{i}}}"#)))
+            .collect();
+        let model = Arc::new(ScriptedModel::new(calls));
+        let sink = Arc::new(DetailSink::default());
+        // Generous max_turns (well past the cap) proves the guardrail — not the
+        // turn budget — is what ends the run.
+        let (agent, recorded) = recorder_agent(model.clone(), sink.clone(), 25);
+        let agent = agent.with_middleware(vec![Arc::new(crate::ToolCallLimit::with_cap(5))]);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(
+            *sink.done.lock().unwrap(),
+            Some(StopReason::Error),
+            "guardrail abort must be StopReason::Error, never BudgetExhausted"
+        );
+        // Overshoot bound: batch size is 1 here, so total executed is exactly
+        // the cap (5) — the crossing call itself never runs.
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            5,
+            "exactly cap (5) calls execute; the 6th (crossing) call is blocked pre-exec"
+        );
+        // All recorded args are pairwise distinct — proves this scenario truly
+        // defeats StuckDetection's (name, args) signature.
+        let seen = recorded.lock().unwrap().clone();
+        let unique: std::collections::HashSet<_> = seen.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "args must vary every turn: {seen:?}"
+        );
+        assert!(
+            sink.errors
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.contains("tool-call guardrail")),
+            "expected a tool-call guardrail Error event; got {:?}",
+            sink.errors.lock().unwrap()
+        );
+    }
+
+    /// Fat crossing batch: the model issues N calls in the crossing turn.
+    /// Total executed <= cap-1 (prior turns) + N (the crossing batch) —
+    /// bounded to one batch, not unbounded (spec §5.5 Fa-F3).
+    #[tokio::test]
+    async fn tool_call_limit_overshoot_is_bounded_to_one_batch() {
+        // Turns 1-4: one call each, distinct args (4 total, under cap=5).
+        // Turn 5: a batch of 4 calls in ONE turn, distinct args — crosses the
+        // cap mid-batch. All 4 execute (wrap_tool_call counts before exec, and
+        // the parallel executor runs the whole turn's batch), then after_tools
+        // observes count=8 >= cap and EndRuns. Total executed = 4 + 4 = 8,
+        // bounded to one batch past the cap (not unbounded across turns).
+        let single =
+            |i: usize| Scripted::Call("c1".into(), "recorder".into(), format!(r#"{{"k":{i}}}"#));
+        let batch = Scripted::Calls(vec![
+            ("b1".into(), "recorder".into(), r#"{"k":100}"#.into()),
+            ("b2".into(), "recorder".into(), r#"{"k":101}"#.into()),
+            ("b3".into(), "recorder".into(), r#"{"k":102}"#.into()),
+            ("b4".into(), "recorder".into(), r#"{"k":103}"#.into()),
+        ]);
+        let model = Arc::new(ScriptedModel::new(vec![
+            single(0),
+            single(1),
+            single(2),
+            single(3),
+            batch,
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(DetailSink::default());
+        let (agent, recorded) = recorder_agent(model.clone(), sink.clone(), 25);
+        let agent = agent.with_middleware(vec![Arc::new(crate::ToolCallLimit::with_cap(5))]);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(
+            *sink.done.lock().unwrap(),
+            Some(StopReason::Error),
+            "guardrail abort must be StopReason::Error"
+        );
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            8,
+            "4 prior single calls + the full 4-call crossing batch = 8, not unbounded"
+        );
+        // The 6th scripted turn (the plain-text "done") must never be reached.
+        assert_eq!(
+            model.remaining(),
+            1,
+            "the turn after the crossing batch must never be consulted"
+        );
+    }
+
+    /// Count-on-failure is intentional (increment BEFORE `next.run`): a
+    /// panicking / denied / errored call still counts (spec §5.5 Fa-F3).
+    /// Drives a tool that ALWAYS errors and asserts the count still advances
+    /// toward the cap (the guardrail still trips on an all-failing runaway).
+    #[tokio::test]
+    async fn tool_call_limit_counts_failed_calls() {
+        struct AlwaysFails;
+        #[async_trait::async_trait]
+        impl Tool for AlwaysFails {
+            fn name(&self) -> &str {
+                "always_fails"
+            }
+            fn description(&self) -> &str {
+                "always errors (test stub)"
+            }
+            fn schema(&self) -> agent_tools::ToolSchema {
+                agent_tools::ToolSchema {
+                    name: "always_fails".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }
+            }
+            fn intent(
+                &self,
+                _args: &serde_json::Value,
+            ) -> Result<agent_tools::ToolIntent, ToolError> {
+                Ok(agent_tools::ToolIntent {
+                    tool: "always_fails".into(),
+                    access: agent_tools::Access::Read,
+                    paths: vec![],
+                    command: None,
+                    summary: "fail".into(),
+                })
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+                _ctx: &ToolCtx,
+            ) -> Result<agent_tools::ToolOutput, ToolError> {
+                Err(ToolError::Failed {
+                    message: "boom".into(),
+                    stderr: None,
+                })
+            }
+        }
+
+        let ws = std::env::temp_dir();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(AlwaysFails));
+        let calls: Vec<Scripted> = (0..20)
+            .map(|i| {
+                Scripted::Call(
+                    "c1".into(),
+                    "always_fails".into(),
+                    format!(r#"{{"k":{i}}}"#),
+                )
+            })
+            .collect();
+        let model = Arc::new(ScriptedModel::new(calls));
+        let sink = Arc::new(DetailSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(reg),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 25,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let agent = agent.with_middleware(vec![Arc::new(crate::ToolCallLimit::with_cap(5))]);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(
+            *sink.done.lock().unwrap(),
+            Some(StopReason::Error),
+            "an all-failing runaway must still trip the guardrail"
+        );
+        // Every attempted call recorded an Error tool_result — 5 of them (the
+        // cap), proving count-on-failure: the guardrail tripped on FAILED
+        // calls, not successful ones.
+        let results = sink.tool_results.lock().unwrap().clone();
+        assert_eq!(
+            results.len(),
+            5,
+            "5 failed calls attempted before the guardrail trips: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|(_, status, _)| *status == ToolStatus::Error),
+            "every attempted call must have failed: {results:?}"
+        );
+    }
+
+    /// Stack order `[StuckDetection, ToolCallLimit]`: `after_tools` fires in
+    /// reverse, so `ToolCallLimit`'s `after_tools` `EndRun` short-circuits
+    /// BEFORE `StuckDetection` flushes a nudge it set that turn. Assert the
+    /// CONTENT outcome: nudge dropped, transcript balanced, no orphaned
+    /// tool_calls (spec §5.6 Fa-F5). Mirrors
+    /// `end_run_from_after_model_drops_pending_nudge_without_orphans`, but the
+    /// EndRun source is `ToolCallLimit`'s `after_tools` (not an `after_model`
+    /// recorder), co-firing with a real `StuckDetectionMiddleware` at a low
+    /// cap so both accumulate on the SAME identical-call turns.
+    #[tokio::test]
+    async fn guardrail_endrun_at_after_tools_drops_pending_nudge_without_orphans() {
+        // Identical calls (same name+args) every turn: StuckDetection's nudge
+        // threshold (STUCK_NUDGE_AFTER = 2, i.e. the 3rd identical turn, 0-based
+        // turn index 2) fires in the SAME turn ToolCallLimit's cap (3) is
+        // crossed — both guardrails are live on turn index 2.
+        let one = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into());
+        let model = Arc::new(ScriptedModel::new(vec![one(), one(), one(), one()]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, count) = counter_agent(model.clone(), sink.clone(), 25);
+        // Stack order [StuckDetection, ToolCallLimit]: after_tools fires in
+        // REVERSE stack order, so ToolCallLimit's after_tools (added later in
+        // the vec) runs FIRST and EndRuns before StuckDetection's after_tools
+        // (which would flush the pending nudge) ever gets a turn.
+        let agent = agent.with_middleware(vec![
+            Arc::new(crate::StuckDetectionMiddleware),
+            Arc::new(crate::ToolCallLimit::with_cap(3)),
+        ]);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        // Turns 0-2 (3 identical calls) execute; the cap (3) is reached at
+        // after_tools on turn index 2, ending the run before turn 3.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "exactly cap (3) identical calls execute before ToolCallLimit ends the run"
+        );
+        assert_eq!(
+            model.remaining(),
+            1,
+            "the 4th scripted turn must never be consulted"
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.last().unwrap(), "done");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("error:") && e.contains("tool-call guardrail")),
+            "expected the tool-call guardrail Error event; got {events:?}"
+        );
+
+        use crate::ContextManager;
+        let built = ctx.build(100_000);
+        assert!(
+            crate::orphaned_tool_positions(&built).is_empty(),
+            "no orphaned tool_calls message after the guardrail's after_tools EndRun: {built:?}"
+        );
+        // Content outcome: the pending nudge StuckDetection set on turn index 2
+        // (repeats crosses STUCK_NUDGE_AFTER=2 on the 3rd identical turn) must
+        // NEVER flush — after_tools (where it's injected) is short-circuited by
+        // ToolCallLimit's after_tools EndRun running first (reverse order).
+        let nudge_present = built.iter().any(|m| {
+            matches!(m.role, agent_model::Role::User) && m.content.contains("identical tool call")
+        });
+        assert!(
+            !nudge_present,
+            "the pending nudge must never flush — ToolCallLimit's after_tools \
+             EndRun (reverse-order first) short-circuits before StuckDetection's \
+             after_tools runs: {built:?}"
+        );
+    }
+
+    /// Default (disabled): `ModelCallLimit` counts in `wrap_model_call` but
+    /// never enforces — a run well within `max_turns` is unaffected. Enabled
+    /// (`ModelCallLimit::enabled_with_cap(2)`): after 2 model calls,
+    /// `after_model` EndRuns with `StopReason::Error`.
+    #[tokio::test]
+    async fn model_call_limit_default_off_is_inert_but_enabled_ends_run() {
+        // Disabled: 3 turns, generous max_turns, distinct-args calls — the run
+        // completes normally (budget-bounded), proving the disabled guardrail
+        // never enforces despite counting every wrap_model_call.
+        {
+            let model = Arc::new(ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "recorder".into(), r#"{"k":0}"#.into()),
+                Scripted::Call("c1".into(), "recorder".into(), r#"{"k":1}"#.into()),
+                Scripted::Text("done".into()),
+            ]));
+            let sink = Arc::new(DetailSink::default());
+            let (agent, recorded) = recorder_agent(model.clone(), sink.clone(), 25);
+            let agent = agent.with_middleware(vec![Arc::new(crate::ModelCallLimit::disabled())]);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "go".into()).await.unwrap();
+
+            assert_eq!(
+                recorded.lock().unwrap().len(),
+                2,
+                "both tool calls executed"
+            );
+            assert_eq!(
+                *sink.done.lock().unwrap(),
+                Some(StopReason::Stop),
+                "disabled ModelCallLimit never enforces; the run ends on its own \
+                 text-only stop, not a guardrail abort"
+            );
+            assert!(
+                sink.errors.lock().unwrap().is_empty(),
+                "no guardrail Error event when disabled: {:?}",
+                sink.errors.lock().unwrap()
+            );
+        }
+        // Enabled with cap=2: 2 model calls trip the cap at after_model,
+        // ending the run with StopReason::Error before a 3rd call is ever made.
+        {
+            let model = Arc::new(ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "recorder".into(), r#"{"k":0}"#.into()),
+                Scripted::Call("c1".into(), "recorder".into(), r#"{"k":1}"#.into()),
+                Scripted::Text("done".into()),
+            ]));
+            let sink = Arc::new(DetailSink::default());
+            let (agent, recorded) = recorder_agent(model.clone(), sink.clone(), 25);
+            let agent =
+                agent.with_middleware(vec![Arc::new(crate::ModelCallLimit::enabled_with_cap(2))]);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "go".into()).await.unwrap();
+
+            assert_eq!(
+                *sink.done.lock().unwrap(),
+                Some(StopReason::Error),
+                "enabled ModelCallLimit must EndRun with StopReason::Error, never BudgetExhausted"
+            );
+            assert_eq!(
+                recorded.lock().unwrap().len(),
+                1,
+                "only the 1st turn's tool call executes — after_model fires BEFORE \
+                 that turn's tools run, so the 2nd model call's after_model trips \
+                 the cap and EndRuns before its own tool call is ever dispatched"
+            );
+            assert_eq!(
+                model.remaining(),
+                1,
+                "the 3rd scripted turn must never be consulted"
+            );
+            assert!(
+                sink.errors
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.contains("model-call guardrail")),
+                "expected a model-call guardrail Error event; got {:?}",
+                sink.errors.lock().unwrap()
+            );
         }
     }
 

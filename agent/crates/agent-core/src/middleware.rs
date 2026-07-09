@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// Nudge after this many consecutive REPEATS of an identical call set
@@ -17,12 +17,32 @@ use tokio_util::sync::CancellationToken;
 pub const STUCK_NUDGE_AFTER: usize = 2;
 pub const STUCK_ABORT_AFTER: usize = 4;
 
+/// One re-ask per consecutive parse-failure streak — the current
+/// `protocol_repairs < 1` (spec §5.3). Named so a future knob is one line.
+pub const MAX_REPAIRS: usize = 1;
+
+/// Generous order-of-magnitude backstops (spec §5.5). Named so a future knob is
+/// a one-line change; NOT runtime-configurable (matches the stuck precedent).
+pub const TOOL_CALL_LIMIT: usize = 1000;
+pub const MODEL_CALL_LIMIT: usize = 500;
+
 /// Node-hook outcome. `EndRun` short-circuits remaining hooks at that point;
 /// the loop maps it to `emit(Done(reason)); return Ok(())` (spec §5.2).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Flow {
     Continue,
     EndRun(StopReason),
+}
+
+/// Outcome of consulting the stack on a total tool-call parse failure (spec §5.1).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Repair {
+    /// Append the raw assistant text + this user message, then the loop
+    /// `continue`s (fresh turn iteration; `est_prompt_tokens` recomputed → no
+    /// calibration skew).
+    ReAsk(String),
+    /// Terminal: today's behavior — emit Error + Done(Error), return Ok.
+    GiveUp,
 }
 
 /// A tool a middleware ships at assembly. `child_visible` controls membership
@@ -60,6 +80,38 @@ impl RunState {
     }
 }
 
+/// Per-run, thread-safe typed state (spec §5.2 — the wrap-hook state facility).
+/// Created fresh per `run_with_cancel`, reachable from BOTH wrap hooks (via
+/// `ModelNext`/`ToolNext`) and node hooks (via `RunCx`), so a middleware can
+/// WRITE in a wrap and READ in a node hook. `RunState` (node, `&mut`,
+/// sequential) and `RunShared` (wrap, `Arc`, concurrent) are two facilities
+/// with different concurrency contracts — a single `&mut` map cannot serve the
+/// parallel `buffer_unordered` tool executor.
+#[derive(Clone, Default)]
+pub struct RunShared(Arc<Mutex<HashMap<TypeId, Box<dyn Any + Send>>>>);
+
+impl RunShared {
+    /// Get-or-default then apply `f` under the lock. The SYNCHRONOUS
+    /// `FnOnce(&mut T) -> R` structurally forbids `.await` inside the lock (a
+    /// guard cannot cross an await by construction). Poison recovery: recovers
+    /// via `into_inner()` and DELIBERATELY DOES NOT PROPAGATE POISON — a tool
+    /// panic must stay contained, and the monotonic counters this holds fail
+    /// safe (a torn value can only over-count, stopping a run slightly early,
+    /// never late). NON-REENTRANT: `f` must not call `with()` again (one Mutex
+    /// guards the whole map → nested `with()` self-deadlocks); 3A's guardrails
+    /// touch one key each, so no nesting.
+    pub fn with<T: 'static + Default + Send, R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = guard
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()));
+        let val = slot
+            .downcast_mut::<T>()
+            .expect("TypeId-keyed entry always downcasts to its own type");
+        f(val)
+    }
+}
+
 /// OWNED snapshot of a parsed turn (spec §5.2): cloned before `after_model`
 /// so no borrow of the loop's `parsed`/`all_calls` crosses the hook `.await`.
 pub struct TurnView {
@@ -86,6 +138,7 @@ pub struct RunCx<'a> {
     /// 0-based turn index; None pre-loop (on_run_start).
     pub turn: Option<usize>,
     pub(crate) maint: MaintView<'a>,
+    pub(crate) shared: &'a RunShared,
 }
 
 impl RunCx<'_> {
@@ -98,6 +151,9 @@ impl RunCx<'_> {
     pub fn effective_model_limit(&self) -> usize {
         self.maint.effective_model_limit
     }
+    pub fn shared(&self) -> &RunShared {
+        self.shared
+    }
 }
 
 /// Continuation for `wrap_model_call`: remaining chain, then the loop's
@@ -107,9 +163,13 @@ pub struct ModelNext<'a> {
     pub(crate) loop_: &'a crate::AgentLoop,
     pub(crate) chain: &'a [Arc<dyn Middleware>],
     pub(crate) cancel: &'a CancellationToken,
+    pub(crate) shared: &'a RunShared,
 }
 
 impl<'a> ModelNext<'a> {
+    pub fn shared(&self) -> &RunShared {
+        self.shared
+    }
     pub fn run(
         self,
         req: agent_model::CompletionRequest,
@@ -123,6 +183,7 @@ impl<'a> ModelNext<'a> {
                             loop_: self.loop_,
                             chain: rest,
                             cancel: self.cancel,
+                            shared: self.shared,
                         },
                     )
                     .await
@@ -141,9 +202,13 @@ pub struct ToolNext<'a> {
     pub(crate) tctx: &'a agent_tools::ToolCtx,
     pub(crate) chain: &'a [Arc<dyn Middleware>],
     pub(crate) call: &'a ToolCall,
+    pub(crate) shared: &'a RunShared,
 }
 
 impl<'a> ToolNext<'a> {
+    pub fn shared(&self) -> &RunShared {
+        self.shared
+    }
     pub fn run(self, args: serde_json::Value) -> BoxFuture<'a, crate::Executed> {
         Box::pin(async move {
             match self.chain.split_first() {
@@ -197,6 +262,21 @@ pub trait Middleware: Send + Sync {
     }
     /// Only on the text-only exit path (loop_.rs:751); see spec §5.1/J5.
     async fn after_final_reply(&self, _cx: &mut RunCx<'_>) {}
+
+    /// The model's output could not be parsed into tool calls at all
+    /// (`protocol.parse` returned `Err`). The loop consults this at the
+    /// total-parse-failure arms, AFTER the Length-truncation short-circuit and
+    /// upstream of the second Length guard. Fires on nothing else: not on
+    /// success, not on partial-invalid turns, not on Length truncation, cancel,
+    /// overflow, or budget. Reverse stack order; the first `ReAsk` wins.
+    async fn on_parse_failure(
+        &self,
+        _cx: &mut RunCx<'_>,
+        _raw: &agent_model::AssistantTurn,
+        _err: &str,
+    ) -> Repair {
+        Repair::GiveUp
+    }
 
     /// Wraps one `completion_with_retry` invocation (spec §5.1/J3, Task 3).
     /// The default is a pure pass-through. Invoked twice, independently,
@@ -423,6 +503,182 @@ impl Middleware for StuckDetectionMiddleware {
     }
 }
 
+/// Malformed-tool-call recovery as a pluggable unit (spec §5.3): reproduces the
+/// loop-resident one-shot re-ask byte-identically. Implements only
+/// `on_parse_failure`; the loop still owns the `continue`/terminal.
+#[derive(Default)]
+pub struct RepairMiddleware;
+
+#[derive(Default)]
+struct RepairState {
+    repairs: usize,
+    /// The last turn index that failed to parse. A gap (an intervening success)
+    /// resets `repairs`, reproducing the loop's reset-on-successful-parse
+    /// (spec §5.3; plan discrepancy S2).
+    last_fail_turn: Option<usize>,
+}
+
+#[async_trait]
+impl Middleware for RepairMiddleware {
+    fn name(&self) -> &str {
+        "repair"
+    }
+    async fn on_parse_failure(
+        &self,
+        cx: &mut RunCx<'_>,
+        _raw: &agent_model::AssistantTurn,
+        err: &str,
+    ) -> Repair {
+        let turn = cx.turn;
+        let s = cx.state.entry::<RepairState>();
+        // Contiguous with the previous failure? (each re-ask `continue`s and
+        // advances `turn`, so consecutive failures have consecutive indices).
+        let contiguous = matches!((s.last_fail_turn, turn), (Some(l), Some(t)) if t == l + 1);
+        if !contiguous {
+            s.repairs = 0;
+        }
+        s.last_fail_turn = turn;
+        if s.repairs < MAX_REPAIRS {
+            s.repairs += 1;
+            Repair::ReAsk(format!(
+                "Your tool call could not be parsed: {err}. Re-emit it correctly."
+            ))
+        } else {
+            Repair::GiveUp
+        }
+    }
+}
+
+/// Tool-call tally in `RunShared`. `pub` so the loop's pre-turn guard reads it
+/// (spec §5.7); stays 0 unless a counting middleware is in the stack.
+#[derive(Default)]
+pub struct ToolCallCount(pub usize);
+
+#[derive(Default)]
+struct ModelCallCount(usize);
+
+/// Always-on runaway backstop (spec §5.5): a runaway that VARIES its args each
+/// turn slips past `StuckDetection` and can burn the whole turn budget. Counts
+/// every tool execution in `wrap_tool_call`, enforces at `after_tools`.
+pub struct ToolCallLimit {
+    cap: usize,
+}
+
+impl ToolCallLimit {
+    pub fn new() -> Self {
+        Self {
+            cap: TOOL_CALL_LIMIT,
+        }
+    }
+    pub fn with_cap(cap: usize) -> Self {
+        Self { cap }
+    }
+}
+
+impl Default for ToolCallLimit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Middleware for ToolCallLimit {
+    fn name(&self) -> &str {
+        "tool-call-limit"
+    }
+    async fn wrap_tool_call(&self, call: ToolCall, next: ToolNext<'_>) -> crate::Executed {
+        // Count BEFORE execution: a panicked/timed-out/denied call still costs an
+        // orchestration round-trip, so count-on-failure is intentional (Fa-F3).
+        next.shared().with::<ToolCallCount, _>(|c| c.0 += 1);
+        next.run(call.args).await
+    }
+    async fn after_tools(&self, cx: &mut RunCx<'_>) -> Flow {
+        if cx.shared().with::<ToolCallCount, _>(|c| c.0) >= self.cap {
+            cx.sink.emit(crate::AgentEvent::Error(
+                "tool-call guardrail: the run exceeded the maximum number of tool \
+                 calls; aborting"
+                    .into(),
+            ));
+            return Flow::EndRun(StopReason::Error);
+        }
+        Flow::Continue
+    }
+}
+
+/// Model-call cap (spec §5.5, E1). Ships DEFAULT-OFF: always counts in
+/// `wrap_model_call` (so `wrap_model_call` has a real consumer and both wrap
+/// surfaces are exercised), enforces at `after_model` only when enabled. It is
+/// subsumed by `max_turns`, hence opt-in, not imposed.
+pub struct ModelCallLimit {
+    cap: usize,
+    enabled: bool,
+}
+
+impl ModelCallLimit {
+    pub fn disabled() -> Self {
+        Self {
+            cap: MODEL_CALL_LIMIT,
+            enabled: false,
+        }
+    }
+    pub fn enabled_with_cap(cap: usize) -> Self {
+        Self { cap, enabled: true }
+    }
+}
+
+#[async_trait]
+impl Middleware for ModelCallLimit {
+    fn name(&self) -> &str {
+        "model-call-limit"
+    }
+    async fn wrap_model_call(
+        &self,
+        req: agent_model::CompletionRequest,
+        next: ModelNext<'_>,
+    ) -> Result<agent_model::AssistantTurn, crate::CompletionFailure> {
+        next.shared().with::<ModelCallCount, _>(|c| c.0 += 1);
+        next.run(req).await
+    }
+    async fn after_model(&self, cx: &mut RunCx<'_>, _turn: &TurnView) -> Flow {
+        if self.enabled && cx.shared().with::<ModelCallCount, _>(|c| c.0) >= self.cap {
+            cx.sink.emit(crate::AgentEvent::Error(
+                "model-call guardrail: the run exceeded the maximum number of model \
+                 calls; aborting"
+                    .into(),
+            ));
+            return Flow::EndRun(StopReason::Error);
+        }
+        Flow::Continue
+    }
+}
+
+/// Planning-by-recitation (spec §5.4): a hookless tool-contributing middleware
+/// (the `ContextCurationMiddleware`+flag shape). Holds the shared todos handle,
+/// contributes a CHILD-VISIBLE `write_todos`; the curator renders the list as a
+/// durable pinned block. No node/wrap hooks.
+pub struct TodoListMiddleware {
+    handle: crate::TodoHandle,
+}
+
+impl TodoListMiddleware {
+    pub fn new(handle: crate::TodoHandle) -> Self {
+        Self { handle }
+    }
+}
+
+#[async_trait]
+impl Middleware for TodoListMiddleware {
+    fn name(&self) -> &str {
+        "todo-list"
+    }
+    fn tools(&self) -> Vec<ToolContribution> {
+        vec![ToolContribution {
+            tool: Arc::new(crate::WriteTodosTool::new(self.handle.clone())),
+            child_visible: true,
+        }]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +697,70 @@ mod tests {
         assert!(s2.get::<Marker>().is_none());
     }
 
+    #[derive(Default)]
+    struct Counter(usize);
+
+    #[test]
+    fn run_shared_typed_roundtrip_and_fresh_isolation() {
+        let s = RunShared::default();
+        assert_eq!(s.with::<Counter, _>(|c| c.0), 0); // get-or-default
+        s.with::<Counter, _>(|c| c.0 = 7);
+        assert_eq!(s.with::<Counter, _>(|c| c.0), 7);
+        // A fresh RunShared (fresh run) starts empty — per-run lifetime.
+        let s2 = RunShared::default();
+        assert_eq!(s2.with::<Counter, _>(|c| c.0), 0);
+        // Clones share the same underlying store (Arc): a write via one clone is
+        // visible through another — this is what threads a wrap-write to a node-read.
+        let s3 = s.clone();
+        s3.with::<Counter, _>(|c| c.0 = 99);
+        assert_eq!(s.with::<Counter, _>(|c| c.0), 99);
+    }
+
+    #[test]
+    fn run_shared_concurrent_increments_dont_lose_updates() {
+        // Serialized under the Mutex: 8 threads × 1000 increments == 8000, no lost
+        // updates (the property the parallel buffer_unordered tool executor needs).
+        let s = RunShared::default();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        s.with::<Counter, _>(|c| c.0 += 1);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(s.with::<Counter, _>(|c| c.0), 8000);
+    }
+
+    #[test]
+    fn run_shared_recovers_from_poison_never_propagates() {
+        // A panic inside a with() closure poisons the std Mutex. RunShared MUST
+        // recover via into_inner() and never re-panic on PoisonError (spec §5.2;
+        // see plan discrepancy S1 — this is the true, achievable poison property).
+        let s = RunShared::default();
+        s.with::<Counter, _>(|c| c.0 = 5);
+        let s2 = s.clone();
+        let joined = std::thread::spawn(move || {
+            s2.with::<Counter, _>(|_| panic!("boom while holding the guard"));
+        })
+        .join();
+        assert!(
+            joined.is_err(),
+            "the closure panic propagates on ITS thread"
+        );
+        // Despite the poisoned mutex, a later with() recovers the prior value.
+        assert_eq!(
+            s.with::<Counter, _>(|c| c.0),
+            5,
+            "poisoned mutex recovered via into_inner; value intact"
+        );
+    }
+
     struct Noop;
     #[async_trait::async_trait]
     impl Middleware for Noop {
@@ -457,5 +777,120 @@ mod tests {
         // (RunCx construction is exercised in loop_ tests; defaults are
         // pure so a unit check of tools() + Flow is enough here.)
         assert_eq!(Flow::Continue, Flow::Continue);
+    }
+
+    // ---- RepairMiddleware unit tests (spec §5.3; A3 brief Step 1) ----------
+    //
+    // These pin the byte-identical default repair policy and the S2
+    // reset-on-non-contiguity reading (reproducing today's
+    // reset-on-successful-parse). They construct a bare `RunCx` directly
+    // (no loop) and drive `on_parse_failure` against a shared `RunState`.
+
+    /// A `RunCx` at `turn`, sharing the caller's `ctx`/`state`/`shared` so a
+    /// streak of failures accumulates in the same `RepairState`.
+    fn parse_fail_cx<'a>(
+        ctx: &'a mut dyn ContextManager,
+        state: &'a mut RunState,
+        shared: &'a RunShared,
+        cancel: &'a CancellationToken,
+        sink: &'a Arc<dyn EventSink>,
+        model: &'a Arc<dyn ModelClient>,
+        turn: usize,
+    ) -> RunCx<'a> {
+        RunCx {
+            ctx,
+            sink,
+            cancel,
+            state,
+            shared,
+            turn: Some(turn),
+            maint: MaintView {
+                maint_model: model,
+                maint_model_limit: 100_000,
+                effective_model_limit: 100_000,
+            },
+        }
+    }
+
+    /// Shared test scaffold: a `WindowContext`, a scripted model, a sink, a
+    /// cancel token, and a `RunShared` — everything a `RunCx` needs.
+    fn repair_harness() -> (
+        crate::WindowContext,
+        Arc<dyn ModelClient>,
+        Arc<dyn EventSink>,
+        RunShared,
+        CancellationToken,
+    ) {
+        let ctx = crate::WindowContext::new(agent_model::Message::system("sys"));
+        let model: Arc<dyn ModelClient> = Arc::new(crate::testkit::ScriptedModel::new(vec![]));
+        let sink: Arc<dyn EventSink> = Arc::new(crate::testkit::CollectingSink::default());
+        (
+            ctx,
+            model,
+            sink,
+            RunShared::default(),
+            CancellationToken::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn repair_default_reasks_once_then_gives_up_on_contiguous_failure() {
+        let raw = agent_model::AssistantTurn {
+            text: "garbage".into(),
+            ..Default::default()
+        };
+        let m = RepairMiddleware;
+        let (mut ctx, model, sink, shared, cancel) = repair_harness();
+        let mut state = RunState::default();
+
+        // Turn 3: first failure of a streak → ReAsk with the exact message.
+        {
+            let mut cx = parse_fail_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, 3);
+            let r = m.on_parse_failure(&mut cx, &raw, "bad json").await;
+            assert_eq!(
+                r,
+                Repair::ReAsk(
+                    "Your tool call could not be parsed: bad json. Re-emit it correctly.".into()
+                )
+            );
+        }
+        // Turn 4 (contiguous): second consecutive failure → terminal GiveUp.
+        {
+            let mut cx = parse_fail_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, 4);
+            let r = m.on_parse_failure(&mut cx, &raw, "bad json").await;
+            assert_eq!(r, Repair::GiveUp);
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_resets_on_non_contiguous_failure() {
+        // Reproduces today's reset-on-successful-parse (loop_.rs Ok-arm): a
+        // failure separated from the prior one by a gap in turn index (an
+        // intervening success) re-asks again (plan discrepancy S2).
+        let raw = agent_model::AssistantTurn {
+            text: "garbage".into(),
+            ..Default::default()
+        };
+        let m = RepairMiddleware;
+        let (mut ctx, model, sink, shared, cancel) = repair_harness();
+        let mut state = RunState::default();
+
+        // Turn 3 fail → ReAsk (repairs 0→1, last_fail=Some(3)).
+        {
+            let mut cx = parse_fail_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, 3);
+            assert!(matches!(
+                m.on_parse_failure(&mut cx, &raw, "e").await,
+                Repair::ReAsk(_)
+            ));
+        }
+        // Turn 7 fail (gap: turns 4..6 parsed OK, no on_parse_failure) →
+        // non-contiguous → repairs reset to 0 → ReAsk again.
+        {
+            let mut cx = parse_fail_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, 7);
+            assert!(matches!(
+                m.on_parse_failure(&mut cx, &raw, "e").await,
+                Repair::ReAsk(_)
+            ));
+        }
     }
 }

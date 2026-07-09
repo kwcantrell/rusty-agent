@@ -40,6 +40,7 @@ pub(crate) fn build_snapshot(
     recall_budget: usize,
     compaction_summary: Option<&Message>,
     history: &[Message],
+    todos: &[crate::TodoItem],
 ) -> ContextSnapshot {
     let mut segments = Vec::new();
 
@@ -95,6 +96,18 @@ pub(crate) fn build_snapshot(
         });
     }
 
+    // Pinned todos plan (spec §5.4 / S5): its own segment keeps est_total equal
+    // to the budget math, exactly like the ledger segment (audit 7.3). Positioned
+    // after `summary` and before `messages`, mirroring pinned()'s last-pinned slot.
+    if let Some(block) = crate::render_todos_block(todos) {
+        segments.push(ContextSegment {
+            category: "todos".into(),
+            est_tokens: message_tokens(&block),
+            items: todos.iter().map(|t| preview(&t.content, 100)).collect(),
+            count: todos.len(),
+        });
+    }
+
     let msg_tokens: usize = history.iter().map(message_tokens).sum();
     segments.push(ContextSegment {
         category: "messages".into(),
@@ -133,6 +146,7 @@ mod tests {
             DEFAULT_RECALL_TOKEN_BUDGET,
             None,
             &[Message::user("hello"), Message::assistant("hi", None)],
+            &[],
         );
         assert_eq!(snap.turn, 3);
         let cats: Vec<&str> = snap.segments.iter().map(|s| s.category.as_str()).collect();
@@ -166,6 +180,7 @@ mod tests {
             DEFAULT_RECALL_TOKEN_BUDGET,
             None,
             &[],
+            &[],
         );
         let cats: Vec<&str> = snap.segments.iter().map(|s| s.category.as_str()).collect();
         assert_eq!(cats, vec!["system", "goal", "ledger", "messages"]);
@@ -196,6 +211,7 @@ mod tests {
             DEFAULT_RECALL_TOKEN_BUDGET,
             None,
             &[],
+            &[],
         );
         assert!(snap.segments.iter().all(|s| s.category != "ledger"));
     }
@@ -223,6 +239,7 @@ mod tests {
             ],
             DEFAULT_RECALL_TOKEN_BUDGET,
             None,
+            &[],
             &[],
         );
         let mem = snap
@@ -255,6 +272,7 @@ mod tests {
             &lines,
             budget,
             None,
+            &[],
             &[],
         );
         let mem = snap

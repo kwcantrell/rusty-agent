@@ -274,6 +274,7 @@ async fn eval_context_run() {
 
         let artifacts = Arc::new(SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
+        let todos = Arc::new(std::sync::Mutex::new(Vec::new()));
         let built = assemble_loop(
             &cfg,
             LoopParts {
@@ -292,6 +293,7 @@ async fn eval_context_run() {
                 base_system_prompt: cc.resolved_system_prompt(EVAL_DEFAULT_PROMPT).to_string(),
                 artifacts: artifacts.clone(),
                 compact_flag: flag.clone(),
+                todos: todos.clone(),
                 sandbox: agent_runtime_config::build_sandbox(&cfg),
                 stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
                 trace: None,
