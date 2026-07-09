@@ -348,8 +348,8 @@ impl DispatchAgentTool {
         };
         let description = format!(
             "Delegate an independent, multi-step subtask to an isolated sub-agent with \
-             its own fresh context window. The sub-agent has the same permissions and \
-             tools as you {caps}, works autonomously on the \
+             its own fresh context window. The sub-agent has at most the same \
+             permissions and tools as you {caps}, works autonomously on the \
              prompt you give it, and its final answer is returned as this tool's \
              result. Make the prompt self-contained: the sub-agent cannot see this \
              conversation. You may dispatch several sub-agents in one message by \
@@ -1227,6 +1227,20 @@ mod tests {
             },
         );
         m
+    }
+
+    /// Spec 3B-1c §2.4 (lib.rs conformance guard's sibling): `dispatch_agent`
+    /// itself must satisfy the identity contract permission floors key on —
+    /// `tool.intent(args).tool == tool.name()`. Cheap here (exec_deps/
+    /// ScriptedModel are hermetic); the lib.rs guard can't construct this tool
+    /// (needs full DispatchDeps) so it's covered in this crate instead.
+    #[test]
+    fn dispatch_agent_intent_name_matches_registry_name() {
+        let tool = DispatchAgentTool::new(exec_deps(ScriptedModel::new(vec![]), 1));
+        let intent = tool
+            .intent(&serde_json::json!({"prompt": "x"}))
+            .expect("intent() must accept a minimal prompt-only call");
+        assert_eq!(intent.tool, tool.name());
     }
 
     #[tokio::test]
