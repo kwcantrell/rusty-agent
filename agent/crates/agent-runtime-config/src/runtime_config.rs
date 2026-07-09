@@ -618,6 +618,67 @@ impl RuntimeConfig {
                 ));
             }
         }
+
+        // 3B-1c advisory lints (spec §2.2 rule 8) — non-fatal by design.
+        // DELIBERATELY broader than dispatch.rs's 1-element IMPLICIT_CHILD_TOOLS
+        // (which gates allowlist-name VALIDITY): this set suppresses false-positive
+        // inert-rule warnings for every tool that can be injected into a child
+        // OUTSIDE its `tools` allowlist (`respond` is allowlist-exempt; write_todos
+        // rebinds when present; dispatch_agent is depth-gated). Do not unify them.
+        const IMPLICIT_CHILD_TOOLS: [&str; 4] = [
+            "context_compact",
+            "respond",
+            "write_todos",
+            "dispatch_agent",
+        ];
+        for s in &self.named_subagents {
+            let Some(p) = &s.permissions else { continue };
+            let all_patterns = p.deny.iter().chain(p.ask.iter());
+            for pat in all_patterns.clone() {
+                // (a) inert exact rule: names a tool the spec's own allowlist excludes.
+                let is_exact = !pat.contains('*');
+                if is_exact {
+                    if let Some(tools) = &s.tools {
+                        if !tools.iter().any(|t| t == pat)
+                            && !IMPLICIT_CHILD_TOOLS.contains(&pat.as_str())
+                        {
+                            out.push(format!(
+                                "named_subagents['{}']: permissions rule '{pat}' names a tool \
+                                 the spec's tools allowlist excludes — the floor is inert",
+                                s.name
+                            ));
+                        }
+                    }
+                }
+                // (b) affix the MCP sanitizer can never produce (`clean()` maps
+                // non-[a-zA-Z0-9-] to '_'; '_' itself survives via the separator).
+                let affix = pat.strip_suffix('*').unwrap_or(pat);
+                if !affix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    out.push(format!(
+                        "named_subagents['{}']: permissions pattern '{pat}' contains characters \
+                         no registered tool name can carry — it can never match",
+                        s.name
+                    ));
+                }
+            }
+            // (c) respond coverage on a response_format spec (exact or wildcard).
+            if s.response_format.is_some() {
+                let covers_respond = all_patterns
+                    .filter_map(|pat| agent_policy::ToolPattern::parse(pat).ok())
+                    .any(|tp| tp.matches("respond"));
+                if covers_respond {
+                    out.push(format!(
+                        "named_subagents['{}']: permissions cover the `respond` tool — this \
+                         structured-response child will always hit the marked free-text fallback",
+                        s.name
+                    ));
+                }
+            }
+        }
+
         out
     }
 
@@ -1869,6 +1930,84 @@ mod tests {
         );
         c.command_allowlist = crate::default_allowlist();
         assert!(c.warnings().is_empty());
+    }
+
+    fn warn_of(specs: Vec<SubAgentSpec>) -> Vec<String> {
+        cfg_with(specs).warnings()
+    }
+
+    #[test]
+    fn lint_inert_exact_rule_vs_tools_allowlist() {
+        let mut s = spec("triage");
+        s.tools = Some(vec!["read_file".into()]);
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec!["execute_command".into()],
+            ask: vec![],
+        });
+        let w = warn_of(vec![s]);
+        assert!(
+            w.iter().any(|m| m.contains("triage")
+                && m.contains("execute_command")
+                && m.contains("inert")),
+            "{w:?}"
+        );
+        // NOT linted: exact rule naming an allowlisted tool, prefix rules, or
+        // the always-available implicit child tools.
+        let mut s = spec("triage");
+        s.tools = Some(vec!["read_file".into()]);
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec![
+                "read_file".into(),
+                "github__*".into(),
+                "context_compact".into(),
+            ],
+            ask: vec![],
+        });
+        assert!(warn_of(vec![s]).is_empty());
+    }
+
+    #[test]
+    fn lint_unsanitizable_mcp_affix() {
+        let mut s = spec("triage");
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec!["git.hub__*".into()],
+            ask: vec![],
+        });
+        let w = warn_of(vec![s]);
+        assert!(
+            w.iter()
+                .any(|m| m.contains("git.hub__*") && m.contains("never match")),
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn lint_respond_coverage_on_response_format_spec() {
+        for pat in ["respond", "re*", "*"] {
+            let mut s = spec("triage");
+            s.response_format = Some(serde_json::json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}}
+            }));
+            s.permissions = Some(SubAgentPermissions {
+                deny: vec![pat.into()],
+                ask: vec![],
+            });
+            let w = warn_of(vec![s]);
+            assert!(
+                w.iter()
+                    .any(|m| m.contains("respond") && m.contains("fallback")),
+                "pattern {pat}: {w:?}"
+            );
+        }
+        // no response_format → no lint even with deny=["*"]
+        let mut s = spec("triage");
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec!["*".into()],
+            ask: vec![],
+        });
+        assert!(warn_of(vec![s]).is_empty());
     }
 
     #[test]
