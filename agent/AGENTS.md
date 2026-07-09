@@ -16,7 +16,7 @@ The agent core. One of two Cargo workspaces in this repo (the other is
 | `agent-policy` | permission policy engine + approval channel |
 | `agent-sandbox` | sandboxed tool/command execution |
 | `agent-skills` | discover, load-on-demand, author, preload markdown skills |
-| `agent-server` | daemon bridging the local agent to the Cloudflare Worker (browser UI backend) |
+| `agent-server` | library crate bridging the local agent to the desktop UI over Tauri IPC (transport-agnostic `Session`/`EventOut` core) |
 | `agent-cli` | terminal front-end binary |
 | `agent-runtime-config` | shared loop wiring (tool registry, protocol picker, command lists) |
 

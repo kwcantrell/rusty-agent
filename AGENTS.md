@@ -1,8 +1,8 @@
 # rust-agent-runtime — agent guide
 
 A local-first LLM agent runtime: a Rust core drives a local model (or the Claude CLI)
-through a tool/policy loop, exposed three ways — a terminal CLI, a Tauri desktop app,
-and a browser SPA that reaches your *local* agent via a Cloudflare Worker.
+through a tool/policy loop, exposed two ways — a terminal CLI and a Tauri desktop app
+whose browser-based UI reaches your *local* agent over Tauri IPC.
 
 ## Repo map
 
@@ -12,9 +12,13 @@ and surface-local gotchas:
 - **[`agent/`](agent/AGENTS.md)** — Rust Cargo workspace (the core); crate map inside.
 - **[`src-tauri/`](src-tauri/AGENTS.md)** — Tauri 2 desktop app wrapping `agent-server`.
   Its own separate Cargo workspace.
-- **[`web/`](web/AGENTS.md)** — React 19 / Vite / Tailwind SPA (the Context Explorer UI).
-- **Cloud path** — `agent-server` dials a Cloudflare Worker so a browser can drive
-  the local agent.
+- **[`web/`](web/AGENTS.md)** — React 19 / Vite / Tailwind SPA (the Context Explorer UI);
+  the Tauri desktop app's frontend, reaching the local agent over **Tauri IPC** (`agent-server`).
+
+> **No cloud/Worker path.** An earlier Cloudflare Worker control plane (browser → Worker →
+> local agent) was removed in `7245526` — `agent-server` is now a library-only crate driven
+> over Tauri IPC. The design docs under
+> `docs/superpowers/{specs,plans}/2026-06-22-cloudflare-control-plane*` are historical.
 
 ## How we work
 
