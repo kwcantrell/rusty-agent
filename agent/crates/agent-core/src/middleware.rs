@@ -605,6 +605,35 @@ impl Middleware for ToolCallLimit {
     }
 }
 
+/// Ends a named child cleanly the moment its `respond` payload is captured
+/// (spec 3B-1b §2.3). Added to the child stack only when the spec declares a
+/// `response_format`, and pushed AFTER `ToolCallLimit` so that — because
+/// `fire_after_tools` iterates the stack in REVERSE and the first `EndRun` wins —
+/// a captured response reports `Stop` even on a turn that also trips the call cap.
+pub struct ResponseCapture {
+    handle: crate::ResponseHandle,
+}
+
+impl ResponseCapture {
+    pub fn new(handle: crate::ResponseHandle) -> Self {
+        Self { handle }
+    }
+}
+
+#[async_trait]
+impl Middleware for ResponseCapture {
+    fn name(&self) -> &str {
+        "response-capture"
+    }
+    async fn after_tools(&self, _cx: &mut RunCx<'_>) -> Flow {
+        if self.handle.lock().unwrap().is_some() {
+            Flow::EndRun(StopReason::Stop)
+        } else {
+            Flow::Continue
+        }
+    }
+}
+
 /// Model-call cap (spec §5.5, E1). Ships DEFAULT-OFF: always counts in
 /// `wrap_model_call` (so `wrap_model_call` has a real consumer and both wrap
 /// surfaces are exercised), enforces at `after_model` only when enabled. It is

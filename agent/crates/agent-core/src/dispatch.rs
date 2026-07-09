@@ -1,8 +1,9 @@
 //! Sub-agent dispatch: sub-agents-as-tools (spec 2026-07-01-subagent-dispatch-core).
 use crate::{
     AgentEvent, AgentLoop, ContextCurationMiddleware, CuratedContext, EventSink, LoopConfig,
-    Middleware, OffloadConfig, RepairMiddleware, SessionArtifacts, StuckDetectionMiddleware,
-    TodoHandle, ToolCallLimit, WriteTodosTool,
+    Middleware, OffloadConfig, RepairMiddleware, RespondTool, ResponseCapture, ResponseHandle,
+    SessionArtifacts, StuckDetectionMiddleware, TodoHandle, ToolCallLimit, WriteTodosTool,
+    RESPOND_TOOL_NAME,
 };
 use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, PolicyEngine};
@@ -17,6 +18,15 @@ pub const SUBAGENT_PREAMBLE: &str = "You are a sub-agent dispatched by a parent 
 agent to complete one self-contained task. Work autonomously: no one can answer \
 questions. Your final message is returned verbatim to the parent as the task \
 result, so end with a complete, standalone answer.";
+
+/// Appended to a named child's composed system prompt when its spec declares a
+/// `response_format` (spec 3B-1b §2.2): the child returns its result by calling
+/// the `respond` tool, not in prose.
+pub const RESPONSE_FORMAT_CLAUSE: &str = "You MUST finish this task by calling the \
+`respond` tool exactly once, passing your final answer as its arguments in the shape \
+the tool's schema requires. Do not put your final answer in prose — only the \
+`respond` call is returned to the parent. If a `respond` call is rejected as invalid, \
+read the error and call `respond` again with corrected arguments.";
 
 /// Upper bound on the `role` arg (system-prompt injection; spec G6).
 pub const MAX_ROLE_CHARS: usize = 2000;
@@ -42,6 +52,9 @@ pub struct ResolvedSubAgent {
     pub model_limit: Option<usize>,
     pub max_tokens: Option<u32>,
     pub tool_call_limit: Option<usize>,
+    /// The resolved flat `response_format` schema (spec 3B-1b §2.1); `None` ⇒ the
+    /// child returns free prose as today.
+    pub response_format: Option<serde_json::Value>,
 }
 
 /// Dispatch-facing named sub-agent registry (spec §2.2). `general-purpose` is
@@ -588,6 +601,25 @@ impl Tool for DispatchAgentTool {
         if filtered_base.iter().any(|t| t.name() == "write_todos") {
             reg.register(Arc::new(WriteTodosTool::new(todos.clone())));
         }
+        // Structured response (3B-1b §2.2): a named child with a response_format gets
+        // a synthetic `respond` tool, registered DIRECTLY here (exempt from the `tools`
+        // allowlist, like the context tools) so it is always callable. The handle is
+        // read back at the handoff and by ResponseCapture.
+        let response_handle: ResponseHandle = Arc::new(Mutex::new(None));
+        let response_schema: Option<serde_json::Value> =
+            resolved.and_then(|r| r.response_format.clone());
+        if let Some(schema) = response_schema.clone() {
+            // Resolved-registry collision guard (spec §2.2): no base/injected tool may
+            // already own the reserved name. Benign by construction today (register is
+            // last-wins, so `respond` would win anyway, and no host/context tool is
+            // named `respond`), but assert it so a future collision fails loudly in
+            // tests rather than silently shadowing a real tool.
+            debug_assert!(
+                reg.get(RESPOND_TOOL_NAME).is_none(),
+                "reserved tool name `{RESPOND_TOOL_NAME}` collides with an existing child tool",
+            );
+            reg.register(Arc::new(RespondTool::new(schema, response_handle.clone())));
+        }
         // Finding 4.1: apply the parent's description overrides to the child
         // registry (registry-level, matching assemble.rs's parent application).
         // Names not in THIS child's registry (e.g. allowlist-filtered tools)
@@ -684,6 +716,11 @@ impl Tool for DispatchAgentTool {
         if let Some(cap) = resolved.and_then(|r| r.tool_call_limit) {
             child_mw.push(Arc::new(ToolCallLimit::with_cap(cap)));
         }
+        // LAST in the vec ⇒ FIRST under fire_after_tools' reverse iteration ⇒ a
+        // captured response wins a same-turn ToolCallLimit trip (reports Stop). §2.3.
+        if response_schema.is_some() {
+            child_mw.push(Arc::new(ResponseCapture::new(response_handle.clone())));
+        }
         let child = child.with_middleware(child_mw).with_backend(child_backend);
         // Route child-loop compaction through the dedicated model when set.
         let child = match &self.deps.compaction_model {
@@ -731,15 +768,34 @@ impl Tool for DispatchAgentTool {
         // emits a stray blank-line run: footer alone, or (budget) note + footer
         // joined by a single newline. With text present: note prefix, the text, a
         // blank line, then the footer.
-        let content = if s.final_text.is_empty() {
-            match budget_note {
-                Some(note) => format!("{note}\n{footer}"),
-                None => footer,
+        let content = if let Some(payload) = response_handle.lock().unwrap().take() {
+            // §2.4 Some: single-line JSON payload (line 1), footer on later lines;
+            // the child's pre-`respond` prose (final_text) is SEVERED. budget_note is
+            // intentionally omitted: a captured payload means ResponseCapture ended the
+            // run with Stop, so s.stop is never BudgetExhausted on this branch.
+            let body = serde_json::to_string(&payload).unwrap_or_else(|_| "null".into());
+            format!("{body}\n\n{footer}")
+        } else if response_schema.is_some() {
+            // §2.4 None + response_format set: marked, distinguishable free-text fallback.
+            let marker = "[response_format: UNSATISFIED — free-text fallback]";
+            match (s.final_text.is_empty(), budget_note) {
+                (true, Some(note)) => format!("{note}\n{marker}\n{footer}"),
+                (true, None) => format!("{marker}\n{footer}"),
+                (false, Some(note)) => format!("{note}\n{}\n\n{marker}\n{footer}", s.final_text),
+                (false, None) => format!("{}\n\n{marker}\n{footer}", s.final_text),
             }
         } else {
-            match budget_note {
-                Some(note) => format!("{note}\n{}\n\n{footer}", s.final_text),
-                None => format!("{}\n\n{footer}", s.final_text),
+            // No response_format → byte-identical to 3B-1.
+            if s.final_text.is_empty() {
+                match budget_note {
+                    Some(note) => format!("{note}\n{footer}"),
+                    None => footer,
+                }
+            } else {
+                match budget_note {
+                    Some(note) => format!("{note}\n{}\n\n{footer}", s.final_text),
+                    None => format!("{}\n\n{footer}", s.final_text),
+                }
             }
         };
         Ok(ToolOutput {
@@ -1103,6 +1159,239 @@ mod tests {
         }
     }
 
+    fn rf_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["summary"],
+            "properties": {"summary": {"type": "string"}}
+        })
+    }
+
+    fn resolved_with(
+        rf: Option<serde_json::Value>,
+        child: ScriptedModel,
+        tcl: Option<usize>,
+    ) -> std::collections::HashMap<String, ResolvedSubAgent> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "triage".to_string(),
+            ResolvedSubAgent {
+                description: "Triage".into(),
+                system_prompt: "You triage.".into(),
+                tools: None,
+                model: Arc::new(child),
+                protocol: Arc::new(PassthroughProtocol),
+                model_limit: None,
+                max_tokens: None,
+                tool_call_limit: tcl,
+                response_format: rf,
+            },
+        );
+        m
+    }
+
+    #[tokio::test]
+    async fn named_child_response_format_returns_severed_payload() {
+        let child = ScriptedModel::new(vec![Scripted::Call(
+            "c1".into(),
+            "respond".into(),
+            r#"{"summary":"done"}"#.into(),
+        )]);
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 3);
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(resolved_with(
+            Some(rf_schema()),
+            child,
+            None,
+        )));
+        let tool = DispatchAgentTool::new(deps);
+        let out = tool
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        let line1 = out.content.lines().next().unwrap();
+        let v: serde_json::Value = serde_json::from_str(line1).expect("line 1 is JSON");
+        assert_eq!(v["summary"], "done");
+        assert!(
+            !out.content.contains("You triage"),
+            "child prose must be severed"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_child_response_format_severs_pre_respond_prose() {
+        // Child reasons aloud (assistant text) in the SAME turn it calls `respond`
+        // (a real tool-calling model can emit text alongside tool_calls in one
+        // turn — Scripted::Text/Call would instead stop the loop after the text
+        // turn via StopReason::Stop, never reaching the call). The prose must
+        // NOT appear in the handoff — only the JSON payload + footer (sever).
+        use agent_model::{Chunk, RawToolCall};
+        let child = ScriptedModel::new(vec![Scripted::Chunks(vec![
+            Chunk::Text("Let me think... the severity is clearly low.".into()),
+            Chunk::ToolCallDelta(RawToolCall {
+                index: None,
+                id: Some("c1".into()),
+                name: Some("respond".into()),
+                args_fragment: r#"{"summary":"done"}"#.into(),
+            }),
+            Chunk::Done(StopReason::ToolCalls),
+        ])]);
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 4);
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(resolved_with(
+            Some(rf_schema()),
+            child,
+            None,
+        )));
+        let out = DispatchAgentTool::new(deps)
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        // Line 1 is the JSON payload.
+        let v: serde_json::Value =
+            serde_json::from_str(out.content.lines().next().unwrap()).unwrap();
+        assert_eq!(v["summary"], "done");
+        // The child's pre-respond prose is severed — absent from the ENTIRE handoff.
+        assert!(
+            !out.content.contains("Let me think"),
+            "pre-respond prose leaked: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("severity is clearly low"),
+            "pre-respond prose leaked: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_respond_retries_then_succeeds() {
+        let child = ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "respond".into(), r#"{"wrong":1}"#.into()),
+            Scripted::Call("c2".into(), "respond".into(), r#"{"summary":"ok"}"#.into()),
+        ]);
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 4);
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(resolved_with(
+            Some(rf_schema()),
+            child,
+            None,
+        )));
+        let out = DispatchAgentTool::new(deps)
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(out.content.lines().next().unwrap()).unwrap();
+        assert_eq!(v["summary"], "ok");
+    }
+
+    #[tokio::test]
+    async fn no_valid_respond_yields_marked_fallback() {
+        let child = ScriptedModel::new(vec![Scripted::Text("prose answer, no tool".into())]);
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 2);
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(resolved_with(
+            Some(rf_schema()),
+            child,
+            None,
+        )));
+        let out = DispatchAgentTool::new(deps)
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("[response_format: UNSATISFIED"));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(out.content.lines().next().unwrap()).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_reachable_under_empty_tools_allowlist() {
+        let child = ScriptedModel::new(vec![Scripted::Call(
+            "c1".into(),
+            "respond".into(),
+            r#"{"summary":"x"}"#.into(),
+        )]);
+        let mut m = resolved_with(Some(rf_schema()), child, None);
+        m.get_mut("triage").unwrap().tools = Some(vec![]); // allowlist omits respond
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 3);
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(m));
+        let out = DispatchAgentTool::new(deps)
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(out.content.lines().next().unwrap()).unwrap()
+                ["summary"],
+            "x"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_wins_same_turn_tool_call_limit() {
+        // tool_call_limit = 1: the respond call is the 1st (and cap-tripping) call.
+        // ResponseCapture (pushed last) must win → footer reports Stop, not Error.
+        let child = ScriptedModel::new(vec![Scripted::Call(
+            "c1".into(),
+            "respond".into(),
+            r#"{"summary":"done"}"#.into(),
+        )]);
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 3);
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(resolved_with(
+            Some(rf_schema()),
+            child,
+            Some(1),
+        )));
+        let out = DispatchAgentTool::new(deps)
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("stop: Stop"),
+            "capture must report Stop: {}",
+            out.content
+        );
+        assert!(!out.content.contains("stop: Error"));
+        // Precedence winning must also sever the payload on the same turn, not just
+        // fix the stop-reason: line 1 is the JSON, not prose.
+        let v: serde_json::Value =
+            serde_json::from_str(out.content.lines().next().unwrap()).unwrap();
+        assert_eq!(v["summary"], "done");
+    }
+
+    #[tokio::test]
+    async fn named_child_without_response_format_is_byte_identical() {
+        let child = ScriptedModel::new(vec![Scripted::Text("plain answer".into())]);
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 3);
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(resolved_with(None, child, None)));
+        let out = DispatchAgentTool::new(deps)
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.content,
+            "plain answer\n\n[sub-agent: 1 turns, 0 tool calls, stop: Stop]"
+        );
+    }
+
     #[test]
     fn empty_registry_omits_subagent_type_from_schema() {
         // A DispatchAgentTool built with an empty registry has a schema byte-identical
@@ -1132,6 +1421,7 @@ mod tests {
                 model_limit: None,
                 max_tokens: None,
                 tool_call_limit: Some(3),
+                response_format: None,
             },
         );
         Arc::new(SubAgentRegistry::from_map(m))
@@ -1236,6 +1526,7 @@ mod tests {
                     model_limit: r.model_limit,
                     max_tokens: r.max_tokens,
                     tool_call_limit: r.tool_call_limit,
+                    response_format: r.response_format.clone(),
                 },
             );
         }
@@ -1302,6 +1593,7 @@ mod tests {
                 model_limit: None,
                 max_tokens: None,
                 tool_call_limit: None,
+                response_format: None,
             },
         );
         let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);

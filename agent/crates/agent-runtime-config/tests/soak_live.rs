@@ -419,3 +419,176 @@ async fn soak_all_components_live() {
         "a disallowed tool produced a result: {tool_results:?}"
     );
 }
+
+/// Capturing sink for the S1 measurement soak: records the `content` of every
+/// parent `dispatch_agent` tool result, so the driver can inspect line 1 (the
+/// structured payload the handoff renders — or a marked fallback). Mirrors the
+/// `AgentEvent::ToolResult { name, output, .. }` shape used by `SoakMonitor`.
+#[derive(Default)]
+struct DispatchCapture {
+    last: Mutex<Option<String>>,
+}
+impl EventSink for DispatchCapture {
+    fn emit(&self, e: AgentEvent) {
+        if let AgentEvent::ToolResult { name, output, .. } = e {
+            if name == "dispatch_agent" {
+                *self.last.lock().unwrap() = Some(output.content);
+            }
+        }
+    }
+}
+
+/// Live measurement (S1, spec §2.6): schema-valid rate + failure-tail turn cost of a
+/// response_format sub-agent on the default model. Ignored — run explicitly with a
+/// live server (AGENT_E2E_URL / AGENT_E2E_MODEL set).
+///
+/// Drives the REAL parent loop (`agent.run_with_cancel`) instructing it to dispatch
+/// to a `response_format` triager sub-agent; a `DispatchCapture` sink taps the
+/// parent's `dispatch_agent` tool result, whose line 1 is the JSON payload (or a
+/// marked fallback). Each trial: parse line 1, `agent_core::validate_payload` it
+/// against the schema, tally valid-rate; sum the sub-agent's reported turn count
+/// (the "[sub-agent: N turns …]" footer) for the failure-tail cost.
+///   AGENT_E2E_URL=http://localhost:8080 AGENT_E2E_MODEL=qwen3.6-35b-a3b RF_TRIALS=10 \
+///     cargo test -p agent-runtime-config --test soak_live \
+///       response_format_valid_rate_live -- --ignored --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live soak: requires AGENT_E2E_URL / AGENT_E2E_MODEL and a live server"]
+async fn response_format_valid_rate_live() {
+    let url = std::env::var("AGENT_E2E_URL").expect("set AGENT_E2E_URL");
+    let model_name = std::env::var("AGENT_E2E_MODEL").expect("set AGENT_E2E_MODEL");
+    let trials: usize = std::env::var("RF_TRIALS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+
+    // Flat-object schema (spec §2.5 dialect): scalar + enum props, `required`,
+    // `additionalProperties = false`. No nesting.
+    let schema = serde_json::json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["severity", "summary"],
+        "properties": {
+            "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+            "summary": {"type": "string"}
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().to_path_buf();
+    let mut cfg = RuntimeConfig::from_launch(
+        "openai".into(),
+        url.clone(),
+        model_name.clone(),
+        "native".into(),
+        8000,
+    );
+    cfg.memory = false;
+    cfg.sandbox_mode = "off".into();
+    cfg.max_turns = 6;
+    cfg.subagent_max_depth = 1; // allow the parent to dispatch
+    cfg.named_subagents = vec![agent_runtime_config::SubAgentSpec {
+        name: "triager".into(),
+        description: "Classify a software failure and summarize it.".into(),
+        system_prompt: "You triage software failures. Given a failure description, \
+            decide its severity and write a one-sentence summary."
+            .into(),
+        tools: Some(vec![]), // no other tools — just reason + respond
+        model: None,
+        tool_call_limit: None,
+        permissions: None,
+        response_format: Some(schema.clone()),
+        middleware: None,
+        skills: None,
+    }];
+    cfg.validate().expect("config valid");
+
+    let mut valid = 0usize;
+    let mut total_turns = 0usize;
+    for i in 0..trials {
+        let capture = Arc::new(DispatchCapture::default());
+        let artifacts = Arc::new(SessionArtifacts::new());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let todos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let approval = Arc::new(SafeApproval {
+            denied: Mutex::new(Vec::new()),
+        });
+
+        let built = assemble_loop(
+            &cfg,
+            LoopParts {
+                model: Arc::new(OpenAiCompatClient::new(
+                    url.clone(),
+                    model_name.clone(),
+                    std::env::var("AGENT_API_KEY").ok(),
+                )),
+                sink: capture.clone(),
+                approval: approval.clone(),
+                workspace: ws.clone(),
+                mcp_tools: vec![],
+                memory_tools: vec![],
+                memory_retriever: None,
+                stream_idle_timeout: Duration::from_secs(120),
+                base_system_prompt: "You dispatch to sub-agents. For each task, call \
+                    dispatch_agent with subagent_type=\"triager\" and the failure text as \
+                    the prompt, then reply with its result verbatim."
+                    .into(),
+                artifacts: artifacts.clone(),
+                compact_flag: flag.clone(),
+                todos: todos.clone(),
+                sandbox: agent_runtime_config::build_sandbox(&cfg),
+                stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
+                trace: None,
+                api_key: None,
+                claude_binary: "claude".into(),
+            },
+        );
+        let agent = built.loop_;
+        let mut ctx = CuratedContext::new(
+            Message::system(built.system_prompt),
+            artifacts.clone(),
+            flag,
+        );
+        let task = "Triage this failure: the CI build fails intermittently, ~1 in 5 runs, \
+            on the integration test step, with no error in the logs.";
+        let _ = agent
+            .run_with_cancel(
+                &mut ctx,
+                task.to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+
+        let out = capture.last.lock().unwrap().clone().unwrap_or_default();
+        let line1 = out.lines().next().unwrap_or("");
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line1) {
+            if agent_core::validate_payload(&schema, &v).is_ok() {
+                valid += 1;
+            }
+        }
+        // Failure-tail cost: the handoff footers the child's turn count as
+        // "[sub-agent: N turns …]". Sum it across trials for an avg.
+        if let Some(n) = out
+            .split("[sub-agent: ")
+            .nth(1)
+            .and_then(|s| s.split(" turns").next())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+        {
+            total_turns += n;
+        }
+        eprintln!(
+            "trial {i}: {}",
+            if line1.starts_with('{') {
+                "structured"
+            } else {
+                "fallback"
+            }
+        );
+    }
+    eprintln!(
+        "response_format valid rate: {valid}/{trials}; avg sub-agent turns: {}",
+        total_turns as f64 / trials.max(1) as f64
+    );
+    assert!(
+        valid * 2 >= trials,
+        "valid rate below 50% floor: {valid}/{trials}"
+    );
+}
