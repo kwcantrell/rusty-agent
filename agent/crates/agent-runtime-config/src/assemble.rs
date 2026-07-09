@@ -417,6 +417,18 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                     max_tokens: s_max_tokens,
                     tool_call_limit: spec.tool_call_limit,
                     response_format: spec.response_format.clone(),
+                    permissions: spec.permissions.as_ref().and_then(|p| {
+                        // Empty block ≡ omitted (spec §2.2 rule 5): normalize to None
+                        // so the dispatch same-Arc fast path stays honest (§2.5).
+                        if p.deny.is_empty() && p.ask.is_empty() {
+                            None
+                        } else {
+                            Some(agent_policy::PermissionLists {
+                                deny: p.deny.clone(),
+                                ask: p.ask.clone(),
+                            })
+                        }
+                    }),
                 },
             );
         }
@@ -1113,6 +1125,68 @@ mod tests {
         assert_eq!(r.response_format.as_ref().unwrap()["type"], "object");
         assert!(r.system_prompt.contains(agent_core::RESPONSE_FORMAT_CLAUSE));
         assert!(r.system_prompt.contains(agent_core::SUBAGENT_PREAMBLE));
+    }
+
+    #[test]
+    fn assembly_threads_raw_permissions_and_normalizes_empty() {
+        use crate::runtime_config::{SubAgentPermissions, SubAgentSpec};
+        let ws = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.named_subagents = vec![
+            SubAgentSpec {
+                name: "floored".into(),
+                description: "d".into(),
+                system_prompt: "p".into(),
+                tools: None,
+                model: None,
+                tool_call_limit: None,
+                permissions: Some(SubAgentPermissions {
+                    deny: vec!["execute_command".into()],
+                    ask: vec!["write_file".into()],
+                }),
+                response_format: None,
+                middleware: None,
+                skills: None,
+            },
+            SubAgentSpec {
+                name: "emptyblock".into(),
+                description: "d".into(),
+                system_prompt: "p".into(),
+                tools: None,
+                model: None,
+                tool_call_limit: None,
+                permissions: Some(SubAgentPermissions::default()),
+                response_format: None,
+                middleware: None,
+                skills: None,
+            },
+            SubAgentSpec {
+                name: "ruleless".into(),
+                description: "d".into(),
+                system_prompt: "p".into(),
+                tools: None,
+                model: None,
+                tool_call_limit: None,
+                permissions: None,
+                response_format: None,
+                middleware: None,
+                skills: None,
+            },
+        ];
+        let built = assemble_loop(&c, parts(ws.path().into(), vec![]));
+        let reg = built
+            .subagent_registry
+            .expect("registry present when subagents on");
+        let floored = reg.get("floored").unwrap();
+        assert_eq!(
+            floored.permissions,
+            Some(agent_policy::PermissionLists {
+                deny: vec!["execute_command".into()],
+                ask: vec!["write_file".into()],
+            })
+        );
+        assert_eq!(reg.get("emptyblock").unwrap().permissions, None);
+        assert_eq!(reg.get("ruleless").unwrap().permissions, None);
     }
 
     #[test]

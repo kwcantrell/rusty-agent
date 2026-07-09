@@ -55,6 +55,10 @@ pub struct ResolvedSubAgent {
     /// The resolved flat `response_format` schema (spec 3B-1b §2.1); `None` ⇒ the
     /// child returns free prose as today.
     pub response_format: Option<serde_json::Value>,
+    /// RAW floor lists (3B-1c §2.5) — parsed at dispatch, not at assembly; `None`
+    /// ⇒ the child gets the caller's policy Arc untouched. Assembly normalizes
+    /// empty blocks to `None`, so `Some` is non-empty by construction.
+    pub permissions: Option<agent_policy::PermissionLists>,
 }
 
 /// Dispatch-facing named sub-agent registry (spec §2.2). `general-purpose` is
@@ -1185,6 +1189,7 @@ mod tests {
                 max_tokens: None,
                 tool_call_limit: tcl,
                 response_format: rf,
+                permissions: None,
             },
         );
         m
@@ -1422,6 +1427,7 @@ mod tests {
                 max_tokens: None,
                 tool_call_limit: Some(3),
                 response_format: None,
+                permissions: None,
             },
         );
         Arc::new(SubAgentRegistry::from_map(m))
@@ -1527,6 +1533,7 @@ mod tests {
                     max_tokens: r.max_tokens,
                     tool_call_limit: r.tool_call_limit,
                     response_format: r.response_format.clone(),
+                    permissions: r.permissions.clone(),
                 },
             );
         }
@@ -1594,6 +1601,7 @@ mod tests {
                 max_tokens: None,
                 tool_call_limit: None,
                 response_format: None,
+                permissions: None,
             },
         );
         let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
