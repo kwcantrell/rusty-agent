@@ -1,12 +1,16 @@
 # Backend seam / virtual filesystem (deepagents refactor, Phase 2) — design
 
-**Status:** PANEL-REVIEWED 2026-07-08 — pending spec-review gate (five
-escalations E1–E5 await the owner's decision; see §6 and the Panel & review
-log).
+**Status:** APPROVED at spec-review gate 2026-07-08 (panel-reviewed;
+escalations E1–E6 all resolved — decisions inline in §6 and in the Panel &
+review log). **Governing goal, stated by the owner at the gate:** the
+refactor's purpose is deepagents-style modularity — custom middleware,
+filesystems, and extensions can be written to change runtime behavior. The
+seam itself is the deliverable; dispositions below are argued against that
+criterion. Next: implementation plan.
 **Knowledge base:** `docs/okf/deepagents-refactor/` (commit d997eec). Design
 judgments in `comparisons/refactor-priorities.md` are *unvalidated input* —
 including the Phase-2/3/4 partition itself; the panel examined it as a claim
-and its findings are escalated at E1/E2/E3.
+and the gate resolved it at E1.
 **Live-source baseline:** commit a68e721, re-read 2026-07-08. All `file:line`
 anchors are orientation only — locate quoted code by content before editing.
 **Builds on:** Phase-1 middleware seam
@@ -67,10 +71,9 @@ surface, one portability seam.
   model action can forge or destroy offloaded content.
 - G5. `context_recall` retired (superseded pins and every consumer of the
   retired surface enumerated in §5.6/§7). `context_compact` survives
-  unchanged. *(The retirement itself is mandate; the panel's counter-case is
-  escalated at E2.)*
+  unchanged. *(Retirement ratified at the gate, E2.)*
 - G6. Dispatch children get their own artifacts namespace (fresh
-  `MemBackend`, child-distinct artifact names) over the same workspace
+  `SessionArtifacts`, child-distinct artifact names) over the same workspace
   mount — the file-tools analog of today's per-child `InMemoryOffloadStore`.
 - G7. Curation **selection logic** is unchanged given identical inputs:
   the offload/fold/compaction triggers, thresholds, `keep_recent`,
@@ -119,12 +122,12 @@ Gap-analysis keep-invariants plus Phase-1 seam invariants:
 
 ## 4. Alternatives considered
 
-**A — Backend via `ToolCtx`, artifacts in a caller-owned `MemBackend`
-(chosen shape; the artifacts-location half is escalated at E3).** The
+**A — Backend via `ToolCtx`, artifacts in caller-owned `MemBackend`s
+(chosen; the artifacts-location half was ratified at the gate, E3).** The
 backend handle rides `LoopConfig → ToolCtx` exactly like `sandbox` already
 does; file tools stay stateless structs; children get a different composite
 simply by the child loop carrying a different backend. Curation writes
-artifacts through the same `MemBackend` via a privileged handle.
+artifacts through the same stores via privileged handles.
 
 **B — deepagents-faithful `FilesystemMiddleware`** shipping backend-bound
 tool instances as contributions. Rejected: with no node/wrap hooks it is a
@@ -151,7 +154,8 @@ the gate as E2** rather than recorded as a settled technical rejection.
 and the shell-coherence gap (sandboxed commands could grep artifacts) in
 one stroke, at the cost of session litter/cleanup and losing
 nothing-persists parity. The original rejection under-priced what
-MemBackend+Composite carry. **Escalated to the gate as E3.** Note the three
+MemBackend+Composite carry. **Escalated to the gate as E3; resolved
+MemBackend (§6).** Note the three
 G2 implementations are mandated and get built either way; E3 only decides
 where the *artifacts* route. The read-only-to-model guard (§5.2) applies
 under either choice.
@@ -232,7 +236,12 @@ user-visible strings where tests pin them
 Paths are `&str` virtual paths, not `Path`: they are model-provided strings
 routed by prefix; only `HostBackend` ever touches the OS path type. No
 host-fs assumption leaks into the trait, so an execute-derived sandbox
-backend stays implementable later (J2).
+backend stays implementable later (J2). **Mount-location transparency
+(E6):** a backend always receives paths relative to its own root — the
+composite strips the mount prefix on the way in and re-prefixes result
+paths (`ls`/`glob`/`grep` hits) on the way out. A custom backend written
+against root-relative paths can therefore be mounted at any prefix without
+modification; it never needs to know where it lives.
 
 ### 5.2 The three backends + the artifacts guard
 
@@ -245,31 +254,39 @@ everything-is-NotFound mapping (declared change, J3). `glob`/`grep` walk
 the root; the skip-set is exactly `.git/` (a stated default, not plan
 whimsy), and reserved-prefix artifacts are never subject to any skip-set.
 
-**`MemBackend`** — `Mutex<BTreeMap<String, String>>` keyed by full virtual
-path. `BTreeMap` gives sorted `ls`/`glob` for free. Unbounded, session-
-scoped, cheap to share by `Arc` — the parity replacement for
-`InMemoryOffloadStore` (verified genuinely unbounded today; parity, J5).
+**`MemBackend`** — `Mutex<BTreeMap<String, String>>` keyed by
+mount-relative path (E6 strip semantics). `BTreeMap` gives sorted
+`ls`/`glob` for free. Unbounded, session-scoped, cheap to share by `Arc` —
+the parity replacement for `InMemoryOffloadStore` (verified genuinely
+unbounded today; parity, J5).
 
 **`CompositeBackend { mounts: Vec<(String, Arc<dyn Backend>)>, default: Arc<dyn Backend> }`**
-— route by **longest matching path prefix**, else `default`. Mounted
-backends receive the full virtual path unmodified. **This is a deliberate
-divergence from live deepagents**, whose `CompositeBackend` strips the
-mount prefix before delegating and re-maps result paths on the way out
-(panel-verified against `backends/composite.py`; the spec's earlier
-"matching deepagents" claim was wrong). No-strip is defended on its own
-merits: `MemBackend` keys full paths and `HostBackend` only ever mounts at
-the default position in Phase 2, so a strip/re-map layer would be pure
-machinery. Flag for the future: mounting a `HostBackend` (or sandbox
-backend) at a *non-root* prefix will force the strip question back open.
-`ls`/`glob`/`grep` **aggregate**: the default's results union'd with every
-mount whose prefix intersects the queried scope, deduped.
+— route by **longest matching path prefix**, else `default`. Per E6 (gate
+decision, reversing the panel-era draft): the composite **strips the mount
+prefix** before delegating and **re-prefixes result paths** on the way out,
+matching live deepagents' `backends/composite.py` (panel-verified) and —
+the deciding argument under the modularity goal — keeping every mounted
+backend mount-location-transparent. The draft's no-strip contract would
+have made every future custom backend mount-aware; retrofitting stripping
+after third-party backends exist would break their contract, so it lands
+now, while zero backends exist. Two consequences the strip forces:
+(1) `MemBackend` keys mount-relative paths, and (2) the two artifact
+prefixes get **two separate `MemBackend` instances** — a single instance
+mounted twice would merge namespaces after stripping (a `grep` under
+`large_tool_results/` would surface `history.md` re-prefixed under the
+wrong mount). The default mount is unstripped: `HostBackend` sees
+workspace-relative paths exactly as today. `ls`/`glob`/`grep`
+**aggregate**: the default's results union'd with every mount whose prefix
+intersects the queried scope, re-prefixed per mount, deduped — and never
+cross-namespace (pinned: a grep scoped to one prefix never surfaces
+another mount's files).
 
 **`ReadOnlyToTools` guard (new, load-bearing).** The composite's artifact
-mounts wrap the artifacts `MemBackend` in a guard that rejects `write` /
+mounts wrap the two artifact `MemBackend`s in a guard that rejects `write` /
 `edit` / `delete` with
 `FsError::Denied("large_tool_results/ and conversation_history/ are
 read-only records of offloaded context")`. Curation holds the **unwrapped**
-`MemBackend` handle and writes directly; tools only ever see the guarded
+`SessionArtifacts` handles and writes directly; tools only ever see the guarded
 composite. Why this is load-bearing (panel blockers 1–2, Failure & abuse):
 placeholders and the compaction pointer vouch for the provenance of what
 they point at, and today's `OffloadStore` is unreachable by any model
@@ -294,26 +311,32 @@ reservation.
   already is (`loop_.rs` ToolCtx construction; panel-verified the mirror is
   exact). `ToolCtx.workspace` stays: shell/git tools still need the OS path.
 - `LoopParts.offload_store` is **replaced** by
-  `artifacts: Arc<MemBackend>` (concrete, not `dyn` — curation needs the
-  unwrapped privileged handle; the composite wraps it for tools), with the
-  survival contract carried over verbatim in the doc comment: *the caller
-  owns it and passes the SAME handle across loop rebuilds (server settings
-  change), so the conversation's offloaded artifacts survive.*
-  `compact_flag` is unchanged. `assemble_loop` composes
-  `CompositeBackend { [large_tool_results/ → ReadOnlyToTools(artifacts), conversation_history/ → ReadOnlyToTools(artifacts)], default: HostBackend(parts.workspace) }`
+  `artifacts: Arc<SessionArtifacts>`, a small struct holding the two
+  per-mount stores (`results: Arc<MemBackend>`, `history: Arc<MemBackend>`
+  — two instances per E6's strip semantics; concrete, not `dyn`, because
+  curation needs the unwrapped privileged handles; the composite wraps them
+  for tools). The survival contract carries over verbatim in the doc
+  comment: *the caller owns it and passes the SAME handle across loop
+  rebuilds (server settings change), so the conversation's offloaded
+  artifacts survive.* `compact_flag` is unchanged. `assemble_loop` composes
+  `CompositeBackend { [large_tool_results/ → ReadOnlyToTools(results), conversation_history/ → ReadOnlyToTools(history)], default: HostBackend(parts.workspace) }`
   fresh per assemble — the composite is derived state; only the artifacts
-  mount is identity-bearing.
+  handle is identity-bearing. Curation's privileged writes use
+  mount-relative keys (`{seq}-{call}` into `results`, `history.md` into
+  `history`); every string the *model* sees (placeholders, pointers, the
+  ledger) carries the full virtual path.
 - Honest blast-radius note (panel): `CuratedContext::new`'s middle
-  parameter changes **type** (`Arc<dyn OffloadStore>` → `Arc<MemBackend>`)
+  parameter changes **type** (`Arc<dyn OffloadStore>` → `Arc<SessionArtifacts>`)
   — a breaking signature change at every construction site (assemble,
   dispatch, server runtime/session, CLI, and the test constructors in
   `curated.rs` / `compaction_routing.rs` / `soak_live.rs`), not a cosmetic
   arity note.
-- Frontends: `agent-cli` builds one `MemBackend` where it builds the store
-  today; `agent-server`'s `Runtime` field and `offload_store()` accessor
-  become the artifacts backend (same rebuild paths in `session.rs`).
+- Frontends: `agent-cli` builds one `SessionArtifacts` where it builds the
+  store today; `agent-server`'s `Runtime` field and `offload_store()`
+  accessor become the artifacts handle (same rebuild paths in
+  `session.rs`).
 - `ContextCurationMiddleware::new(artifacts, flag, max_result_bytes)` —
-  same shape, store swapped for the privileged backend handle.
+  same shape, store swapped for the privileged artifacts handle.
 
 ### 5.4 File tools on the backend
 
@@ -365,7 +388,7 @@ recovery is read+search, never discovery-by-pattern.
 
 ### 5.5 Curation writes files
 
-`CuratedContext` holds `artifacts: Arc<MemBackend>` (replacing
+`CuratedContext` holds `artifacts: Arc<SessionArtifacts>` (replacing
 `store: Arc<dyn OffloadStore>`) plus a monotone per-instance sequence
 counter. **Selection logic is untouched** (G7 as restated). What changes is
 the sink:
@@ -459,7 +482,7 @@ The panel required every consumer of `context_recall` / `OffloadStore` /
 | `web/src/state.ts` offloaded render (template literal reads `detail.id`, type-checks as `undefined` — silent break) | Reads `detail.path ?? detail.id` (the fallback keeps pre-Phase-2 session-trace replays rendering sanely) |
 | `web/src/components/design/archFixture.ts` (`context_recall` fixture entry) | Updated |
 | Tests: `soak_live.rs` (recall-driving soak), `compaction_routing.rs` (store construction), `dispatch_tool.rs`, `e2e_context_management.rs`, `stress_context_management.rs` | See §7 |
-| `eval_context.rs` + context-evolve configs | Deliberately not migrated (mandate; E5) |
+| `eval_context.rs` + context-evolve task drivers | **Migrated in wave 2** (E5, gate override of the draft's ignore-and-note posture): the harness compiles and runs against the `read_file`/`grep` recovery grammar. Guard-ceiling *re-measurement* stays parked until a context-evolve campaign resumes (a ceiling is a (config, rate) pair; see memory note) |
 
 Registry surface after Phase 2: base = file tools (4 existing + grep) +
 shell/git/artifact/http; middleware contributions = memory tools
@@ -469,12 +492,13 @@ invariant from Phase 1 assembly is untouched.
 ### 5.7 Dispatch children
 
 Where dispatch today builds a fresh `InMemoryOffloadStore` + flag per child
-(`dispatch.rs`), it now builds a fresh `MemBackend` + flag, composes the
-child composite `{ artifact prefixes → ReadOnlyToTools(child MemBackend),
+(`dispatch.rs`), it now builds a fresh `SessionArtifacts` + flag, composes
+the child composite `{ artifact prefixes → ReadOnlyToTools(child stores),
 default: the parent's HostBackend mount }`, and hands it to the child
 `LoopConfig` and the child's `ContextCurationMiddleware`. Child artifact
-names carry the dispatch prefix the sink attribution already mints
-(`sub{n}:`), e.g. `large_tool_results/sub1-{seq}-{call}` — making a
+names carry a path-sanitized form of the dispatch prefix the sink
+attribution already mints (`sub{n}:` → `sub{n}-`), e.g.
+`large_tool_results/sub1-{seq}-{call}` — making a
 parent/child name collision structurally impossible. Consequences, pinned
 by test:
 
@@ -533,40 +557,60 @@ before the contested surface:
   No curation change, no retirement, no wire change.
 - **Wave 2 — the substrate migration:** curation writes files, placeholder
   grammar, `read_file` paging contract + `grep` tool, `context_recall`
-  retirement + consumer sweep (§5.6 table), wire/event change, children.
+  retirement + consumer sweep (§5.6 table), wire/event change, children,
+  and the eval-harness migration (E5).
 
 ## 6. Judgments and gate escalations
 
 Escalations (panel findings that conflict with or reinterpret the mandate —
-the gate decides; none silently adopted or dismissed):
+none silently adopted or dismissed; **all resolved at the 2026-07-08 gate**
+under the owner's stated modularity goal):
 
 - **E1 — Is the backend seam really Phase 2?** The scope reviewer's case:
   Phase 2's one user-facing gain (compaction-span preservation) is buildable
   on the existing store in ~20 lines; everything else is
-  uniformity/portability plumbing whose consumers are Phase 3/4 — and the
-  Phase-1 gate committed to *Phase 3*, whose items (todos, named subagents,
-  caching, repair, guardrails) need the middleware seam, not this one. The
-  mandate names Phase 2 as this session's deliverable; proceeding vs
-  re-sequencing is the owner's call.
+  uniformity/portability plumbing whose consumers are Phase 3/4.
+  **Decision: proceed as specced.** The reviewer priced the phase by
+  user-facing payoff; under the modularity goal the pluggable seam *is* the
+  payoff — the same shape as Phase 1's J1 resolution (full seam over
+  extract-object). §5.10's staging addresses the surviving risk portion.
 - **E2 — Retire `context_recall` at all?** The original alt-C rejection was
-  circular (§4 C). Retirement stands on the uniformity goal, not technical
-  necessity. Owner's call; the spec as written implements retirement.
-- **E3 — Artifacts on `MemBackend` vs host-disk (§4 D).** Host-disk deletes
-  the artifacts-routing machinery and the shell-coherence gap at the price
-  of session litter and persistence semantics. The spec as written keeps
-  MemBackend (parity); the panel found the trade closer than the draft
-  admitted.
-- **E4 — Compaction failure posture** when the history write fails:
-  commit-with-honest-incomplete-marker (spec default, preserves maintenance
-  liveness) vs abort-like-fold (preserves the transcript-completeness
-  claim). §5.5 implements the default; either way, the INCOMPLETE marker
-  ensures the pointer never over-promises.
-- **E5 — Eval harness left broken.** The mandate says ignore the
-  context-evolve harness and note it for later (memory note written:
-  `context-evolve-needs-backend-migration`). The scope reviewer's
-  counterpoint stands on record: Phase 2 changes offload behavior while
-  disabling the eval that measures it, so the phase lands unmeasured unless
-  the gate orders a harness migration or a manual eval run before merge.
+  circular (§4 C); retirement stands on the uniformity goal, not technical
+  necessity. **Decision: retire.** The id-keyed tool couples recovery to
+  one store implementation; the file-tool grammar gives every future custom
+  backend offload recovery for free. Migration cost is one-time and priced
+  in §5.6.
+- **E3 — Artifacts on `MemBackend` vs host-disk (§4 D).**
+  **Decision: MemBackend (spec default).** Under the modularity lens the
+  composite is the extensibility surface, and routing artifacts through it
+  gives the mount table an always-exercised consumer from day one — the
+  seam lands tested-in-anger rather than idle until Phase 4. The
+  shell-coherence gap stays a documented tool-prose note; the disk option
+  remains a one-line mount swap later.
+- **E4 — Compaction failure posture** when the history write fails.
+  **Decision: commit-with-INCOMPLETE-marker (spec default).** Modularity
+  raises the stakes in this direction: pluggable backends make write
+  failures realistic (disk-full, remote-store timeout), and a mounted
+  backend's failure must not wedge window maintenance — otherwise every
+  custom backend is a liveness risk to the core loop. The permanent marker
+  keeps the pointer honest under any mount.
+- **E5 — Eval harness left broken.** The draft mandate said ignore the
+  context-evolve harness and note it for later. **Decision: gate override —
+  migrate the harness in wave 2** (§5.6, §5.10, §7). Phase 2 changes
+  offload behavior (J6's input-distribution shift) while the harness is the
+  instrument that measures it, and under the modularity goal the harness's
+  long-term role grows (the regression guard when someone swaps a backend).
+  Ceiling re-measurement stays parked (memory note
+  `context-evolve-needs-backend-migration`).
+- **E6 — Composite path contract (raised post-panel at the gate, from the
+  modularity goal).** The panel-era draft passed full virtual paths to
+  mounts, defended by Phase-2 circumstances. **Decision: strip+remap**
+  (§5.1/§5.2) — mount-location transparency is the composable contract for
+  third-party backends, it re-aligns with live deepagents, and it is
+  cheapest now, before any backend or artifact-name format exists.
+  Consequence absorbed: two `MemBackend` instances inside one
+  `SessionArtifacts` handle (a single instance mounted twice would merge
+  namespaces after stripping).
 
 Judgments (panel-reviewed, held; numbering starts at J2 — the draft's J1,
 "the partition is a claim", became escalation E1):
@@ -581,6 +625,10 @@ Judgments (panel-reviewed, held; numbering starts at J2 — the draft's J1,
   `execute` is added) — a topology this runtime does not have; (3) the
   refusal-on-degraded posture would need re-derivation across seven ops.
   What Phase 2 owes the future: a trait with no host-fs assumptions (§5.1).
+  **Gate amendment (modularity goal):** the "no host-fs assumptions"
+  guardrail is load-bearing, not courtesy — and the §7 backend contract
+  suite is declared a **public conformance surface**: the acceptance test a
+  custom-backend author runs against their implementation.
 - **J3 — multimodal files: assessed, excluded.** The UNASSESSED gap row is
   resolved: current behavior is text-only end-to-end (`read_to_string`;
   `ToolOutput.content: String`; `Message.content: String`). deepagents'
@@ -592,10 +640,15 @@ Judgments (panel-reviewed, held; numbering starts at J2 — the draft's J1,
   deliberately deferred".
 - **J4 — backend handle rides `ToolCtx`,** not middleware-bound tool
   instances (§4 B rationale; `sandbox` is the established precedent for
-  loop-scoped tool deps; the ToolCtx mirror was panel-verified).
-- **J5 — artifacts live in a caller-owned `MemBackend`** (subject to E3).
-  Parity with `InMemoryOffloadStore`, same one-identity-bearing-handle
-  survival shape. Known coherence gap, accepted and documented in tool
+  loop-scoped tool deps; the ToolCtx mirror was panel-verified). **Gate
+  clarification (modularity goal):** the filesystem extensibility point is
+  the composite **mount table in `assemble_loop`** — extenders swap or add
+  mounts; they do not write a filesystem middleware. Hardcoded mounts are
+  correct while all mounts are internal; a config-driven mount table is
+  the expected Phase-4 shape (§8).
+- **J5 — artifacts live in caller-owned `MemBackend`s** (`SessionArtifacts`
+  pair; ratified at E3). Parity with `InMemoryOffloadStore`, same
+  one-identity-bearing-handle survival shape. Known coherence gap, accepted and documented in tool
   prose: sandboxed shell commands cannot see the artifact prefixes;
   dissolves under E3's disk option.
 - **J6 — uniform offload + source-bounded `read_file`, not deepagents'
@@ -609,7 +662,10 @@ Judgments (panel-reviewed, held; numbering starts at J2 — the draft's J1,
   `## folded-{seq}` / `## compacted-{seq}` sections (a deliberate
   divergence from deepagents' per-thread files): a single stable path keeps
   the summary pointer constant. Per-instance file; children write to their
-  own mount. Deep-recovery recipe pinned (§5.5).
+  own mount. Deep-recovery recipe pinned (§5.5). **Gate-added revisit
+  trigger:** a store-backed `conversation_history/` mount (per-user/
+  per-thread namespacing) would prefer keyed files over one rolling
+  append-file — revisit alongside Phase 4's memory judgment (§8).
 - **J8 — no agent-facing `glob` or `delete` tools.** `delete`: destructive
   surface with no Phase-2 consumer. `glob` (panel): no role in recovery —
   placeholders cite exact paths. Both trait ops remain (protocol shape;
@@ -664,17 +720,25 @@ decision):**
 - `agent-server` `architecture` classification test, `contract.rs`
   name-cluster list, `agent-cli/render.rs` + `wire.rs` Offloaded arms,
   `web` state/fixture — per the §5.6 table.
-- **Out of scope by mandate (E5):** `eval_context.rs` + guard-ceiling
-  configs — deliberately not migrated; memory note
-  `context-evolve-needs-backend-migration` records the rework debt.
+- `eval_context.rs` — **migrated in wave 2** (E5 gate decision): the
+  harness's recall-driving task machinery moves to the `read_file`/`grep`
+  grammar so the phase does not land with its measurement instrument
+  uncompilable. Ceiling re-measurement remains out of scope (memory note
+  `context-evolve-needs-backend-migration` records that debt).
 
 **New tests:**
 
 - Backend contract suite run against all three impls (ls/read/write/edit/
   glob/grep/delete, structured-error cases incl. `NotUtf8`, containment
-  `Denied`, `EditConflict`); composite: longest-prefix routing, aggregation
-  across mounts, reserved-prefix shadowing + the assembly-time shadow
-  warning.
+  `Denied`, `EditConflict`). Per J2's gate amendment this suite is the
+  **public conformance surface** for custom-backend authors — written
+  generic over `Arc<dyn Backend>` so a fourth implementation runs it
+  unmodified. Composite: longest-prefix routing, **strip-on-entry /
+  re-prefix-on-exit (E6)** incl. the mount-transparency property (a backend
+  mounted at two different prefixes behaves identically), aggregation
+  across mounts, **no cross-namespace leak** (a grep scoped to one prefix
+  never surfaces another mount's files — the two-MemBackend consequence),
+  reserved-prefix shadowing + the assembly-time shadow warning.
 - **Guard:** model-originated `write_file`/`edit_file` (and trait-level
   `delete`) against artifact prefixes are `Denied`; curation's privileged
   handle still writes; an artifact's bytes are byte-identical after a
@@ -693,8 +757,7 @@ decision):**
   change is a conscious one).
 - Compaction writes `## compacted-{seq}` AND the summary pointer appears;
   pointer survives re-compaction verbatim; a failed history write sets the
-  permanent INCOMPLETE marker and still commits (or aborts, per E4's gate
-  outcome).
+  permanent INCOMPLETE marker and still commits (E4).
 - Fold cites `history.md § folded-{seq}`; fold aborts atomically on backend
   write failure.
 - Deep-recovery recipe: grep section header → `read_file(offset:
@@ -712,14 +775,18 @@ decision):**
 
 ## 8. Open questions
 
-- E3's disk option, if taken, reopens: artifacts dir location, gitignore,
-  cleanup lifecycle, and re-derived containment (§5.9).
+- The disk-artifacts option (rejected at E3 for Phase 2) remains the
+  documented future knob; taking it later reopens: artifacts dir location,
+  gitignore, cleanup lifecycle, and re-derived containment (§5.9).
+- Config-driven composite mount table (J4 gate clarification): expected
+  Phase-4 shape once external mounts exist; hardcoded until then.
 - `grep` engine for `HostBackend` (walk + `regex` crate vs shelling to
   `rg`): plan-level; the contract (capped, containment-checked, `.git/`
   skip, artifacts never skipped) is fixed here.
 - Whether Phase 4's memory files reuse the artifacts backend or a
   store-backed mount — out of scope; the composite makes either a one-line
-  mount change.
+  mount change. Paired J7 revisit: a store-backed `conversation_history/`
+  mount would prefer keyed per-thread files over the rolling `history.md`.
 
 ## Panel & review log
 
@@ -781,5 +848,35 @@ decision):**
   cross-section agreement, escalation-label parity, cross-references, and
   status-vs-log all CLEAN; one truncated sentence in §6 E4 fixed; the
   J2-start numbering annotated as intentional.
-- **2026-07-08 — spec-review gate (Kalen):** *(pending — E1–E5 await
-  decision.)*
+- **2026-07-08 — spec-review gate (Kalen): APPROVED, all escalations
+  resolved.** The owner stated the governing goal at the gate — the
+  refactor exists to provide deepagents-style modularity (custom
+  middleware/filesystems/extensions change runtime behavior) — and every
+  disposition below was argued against that criterion:
+  - **E1 proceed as specced** (the seam is the payoff; same shape as
+    Phase 1's J1). **E2 retire `context_recall`** (file-tool grammar gives
+    any future backend recovery for free). **E3 MemBackend artifacts** (the
+    composite gets an always-exercised consumer from day one). **E4
+    commit-with-INCOMPLETE-marker** (a pluggable backend's failure must not
+    wedge maintenance). **E5 gate override of the draft mandate: eval
+    harness migrated in wave 2** (the phase must not land with its
+    measurement instrument uncompilable); ceiling re-measurement stays
+    parked.
+  - **E6 (new at the gate): composite switched to strip+remap** — the
+    panel-era no-strip contract was a Phase-2 simplification that would
+    have made every third-party backend mount-aware; strip+remap restores
+    mount-location transparency and re-aligns with live deepagents.
+    Absorbed consequence: `SessionArtifacts` holds two `MemBackend`s (one
+    per prefix) since stripping would merge a shared instance's namespaces.
+  - **Judgment amendments:** J2 + §7 — the backend contract suite is a
+    public conformance surface for custom-backend authors; J4 — the
+    extensibility point is the `assemble_loop` mount table (config-driven
+    table expected Phase 4, §8); J7 — store-backed keyed-files revisit
+    trigger recorded (§8). J3/J5/J6/J8/J9/J10 held as written (J6 and J9
+    additionally reinforced by the modularity lens).
+- **2026-07-08 — post-decision consistency read** (light tier): E6 ripple
+  (strip+remap / mount-relative keys / two-store SessionArtifacts), E5
+  ripple, E1–E6 §6-vs-log coherence, child naming under strip semantics,
+  and §8 dangling references all CLEAN; one stale E4 hedge in a §7 test
+  description fixed, plus the `sub{n}:` → `sub{n}-` sanitization made
+  explicit in §5.7.
