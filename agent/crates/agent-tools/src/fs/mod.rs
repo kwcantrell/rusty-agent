@@ -1,8 +1,10 @@
 pub mod paths;
 pub mod read;
+pub mod search;
 pub mod write;
 pub use paths::resolve_in_workspace;
 pub use read::{ListDirectory, ReadFile};
+pub use search::GrepTool;
 pub use write::{EditFile, WriteFile};
 
 use crate::backend::FsError;

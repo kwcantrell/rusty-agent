@@ -26,7 +26,7 @@ use agent_model::{
 };
 use agent_sandbox::{validate_mount, DockerSandbox, SandboxPolicy};
 use agent_skills::{CreateSkill, ListSkills, ReadSkillFile, SkillRegistry, UseSkill};
-use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
+use agent_tools::fs::{EditFile, GrepTool, ListDirectory, ReadFile, WriteFile};
 use agent_tools::{
     git::{GitCommit, GitDiff, GitStatus},
     shell::ExecuteCommand,
@@ -131,6 +131,7 @@ pub fn build_registry(http_allow_hosts: &[String], max_read_bytes: usize) -> Too
     r.register(Arc::new(WriteFile));
     r.register(Arc::new(EditFile));
     r.register(Arc::new(ListDirectory));
+    r.register(Arc::new(GrepTool));
     r.register(Arc::new(ExecuteCommand));
     r.register(Arc::new(GitStatus));
     r.register(Arc::new(GitDiff));
@@ -485,6 +486,7 @@ mod tests {
             "write_file",
             "edit_file",
             "list_directory",
+            "grep",
             "execute_command",
             "git_status",
             "git_diff",
