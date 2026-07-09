@@ -67,6 +67,52 @@ impl ModelRef {
     }
 }
 
+/// Upper bound on a named sub-agent's `system_prompt` (prepended to every child
+/// turn; mirrors `MAX_ROLE_CHARS` for the ad-hoc `role` path). Panel fix M3.
+pub const MAX_SUBAGENT_SYSTEM_PROMPT_CHARS: usize = 20_000;
+/// Upper bound on a named sub-agent's `tool_call_limit` (panel fix M3; the field
+/// exists to BOUND runaway, so it must itself be bounded).
+pub const MAX_SUBAGENT_TOOL_CALLS: usize = 1_000;
+
+/// A config-declared, named sub-agent (deepagents `SubAgent`, minimal-viable
+/// subset; spec §2.1). Reserved fields are inert in 3B-1 (validation rejects
+/// any non-null value; see `validate`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubAgentSpec {
+    /// Unique registry key; the model selects by this via `dispatch_agent`'s
+    /// `subagent_type`. Reserved: `"general-purpose"` is not overridable.
+    pub name: String,
+    /// "When to use me" — surfaced as the `subagent_type` enum value's doc.
+    pub description: String,
+    /// Replaces the parent-derived child prompt; the `SUBAGENT_PREAMBLE` is
+    /// still always composed in (see assembly).
+    pub system_prompt: String,
+    /// Tool allowlist over the parent snapshot; `None` = full snapshot.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Routed model override; `None` = the child default (`subagent_model`).
+    /// May set only `model`/`protocol`/`context_limit`/`max_tokens` (validated).
+    #[serde(default)]
+    pub model: Option<ModelRef>,
+    /// Child `ToolCallLimit` cap (3A residual E4); bounded `1..=MAX_SUBAGENT_TOOL_CALLS`.
+    #[serde(default)]
+    pub tool_call_limit: Option<usize>,
+
+    // ---- RESERVED (inert in 3B-1; validation rejects any non-null value) ----
+    /// → 3B-1c (per-sub-agent permissions).
+    #[serde(default)]
+    pub permissions: Option<serde_json::Value>,
+    /// → 3B-1b (structured-response handoff).
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
+    /// Dropped (no committed follow-on); see spec §9.
+    #[serde(default)]
+    pub middleware: Option<Vec<String>>,
+    /// Dropped (no committed follow-on); see spec §9.
+    #[serde(default)]
+    pub skills: Option<Vec<String>>,
+}
+
 /// The editable runtime surface, persisted to disk and mirrored on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeConfig {
@@ -113,6 +159,9 @@ pub struct RuntimeConfig {
     /// clamp to >= 1; "no sub-agents at all" is `subagents: false`.
     #[serde(default = "default_subagent_max_depth")]
     pub subagent_max_depth: usize,
+    /// Config-declared named sub-agents (spec 2026-07-09-named-subagent-registry).
+    #[serde(default)]
+    pub named_subagents: Vec<SubAgentSpec>,
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -199,6 +248,8 @@ struct PartialRuntimeConfig {
     subagent_model: Option<ModelRef>,
     compaction_model: Option<ModelRef>,
     subagent_max_depth: Option<usize>,
+    #[serde(default)]
+    named_subagents: Option<Vec<SubAgentSpec>>,
     top_p: Option<f32>,
     top_k: Option<u32>,
     min_p: Option<f32>,
@@ -311,6 +362,7 @@ impl RuntimeConfig {
             subagent_model: None,
             compaction_model: None,
             subagent_max_depth: default_subagent_max_depth(),
+            named_subagents: Vec::new(),
             top_p: None,
             top_k: None,
             min_p: None,
@@ -545,6 +597,9 @@ impl RuntimeConfig {
         }
         if let Some(v) = p.subagent_max_depth {
             self.subagent_max_depth = v;
+        }
+        if let Some(v) = p.named_subagents {
+            self.named_subagents = v;
         }
         if let Some(v) = p.top_p {
             self.top_p = Some(v);
@@ -803,6 +858,23 @@ mod tests {
     }
 
     #[test]
+    fn named_subagents_default_empty_and_roundtrip() {
+        let c = RuntimeConfig::default();
+        assert!(c.named_subagents.is_empty());
+
+        let json = r#"{"named_subagents":[{"name":"reviewer","description":"reviews code","system_prompt":"You review Rust.","tools":["read_file","grep"]}]}"#;
+        let parsed = base().merge(serde_json::from_str::<PartialRuntimeConfig>(json).unwrap());
+        assert_eq!(parsed.named_subagents.len(), 1);
+        let s = &parsed.named_subagents[0];
+        assert_eq!(s.name, "reviewer");
+        assert_eq!(
+            s.tools.as_deref(),
+            Some(&["read_file".to_string(), "grep".to_string()][..])
+        );
+        assert!(s.model.is_none() && s.tool_call_limit.is_none() && s.permissions.is_none());
+    }
+
+    #[test]
     fn max_parallel_tools_partial_file_overrides_only_that_field() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("partial.json");
@@ -1002,6 +1074,18 @@ mod tests {
                 ..Default::default()
             }),
             subagent_max_depth: 2,
+            named_subagents: vec![SubAgentSpec {
+                name: "reviewer".into(),
+                description: "reviews code".into(),
+                system_prompt: "You review Rust.".into(),
+                tools: Some(vec!["read_file".into()]),
+                model: None,
+                tool_call_limit: None,
+                permissions: None,
+                response_format: None,
+                middleware: None,
+                skills: None,
+            }],
             top_p: Some(0.9),
             top_k: Some(40),
             min_p: Some(0.05),
