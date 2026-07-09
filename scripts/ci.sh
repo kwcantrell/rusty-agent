@@ -9,8 +9,10 @@ cd "$(dirname "$0")/.."
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 
 echo "==> okf bundle check"
-python3 scripts/test_okf_check.py
-python3 scripts/okf_check.py docs/okf/agent-sdlc
+uv run scripts/test_okf_check.py
+for bundle in docs/okf/*/; do
+  uv run scripts/okf_check.py "$bundle"
+done
 
 echo "==> skills lint"
 python3 scripts/test_skills_lint.py

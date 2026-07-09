@@ -35,14 +35,14 @@ timestamp: 2026-07-06T00:00:00Z
 ---
 ```
 
-## YAML gotcha: inline lists only
+## YAML style: inline lists, quote colons
 
-The checker's frontmatter parser accepts only flat `key: value` lines and
-**inline** lists — `tags: [a, b]`. Block-style lists fail validation:
+The checker parses frontmatter with real YAML (PyYAML via uv). House style is
+still **inline** lists — `tags: [a, b]` — and any value containing a colon must
+be quoted:
 
 ```yaml
-tags:            # ✗ FAILS okf_check
-  - building-agents
+title: "AgentBench: Evaluating LLMs as Agents"   # unquoted colon = parse error
 ```
 
 ## Citation rule
@@ -83,7 +83,7 @@ the citation check even when it resolves.
 4. Validate:
 
    ```bash
-   python3 scripts/okf_check.py docs/okf/agent-sdlc
+   uv run scripts/okf_check.py docs/okf/agent-sdlc
    ```
 
    Require `OK`. It exits 1 with one error per line otherwise — fix every
