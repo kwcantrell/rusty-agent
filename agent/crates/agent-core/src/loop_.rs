@@ -1,4 +1,4 @@
-use crate::{built_tokens, AgentEvent, ContextManager, EventSink, Retriever, ToolStatus};
+use crate::{built_tokens, AgentEvent, ContextManager, EventSink, ToolStatus};
 use agent_model::{
     AssistantTurn, Chunk, CompletionRequest, ErrorClass, Message, ModelClient, ModelError,
     RawToolCall, StopReason, ToolCallProtocol,
@@ -25,12 +25,6 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Default bound on how many of a turn's tool calls execute concurrently.
 /// A `LoopConfig.max_parallel_tools` of 0 (the `Default`) resolves to this.
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
-
-/// Nudge after this many consecutive REPEATS of an identical call set
-/// (i.e. on the 3rd identical turn); abort after STUCK_ABORT_AFTER (the 5th).
-/// Not configurable until a real workload needs the knob (spec 2026-07-02 §4).
-pub const STUCK_NUDGE_AFTER: usize = 2;
-pub const STUCK_ABORT_AFTER: usize = 4;
 
 /// Appended when `max_turns` exhausts with the model still issuing tool calls;
 /// the run then gets ONE tools-disabled wrap-up completion (best-effort) so it
@@ -71,9 +65,10 @@ fn jittered_backoff(attempt: usize) -> Duration {
     base + Duration::from_millis(jitter)
 }
 
-/// Why `completion_with_retry` gave up. Loop-private: the turn loop maps
-/// these onto events + `AgentError`.
-enum RetryFailure {
+/// Why `completion_with_retry` gave up. `pub` so the wrap-chain base case in
+/// `middleware.rs` can name it (provisional contract, Task 3); the turn loop
+/// maps it onto events + `AgentError`.
+pub enum CompletionFailure {
     /// Fatal on first sight, or retryable and retries exhausted.
     Fatal(String),
     /// Cancellation observed (token or `ModelError::Cancelled`).
@@ -156,13 +151,16 @@ pub struct AgentLoop {
     approval: Arc<dyn ApprovalChannel>,
     sink: Arc<dyn EventSink>,
     config: LoopConfig,
-    retriever: Option<Arc<dyn Retriever>>,
     compaction_model: Option<Arc<dyn ModelClient>>,
     /// Observed (server prompt_tokens / chars-4 estimate) ratio, EMA-smoothed,
     /// fixed-point micros. 1_000_000 = 1.0 = uncalibrated. Shrink-only: clamped
     /// to [1.0, 4.0] and applied as a divisor on model_limit (spec 2026-07-02
     /// server-usage-calibrated budgeting).
     calib_ratio_micros: std::sync::atomic::AtomicU64,
+    /// Node-hook/wrap middleware stack (spec middleware-seam §5). Empty by
+    /// default: every dispatch point is then a no-op and behavior is
+    /// bit-identical to pre-middleware runs.
+    middleware: Vec<Arc<dyn crate::Middleware>>,
 }
 
 impl AgentLoop {
@@ -184,9 +182,9 @@ impl AgentLoop {
             approval,
             sink,
             config,
-            retriever: None,
             compaction_model: None,
             calib_ratio_micros: std::sync::atomic::AtomicU64::new(1_000_000),
+            middleware: Vec::new(),
         }
     }
 
@@ -200,17 +198,23 @@ impl AgentLoop {
         self.tools.schemas()
     }
 
-    /// Attach a memory retriever. When set, each turn auto-retrieves relevant
-    /// memories and injects them into the context before the model runs.
-    pub fn with_retriever(mut self, retriever: Arc<dyn Retriever>) -> Self {
-        self.retriever = Some(retriever);
-        self
-    }
-
     /// Route context compaction to a (typically cheaper) dedicated model
     /// (spec 2026-07-02 sub-spec #3, G4). None = the session model.
     pub fn with_compaction_model(mut self, model: Arc<dyn ModelClient>) -> Self {
         self.compaction_model = Some(model);
+        self
+    }
+
+    /// Install the middleware stack (spec §5.4 ordering contract).
+    ///
+    /// WARNING: this REPLACES any prior stack — it does not append. An empty
+    /// stack means NO recall injection, NO scheduled curation, and NO stuck
+    /// detection: those behaviors used to live in the loop itself and now
+    /// arrive only via middleware on this stack. Production wiring is
+    /// `assemble_loop`; call sites that build their own stack (tests
+    /// included) must include every middleware they need.
+    pub fn with_middleware(mut self, stack: Vec<Arc<dyn crate::Middleware>>) -> Self {
+        self.middleware = stack;
         self
     }
 
@@ -237,6 +241,165 @@ impl AgentLoop {
         match self.config.compaction_model_limit {
             Some(cl) => self.effective_model_limit().min(cl),
             None => self.effective_model_limit(),
+        }
+    }
+
+    /// Precompute the read-only maintenance view for one hook point.
+    fn maint_view(&self) -> crate::MaintView<'_> {
+        crate::MaintView {
+            maint_model: self.maint_model(),
+            maint_model_limit: self.maint_model_limit(),
+            effective_model_limit: self.effective_model_limit(),
+        }
+    }
+
+    // Node-hook dispatch (spec §5.1/§5.4). A generic HRTB-closure dispatcher
+    // was tried first; the `for<'c> FnMut(&'c .., &'c mut RunCx<'_>) ->
+    // BoxFuture<'c, _>` shape fights the borrow checker as soon as the
+    // closure captures anything borrowed from the caller's stack (the
+    // captured lifetime can't unify with the HRTB `'c`) — confirmed on both
+    // `on_run_start` (borrows `user_input`) and `after_model` (borrows
+    // `turn_view`). Falling back to five small concrete methods per the
+    // brief's noted fallback: each is the same reborrow-per-iteration loop,
+    // inlined. Positions and ordering are the contract, not the dispatcher's
+    // genericity.
+
+    /// Bottom-of-loop invariant check shared by all five call-outs: no
+    /// middleware may leave an orphaned tool_calls message (spec §5.2).
+    fn assert_no_orphans(ctx: &dyn ContextManager, mw_name: &str) {
+        debug_assert!(
+            crate::orphaned_tool_positions(&ctx.build(usize::MAX)).is_empty(),
+            "middleware {mw_name} left an orphaned tool_calls message"
+        );
+    }
+
+    /// Forward order (stack order): before the goal is set / user message
+    /// appended.
+    async fn fire_run_start(
+        &self,
+        ctx: &mut dyn ContextManager,
+        state: &mut crate::RunState,
+        cancel: &CancellationToken,
+        input: &str,
+    ) -> crate::Flow {
+        for mw in self.middleware.iter() {
+            let mut cx = crate::RunCx {
+                ctx: &mut *ctx,
+                sink: &self.sink,
+                cancel,
+                state: &mut *state,
+                turn: None,
+                maint: self.maint_view(),
+            };
+            let flow = mw.on_run_start(&mut cx, input).await;
+            Self::assert_no_orphans(ctx, mw.name());
+            if let crate::Flow::EndRun(reason) = flow {
+                return crate::Flow::EndRun(reason);
+            }
+        }
+        crate::Flow::Continue
+    }
+
+    /// Reverse order: between id normalization and the assistant append.
+    async fn fire_after_model(
+        &self,
+        ctx: &mut dyn ContextManager,
+        state: &mut crate::RunState,
+        cancel: &CancellationToken,
+        turn: usize,
+        turn_view: &crate::TurnView,
+    ) -> crate::Flow {
+        for mw in self.middleware.iter().rev() {
+            let mut cx = crate::RunCx {
+                ctx: &mut *ctx,
+                sink: &self.sink,
+                cancel,
+                state: &mut *state,
+                turn: Some(turn),
+                maint: self.maint_view(),
+            };
+            let flow = mw.after_model(&mut cx, turn_view).await;
+            Self::assert_no_orphans(ctx, mw.name());
+            if let crate::Flow::EndRun(reason) = flow {
+                return crate::Flow::EndRun(reason);
+            }
+        }
+        crate::Flow::Continue
+    }
+
+    /// Reverse order: after the turn's tool results (and any post-validator
+    /// message).
+    async fn fire_after_tools(
+        &self,
+        ctx: &mut dyn ContextManager,
+        state: &mut crate::RunState,
+        cancel: &CancellationToken,
+        turn: usize,
+    ) -> crate::Flow {
+        for mw in self.middleware.iter().rev() {
+            let mut cx = crate::RunCx {
+                ctx: &mut *ctx,
+                sink: &self.sink,
+                cancel,
+                state: &mut *state,
+                turn: Some(turn),
+                maint: self.maint_view(),
+            };
+            let flow = mw.after_tools(&mut cx).await;
+            Self::assert_no_orphans(ctx, mw.name());
+            if let crate::Flow::EndRun(reason) = flow {
+                return crate::Flow::EndRun(reason);
+            }
+        }
+        crate::Flow::Continue
+    }
+
+    /// Reverse order: bottom of a completed tool turn.
+    async fn fire_turn_end(
+        &self,
+        ctx: &mut dyn ContextManager,
+        state: &mut crate::RunState,
+        cancel: &CancellationToken,
+        turn: usize,
+    ) -> crate::Flow {
+        for mw in self.middleware.iter().rev() {
+            let mut cx = crate::RunCx {
+                ctx: &mut *ctx,
+                sink: &self.sink,
+                cancel,
+                state: &mut *state,
+                turn: Some(turn),
+                maint: self.maint_view(),
+            };
+            let flow = mw.on_turn_end(&mut cx).await;
+            Self::assert_no_orphans(ctx, mw.name());
+            if let crate::Flow::EndRun(reason) = flow {
+                return crate::Flow::EndRun(reason);
+            }
+        }
+        crate::Flow::Continue
+    }
+
+    /// Reverse order: only on the text-only exit path; no `Flow` (the run is
+    /// already ending).
+    async fn fire_final_reply(
+        &self,
+        ctx: &mut dyn ContextManager,
+        state: &mut crate::RunState,
+        cancel: &CancellationToken,
+        turn: usize,
+    ) {
+        for mw in self.middleware.iter().rev() {
+            let mut cx = crate::RunCx {
+                ctx: &mut *ctx,
+                sink: &self.sink,
+                cancel,
+                state: &mut *state,
+                turn: Some(turn),
+                maint: self.maint_view(),
+            };
+            mw.after_final_reply(&mut cx).await;
+            Self::assert_no_orphans(ctx, mw.name());
         }
     }
 
@@ -344,11 +507,13 @@ impl AgentLoop {
     /// Stream with classified retry: transient errors retry with exponential
     /// backoff; permanent request errors fail on first sight; context
     /// overflow is deferred to the turn loop (retrying verbatim cannot help).
-    async fn completion_with_retry(
+    /// `pub(crate)`: the base case of the model wrap chain in
+    /// `middleware.rs::ModelNext::run` calls this directly (Task 3).
+    pub(crate) async fn completion_with_retry(
         &self,
         base: &CompletionRequest,
         cancel: &CancellationToken,
-    ) -> Result<AssistantTurn, RetryFailure> {
+    ) -> Result<AssistantTurn, CompletionFailure> {
         let mut attempt = 0;
         loop {
             let mut req = base.clone();
@@ -358,10 +523,10 @@ impl AgentLoop {
             let mut emitted = (0usize, 0usize);
             match self.one_completion(req, cancel, &mut emitted).await {
                 Ok(turn) => return Ok(turn),
-                Err(ModelError::Cancelled) => return Err(RetryFailure::Cancelled),
+                Err(ModelError::Cancelled) => return Err(CompletionFailure::Cancelled),
                 Err(e) => {
                     if cancel.is_cancelled() {
-                        return Err(RetryFailure::Cancelled);
+                        return Err(CompletionFailure::Cancelled);
                     }
                     match e.class() {
                         ErrorClass::ContextOverflow => {
@@ -369,17 +534,17 @@ impl AgentLoop {
                                 "context overflow; deferring to turn-level recovery");
                             // Defer retraction to the turn loop: only its FIRST
                             // overflow arm re-attempts; a second overflow is terminal.
-                            return Err(RetryFailure::Overflow(e.to_string(), emitted));
+                            return Err(CompletionFailure::Overflow(e.to_string(), emitted));
                         }
                         ErrorClass::Fatal => {
                             self.sink.emit(AgentEvent::Error(e.to_string()));
-                            return Err(RetryFailure::Fatal(e.to_string()));
+                            return Err(CompletionFailure::Fatal(e.to_string()));
                         }
                         ErrorClass::Retryable => {
                             attempt += 1;
                             if attempt > self.config.max_retries {
                                 self.sink.emit(AgentEvent::Error(e.to_string()));
-                                return Err(RetryFailure::Fatal(e.to_string()));
+                                return Err(CompletionFailure::Fatal(e.to_string()));
                             }
                             // Another attempt follows: retract any partial output this
                             // attempt already streamed, before the backoff sleep and
@@ -472,36 +637,27 @@ impl AgentLoop {
             system: ctx.system().map(|m| m.content.clone()),
         });
 
-        if let Some(retriever) = &self.retriever {
-            // Unconditional: an empty retrieval clears the prior run's recall
-            // block (contexts persist across runs). set_recall(vec![]) renders
-            // no block. (spec §2, audit Spine B #4)
-            ctx.set_recall(retriever.retrieve(&user_input).await);
+        // Per-run middleware state (spec §5.3): fresh for every invocation so
+        // middleware stay stateless `&self` objects. Empty `self.middleware`
+        // makes every `fire_*` hook method below a no-op loop (behavior unchanged).
+        let mut mw_state = crate::RunState::default();
+        let flow = self
+            .fire_run_start(ctx, &mut mw_state, &cancel, &user_input)
+            .await;
+        if let crate::Flow::EndRun(reason) = flow {
+            self.sink.emit(AgentEvent::Done(reason));
+            return Ok(());
         }
+
         ctx.set_goal(user_input.clone());
         ctx.append(Message::user(user_input));
         let mut protocol_repairs = 0;
-
-        // Repeated-identical-call detection (spec §4): a model re-emitting the
-        // byte-identical call set every turn burns all max_turns. Track the last
-        // turn's signature and how many consecutive turns have repeated it; nudge
-        // at STUCK_NUDGE_AFTER, abort at STUCK_ABORT_AFTER.
-        let mut last_sig: Option<String> = None;
-        let mut repeats = 0usize;
-        let mut nudged = false;
 
         // Agentic (tool-bearing) runs auto-preserve reasoning so the model keeps
         // its chain-of-thought across the within-turn tool loop; each backend then
         // decides how to surface it (Qwen3.6 via reasoning_content + the kwarg;
         // claude_cli inline). Plain config still controls the tool-less case.
         let preserve_thinking = self.config.preserve_thinking || !self.tools.schemas().is_empty();
-
-        // Whether this run has already been curated by a loop-bottom maintain
-        // (i.e. completed at least one tool turn). Gates the text-exit maintain
-        // to PURE text-only runs — the structural gap — so tool-bearing runs
-        // keep the exact v3 maintenance cadence (an extra exit pass measurably
-        // wobbled locked-portmap/memory-roster; see the 2026-07-02 spec).
-        let mut run_maintained = false;
 
         for turn in 0..self.config.max_turns {
             if cancel.is_cancelled() {
@@ -524,13 +680,20 @@ impl AgentLoop {
             let turn_started = std::time::Instant::now();
             let mut overflow_recovered = false;
             let assistant = loop {
-                match self.completion_with_retry(&base, &cancel).await {
+                let model_result = crate::ModelNext {
+                    loop_: self,
+                    chain: &self.middleware,
+                    cancel: &cancel,
+                }
+                .run(base.clone())
+                .await;
+                match model_result {
                     Ok(t) => break t,
-                    Err(RetryFailure::Cancelled) => {
+                    Err(CompletionFailure::Cancelled) => {
                         self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
                         return Ok(());
                     }
-                    Err(RetryFailure::Overflow(_, emitted)) if !overflow_recovered => {
+                    Err(CompletionFailure::Overflow(_, emitted)) if !overflow_recovered => {
                         overflow_recovered = true;
                         // A partial answer streamed before the overflow is abandoned
                         // by the compaction rebuild; retract it before the rebuilt
@@ -565,14 +728,14 @@ impl AgentLoop {
                         });
                         base = self.completion_request(messages, preserve_thinking);
                     }
-                    Err(RetryFailure::Overflow(msg, _)) => {
+                    Err(CompletionFailure::Overflow(msg, _)) => {
                         // Second overflow in the turn — terminal, no further attempt,
                         // so no StreamRetry (the partial stays; Done explains).
                         self.sink.emit(AgentEvent::Error(msg.clone()));
                         self.sink.emit(AgentEvent::Done(StopReason::Error));
                         return Err(AgentError::Model(msg));
                     }
-                    Err(RetryFailure::Fatal(msg)) => {
+                    Err(CompletionFailure::Fatal(msg)) => {
                         self.sink.emit(AgentEvent::Done(StopReason::Error));
                         return Err(AgentError::Model(msg));
                     }
@@ -641,6 +804,25 @@ impl AgentLoop {
             normalize_tool_call_ids(&mut parsed.tool_calls);
             normalize_invalid_ids(&parsed.tool_calls, &mut parsed.invalid);
 
+            // Node hook: after_model (spec §5.1). OWNED TurnView so no borrow of
+            // `parsed` crosses the hook `.await` (spec §5.2).
+            let turn_view = crate::TurnView {
+                text: parsed.text.clone(),
+                tool_calls: parsed.tool_calls.clone(),
+                invalid: parsed
+                    .invalid
+                    .iter()
+                    .map(|i| (i.name.clone(), i.error.clone()))
+                    .collect(),
+            };
+            let flow = self
+                .fire_after_model(ctx, &mut mw_state, &cancel, turn, &turn_view)
+                .await;
+            if let crate::Flow::EndRun(reason) = flow {
+                self.sink.emit(AgentEvent::Done(reason));
+                return Ok(());
+            }
+
             // The assistant message must carry ALL ids (valid + invalid) so every
             // tool message keeps a matching parent call; invalid calls carry `{}`
             // args since their real args could not be parsed.
@@ -650,56 +832,6 @@ impl AgentLoop {
                 name: inv.name.clone(),
                 args: serde_json::json!({}),
             }));
-
-            // Repeated-identical-call detection (spec §4). Signature is the sorted
-            // set of (name, args) for valid calls plus (name, error) for invalid
-            // ones — id-independent, so an id normalization can't mask a repeat.
-            // `\u{1}`/`\u{2}` are field/record separators that won't appear in JSON.
-            let mut nudge_pending = false;
-            if !all_calls.is_empty() {
-                let mut parts: Vec<String> = parsed
-                    .tool_calls
-                    .iter()
-                    .map(|c| format!("{}\u{1}{}", c.name, c.args))
-                    .chain(
-                        parsed
-                            .invalid
-                            .iter()
-                            .map(|i| format!("{}\u{1}{}", i.name, i.error)),
-                    )
-                    .collect();
-                parts.sort();
-                let sig = parts.join("\u{2}");
-                if last_sig.as_deref() == Some(&sig) {
-                    repeats += 1;
-                } else {
-                    repeats = 0;
-                    nudged = false;
-                }
-                last_sig = Some(sig);
-
-                // Constraint (a): abort BEFORE the assistant tool_calls message is
-                // appended. Append the turn as text only — a dangling assistant
-                // tool_calls message with no answering tool results would 400 an
-                // OpenAI-compat server on the next run (contexts survive across runs).
-                if repeats >= STUCK_ABORT_AFTER {
-                    ctx.append(Message::assistant(parsed.text.clone(), None));
-                    self.sink.emit(AgentEvent::Error(
-                        "model repeated the identical tool call(s) 5 turns in a row; \
-                         aborting the run"
-                            .into(),
-                    ));
-                    self.sink.emit(AgentEvent::Done(StopReason::Error));
-                    return Ok(());
-                }
-                // Constraint (b): defer the nudge until after this turn's tool
-                // results land (a user message between the assistant tool_calls
-                // message and its Role::Tool results is invalid for OpenAI-compat).
-                if repeats >= STUCK_NUDGE_AFTER && !nudged {
-                    nudged = true;
-                    nudge_pending = true;
-                }
-            }
 
             let mut msg = Message::assistant(
                 parsed.text.clone(),
@@ -718,36 +850,16 @@ impl AgentLoop {
             ctx.append(msg);
 
             if all_calls.is_empty() {
-                // End-of-run curation for PURE text-only runs: their reply
-                // ends the run before the loop-bottom maintain, so a chat
-                // session would never be curated at all — only silently
-                // truncated by build(). Tool-bearing runs skip this: they were
-                // already maintained after each tool turn, and an extra exit
-                // pass measurably wobbled locked-portmap/memory-roster by
-                // compacting one unit deeper per run. (Start-of-turn
-                // maintenance was tried first and regressed memory-roster
-                // 10/10 -> 6/10: maintaining with the fresh user prompt
-                // already appended pushes the previous tool turn into the
-                // compactable span one run earlier, and the model imitates the
-                // visible ack-without-tool-call pattern. See the 2026-07-02
-                // maintain-start-of-turn spec.)
-                if !run_maintained {
-                    let deps = crate::MaintCtx {
-                        model_limit: self.maint_model_limit(),
-                        model: self.maint_model(),
-                        sink: &self.sink,
-                        cancel: &cancel,
-                    };
-                    let report = ctx.maintain(&deps).await;
-                    if report.offloaded > 0 || report.compacted_turns > 0 {
-                        tracing::debug!(
-                            offloaded = report.offloaded,
-                            offloaded_bytes = report.offloaded_bytes,
-                            compacted_turns = report.compacted_turns,
-                            "context maintained at text-only exit"
-                        );
-                    }
-                }
+                // End-of-run curation for PURE text-only runs now lives in
+                // ContextCurationMiddleware::after_final_reply (spec §5.5):
+                // it fires only when no tool turn's on_turn_end already
+                // maintained this run (the Maintained run-state marker).
+                //
+                // Node hook: after_final_reply (spec §5.1) — text-only exit only
+                // (spec §6 J5); no Flow, the run is already ending.
+                self.fire_final_reply(ctx, &mut mw_state, &cancel, turn)
+                    .await;
+
                 self.sink.emit(AgentEvent::Done(assistant.stop));
                 return Ok(());
             }
@@ -828,9 +940,25 @@ impl AgentLoop {
                     // The effective per-call deadline (may be a tool's
                     // timeout_override, not the loop default) — logged on timeout.
                     let timeout = ctx.timeout;
+                    let middleware = &self.middleware;
                     async move {
                         let started = std::time::Instant::now();
-                        let ex = execute_isolated(tool, args, &name, &ctx).await;
+                        // The gate already ran (Phase 1); this call is the
+                        // already-approved ToolCall the wrap-tool chain sees.
+                        let call = ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            args: args.clone(),
+                        };
+                        let ex = crate::ToolNext {
+                            tool,
+                            name: &name,
+                            tctx: &ctx,
+                            chain: middleware,
+                            call: &call,
+                        }
+                        .run(args)
+                        .await;
                         (
                             id,
                             name,
@@ -1001,32 +1129,25 @@ impl AgentLoop {
                 }
             }
 
-            // Constraint (b): the nudge goes in AFTER the turn's tool-result
-            // messages, never between the assistant tool_calls message and its
-            // Role::Tool results.
-            if nudge_pending {
-                ctx.append(Message::user(
-                    "You have now issued the identical tool call(s) 3 turns in a row; \
-                     repeating them will not change the result. Change your approach, or \
-                     reply with a summary and no tool call if you are done.",
-                ));
+            // Node hook: after_tools (spec §5.1).
+            let flow = self
+                .fire_after_tools(ctx, &mut mw_state, &cancel, turn)
+                .await;
+            if let crate::Flow::EndRun(reason) = flow {
+                self.sink.emit(AgentEvent::Done(reason));
+                return Ok(());
             }
 
-            let deps = crate::MaintCtx {
-                model_limit: self.maint_model_limit(),
-                model: self.maint_model(),
-                sink: &self.sink,
-                cancel: &cancel,
-            };
-            let report = ctx.maintain(&deps).await;
-            run_maintained = true;
-            if report.offloaded > 0 || report.compacted_turns > 0 {
-                tracing::debug!(
-                    offloaded = report.offloaded,
-                    offloaded_bytes = report.offloaded_bytes,
-                    compacted_turns = report.compacted_turns,
-                    "context maintained"
-                );
+            // Scheduled loop-bottom maintain now lives in
+            // ContextCurationMiddleware::on_turn_end (spec §5.5), fired below;
+            // it also sets the Maintained run-state marker that gates the
+            // text-only-exit maintain in after_final_reply.
+            //
+            // Node hook: on_turn_end (spec §5.1).
+            let flow = self.fire_turn_end(ctx, &mut mw_state, &cancel, turn).await;
+            if let crate::Flow::EndRun(reason) = flow {
+                self.sink.emit(AgentEvent::Done(reason));
+                return Ok(());
             }
         }
         // Budget exhausted with the model still tool-hungry (text-only replies
@@ -1243,9 +1364,10 @@ enum Resolved {
 }
 
 /// Outcome of an isolated tool execution: the terminal result plus a tag the
-/// caller uses to decide how loudly to surface it.
+/// caller uses to decide how loudly to surface it. `pub` so the wrap-chain
+/// base case in `middleware.rs` can name it (provisional contract, Task 3).
 #[derive(Debug)]
-enum Executed {
+pub enum Executed {
     Ok(agent_tools::ToolOutput),
     /// Tool returned `Err` — a normal outcome, surfaced only to the model.
     ToolErr(String),
@@ -1363,8 +1485,9 @@ fn truncate_on_char_boundary(s: &str, cap: usize) -> String {
 /// bounds so it is unit-testable without driving the loop; the caller owns event
 /// emission. `catch_unwind` keeps a panicking tool from unwinding the loop's task;
 /// `timeout` bounds a tool that ignores `ctx.timeout` so one hang can't wedge the
-/// whole `buffer_unordered` batch.
-async fn execute_isolated(
+/// whole `buffer_unordered` batch. `pub(crate)`: the base case of the tool
+/// wrap chain in `middleware.rs::ToolNext::run` calls this directly (Task 3).
+pub(crate) async fn execute_isolated(
     tool: Arc<dyn Tool>,
     args: serde_json::Value,
     name: &str,
@@ -2435,6 +2558,15 @@ mod tests {
                 ..Default::default()
             },
         );
+        // CAUTION (invariant, verified at plan review, task-6 brief): `with_middleware`
+        // REPLACES the whole stack, so any caller that later installs its own stack
+        // (e.g. a recording/wrapping chain via `.with_middleware(...)` after calling
+        // this helper) silently drops stuck detection too. Harmless today because
+        // only the two dedicated stuck tests (plus the malformed-turn parity pin)
+        // script >=5 identical calls and none of them override the stack — but any
+        // future `counter_agent` caller that BOTH overrides the stack AND scripts
+        // repeats must re-add `StuckDetectionMiddleware` itself.
+        let agent = agent.with_middleware(vec![Arc::new(crate::StuckDetectionMiddleware)]);
         (agent, count)
     }
 
@@ -2556,6 +2688,37 @@ mod tests {
         assert_eq!(events.last().unwrap(), "done");
     }
 
+    /// A repair turn must not advance OR reset stuck counters (spec §5.1):
+    /// A, A, malformed, A, A, A → abort on the 5th *parsed* identical turn,
+    /// exactly as if the malformed turn never happened — today's inline code
+    /// skips the signature block entirely on the repair turn, so
+    /// last_sig/repeats survive the repair turn unchanged. This is a parity
+    /// pin: captured against the pre-migration (inline) implementation in
+    /// Task 6 Step 2, then held unchanged across the middleware migration.
+    #[tokio::test]
+    async fn repair_turn_leaves_stuck_counters_untouched() {
+        let a = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into());
+        let model = Arc::new(ScriptedModel::new(vec![
+            a(),
+            a(),
+            // Malformed-args Call (no `Malformed` variant exists — see the
+            // testkit note in Task 2): registered tool, unparseable JSON args.
+            Scripted::Call("c1".into(), "counter".into(), r#"{"k": "#.into()),
+            a(),
+            a(),
+            a(),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, count) = counter_agent(model, sink.clone(), 25);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        // Baseline captured against the pre-migration (inline stuck-detection)
+        // tree in Task 6 Step 2 — see task-6-report.md for the raw run.
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let events = sink.events.lock().unwrap().clone();
+        assert!(events.iter().any(|e| e.contains("5 turns in a row")));
+    }
+
     struct FakeRetriever(Vec<String>);
     #[async_trait::async_trait]
     impl crate::Retriever for FakeRetriever {
@@ -2588,10 +2751,13 @@ mod tests {
                 stream_idle_timeout: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
-        )
-        .with_retriever(Arc::new(FakeRetriever(vec![
-            "user prefers rust 2021".into()
-        ])));
+        );
+        let agent = agent.with_middleware(vec![Arc::new(crate::MemoryRecallMiddleware::new(
+            vec![],
+            Some(Arc::new(FakeRetriever(vec![
+                "user prefers rust 2021".into()
+            ]))),
+        ))]);
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "hello".into()).await.unwrap();
 
@@ -2626,8 +2792,11 @@ mod tests {
                 stream_idle_timeout: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
-        )
-        .with_retriever(Arc::new(FakeRetriever(vec![])));
+        );
+        let agent = agent.with_middleware(vec![Arc::new(crate::MemoryRecallMiddleware::new(
+            vec![],
+            Some(Arc::new(FakeRetriever(vec![]))),
+        ))]);
         let mut ctx = WindowContext::new(Message::system("sys"));
         agent.run(&mut ctx, "hello".into()).await.unwrap();
 
@@ -2680,10 +2849,13 @@ mod tests {
                 stream_idle_timeout: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
-        )
-        .with_retriever(Arc::new(TogglingRetriever(
-            std::sync::atomic::AtomicUsize::new(0),
-        )));
+        );
+        let agent = agent.with_middleware(vec![Arc::new(crate::MemoryRecallMiddleware::new(
+            vec![],
+            Some(Arc::new(TogglingRetriever(
+                std::sync::atomic::AtomicUsize::new(0),
+            ))),
+        ))]);
 
         // Shared real context across two runs (persists like a REPL/server session).
         let mut ctx = WindowContext::new(Message::system("sys"));
@@ -5118,6 +5290,12 @@ mod tests {
     }
 
     /// Context stub recording the order of maintain() and build() calls.
+    /// `usize::MAX` is the sentinel the middleware seam's own
+    /// `assert_no_orphans` invariant self-check uses (loop_.rs
+    /// `AgentLoop::assert_no_orphans`, fired after every node hook,
+    /// independent of what that hook does) — it is not a "the loop is
+    /// building a request" event, so it is excluded from the recorded
+    /// cadence these tests pin.
     struct SeqCtx {
         history: Vec<Message>,
         calls: std::sync::Mutex<Vec<&'static str>>,
@@ -5130,8 +5308,10 @@ mod tests {
         fn set_system(&mut self, _: Message) {}
         fn set_recall(&mut self, _: Vec<String>) {}
         fn set_goal(&mut self, _: String) {}
-        fn build(&self, _limit: usize) -> Vec<Message> {
-            self.calls.lock().unwrap().push("build");
+        fn build(&self, limit: usize) -> Vec<Message> {
+            if limit != usize::MAX {
+                self.calls.lock().unwrap().push("build");
+            }
             self.history.clone()
         }
         async fn maintain(&mut self, _deps: &crate::MaintCtx<'_>) -> crate::MaintReport {
@@ -5154,6 +5334,8 @@ mod tests {
             "just a chat reply".into(),
         )]));
         let sink = Arc::new(CollectingSink::default());
+        let store: Arc<dyn crate::OffloadStore> = Arc::new(crate::InMemoryOffloadStore::new());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let agent = AgentLoop::new(
             model,
             Arc::new(PassthroughProtocol),
@@ -5172,7 +5354,10 @@ mod tests {
                 stream_idle_timeout: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
-        );
+        )
+        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(
+            store, flag, 16384,
+        ))]);
         let mut ctx = SeqCtx {
             history: vec![],
             calls: Default::default(),
@@ -5211,6 +5396,8 @@ mod tests {
             Scripted::Text("The file says FILEBODY".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
+        let store: Arc<dyn crate::OffloadStore> = Arc::new(crate::InMemoryOffloadStore::new());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let agent = AgentLoop::new(
             model,
             Arc::new(PassthroughProtocol),
@@ -5229,7 +5416,10 @@ mod tests {
                 stream_idle_timeout: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
-        );
+        )
+        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(
+            store, flag, 16384,
+        ))]);
         let mut ctx = SeqCtx {
             history: vec![],
             calls: Default::default(),
@@ -5301,6 +5491,163 @@ mod tests {
             "expected pre-request + post-rebuild Usage events: {events:?}"
         );
         assert_eq!(events.last().map(String::as_str), Some("done"));
+    }
+
+    /// Counting wrapper: logs enter/exit so nesting order is observable.
+    struct Wrapping {
+        name: &'static str,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::Middleware for Wrapping {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn wrap_model_call(
+            &self,
+            req: agent_model::CompletionRequest,
+            next: crate::ModelNext<'_>,
+        ) -> Result<agent_model::AssistantTurn, crate::CompletionFailure> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:model_enter", self.name));
+            let r = next.run(req).await;
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:model_exit", self.name));
+            r
+        }
+        async fn wrap_tool_call(
+            &self,
+            call: agent_tools::ToolCall,
+            next: crate::ToolNext<'_>,
+        ) -> crate::Executed {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:tool_enter", self.name));
+            let r = next.run(call.args).await;
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:tool_exit", self.name));
+            r
+        }
+    }
+
+    /// First middleware outermost, for both chains (spec §5.4).
+    #[tokio::test]
+    async fn wrap_chains_nest_first_outermost() {
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into()),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, _c) = counter_agent(model, sink, 5);
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = agent.with_middleware(vec![
+            Arc::new(Wrapping {
+                name: "a",
+                log: log.clone(),
+            }),
+            Arc::new(Wrapping {
+                name: "b",
+                log: log.clone(),
+            }),
+        ]);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let l = log.lock().unwrap().clone();
+        // Turn 1 model call, then its tool call, then turn 2 model call.
+        assert_eq!(
+            l,
+            vec![
+                "a:model_enter",
+                "b:model_enter",
+                "b:model_exit",
+                "a:model_exit",
+                "a:tool_enter",
+                "b:tool_enter",
+                "b:tool_exit",
+                "a:tool_exit",
+                "a:model_enter",
+                "b:model_enter",
+                "b:model_exit",
+                "a:model_exit",
+            ]
+        );
+    }
+
+    /// The model wrap chain is invoked twice, independently, across an overflow
+    /// rebuild (spec §5.1/J3) — pins composition semantics, not signatures.
+    /// Mirrors the ScriptedModel arrangement of
+    /// `overflow_compacts_rebuilds_and_recovers_once` verbatim, adding the
+    /// Wrapping middleware; asserts the log contains exactly TWO
+    /// "a:model_enter" entries and the run recovers (same terminal
+    /// assertions as the source test).
+    #[tokio::test]
+    async fn model_wrap_chain_fires_twice_across_overflow_rebuild() {
+        let ws = std::env::temp_dir();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Status {
+                code: 400,
+                body: "maximum context length exceeded".into(),
+                retry_after: None,
+            }),
+            Scripted::Text("recovered after compaction".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 0, // proving overflow recovery does NOT consume retry budget
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = agent.with_middleware(vec![Arc::new(Wrapping {
+            name: "a",
+            log: log.clone(),
+        })]);
+        let mut ctx = OverflowCtx {
+            history: vec![],
+            compaction_requests: 0,
+            maintains: 0,
+        };
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(ctx.compaction_requests, 1);
+        assert!(ctx.maintains >= 1);
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e == "overflow_recovery"),
+            "recovery must be observable as a context event: {events:?}"
+        );
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+        let enters = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.as_str() == "a:model_enter")
+            .count();
+        assert_eq!(
+            enters, 2,
+            "the model wrap chain fires once per completion_with_retry \
+             invocation: the overflowing attempt, then the rebuilt attempt"
+        );
     }
 
     #[tokio::test]
@@ -6523,6 +6870,666 @@ mod tests {
         assert!(
             !names.is_empty(),
             "fixture loop registers at least one tool"
+        );
+    }
+
+    // --- Task 2: middleware node-hook plumbing -----------------------------
+
+    /// Records every hook firing as "name:hook" so ordering tests read as data.
+    struct Recording {
+        name: &'static str,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        end_at: Option<&'static str>, // hook name at which to return EndRun
+    }
+    #[async_trait::async_trait]
+    impl crate::Middleware for Recording {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn on_run_start(&self, _cx: &mut crate::RunCx<'_>, _i: &str) -> crate::Flow {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:run_start", self.name));
+            self.flow("run_start")
+        }
+        async fn after_model(
+            &self,
+            _cx: &mut crate::RunCx<'_>,
+            _t: &crate::TurnView,
+        ) -> crate::Flow {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:after_model", self.name));
+            self.flow("after_model")
+        }
+        async fn after_tools(&self, _cx: &mut crate::RunCx<'_>) -> crate::Flow {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:after_tools", self.name));
+            self.flow("after_tools")
+        }
+        async fn on_turn_end(&self, _cx: &mut crate::RunCx<'_>) -> crate::Flow {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:turn_end", self.name));
+            self.flow("turn_end")
+        }
+        async fn after_final_reply(&self, _cx: &mut crate::RunCx<'_>) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:final_reply", self.name));
+        }
+    }
+    impl Recording {
+        fn flow(&self, hook: &str) -> crate::Flow {
+            if self.end_at == Some(hook) {
+                crate::Flow::EndRun(StopReason::Error)
+            } else {
+                crate::Flow::Continue
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn recording_pair(
+        end_at: Option<&'static str>,
+    ) -> (
+        Vec<Arc<dyn crate::Middleware>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let a = Recording {
+            name: "a",
+            log: log.clone(),
+            end_at: None,
+        };
+        let b = Recording {
+            name: "b",
+            log: log.clone(),
+            end_at,
+        };
+        (vec![Arc::new(a), Arc::new(b)], log)
+    }
+
+    /// Before-side hooks run in stack order; after-side in reverse (spec §5.4).
+    #[tokio::test]
+    async fn hooks_fire_forward_then_reverse_across_a_tool_turn() {
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into()),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, _count) = counter_agent(model, sink, 5);
+        let (stack, log) = recording_pair(None);
+        let agent = agent.with_middleware(stack);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![
+                "a:run_start",
+                "b:run_start", // forward
+                "b:after_model",
+                "a:after_model", // reverse (turn 1)
+                "b:after_tools",
+                "a:after_tools", // reverse
+                "b:turn_end",
+                "a:turn_end", // reverse
+                "b:after_model",
+                "a:after_model", // turn 2 (text-only)
+                "b:final_reply",
+                "a:final_reply", // reverse, text exit
+            ]
+        );
+    }
+
+    /// EndRun short-circuits the remaining hooks at that point (spec §5.4).
+    #[tokio::test]
+    async fn end_run_short_circuits_and_emits_done() {
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("hi".into())]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, _c) = counter_agent(model, sink.clone(), 5);
+        // b (deeper in stack) EndRuns at run_start; a's run_start already ran.
+        let (stack, log) = recording_pair(Some("run_start"));
+        let agent = agent.with_middleware(stack);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec!["a:run_start", "b:run_start"]
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.last().unwrap(), "done");
+    }
+
+    /// Spec §7 gap-fill (missing from the pre-Task-7 tree): an `EndRun` fired
+    /// from `after_tools` — AFTER the turn's real tool-call/tool-result pair
+    /// is already durably appended — must end the run cleanly with no
+    /// orphaned tool_calls message. Stack is `[a, b]`: `b` (reverse-order
+    /// first) EndRuns at `after_tools`, so `a`'s `after_tools` (and — in a
+    /// real assembled stack — StuckDetection's, the hook that would flush any
+    /// pending nudge) never fires this turn; the invariant under test is
+    /// `assert_no_orphans`'s guarantee holding across the short-circuit, not
+    /// any nudge content (this fixture's `counter_agent` replaces the whole
+    /// stack via `with_middleware`, so no StuckDetection instance is even
+    /// present here). See `end_run_from_after_model_drops_pending_nudge_without_orphans`
+    /// for the sibling case where a real `StuckDetectionMiddleware` instance
+    /// IS present and an `EndRun` fires from `after_model` instead.
+    #[tokio::test]
+    async fn end_run_from_after_tools_leaves_no_orphans() {
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Call(
+            "c1".into(),
+            "counter".into(),
+            r#"{"k":"a"}"#.into(),
+        )]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, count) = counter_agent(model, sink.clone(), 5);
+        let (stack, log) = recording_pair(Some("after_tools"));
+        let agent = agent.with_middleware(stack);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![
+                "a:run_start",
+                "b:run_start",
+                "b:after_model",
+                "a:after_model",
+                "b:after_tools"
+            ],
+            "a:after_tools and everything past it must never fire"
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.last().unwrap(), "done");
+
+        use crate::ContextManager;
+        let built = ctx.build(100_000);
+        assert!(
+            crate::orphaned_tool_positions(&built).is_empty(),
+            "no orphaned tool_calls message after an after_tools EndRun: {built:?}"
+        );
+    }
+
+    /// EndRuns from `after_model` on a specific 0-based turn index only —
+    /// `Recording::end_at` is unconditional on hook name (it would EndRun on
+    /// turn 1 already), and this test needs to let StuckDetection accumulate
+    /// repeats across several turns before ending the run on the exact turn
+    /// where a nudge goes pending.
+    struct EndAtTurn {
+        turn: usize,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::Middleware for EndAtTurn {
+        fn name(&self) -> &str {
+            "end-at-turn"
+        }
+        async fn on_run_start(&self, _cx: &mut crate::RunCx<'_>, _i: &str) -> crate::Flow {
+            self.log
+                .lock()
+                .unwrap()
+                .push("end_at_turn:run_start".into());
+            crate::Flow::Continue
+        }
+        async fn after_model(
+            &self,
+            cx: &mut crate::RunCx<'_>,
+            _t: &crate::TurnView,
+        ) -> crate::Flow {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("end_at_turn:after_model(turn={:?})", cx.turn));
+            if cx.turn == Some(self.turn) {
+                crate::Flow::EndRun(StopReason::Error)
+            } else {
+                crate::Flow::Continue
+            }
+        }
+    }
+
+    /// Sibling of `end_run_from_after_tools_leaves_no_orphans`: this time a
+    /// real `StuckDetectionMiddleware` is on the stack, and the `EndRun`
+    /// fires one hook earlier — from `after_model` — so the nudge it sets
+    /// pending never gets the chance to flush (that only happens in
+    /// `after_tools`, which the `EndRun` short-circuits).
+    ///
+    /// Firing order note: `after_model` dispatches in REVERSE stack order
+    /// (`fire_after_model` iterates `.iter().rev()`, confirmed by
+    /// `hooks_fire_forward_then_reverse_across_a_tool_turn`). To get
+    /// StuckDetection's `after_model` to run BEFORE the `EndAtTurn` recorder's
+    /// — so the pending-nudge marker is actually set before the run ends —
+    /// StuckDetection must sit DEEPER in the stack vec than the recorder:
+    /// `[recorder, StuckDetection]`. Reverse iteration then visits
+    /// StuckDetection first (sets `nudge_pending`), then the recorder
+    /// (returns `EndRun` on the targeted turn), short-circuiting before
+    /// StuckDetection's `after_tools` would have flushed that pending nudge
+    /// into a `Message::user`.
+    ///
+    /// Four identical `counter` calls are scripted: turns 0-1 build no
+    /// repeats yet; turn 2 (0-based) is the 3rd identical call, where
+    /// StuckDetection's `repeats` counter crosses `STUCK_NUDGE_AFTER` (2) and
+    /// sets the pending-nudge marker — the same threshold
+    /// `stuck_identical_calls_nudged_then_aborted` proves nudges on. The
+    /// recorder is configured to EndRun exactly on turn 2's `after_model`,
+    /// right after StuckDetection has set that marker but before
+    /// `after_tools` (where it would flush) ever runs. A 4th scripted turn
+    /// is never reached, proving the short-circuit actually took effect.
+    #[tokio::test]
+    async fn end_run_from_after_model_drops_pending_nudge_without_orphans() {
+        let one = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into());
+        let model = Arc::new(ScriptedModel::new(vec![one(), one(), one(), one()]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, count) = counter_agent(model.clone(), sink.clone(), 5);
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = EndAtTurn {
+            turn: 2,
+            log: log.clone(),
+        };
+        let stack: Vec<Arc<dyn crate::Middleware>> = vec![
+            Arc::new(recorder),
+            Arc::new(crate::StuckDetectionMiddleware),
+        ];
+        let agent = agent.with_middleware(stack);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        // Turns 0-1 execute the tool normally; turn 2 is consulted (its
+        // identical-call signature is what crosses the nudge threshold) then
+        // the recorder's after_model EndRuns before the tool call for turn 2
+        // ever executes.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "tool executes exactly twice; turn index 2 EndRuns from after_model, pre-exec"
+        );
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![
+                "end_at_turn:run_start",
+                "end_at_turn:after_model(turn=Some(0))",
+                "end_at_turn:after_model(turn=Some(1))",
+                "end_at_turn:after_model(turn=Some(2))",
+            ],
+            "recorder's after_model on turn index 2 ends the run; turn 3 never consulted"
+        );
+        assert_eq!(
+            model.remaining(),
+            1,
+            "the 4th scripted turn must never be consumed"
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.last().unwrap(), "done");
+
+        use crate::ContextManager;
+        let built = ctx.build(100_000);
+        assert!(
+            crate::orphaned_tool_positions(&built).is_empty(),
+            "no orphaned tool_calls message after an after_model EndRun: {built:?}"
+        );
+        let nudge_present = built.iter().any(|m| {
+            matches!(m.role, agent_model::Role::User) && m.content.contains("identical tool call")
+        });
+        assert!(
+            !nudge_present,
+            "the pending nudge must never flush — after_tools (where it's \
+             injected) is short-circuited by the after_model EndRun: {built:?}"
+        );
+    }
+
+    /// No node hook fires on the protocol-repair `continue` or a Length exit
+    /// (spec §5.1 firing set). Reuses the malformed-call scripting that
+    /// `protocol_repair_exhausted_emits_done` uses; assert after_model count.
+    #[tokio::test]
+    async fn repair_turn_fires_no_after_model() {
+        let model = Arc::new(ScriptedModel::new(vec![
+            // Repair-triggering shape: a registered tool name with MALFORMED
+            // JSON args (there is no `Malformed` variant in testkit — this is
+            // the same shape protocol_repair_exhausted_emits_done uses).
+            Scripted::Call("c1".into(), "counter".into(), r#"{"k": "#.into()),
+            Scripted::Text("recovered".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, _c) = counter_agent(model, sink, 5);
+        let (stack, log) = recording_pair(None);
+        let agent = agent.with_middleware(stack);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let l = log.lock().unwrap().clone();
+        // Exactly one after_model pair (the recovered text turn), none for the
+        // malformed turn.
+        assert_eq!(
+            l.iter().filter(|e| e.ends_with(":after_model")).count(),
+            2,
+            "one turn × two middleware; repair turn must not fire after_model: {l:?}"
+        );
+    }
+
+    // --- Task 7: remaining parity pins --------------------------------------
+
+    /// A Write-tier tool (mirrors `WriteStub`'s Access::Write shape, but named
+    /// `counter` so `stuck_identical_calls_nudged_then_aborted`-style repeated
+    /// scripting drives BOTH the stuck-detection nudge and the post-tool
+    /// validator path in the same run — the plain `Counter` test tool is
+    /// Access::Read and would never trigger validators (task-7 brief note).
+    struct WriteCounter(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for WriteCounter {
+        fn name(&self) -> &str {
+            "counter"
+        }
+        fn description(&self) -> &str {
+            "records each execution (write-tier)"
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: "counter".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<agent_tools::ToolIntent, ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: "counter".into(),
+                access: agent_tools::Access::Write,
+                paths: vec![],
+                command: None,
+                summary: "count".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, ToolError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(agent_tools::ToolOutput {
+                content: "ok".into(),
+                display: None,
+            })
+        }
+    }
+
+    /// Spec §5.4 timeline: validator failure + pending nudge + maintain, in
+    /// today's exact durable order (tool results → validator msg → nudge).
+    /// Three identical Write-tier call turns trip the stuck-detection nudge
+    /// (3rd identical turn, spec §5.5) while `post_tool_validators =
+    /// ["false"]` fails validation on every one of them (a mutating Ok call);
+    /// a 4th, differing text turn ends the run cleanly.
+    #[tokio::test]
+    async fn nudged_turn_with_validator_failure_keeps_message_order() {
+        let ws = std::env::temp_dir();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(WriteCounter(count.clone())));
+        let one = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into());
+        let model = Arc::new(ScriptedModel::new(vec![
+            one(),
+            one(),
+            one(),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(reg),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                post_tool_validators: vec!["false".into()],
+                ..Default::default()
+            },
+        );
+        // Stuck-detection installed explicitly (mirrors counter_agent's own
+        // caution note): default AgentLoop::new carries no middleware.
+        let agent = agent.with_middleware(vec![Arc::new(crate::StuckDetectionMiddleware)]);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "all three identical Write-tier turns executed (no abort — only the nudge threshold)"
+        );
+
+        let built = ctx.build(100_000);
+        // Locate the 3rd turn's Tool-result message (the write's own result),
+        // and confirm the durable order right after it: Tool -> User(validation
+        // failure) -> User(nudge) -> (eventually) the next Assistant turn.
+        let tool_idx: Vec<usize> = built
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m.role, agent_model::Role::Tool))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            tool_idx.len(),
+            3,
+            "one tool-result message per Write-tier turn: {built:?}"
+        );
+        let last_tool_idx = *tool_idx.last().unwrap();
+        let validation_idx = last_tool_idx + 1;
+        let nudge_idx = last_tool_idx + 2;
+        assert!(
+            matches!(built[validation_idx].role, agent_model::Role::User)
+                && built[validation_idx]
+                    .content
+                    .contains("Post-edit validation reported problems"),
+            "validator failure must land immediately after the 3rd turn's tool result: {built:?}"
+        );
+        assert!(
+            matches!(built[nudge_idx].role, agent_model::Role::User)
+                && built[nudge_idx].content.contains("identical tool call"),
+            "the stuck-detection nudge must land immediately after the validator message: {built:?}"
+        );
+    }
+
+    /// Spec §5.1: no node hook fires on cancellation or budget exhaustion.
+    ///
+    /// (a) A precancelled token: `fire_run_start` runs BEFORE the turn-top
+    /// cancel check (loop_.rs `run_with_cancel`), so — observed, not the
+    /// brief's first guess of an empty log — both middleware's run_start DO
+    /// fire; the run then ends Done(Cancelled) with no further hooks.
+    /// (b) Budget exhaustion: the tools-disabled wrap-up completion is a bare
+    /// model call outside the node-hook dispatcher entirely, so it fires no
+    /// `final_reply` — only the one completed tool turn's hooks appear.
+    #[tokio::test]
+    async fn cancel_and_budget_paths_fire_no_hooks() {
+        // (a) precancelled token.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let ws = dir.path().to_path_buf();
+            let model = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+                "should never run".into(),
+            )]));
+            let sink = Arc::new(CollectingSink::default());
+            let agent = AgentLoop::new(
+                model,
+                Arc::new(PassthroughProtocol),
+                registry(),
+                policy(ws.clone()),
+                Arc::new(AlwaysApprove),
+                sink.clone(),
+                LoopConfig {
+                    model_limit: 100_000,
+                    max_turns: 10,
+                    max_retries: 2,
+                    temperature: 0.0,
+                    max_tokens: None,
+                    workspace: ws,
+                    tool_timeout: std::time::Duration::from_secs(5),
+                    stream_idle_timeout: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                },
+            );
+            let (stack, log) = recording_pair(None);
+            let agent = agent.with_middleware(stack);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            let cancel = CancellationToken::new();
+            cancel.cancel(); // already cancelled before the run starts
+
+            agent
+                .run_with_cancel(&mut ctx, "go".into(), cancel)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                log.lock().unwrap().clone(),
+                vec!["a:run_start", "b:run_start"],
+                "run_start fires (it runs before the turn-top cancel check); \
+                 no other hook fires on a precancelled run"
+            );
+            let events = sink.events.lock().unwrap().clone();
+            assert_eq!(
+                events,
+                vec![
+                    "run_start:go:system_none=false".to_string(),
+                    "done".to_string()
+                ],
+                "no model call happened; events were: {events:?}"
+            );
+        }
+
+        // (b) budget exhaustion.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let ws = dir.path().to_path_buf();
+            std::fs::write(ws.join("f.txt"), "x").unwrap();
+            let model = Arc::new(ScriptedModel::new(vec![
+                Scripted::Call(
+                    "c1".into(),
+                    "read_file".into(),
+                    format!(r#"{{"path":"{}"}}"#, ws.join("f.txt").display()),
+                ),
+                Scripted::Text("wrap-up summary".into()),
+            ]));
+            let sink = Arc::new(CollectingSink::default());
+            let agent = AgentLoop::new(
+                model,
+                Arc::new(PassthroughProtocol),
+                registry(),
+                policy(ws.clone()),
+                Arc::new(AlwaysApprove),
+                sink.clone(),
+                LoopConfig {
+                    model_limit: 100_000,
+                    max_turns: 1,
+                    max_retries: 2,
+                    temperature: 0.0,
+                    max_tokens: None,
+                    workspace: ws,
+                    tool_timeout: std::time::Duration::from_secs(5),
+                    stream_idle_timeout: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                },
+            );
+            let (stack, log) = recording_pair(None);
+            let agent = agent.with_middleware(stack);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "go".into()).await.unwrap();
+
+            // The one real (budget = 1) tool turn runs the full forward+reverse
+            // hook set; the tools-disabled wrap-up completion afterward is a bare
+            // model call the node-hook dispatcher never sees — no second
+            // after_model/after_tools/turn_end, and no final_reply (the run ends
+            // Done(BudgetExhausted), not the text-only exit path).
+            assert_eq!(
+                log.lock().unwrap().clone(),
+                vec![
+                    "a:run_start",
+                    "b:run_start",
+                    "b:after_model",
+                    "a:after_model",
+                    "b:after_tools",
+                    "a:after_tools",
+                    "b:turn_end",
+                    "a:turn_end",
+                ],
+                "budget exhaustion's wrap-up completion must fire no additional hooks"
+            );
+            let events = sink.events.lock().unwrap().clone();
+            assert!(
+                events.iter().any(|e| e == "token:wrap-up summary"),
+                "the wrap-up still streamed its text: {events:?}"
+            );
+            assert_eq!(events.last().map(String::as_str), Some("done"));
+        }
+    }
+
+    /// Spec §7: no maintain on either Length-stop exit. Mirrors
+    /// `truncated_tool_call_reports_max_tokens_not_bad_args`: a
+    /// `TruncatedCall` immediately yields `StopReason::Length`. OBSERVED (not
+    /// the brief's first guess of an empty log): `fire_run_start` runs before
+    /// the model is ever called, so both middleware's run_start DO fire; the
+    /// Length return then short-circuits everything after — no after_model,
+    /// no after_tools, no on_turn_end, and critically no after_final_reply
+    /// (the maintain hook), since the run never reaches the text-only exit
+    /// path either.
+    #[tokio::test]
+    async fn length_exit_fires_no_maintain_hooks() {
+        let ws = std::env::temp_dir();
+        let truncated = r##"{"path":"big.py","content":"#!/usr/bin/env python3\nprint('hi"##;
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::TruncatedCall(
+            "write_file".into(),
+            truncated.into(),
+        )]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: Some(2048),
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let (stack, log) = recording_pair(None);
+        let agent = agent.with_middleware(stack);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent
+            .run(&mut ctx, "write a big file".into())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec!["a:run_start", "b:run_start"],
+            "run_start fires (it runs before the model is ever called); a Length-stop \
+             exit must fire no after_model/after_tools/turn_end/final_reply — in \
+             particular no maintain hook runs on this exit"
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("done"),
+            "the truncation abort must still terminate with Done; events were: {events:?}"
         );
     }
 }

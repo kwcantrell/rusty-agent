@@ -164,14 +164,41 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     for t in &parts.mcp_tools {
         registry.register(t.clone());
     }
-    if cfg.memory {
-        for t in &parts.memory_tools {
-            registry.register(t.clone());
-        }
-    }
     let (skill_registry, skill_tools) = build_skills(&cfg.skills_dirs, &parts.workspace);
     for t in skill_tools {
         registry.register(t);
+    }
+
+    // The middleware stack. Built here so its tool contributions can register
+    // before the child_base snapshot below (spec §5.5/§5.6).
+    let mut stack: Vec<Arc<dyn agent_core::Middleware>> = Vec::new();
+    if cfg.memory {
+        stack.push(Arc::new(agent_core::MemoryRecallMiddleware::new(
+            parts.memory_tools.clone(),
+            parts.memory_retriever.clone(),
+        )));
+    }
+    // Scheduled context curation (spec §5.5): loop-bottom + text-exit maintain,
+    // plus the context-management tools (child-invisible; children get their
+    // own per-dispatch instance bound to a fresh store/flag below).
+    stack.push(Arc::new(agent_core::ContextCurationMiddleware::new(
+        parts.offload_store.clone(),
+        parts.compact_flag.clone(),
+        cfg.max_tool_result_bytes,
+    )));
+    // Repeated-identical-call detection (spec §5.5): stateless, so a single
+    // shared instance is fine on both the parent and every dispatch child.
+    stack.push(Arc::new(agent_core::StuckDetectionMiddleware));
+    // Register child-visible contributions BEFORE the child_base snapshot;
+    // the rest after (spec §5.6). debug_assert: no name collisions.
+    for c in stack.iter().flat_map(|m| m.tools()) {
+        if c.child_visible {
+            debug_assert!(
+                registry.get(c.tool.name()).is_none(),
+                "middleware tool contribution shadows an existing tool"
+            );
+            registry.register(c.tool.clone());
+        }
     }
 
     // Snapshot for sub-agent children BEFORE context tools (child gets its own,
@@ -179,14 +206,13 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     // structural no-recursion). The POSITION of this line is the invariant.
     let child_base = cfg.subagents.then(|| registry.all());
 
-    // Context-management tools share the caller-owned offload store + compact flag
-    // with the frontend's CuratedContext (passed in via LoopParts).
-    for t in agent_core::context_tools(
-        parts.offload_store.clone(),
-        parts.compact_flag.clone(),
-        cfg.max_tool_result_bytes,
-    ) {
-        registry.register(t);
+    // Non-child-visible middleware tool contributions register after the
+    // snapshot — context-curation tools land here (child-invisible: children
+    // get their own instance in dispatch.rs, spec §5.6).
+    for c in stack.iter().flat_map(|m| m.tools()) {
+        if !c.child_visible {
+            registry.register(c.tool.clone());
+        }
     }
 
     let available: HashSet<String> = skill_registry.scan().into_iter().map(|s| s.name).collect();
@@ -370,14 +396,11 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         sink,
         loop_config,
     );
-    let agent = match (cfg.memory, &parts.memory_retriever) {
-        (true, Some(r)) => agent.with_retriever(r.clone()),
-        _ => agent,
-    };
     let agent = match &compaction_model {
         Some(m) => agent.with_compaction_model(m.clone()),
         None => agent,
     };
+    let agent = agent.with_middleware(stack);
 
     BuiltLoop {
         loop_: Arc::new(agent),

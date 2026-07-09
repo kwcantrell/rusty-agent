@@ -1,7 +1,7 @@
 //! Sub-agent dispatch: sub-agents-as-tools (spec 2026-07-01-subagent-dispatch-core).
 use crate::{
-    AgentEvent, AgentLoop, CuratedContext, EventSink, InMemoryOffloadStore, LoopConfig,
-    OffloadConfig,
+    AgentEvent, AgentLoop, ContextCurationMiddleware, CuratedContext, EventSink,
+    InMemoryOffloadStore, LoopConfig, Middleware, OffloadConfig, StuckDetectionMiddleware,
 };
 use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, PolicyEngine};
@@ -473,8 +473,15 @@ impl Tool for DispatchAgentTool {
         }
         let store: Arc<dyn crate::OffloadStore> = Arc::new(InMemoryOffloadStore::new());
         let flag = Arc::new(AtomicBool::new(false));
-        for t in crate::context_tools(store.clone(), flag.clone(), self.deps.max_result_bytes) {
-            reg.register(t);
+        // Each dispatch child gets its own ContextCurationMiddleware instance,
+        // bound to THIS child's store/flag (never the parent's) — spec §5.6.
+        let curation = Arc::new(ContextCurationMiddleware::new(
+            store.clone(),
+            flag.clone(),
+            self.deps.max_result_bytes,
+        ));
+        for c in curation.tools() {
+            reg.register(c.tool.clone());
         }
         // Finding 4.1: apply the parent's description overrides to the child
         // registry (registry-level, matching assemble.rs's parent application).
@@ -509,6 +516,11 @@ impl Tool for DispatchAgentTool {
             sink.clone(),
             self.deps.loop_config.clone(),
         );
+        // Own middleware instance per child (spec §5.6): scheduled curation
+        // against THIS child's store/flag, not the parent's. StuckDetection is
+        // stateless, so a fresh instance per child (rather than sharing the
+        // parent's) is just as correct and keeps ownership uniform.
+        let child = child.with_middleware(vec![curation, Arc::new(StuckDetectionMiddleware)]);
         // Route child-loop compaction through the dedicated model when set.
         let child = match &self.deps.compaction_model {
             Some(m) => child.with_compaction_model(m.clone()),
@@ -1018,5 +1030,163 @@ mod tests {
                 .any(|(n, desc)| n == "context_recall" && desc.starts_with("OVERRIDDEN")),
             "child request schemas must carry the override: {seen:?}"
         );
+    }
+
+    // --- Task 7: child-stack invariant pin -----------------------------------
+
+    /// A trivial memory-shaped tool: exercises "memory tools present in
+    /// base_tools" without any real agent-memory coupling. Named `remember`
+    /// so it reads unambiguously as a memory tool in the captured schema list.
+    struct RememberStub;
+    #[async_trait::async_trait]
+    impl Tool for RememberStub {
+        fn name(&self) -> &str {
+            "remember"
+        }
+        fn description(&self) -> &str {
+            "remember a fact (test stub)"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "remember".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+            Ok(ToolIntent {
+                tool: "remember".into(),
+                access: Access::Write,
+                paths: vec![],
+                command: None,
+                summary: "remember".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                content: "remembered".into(),
+                display: None,
+            })
+        }
+    }
+
+    /// The normative claim (task-7 brief): children run `[context-curation,
+    /// stuck-detection]`, never `memory-recall`. Behavioral evidence over new
+    /// `#[cfg(test)]` surface (per the brief's stated preference), reusing the
+    /// `SchemaCapturingModel` shape from `description_overrides_reach_child_registry`:
+    ///
+    /// (a) tool-surface evidence: a memory tool placed in `base_tools` (the
+    ///     spec D4/§5.6 channel real memory tools use — `ToolContribution {
+    ///     child_visible: true }` in the assembled parent's base snapshot)
+    ///     reaches the child's registered tool schemas alongside the
+    ///     context-curation tools (`context_recall`/`context_compact`), proving
+    ///     `filtered_base` + `curation.tools()` both land in the child registry.
+    /// (b) stuck-detection is LIVE: three identical calls trip the spec §5.5
+    ///     nudge inside the child's own turn loop (only reachable if
+    ///     `StuckDetectionMiddleware` is actually in the child's stack).
+    /// (c) memory-recall is ABSENT: even with a memory tool visible, nothing
+    ///     injects a "Relevant memories" recall block into the child's own
+    ///     completion requests (`MemoryRecallMiddleware::on_run_start` is the
+    ///     only source of that block, and it is never constructed in
+    ///     `DispatchAgentTool::execute`) — the strongest observable proxy for
+    ///     "never memory-recall" without a #[cfg(test)] stack accessor.
+    #[tokio::test]
+    async fn child_stack_is_exactly_curation_and_stuck_detection_never_memory_recall() {
+        struct SchemaCapturingModel {
+            inner: ScriptedModel,
+            seen: std::sync::Mutex<Vec<(String, String)>>,
+            /// Every request's full system+user text, to prove no recall block
+            /// ever appears anywhere in the child's own model traffic.
+            request_texts: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl agent_model::ModelClient for SchemaCapturingModel {
+            async fn stream(
+                &self,
+                req: agent_model::CompletionRequest,
+            ) -> Result<
+                futures::stream::BoxStream<
+                    'static,
+                    Result<agent_model::Chunk, agent_model::ModelError>,
+                >,
+                agent_model::ModelError,
+            > {
+                self.seen.lock().unwrap().extend(
+                    req.tools
+                        .iter()
+                        .map(|t| (t.name.clone(), t.description.clone())),
+                );
+                self.request_texts.lock().unwrap().push(
+                    req.messages
+                        .iter()
+                        .map(|m| m.content.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                self.inner.stream(req).await
+            }
+        }
+        // Three identical write_stub-style calls (via `remember`) to trip the
+        // child's own stuck-detection nudge on the 3rd turn, then a text exit.
+        let one = || Scripted::Call("c1".into(), "remember".into(), r#"{"k":"a"}"#.into());
+        let model = Arc::new(SchemaCapturingModel {
+            inner: ScriptedModel::new(vec![one(), one(), one(), Scripted::Text("done".into())]),
+            seen: Default::default(),
+            request_texts: Default::default(),
+        });
+        let mut d = exec_deps(ScriptedModel::new(vec![]), 10);
+        d.model = model.clone();
+        d.base_tools = vec![Arc::new(RememberStub)];
+        let tool = DispatchAgentTool::new(d);
+        tool.execute(serde_json::json!({"prompt": "p"}), &exec_ctx())
+            .await
+            .unwrap();
+
+        // (a) tool-surface: the memory tool AND both context-curation tools
+        // reached the child's registered schemas.
+        let seen = model.seen.lock().unwrap();
+        let seen_names: std::collections::HashSet<&str> =
+            seen.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            seen_names.contains("remember"),
+            "memory tool from base_tools must reach the child registry: {seen_names:?}"
+        );
+        assert!(
+            seen_names.contains("context_recall") && seen_names.contains("context_compact"),
+            "context-curation's tools must reach the child registry: {seen_names:?}"
+        );
+        assert!(
+            !seen_names.contains("dispatch_agent"),
+            "dispatch_agent must never be child-visible (spec D4): {seen_names:?}"
+        );
+
+        // (b) stuck-detection is live in the child's own loop: 4 requests sent
+        // (3 identical + 1 differing after the nudge), matching the top-level
+        // "nudge on 3rd, no abort within budget" shape.
+        assert_eq!(
+            model.request_texts.lock().unwrap().len(),
+            4,
+            "child model must be consulted once per turn (3 calls + 1 text exit)"
+        );
+        let last_request = model.request_texts.lock().unwrap().last().unwrap().clone();
+        assert!(
+            last_request.contains("identical tool call"),
+            "the child's own stuck-detection nudge must appear in its own request \
+             history, proving StuckDetectionMiddleware ran inside the child: {last_request}"
+        );
+
+        // (c) memory-recall is absent: no request ever carries a recall block,
+        // even though a memory tool was visible and callable.
+        for (i, text) in model.request_texts.lock().unwrap().iter().enumerate() {
+            assert!(
+                !text.contains("Relevant memories from past sessions"),
+                "request {i} must carry no memory-recall block — MemoryRecallMiddleware \
+                 is never installed on a dispatch child: {text}"
+            );
+        }
     }
 }
