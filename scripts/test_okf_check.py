@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["pyyaml"]
+# ///
 import os
 import sys
 import tempfile
@@ -127,6 +131,64 @@ class OkfCheckTest(unittest.TestCase):
               "# Citations\n1. [example](/sources/example.md)\n")
         errs = okf_check.check_bundle(self.root)
         self.assertTrue(any("dangling.md" in e and "marker" in e for e in errs))
+
+    def test_block_style_list_parses(self):
+        # Parser tolerance (house style stays inline lists).
+        valid_bundle(self.root)
+        write(self.root, "sources/block.md",
+              "---\ntype: Source\nresource: https://example.com/b\n"
+              "tags:\n  - a\n  - b\n---\nbody\n")
+        write(self.root, "sources/index.md",
+              "# Sources\n- [example](/sources/example.md)\n- [block](/sources/block.md)\n")
+        self.assertEqual(okf_check.check_bundle(self.root), [])
+
+    def test_unquoted_colon_in_value_fails(self):
+        valid_bundle(self.root)
+        write(self.root, "sources/colon.md",
+              "---\ntype: Source\ntitle: AgentBench: Evaluating LLMs\n"
+              "resource: https://example.com/c\n---\nbody\n")
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("colon.md" in e and "unparseable" in e for e in errs))
+
+    def test_non_mapping_frontmatter_fails(self):
+        valid_bundle(self.root)
+        write(self.root, "sources/listfm.md", "---\n- a\n- b\n---\nbody\n")
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("listfm.md" in e and "unparseable" in e for e in errs))
+
+    def test_datetime_timestamp_ok(self):
+        # yaml parses bare ISO timestamps into datetime objects; checks must tolerate.
+        valid_bundle(self.root)
+        write(self.root, "sources/dated.md",
+              "---\ntype: Source\nresource: https://example.com/d\n"
+              "timestamp: 2026-07-09T00:00:00Z\n---\nbody\n")
+        write(self.root, "sources/index.md",
+              "# Sources\n- [example](/sources/example.md)\n- [dated](/sources/dated.md)\n")
+        self.assertEqual(okf_check.check_bundle(self.root), [])
+
+    def test_capability_type_with_citations_passes(self):
+        valid_bundle(self.root)
+        write(self.root, "capabilities/ipc.md",
+              "---\ntype: Capability\ntitle: IPC\n---\nClaim [1].\n\n"
+              "# Citations\n1. [example](/sources/example.md)\n")
+        self.assertEqual(okf_check.check_bundle(self.root), [])
+
+    def test_capability_missing_citations_fails(self):
+        valid_bundle(self.root)
+        write(self.root, "capabilities/uncited.md",
+              "---\ntype: Capability\ntitle: X\n---\nA claim, no citations.\n")
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("uncited.md" in e and "Citations" in e for e in errs))
+
+    def test_marker_in_code_ignored(self):
+        # `content[0].text` inline and args[1] in a fence are not citation markers.
+        valid_bundle(self.root)
+        write(self.root, "practices/codey.md",
+              "---\ntype: Practice\n---\nUse `content[0].text` for claim [1].\n\n"
+              "```js\nconst x = args[1];\n```\n\n"
+              "# Citations\n1. [example](/sources/example.md)\n")
+        errs = okf_check.check_bundle(self.root)
+        self.assertEqual(errs, [])
 
 
 if __name__ == "__main__":
