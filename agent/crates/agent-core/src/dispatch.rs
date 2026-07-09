@@ -2,7 +2,7 @@
 use crate::{
     AgentEvent, AgentLoop, ContextCurationMiddleware, CuratedContext, EventSink, LoopConfig,
     Middleware, OffloadConfig, RepairMiddleware, SessionArtifacts, StuckDetectionMiddleware,
-    TodoHandle, WriteTodosTool,
+    TodoHandle, ToolCallLimit, WriteTodosTool,
 };
 use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, PolicyEngine};
@@ -460,9 +460,6 @@ impl Tool for DispatchAgentTool {
                 }
             }
         };
-        // B4 consumes `resolved` to change child construction; keep the binding
-        // (not yet read) from tripping -D warnings until then.
-        let _ = &resolved;
         let role: Option<String> = match args.get("role") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(s)) => {
@@ -495,6 +492,12 @@ impl Tool for DispatchAgentTool {
                     "tools must be an array of strings".into(),
                 ))
             }
+        };
+        // Named type: its allowlist REPLACES per-call tools (deepagents replace
+        // semantics). general-purpose keeps the per-call `allow` computed above.
+        let allow = match resolved {
+            Some(r) => r.tools.clone(),
+            None => allow,
         };
         const IMPLICIT_CHILD_TOOLS: [&str; 1] = ["context_compact"];
         // "dispatch_agent" is a valid allowlist name ONLY while the child could
@@ -590,9 +593,15 @@ impl Tool for DispatchAgentTool {
         // Names not in THIS child's registry (e.g. allowlist-filtered tools)
         // just warn — same posture as the parent path.
         reg.set_description_overrides(self.deps.description_overrides.clone());
-        let system = match &role {
-            Some(r) => format!("{}\n\nRole: {r}", self.deps.child_system_prompt),
-            None => self.deps.child_system_prompt.clone(),
+        // Named type replaces the parent-derived prompt (preamble already baked
+        // into resolved.system_prompt) and ignores `role`. general-purpose keeps
+        // the parent child_system_prompt + optional role (byte-identical to 3A).
+        let system = match resolved {
+            Some(r) => r.system_prompt.clone(),
+            None => match &role {
+                Some(rl) => format!("{}\n\nRole: {rl}", self.deps.child_system_prompt),
+                None => self.deps.child_system_prompt.clone(),
+            },
         };
         let mut child_ctx = CuratedContext::new(Message::system(system), artifacts.clone(), flag)
             .with_offload_config(OffloadConfig {
@@ -611,14 +620,33 @@ impl Tool for DispatchAgentTool {
             parent_id,
             self.deps.child_trace.clone(),
         ));
+        // Named type may route its own model/protocol/window; general-purpose
+        // uses the parent-configured child defaults (byte-identical to 3A).
+        let (child_model, child_protocol, child_loop_config) = match resolved {
+            Some(r) => {
+                let mut lc = self.deps.loop_config.clone();
+                if let Some(ml) = r.model_limit {
+                    lc.model_limit = ml;
+                }
+                if r.max_tokens.is_some() {
+                    lc.max_tokens = r.max_tokens;
+                }
+                (r.model.clone(), r.protocol.clone(), lc)
+            }
+            None => (
+                self.deps.model.clone(),
+                self.deps.protocol.clone(),
+                self.deps.loop_config.clone(),
+            ),
+        };
         let child = AgentLoop::new(
-            self.deps.model.clone(),
-            self.deps.protocol.clone(),
+            child_model,
+            child_protocol,
             Arc::new(reg),
             self.deps.policy.clone(),
             self.deps.approval.clone(),
             sink.clone(),
-            self.deps.loop_config.clone(),
+            child_loop_config,
         );
         // Own middleware instance per child (spec §5.6): scheduled curation
         // against THIS child's store/flag, not the parent's. StuckDetection is
@@ -646,13 +674,17 @@ impl Tool for DispatchAgentTool {
                     self.deps.loop_config.workspace.clone(),
                 )),
             ));
-        let child = child
-            .with_middleware(vec![
-                curation,
-                Arc::new(StuckDetectionMiddleware),
-                Arc::new(RepairMiddleware),
-            ])
-            .with_backend(child_backend);
+        // 3A default child stack; a named type with tool_call_limit appends the
+        // 3A ToolCallLimit guardrail (E4). Aborts via EndRun(StopReason::Error).
+        let mut child_mw: Vec<Arc<dyn Middleware>> = vec![
+            curation,
+            Arc::new(StuckDetectionMiddleware),
+            Arc::new(RepairMiddleware),
+        ];
+        if let Some(cap) = resolved.and_then(|r| r.tool_call_limit) {
+            child_mw.push(Arc::new(ToolCallLimit::with_cap(cap)));
+        }
+        let child = child.with_middleware(child_mw).with_backend(child_backend);
         // Route child-loop compaction through the dedicated model when set.
         let child = match &self.deps.compaction_model {
             Some(m) => child.with_compaction_model(m.clone()),
@@ -1127,6 +1159,157 @@ mod tests {
         let err = tool
             .execute(
                 serde_json::json!({"prompt":"hi","subagent_type":"nope"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+    }
+
+    // --- Task B4: named-type resolution applied to child construction -------
+
+    /// `DispatchDeps` wired so that whichever model actually runs the child —
+    /// `deps.model` (general-purpose path) OR a named type's own
+    /// `resolved.model` (named path) — records the child's OWN system message
+    /// (`Role::System`) into a shared `Arc<Mutex<Option<String>>>`. Rebuilds
+    /// `registry` with each entry's model wrapped by the same capturing
+    /// client, so callers can pass `one_agent_registry()` unmodified and this
+    /// harness stays agnostic to which path a given test exercises. Reuses the
+    /// `SchemaCapturingModel`/`RequestTextCapturingModel` idiom already used
+    /// above, specialized to pull out exactly the system message content so
+    /// prompt/preamble assertions don't have to parse the joined transcript.
+    fn deps_with_capturing_child(
+        registry: Arc<SubAgentRegistry>,
+    ) -> (DispatchDeps, Arc<Mutex<Option<String>>>) {
+        struct SystemCapturingModel {
+            inner: Arc<dyn ModelClient>,
+            captured_system: Arc<Mutex<Option<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl agent_model::ModelClient for SystemCapturingModel {
+            async fn stream(
+                &self,
+                req: agent_model::CompletionRequest,
+            ) -> Result<
+                futures::stream::BoxStream<
+                    'static,
+                    Result<agent_model::Chunk, agent_model::ModelError>,
+                >,
+                agent_model::ModelError,
+            > {
+                {
+                    let mut guard = self.captured_system.lock().unwrap();
+                    if guard.is_none() {
+                        if let Some(m) = req
+                            .messages
+                            .iter()
+                            .find(|m| m.role == agent_model::Role::System)
+                        {
+                            *guard = Some(m.content.clone());
+                        }
+                    }
+                }
+                self.inner.stream(req).await
+            }
+        }
+        let captured_system: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let wrap = |inner: Arc<dyn ModelClient>| -> Arc<dyn ModelClient> {
+            Arc::new(SystemCapturingModel {
+                inner,
+                captured_system: captured_system.clone(),
+            })
+        };
+        let model: Arc<dyn ModelClient> = wrap(Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "done".into(),
+        )])));
+        let mut wrapped_map = std::collections::HashMap::new();
+        for name in registry.names() {
+            let r = registry.get(name).unwrap();
+            wrapped_map.insert(
+                name.to_string(),
+                ResolvedSubAgent {
+                    description: r.description.clone(),
+                    system_prompt: r.system_prompt.clone(),
+                    tools: r.tools.clone(),
+                    model: wrap(r.model.clone()),
+                    protocol: r.protocol.clone(),
+                    model_limit: r.model_limit,
+                    max_tokens: r.max_tokens,
+                    tool_call_limit: r.tool_call_limit,
+                },
+            );
+        }
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 5);
+        deps.model = model;
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(wrapped_map));
+        (deps, captured_system)
+    }
+
+    #[tokio::test]
+    async fn named_type_uses_spec_prompt_and_preamble_ignoring_role_tools() {
+        // A capturing model records the child's system prompt; assert it is the
+        // spec prompt + preamble, NOT the parent child_system_prompt or the role.
+        let (deps, captured_system) = deps_with_capturing_child(one_agent_registry());
+        let tool = DispatchAgentTool::new(deps);
+        let _ = tool
+            .execute(
+                serde_json::json!({
+                    "prompt":"do it","subagent_type":"reviewer",
+                    "role":"IGNORED ROLE","tools":["IGNORED"]
+                }),
+                &exec_ctx(),
+            )
+            .await;
+        let sys = captured_system.lock().unwrap().clone().expect("child ran");
+        assert!(sys.starts_with("You review."));
+        assert!(sys.contains(SUBAGENT_PREAMBLE));
+        assert!(!sys.contains("IGNORED ROLE"));
+    }
+
+    // Pin m-3 / architecture item (b): with a NON-EMPTY registry, selecting
+    // general-purpose still yields the 3A child (parent prompt + role appended) —
+    // the headline byte-identical invariant (spec §3 invariant 1) on the `None` arm.
+    #[tokio::test]
+    async fn general_purpose_under_nonempty_registry_is_unchanged() {
+        let (deps, captured_system) = deps_with_capturing_child(one_agent_registry());
+        let parent_prompt = deps.child_system_prompt.clone();
+        let tool = DispatchAgentTool::new(deps);
+        let _ = tool
+            .execute(
+                serde_json::json!({
+                    "prompt":"do it","subagent_type":"general-purpose","role":"R"
+                }),
+                &exec_ctx(),
+            )
+            .await;
+        let sys = captured_system.lock().unwrap().clone().expect("child ran");
+        assert!(sys.starts_with(&parent_prompt)); // parent-derived prompt, not a spec's
+        assert!(sys.contains("Role: R")); // role honored on the general-purpose path
+    }
+
+    // Unknown-tool refs surface at DISPATCH time (Task B2 design note), not assembly.
+    #[tokio::test]
+    async fn named_type_unknown_tool_errors_at_dispatch() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "bad".to_string(),
+            ResolvedSubAgent {
+                description: "d".into(),
+                system_prompt: format!("p\n\n{}", SUBAGENT_PREAMBLE),
+                tools: Some(vec!["no_such_tool".into()]), // not in the (empty) base snapshot
+                model: Arc::new(ScriptedModel::new(vec![])),
+                protocol: Arc::new(PassthroughProtocol),
+                model_limit: None,
+                max_tokens: None,
+                tool_call_limit: None,
+            },
+        );
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(m));
+        let tool = DispatchAgentTool::new(deps);
+        let err = tool
+            .execute(
+                serde_json::json!({"prompt":"hi","subagent_type":"bad"}),
                 &exec_ctx(),
             )
             .await
