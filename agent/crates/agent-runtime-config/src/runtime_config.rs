@@ -554,16 +554,26 @@ impl RuntimeConfig {
                     ));
                 }
             }
-            // Reserved fields are inert in 3B-1 (spec §2.7 item 6).
-            if s.permissions.is_some()
-                || s.response_format.is_some()
-                || s.middleware.is_some()
-                || s.skills.is_some()
-            {
+            // permissions/middleware/skills remain inert (3B-1c / dropped, spec §0).
+            if s.permissions.is_some() || s.middleware.is_some() || s.skills.is_some() {
                 return Err(format!(
-                    "named_subagents['{}']: permissions/response_format/middleware/skills are not supported in 3B-1 (see 3B-1b/3B-1c)",
+                    "named_subagents['{}']: permissions/middleware/skills are not supported (see 3B-1c)",
                     s.name
                 ));
+            }
+            // 3B-1b: response_format is accepted, validated as a flat-object schema.
+            if let Some(rf) = &s.response_format {
+                agent_core::validate_schema(rf)
+                    .map_err(|e| format!("named_subagents['{}']: response_format {e}", s.name))?;
+            }
+            // `respond` is the reserved synthetic structured-response tool name.
+            if let Some(tools) = &s.tools {
+                if tools.iter().any(|t| t == agent_core::RESPOND_TOOL_NAME) {
+                    return Err(format!(
+                        "named_subagents['{}']: `respond` is a reserved tool name",
+                        s.name
+                    ));
+                }
             }
         }
         Ok(())
@@ -1545,9 +1555,6 @@ mod tests {
         s.permissions = Some(serde_json::json!({}));
         assert!(cfg_with(vec![s]).validate().is_err());
         let mut s = spec("a");
-        s.response_format = Some(serde_json::json!({}));
-        assert!(cfg_with(vec![s]).validate().is_err());
-        let mut s = spec("a");
         s.middleware = Some(vec!["memory_recall".into()]);
         assert!(cfg_with(vec![s]).validate().is_err());
         let mut s = spec("a");
@@ -1572,6 +1579,47 @@ mod tests {
             ..Default::default()
         });
         assert!(cfg_with(vec![s]).validate().is_err());
+    }
+    #[test]
+    fn accepts_valid_response_format_still_rejects_others() {
+        let good = serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["summary"],
+            "properties": {"summary": {"type": "string"}}
+        });
+        let mut s = spec("triage");
+        s.response_format = Some(good.clone());
+        assert!(
+            cfg_with(vec![s]).validate().is_ok(),
+            "valid flat response_format must be accepted"
+        );
+
+        // ill-formed response_format (nested) → error naming the spec.
+        let mut s2 = spec("triage");
+        s2.response_format = Some(serde_json::json!({
+            "type":"object","additionalProperties":false,
+            "properties":{"inner":{"type":"object","additionalProperties":false,"properties":{}}}
+        }));
+        let e = cfg_with(vec![s2]).validate().unwrap_err();
+        assert!(e.contains("response_format") && e.contains("triage"), "{e}");
+
+        // permissions / middleware / skills still rejected.
+        let mut sp = spec("triage");
+        sp.permissions = Some(serde_json::json!({}));
+        assert!(cfg_with(vec![sp]).validate().is_err());
+        let mut sm = spec("triage");
+        sm.middleware = Some(vec!["x".into()]);
+        assert!(cfg_with(vec![sm]).validate().is_err());
+        let mut sk = spec("triage");
+        sk.skills = Some(vec!["x".into()]);
+        assert!(cfg_with(vec![sk]).validate().is_err());
+    }
+    #[test]
+    fn reserves_respond_tool_name() {
+        let mut s = spec("triage");
+        s.tools = Some(vec!["respond".into()]);
+        let e = cfg_with(vec![s]).validate().unwrap_err();
+        assert!(e.contains("respond") && e.contains("reserved"), "{e}");
     }
 
     #[test]
