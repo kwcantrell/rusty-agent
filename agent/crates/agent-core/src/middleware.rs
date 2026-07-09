@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// Nudge after this many consecutive REPEATS of an identical call set
@@ -57,6 +57,38 @@ impl RunState {
             .or_insert_with(|| Box::new(T::default()))
             .downcast_mut()
             .expect("TypeId-keyed entry always downcasts to its own type")
+    }
+}
+
+/// Per-run, thread-safe typed state (spec §5.2 — the wrap-hook state facility).
+/// Created fresh per `run_with_cancel`, reachable from BOTH wrap hooks (via
+/// `ModelNext`/`ToolNext`) and node hooks (via `RunCx`), so a middleware can
+/// WRITE in a wrap and READ in a node hook. `RunState` (node, `&mut`,
+/// sequential) and `RunShared` (wrap, `Arc`, concurrent) are two facilities
+/// with different concurrency contracts — a single `&mut` map cannot serve the
+/// parallel `buffer_unordered` tool executor.
+#[derive(Clone, Default)]
+pub struct RunShared(Arc<Mutex<HashMap<TypeId, Box<dyn Any + Send>>>>);
+
+impl RunShared {
+    /// Get-or-default then apply `f` under the lock. The SYNCHRONOUS
+    /// `FnOnce(&mut T) -> R` structurally forbids `.await` inside the lock (a
+    /// guard cannot cross an await by construction). Poison recovery: recovers
+    /// via `into_inner()` and DELIBERATELY DOES NOT PROPAGATE POISON — a tool
+    /// panic must stay contained, and the monotonic counters this holds fail
+    /// safe (a torn value can only over-count, stopping a run slightly early,
+    /// never late). NON-REENTRANT: `f` must not call `with()` again (one Mutex
+    /// guards the whole map → nested `with()` self-deadlocks); 3A's guardrails
+    /// touch one key each, so no nesting.
+    pub fn with<T: 'static + Default + Send, R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = guard
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()));
+        let val = slot
+            .downcast_mut::<T>()
+            .expect("TypeId-keyed entry always downcasts to its own type");
+        f(val)
     }
 }
 
@@ -439,6 +471,70 @@ mod tests {
         // A fresh RunState (fresh run) starts empty — per-run lifetime.
         let s2 = RunState::default();
         assert!(s2.get::<Marker>().is_none());
+    }
+
+    #[derive(Default)]
+    struct Counter(usize);
+
+    #[test]
+    fn run_shared_typed_roundtrip_and_fresh_isolation() {
+        let s = RunShared::default();
+        assert_eq!(s.with::<Counter, _>(|c| c.0), 0); // get-or-default
+        s.with::<Counter, _>(|c| c.0 = 7);
+        assert_eq!(s.with::<Counter, _>(|c| c.0), 7);
+        // A fresh RunShared (fresh run) starts empty — per-run lifetime.
+        let s2 = RunShared::default();
+        assert_eq!(s2.with::<Counter, _>(|c| c.0), 0);
+        // Clones share the same underlying store (Arc): a write via one clone is
+        // visible through another — this is what threads a wrap-write to a node-read.
+        let s3 = s.clone();
+        s3.with::<Counter, _>(|c| c.0 = 99);
+        assert_eq!(s.with::<Counter, _>(|c| c.0), 99);
+    }
+
+    #[test]
+    fn run_shared_concurrent_increments_dont_lose_updates() {
+        // Serialized under the Mutex: 8 threads × 1000 increments == 8000, no lost
+        // updates (the property the parallel buffer_unordered tool executor needs).
+        let s = RunShared::default();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        s.with::<Counter, _>(|c| c.0 += 1);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(s.with::<Counter, _>(|c| c.0), 8000);
+    }
+
+    #[test]
+    fn run_shared_recovers_from_poison_never_propagates() {
+        // A panic inside a with() closure poisons the std Mutex. RunShared MUST
+        // recover via into_inner() and never re-panic on PoisonError (spec §5.2;
+        // see plan discrepancy S1 — this is the true, achievable poison property).
+        let s = RunShared::default();
+        s.with::<Counter, _>(|c| c.0 = 5);
+        let s2 = s.clone();
+        let joined = std::thread::spawn(move || {
+            s2.with::<Counter, _>(|_| panic!("boom while holding the guard"));
+        })
+        .join();
+        assert!(
+            joined.is_err(),
+            "the closure panic propagates on ITS thread"
+        );
+        // Despite the poisoned mutex, a later with() recovers the prior value.
+        assert_eq!(
+            s.with::<Counter, _>(|c| c.0),
+            5,
+            "poisoned mutex recovered via into_inner; value intact"
+        );
     }
 
     struct Noop;
