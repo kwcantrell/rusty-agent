@@ -43,6 +43,14 @@ before approving (the opposite of the stock "approve unless broken" reviewers).
 Then **synthesize** (dedup, resolve conflicts, rank by severity) and feed that into
 the user's spec-review gate — the panel *arms* the human gate, it doesn't replace it.
 
+Disposition rule: a finding that conflicts with the user's stated mandate is
+**escalated to the gate as an explicit decision, never silently adopted or
+dismissed** — the panel doesn't outrank the owner, and the mandate doesn't
+grade its own work. Record every disposition in the artifact's dated
+**"Panel & review log"** section, in three buckets: blockers/majors *fixed in
+place*, findings *escalated to the gate* (with the eventual decision), and
+minors *accepted as residual*.
+
 When fanning out sub-agents (here or anywhere), **match model tier to the task**:
 light models (haiku/sonnet) for fetch-and-compare verification and mechanical
 sweeps; heavyweight models for synthesis and adversarial judgment.
@@ -63,6 +71,16 @@ facts. Record both as dated entries in the artifact's log; design judgments
 stay unverified and go to the spec panel. Mechanics:
 `.agents/skills/agent-sdlc/authoring.md`.
 
+### Post-gate edits get a consistency read, not a re-panel
+
+The same complementarity applies downstream: when gate decisions or review
+fixes are applied as **targeted edits** to an already-reviewed artifact (a
+spec after its gate, a plan after its review), run one **light-tier
+consistency reviewer** over the final document before it feeds the next
+stage — stale pre-decision language, contradictions between dispositions and
+normative sections, broken cross-references. A full re-panel is warranted
+only for **structural rework**; disposition-recording prose is not that.
+
 ### Docs-only exception
 
 Docs/ledger-only campaigns (audits, triage records, campaign ledgers, memory
@@ -79,6 +97,9 @@ still branches.
 - **Commit and push only when asked.** Branch off `main` for PRs.
 - **Changes ship with tests.** Run the relevant suite (`cargo test` / `npm test`)
   before calling it done.
+- **`file:line` anchors in specs/plans/briefs go stale** the moment earlier
+  work inserts code. Anchors are for orientation; **locate the quoted code by
+  content before editing**, and say so in any prompt you hand a sub-agent.
 
 ## CI gate
 
