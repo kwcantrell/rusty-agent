@@ -11,6 +11,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// Nudge after this many consecutive REPEATS of an identical call set
+/// (i.e. on the 3rd identical turn); abort after STUCK_ABORT_AFTER (the 5th).
+/// Not configurable until a real workload needs the knob (spec 2026-07-02 §4).
+pub const STUCK_NUDGE_AFTER: usize = 2;
+pub const STUCK_ABORT_AFTER: usize = 4;
+
 /// Node-hook outcome. `EndRun` short-circuits remaining hooks at that point;
 /// the loop maps it to `emit(Done(reason)); return Ok(())` (spec §5.2).
 #[derive(Debug, Clone, PartialEq)]
@@ -344,6 +350,86 @@ impl Middleware for ContextCurationMiddleware {
         if !cx.state.get::<Maintained>().map(|m| m.0).unwrap_or(false) {
             self.maintain(cx, true).await;
         }
+    }
+}
+
+/// Repeated-identical-call detection (spec §5.5): nudge on the 3rd identical
+/// turn, abort on the 5th. Signature and message strings are byte-identical
+/// to the loop-resident original.
+pub struct StuckDetectionMiddleware;
+
+#[derive(Default)]
+struct StuckState {
+    last_sig: Option<String>,
+    repeats: usize,
+    nudged: bool,
+    nudge_pending: bool,
+}
+
+#[async_trait]
+impl Middleware for StuckDetectionMiddleware {
+    fn name(&self) -> &str {
+        "stuck-detection"
+    }
+
+    async fn after_model(&self, cx: &mut RunCx<'_>, turn: &TurnView) -> Flow {
+        if turn.tool_calls.is_empty() && turn.invalid.is_empty() {
+            return Flow::Continue; // text-only turns never tracked (as today)
+        }
+        // Identical encoding to the original loop-resident signature block:
+        // sorted (name\u{1}args|error), joined by \u{2} — id-independent.
+        let mut parts: Vec<String> = turn
+            .tool_calls
+            .iter()
+            .map(|c| format!("{}\u{1}{}", c.name, c.args))
+            .chain(turn.invalid.iter().map(|(n, e)| format!("{n}\u{1}{e}")))
+            .collect();
+        parts.sort();
+        let sig = parts.join("\u{2}");
+
+        // End the `s` borrow before touching `cx.ctx`/`cx.sink` (BORROW NOTE,
+        // task-6 brief): compute the abort/nudge decision into locals first.
+        let s = cx.state.entry::<StuckState>();
+        if s.last_sig.as_deref() == Some(&sig) {
+            s.repeats += 1;
+        } else {
+            s.repeats = 0;
+            s.nudged = false;
+        }
+        s.last_sig = Some(sig);
+        let abort = s.repeats >= STUCK_ABORT_AFTER;
+        let nudge = !abort && s.repeats >= STUCK_NUDGE_AFTER && !s.nudged;
+        if nudge {
+            s.nudged = true;
+            s.nudge_pending = true;
+        }
+
+        if abort {
+            // Abort BEFORE the assistant tool_calls append (spec §5.5): the
+            // middleware appends the text-only form; the loop skips its own.
+            let text = turn.text.clone();
+            cx.ctx.append(agent_model::Message::assistant(text, None));
+            cx.sink.emit(crate::AgentEvent::Error(
+                "model repeated the identical tool call(s) 5 turns in a row; \
+                 aborting the run"
+                    .into(),
+            ));
+            return Flow::EndRun(StopReason::Error);
+        }
+        Flow::Continue
+    }
+
+    async fn after_tools(&self, cx: &mut RunCx<'_>) -> Flow {
+        let s = cx.state.entry::<StuckState>();
+        let pending = std::mem::take(&mut s.nudge_pending);
+        if pending {
+            cx.ctx.append(agent_model::Message::user(
+                "You have now issued the identical tool call(s) 3 turns in a row; \
+                 repeating them will not change the result. Change your approach, or \
+                 reply with a summary and no tool call if you are done.",
+            ));
+        }
+        Flow::Continue
     }
 }
 

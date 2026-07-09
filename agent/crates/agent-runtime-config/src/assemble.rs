@@ -169,9 +169,8 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         registry.register(t);
     }
 
-    // The middleware stack (ContextCuration/Stuck join in Tasks 5-6). Built
-    // here so its tool contributions can register before the child_base
-    // snapshot below (spec §5.5/§5.6).
+    // The middleware stack. Built here so its tool contributions can register
+    // before the child_base snapshot below (spec §5.5/§5.6).
     let mut stack: Vec<Arc<dyn agent_core::Middleware>> = Vec::new();
     if cfg.memory {
         stack.push(Arc::new(agent_core::MemoryRecallMiddleware::new(
@@ -187,6 +186,9 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         parts.compact_flag.clone(),
         cfg.max_tool_result_bytes,
     )));
+    // Repeated-identical-call detection (spec §5.5): stateless, so a single
+    // shared instance is fine on both the parent and every dispatch child.
+    stack.push(Arc::new(agent_core::StuckDetectionMiddleware));
     // Register child-visible contributions BEFORE the child_base snapshot;
     // the rest after (spec §5.6). debug_assert: no name collisions.
     for c in stack.iter().flat_map(|m| m.tools()) {

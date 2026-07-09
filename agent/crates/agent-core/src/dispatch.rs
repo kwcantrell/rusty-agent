@@ -1,7 +1,7 @@
 //! Sub-agent dispatch: sub-agents-as-tools (spec 2026-07-01-subagent-dispatch-core).
 use crate::{
     AgentEvent, AgentLoop, ContextCurationMiddleware, CuratedContext, EventSink,
-    InMemoryOffloadStore, LoopConfig, Middleware, OffloadConfig,
+    InMemoryOffloadStore, LoopConfig, Middleware, OffloadConfig, StuckDetectionMiddleware,
 };
 use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, PolicyEngine};
@@ -517,9 +517,10 @@ impl Tool for DispatchAgentTool {
             self.deps.loop_config.clone(),
         );
         // Own middleware instance per child (spec §5.6): scheduled curation
-        // against THIS child's store/flag, not the parent's. StuckDetection
-        // joins this stack in Task 6.
-        let child = child.with_middleware(vec![curation]);
+        // against THIS child's store/flag, not the parent's. StuckDetection is
+        // stateless, so a fresh instance per child (rather than sharing the
+        // parent's) is just as correct and keeps ownership uniform.
+        let child = child.with_middleware(vec![curation, Arc::new(StuckDetectionMiddleware)]);
         // Route child-loop compaction through the dedicated model when set.
         let child = match &self.deps.compaction_model {
             Some(m) => child.with_compaction_model(m.clone()),

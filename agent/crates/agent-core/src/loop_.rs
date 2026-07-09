@@ -26,12 +26,6 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A `LoopConfig.max_parallel_tools` of 0 (the `Default`) resolves to this.
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
 
-/// Nudge after this many consecutive REPEATS of an identical call set
-/// (i.e. on the 3rd identical turn); abort after STUCK_ABORT_AFTER (the 5th).
-/// Not configurable until a real workload needs the knob (spec 2026-07-02 §4).
-pub const STUCK_NUDGE_AFTER: usize = 2;
-pub const STUCK_ABORT_AFTER: usize = 4;
-
 /// Appended when `max_turns` exhausts with the model still issuing tool calls;
 /// the run then gets ONE tools-disabled wrap-up completion (best-effort) so it
 /// ends on a summary instead of mid-thought (spec: runtime-knobs Part 2).
@@ -652,14 +646,6 @@ impl AgentLoop {
         ctx.append(Message::user(user_input));
         let mut protocol_repairs = 0;
 
-        // Repeated-identical-call detection (spec §4): a model re-emitting the
-        // byte-identical call set every turn burns all max_turns. Track the last
-        // turn's signature and how many consecutive turns have repeated it; nudge
-        // at STUCK_NUDGE_AFTER, abort at STUCK_ABORT_AFTER.
-        let mut last_sig: Option<String> = None;
-        let mut repeats = 0usize;
-        let mut nudged = false;
-
         // Agentic (tool-bearing) runs auto-preserve reasoning so the model keeps
         // its chain-of-thought across the within-turn tool loop; each backend then
         // decides how to surface it (Qwen3.6 via reasoning_content + the kwarg;
@@ -839,56 +825,6 @@ impl AgentLoop {
                 name: inv.name.clone(),
                 args: serde_json::json!({}),
             }));
-
-            // Repeated-identical-call detection (spec §4). Signature is the sorted
-            // set of (name, args) for valid calls plus (name, error) for invalid
-            // ones — id-independent, so an id normalization can't mask a repeat.
-            // `\u{1}`/`\u{2}` are field/record separators that won't appear in JSON.
-            let mut nudge_pending = false;
-            if !all_calls.is_empty() {
-                let mut parts: Vec<String> = parsed
-                    .tool_calls
-                    .iter()
-                    .map(|c| format!("{}\u{1}{}", c.name, c.args))
-                    .chain(
-                        parsed
-                            .invalid
-                            .iter()
-                            .map(|i| format!("{}\u{1}{}", i.name, i.error)),
-                    )
-                    .collect();
-                parts.sort();
-                let sig = parts.join("\u{2}");
-                if last_sig.as_deref() == Some(&sig) {
-                    repeats += 1;
-                } else {
-                    repeats = 0;
-                    nudged = false;
-                }
-                last_sig = Some(sig);
-
-                // Constraint (a): abort BEFORE the assistant tool_calls message is
-                // appended. Append the turn as text only — a dangling assistant
-                // tool_calls message with no answering tool results would 400 an
-                // OpenAI-compat server on the next run (contexts survive across runs).
-                if repeats >= STUCK_ABORT_AFTER {
-                    ctx.append(Message::assistant(parsed.text.clone(), None));
-                    self.sink.emit(AgentEvent::Error(
-                        "model repeated the identical tool call(s) 5 turns in a row; \
-                         aborting the run"
-                            .into(),
-                    ));
-                    self.sink.emit(AgentEvent::Done(StopReason::Error));
-                    return Ok(());
-                }
-                // Constraint (b): defer the nudge until after this turn's tool
-                // results land (a user message between the assistant tool_calls
-                // message and its Role::Tool results is invalid for OpenAI-compat).
-                if repeats >= STUCK_NUDGE_AFTER && !nudged {
-                    nudged = true;
-                    nudge_pending = true;
-                }
-            }
 
             let mut msg = Message::assistant(
                 parsed.text.clone(),
@@ -1193,17 +1129,6 @@ impl AgentLoop {
             if let crate::Flow::EndRun(reason) = flow {
                 self.sink.emit(AgentEvent::Done(reason));
                 return Ok(());
-            }
-
-            // Constraint (b): the nudge goes in AFTER the turn's tool-result
-            // messages, never between the assistant tool_calls message and its
-            // Role::Tool results.
-            if nudge_pending {
-                ctx.append(Message::user(
-                    "You have now issued the identical tool call(s) 3 turns in a row; \
-                     repeating them will not change the result. Change your approach, or \
-                     reply with a summary and no tool call if you are done.",
-                ));
             }
 
             // Scheduled loop-bottom maintain now lives in
@@ -2626,6 +2551,15 @@ mod tests {
                 ..Default::default()
             },
         );
+        // CAUTION (invariant, verified at plan review, task-6 brief): `with_middleware`
+        // REPLACES the whole stack, so any caller that later installs its own stack
+        // (e.g. a recording/wrapping chain via `.with_middleware(...)` after calling
+        // this helper) silently drops stuck detection too. Harmless today because
+        // only the two dedicated stuck tests (plus the malformed-turn parity pin)
+        // script >=5 identical calls and none of them override the stack — but any
+        // future `counter_agent` caller that BOTH overrides the stack AND scripts
+        // repeats must re-add `StuckDetectionMiddleware` itself.
+        let agent = agent.with_middleware(vec![Arc::new(crate::StuckDetectionMiddleware)]);
         (agent, count)
     }
 
@@ -2745,6 +2679,37 @@ mod tests {
             "no abort should fire; got {events:?}"
         );
         assert_eq!(events.last().unwrap(), "done");
+    }
+
+    /// A repair turn must not advance OR reset stuck counters (spec §5.1):
+    /// A, A, malformed, A, A, A → abort on the 5th *parsed* identical turn,
+    /// exactly as if the malformed turn never happened — today's inline code
+    /// skips the signature block entirely on the repair turn, so
+    /// last_sig/repeats survive the repair turn unchanged. This is a parity
+    /// pin: captured against the pre-migration (inline) implementation in
+    /// Task 6 Step 2, then held unchanged across the middleware migration.
+    #[tokio::test]
+    async fn repair_turn_leaves_stuck_counters_untouched() {
+        let a = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into());
+        let model = Arc::new(ScriptedModel::new(vec![
+            a(),
+            a(),
+            // Malformed-args Call (no `Malformed` variant exists — see the
+            // testkit note in Task 2): registered tool, unparseable JSON args.
+            Scripted::Call("c1".into(), "counter".into(), r#"{"k": "#.into()),
+            a(),
+            a(),
+            a(),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, count) = counter_agent(model, sink.clone(), 25);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        // Baseline captured against the pre-migration (inline stuck-detection)
+        // tree in Task 6 Step 2 — see task-6-report.md for the raw run.
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let events = sink.events.lock().unwrap().clone();
+        assert!(events.iter().any(|e| e.contains("5 turns in a row")));
     }
 
     struct FakeRetriever(Vec<String>);
