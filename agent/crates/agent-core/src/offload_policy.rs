@@ -1,7 +1,28 @@
-use crate::offload::{OffloadEntry, OffloadId, OffloadKind};
 use agent_model::{Message, Role};
 
-const PLACEHOLDER_PREFIX: &str = "[tool_result#";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OffloadKind {
+    Error,
+    Output,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffloadEntry {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub kind: OffloadKind,
+    pub content: String,
+    pub bytes: usize,
+    pub turn: usize,
+}
+
+/// The two skip literals (spec §5.5) — as narrow as the old "[tool_result#":
+/// selectors and the durable-unit detector all gate on exactly these.
+pub const PLACEHOLDER_PREFIXES: [&str; 2] = ["[tool_result offloaded", "[tool_result truncated"];
+
+pub fn is_placeholder(content: &str) -> bool {
+    PLACEHOLDER_PREFIXES.iter().any(|p| content.starts_with(p))
+}
 
 /// Default eager ingestion cap (`OffloadConfig::max_result_bytes`), also the
 /// default for `RuntimeConfig::max_tool_result_bytes`. ~4K tokens: large
@@ -75,7 +96,7 @@ pub fn select_offloads(history: &[Message], config: &OffloadConfig) -> Vec<Offlo
     let mut hits = Vec::new();
     for &i in eligible_indices {
         let m = &history[i];
-        if m.content.starts_with(PLACEHOLDER_PREFIX) {
+        if is_placeholder(&m.content) {
             continue; // already offloaded
         }
         let tool_name = m.name.clone().unwrap_or_default();
@@ -90,7 +111,6 @@ pub fn select_offloads(history: &[Message], config: &OffloadConfig) -> Vec<Offlo
         hits.push(OffloadHit {
             history_index: i,
             entry: OffloadEntry {
-                id: 0,
                 tool_call_id: m.tool_call_id.clone().unwrap_or_default(),
                 tool_name,
                 kind,
@@ -103,48 +123,49 @@ pub fn select_offloads(history: &[Message], config: &OffloadConfig) -> Vec<Offlo
     hits
 }
 
-/// The compact stub left in the live window in place of offloaded content.
-pub fn placeholder_for(id: OffloadId, tool_name: &str, kind: &OffloadKind, bytes: usize) -> String {
+/// The compact stub left in the live window (spec §5.5 grammar, verbatim).
+pub fn placeholder_for(vpath: &str, tool_name: &str, kind: &OffloadKind, bytes: usize) -> String {
     let kind_str = match kind {
         OffloadKind::Error => "error",
         OffloadKind::Output => "output",
     };
     format!(
-        "[tool_result#{id} offloaded: {bytes}B {kind_str} from \"{tool_name}\" \
-         — recall with context_recall({id})]"
+        "[tool_result offloaded to {vpath}: {bytes}B {kind_str} from \"{tool_name}\" \
+         — read_file the path, or grep large_tool_results/ to search]"
     )
 }
 
-/// Marker appended to an ingestion-capped preview. `shown`/`total` are byte counts.
-pub fn truncation_marker(id: OffloadId, tool_name: &str, shown: usize, total: usize) -> String {
+/// Marker appended to an ingestion-capped preview; continuation is read_file
+/// byte mode against the artifact path (spec §5.4/§5.5).
+pub fn truncation_marker(vpath: &str, tool_name: &str, shown: usize, total: usize) -> String {
     format!(
-        "\n[tool_result#{id} truncated: showing first {shown}B of {total}B from \
-         \"{tool_name}\" — continue with context_recall(id: {id}, offset: {shown})]"
+        "\n[tool_result truncated: showing first {shown}B of {total}B from \"{tool_name}\" \
+         — full content at {vpath}; continue with read_file(path: \"{vpath}\", byte_offset: {shown})]"
     )
 }
 
 /// Truncate `content` so preview + marker fit within `cap` bytes (char-boundary
 /// safe). When `cap` cannot even hold the marker, degrades to a marker-only
-/// string with no leading newline, which starts with `PLACEHOLDER_PREFIX` and
-/// is therefore never re-selected.
-pub fn capped_preview(content: &str, cap: usize, id: OffloadId, tool_name: &str) -> String {
+/// string with no leading newline, which starts with `[tool_result truncated`
+/// and is therefore never re-selected.
+pub fn capped_preview(content: &str, cap: usize, vpath: &str, tool_name: &str) -> String {
     let total = content.len();
     // Budget against the widest the marker can render (`shown = total`), so the
     // final string can only come in under `cap`.
-    let worst = truncation_marker(id, tool_name, total, total);
+    let worst = truncation_marker(vpath, tool_name, total, total);
     let mut cut = cap.saturating_sub(worst.len()).min(total);
     while !content.is_char_boundary(cut) {
         cut -= 1;
     }
     if cut == 0 {
-        return truncation_marker(id, tool_name, 0, total)
+        return truncation_marker(vpath, tool_name, 0, total)
             .trim_start()
             .to_string();
     }
     format!(
         "{}{}",
         &content[..cut],
-        truncation_marker(id, tool_name, cut, total)
+        truncation_marker(vpath, tool_name, cut, total)
     )
 }
 
@@ -154,7 +175,7 @@ pub fn select_oversized(history: &[Message], config: &OffloadConfig) -> Vec<Offl
     let mut hits = Vec::new();
     for (i, m) in history.iter().enumerate() {
         if !matches!(m.role, Role::Tool)
-            || m.content.starts_with(PLACEHOLDER_PREFIX)
+            || is_placeholder(&m.content)
             || m.content.len() <= config.max_result_bytes
         {
             continue;
@@ -166,7 +187,6 @@ pub fn select_oversized(history: &[Message], config: &OffloadConfig) -> Vec<Offl
         hits.push(OffloadHit {
             history_index: i,
             entry: OffloadEntry {
-                id: 0,
                 tool_call_id: m.tool_call_id.clone().unwrap_or_default(),
                 tool_name,
                 kind: classify(&m.content),
@@ -264,7 +284,7 @@ mod tests {
     fn already_offloaded_placeholder_is_skipped() {
         let history = vec![tool_msg(
             "shell",
-            &placeholder_for(7, "shell", &OffloadKind::Error, 300),
+            &placeholder_for("large_tool_results/7-c1", "shell", &OffloadKind::Error, 300),
         )];
         let hits = select_offloads(
             &history,
@@ -298,10 +318,10 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_preserves_id_and_tool() {
-        let p = placeholder_for(7, "shell", &OffloadKind::Error, 3100);
-        assert!(p.contains("tool_result#7"));
-        assert!(p.contains("context_recall(7)"));
+    fn placeholder_preserves_path_and_tool() {
+        let p = placeholder_for("large_tool_results/7-c1", "shell", &OffloadKind::Error, 3100);
+        assert!(p.contains("offloaded to large_tool_results/7-c1"));
+        assert!(p.contains("read_file the path"));
         assert!(p.contains("shell"));
         assert!(p.contains("3100B"));
     }
@@ -340,8 +360,8 @@ mod tests {
     #[test]
     fn placeholders_and_excluded_tools_are_not_selected() {
         let placeholder = format!(
-            "[tool_result#7 offloaded: 9000B output \
-             from \"shell\" — recall with context_recall(7)]{}",
+            "[tool_result offloaded to large_tool_results/7-c1: 9000B output \
+             from \"shell\" — read_file the path, or grep large_tool_results/ to search]{}",
             "x".repeat(2000)
         );
         let history = vec![
@@ -365,19 +385,19 @@ mod tests {
     #[test]
     fn capped_preview_fits_cap_and_carries_the_recall_hint() {
         let content = "x".repeat(50_000);
-        let out = capped_preview(&content, 1024, 42, "shell");
+        let out = capped_preview(&content, 1024, "large_tool_results/42-c1", "shell");
         assert!(out.len() <= 1024, "preview+marker {} > cap", out.len());
         assert!(out.starts_with("xxx"));
-        assert!(out.contains("tool_result#42 truncated"));
+        assert!(out.contains("full content at large_tool_results/42-c1"));
         assert!(out.contains("of 50000B"));
-        assert!(out.contains("context_recall(id: 42, offset: "));
+        assert!(out.contains("byte_offset: "));
     }
 
     #[test]
     fn capped_preview_respects_char_boundaries() {
         // 4-byte scalars; a byte-index cut inside one would panic on slicing.
         let content = "🦀".repeat(20_000);
-        let out = capped_preview(&content, 1024, 1, "shell");
+        let out = capped_preview(&content, 1024, "large_tool_results/1-c1", "shell");
         assert!(out.len() <= 1024);
         assert!(out.starts_with('🦀'));
     }
@@ -385,7 +405,7 @@ mod tests {
     #[test]
     fn capped_preview_is_idempotent_under_reselection() {
         let content = "x".repeat(50_000);
-        let out = capped_preview(&content, 1024, 1, "shell");
+        let out = capped_preview(&content, 1024, "large_tool_results/1-c1", "shell");
         let history = vec![Message::tool("c1", "shell", &out)];
         assert!(
             select_oversized(&history, &cap_cfg(1024)).is_empty(),
@@ -396,11 +416,27 @@ mod tests {
     #[test]
     fn pathological_small_cap_degrades_to_placeholder_prefix() {
         // cap smaller than the marker itself: output is marker-only and must
-        // start with PLACEHOLDER_PREFIX so both selectors skip it forever.
+        // start with a skip literal so both selectors skip it forever.
         let content = "x".repeat(50_000);
-        let out = capped_preview(&content, 16, 3, "shell");
-        assert!(out.starts_with("[tool_result#3"));
+        let out = capped_preview(&content, 16, "large_tool_results/3-c1", "shell");
+        assert!(out.starts_with("[tool_result truncated"));
         let history = vec![Message::tool("c1", "shell", &out)];
         assert!(select_oversized(&history, &cap_cfg(16)).is_empty());
+    }
+
+    #[test]
+    fn result_echoing_a_placeholder_line_is_skipped_accepted_residual() {
+        // A large tool result whose content STARTS with a full placeholder
+        // line is skipped by the selectors — the same theoretical false
+        // positive today's "[tool_result#" prefix had, accepted at the panel
+        // (spec §5.5). This pin makes any future change to that behavior a
+        // conscious decision.
+        let echoed = format!(
+            "{}\n{}",
+            placeholder_for("large_tool_results/9-cX", "shell", &OffloadKind::Output, 9000),
+            "y".repeat(5000)
+        );
+        let history = vec![Message::tool("c1", "shell", &echoed)];
+        assert!(select_oversized(&history, &cap_cfg(1024)).is_empty());
     }
 }
