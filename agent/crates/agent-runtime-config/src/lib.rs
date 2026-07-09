@@ -3,7 +3,8 @@
 
 mod runtime_config;
 pub use runtime_config::{
-    ModelRef, RuntimeConfig, DEFAULT_SANDBOX_IMAGE, EFFORT_LEVELS, HARD_FLOOR_DENYLIST,
+    ModelRef, RuntimeConfig, SubAgentSpec, DEFAULT_SANDBOX_IMAGE, EFFORT_LEVELS,
+    HARD_FLOOR_DENYLIST,
 };
 
 mod assemble;

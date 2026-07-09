@@ -15,3 +15,8 @@ context_limit = 8192
 # tools = ["read_file", "grep", "git_status"]   # optional allowlist (default: all)
 # tool_call_limit = 50                            # optional runaway bound (1..=1000)
 # # model = { model = "haiku" }                   # optional; same endpoint only
+# # Optional: force this sub-agent to return a structured answer via the built-in
+# # `respond` tool. FLAT objects only — scalar / enum / array-of-scalar properties,
+# # `required`, and `additionalProperties = false`. No nesting, no regex/pattern.
+# # The dispatch handoff's first line is then the JSON payload (or a marked fallback).
+# # response_format = { type = "object", additionalProperties = false, required = ["severity", "summary"], properties = { severity = { type = "string", enum = ["low", "high"] }, files = { type = "array", items = { type = "string" } }, summary = { type = "string" } } }
