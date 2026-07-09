@@ -34,7 +34,9 @@ pub struct RunState {
 
 impl RunState {
     pub fn get<T: 'static>(&self) -> Option<&T> {
-        self.map.get(&TypeId::of::<T>()).and_then(|b| b.downcast_ref())
+        self.map
+            .get(&TypeId::of::<T>())
+            .and_then(|b| b.downcast_ref())
     }
     pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
         self.map
