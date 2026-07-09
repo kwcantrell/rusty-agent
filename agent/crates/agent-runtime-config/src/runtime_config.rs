@@ -495,6 +495,77 @@ impl RuntimeConfig {
                 self.sandbox_mode
             ));
         }
+        // ---- Named sub-agents (spec §2.7) ----
+        let mut seen = std::collections::HashSet::new();
+        for s in &self.named_subagents {
+            if s.name.trim().is_empty() {
+                return Err("named_subagents: name must be non-empty".into());
+            }
+            if s.name == "general-purpose" {
+                return Err(
+                    "named_subagents: 'general-purpose' is a reserved name and cannot be redefined"
+                        .into(),
+                );
+            }
+            if !seen.insert(s.name.clone()) {
+                return Err(format!("named_subagents: duplicate name '{}'", s.name));
+            }
+            if s.description.trim().is_empty() {
+                return Err(format!(
+                    "named_subagents['{}']: description must be non-empty",
+                    s.name
+                ));
+            }
+            if s.system_prompt.trim().is_empty() {
+                return Err(format!(
+                    "named_subagents['{}']: system_prompt must be non-empty",
+                    s.name
+                ));
+            }
+            if s.system_prompt.chars().count() > MAX_SUBAGENT_SYSTEM_PROMPT_CHARS {
+                return Err(format!(
+                    "named_subagents['{}']: system_prompt exceeds {MAX_SUBAGENT_SYSTEM_PROMPT_CHARS} chars",
+                    s.name
+                ));
+            }
+            if let Some(n) = s.tool_call_limit {
+                if !(1..=MAX_SUBAGENT_TOOL_CALLS).contains(&n) {
+                    return Err(format!(
+                        "named_subagents['{}']: tool_call_limit must be 1..={MAX_SUBAGENT_TOOL_CALLS}",
+                        s.name
+                    ));
+                }
+            }
+            if let Some(cl) = s.model.as_ref().and_then(|m| m.context_limit) {
+                if cl < 1024 {
+                    return Err(format!(
+                        "named_subagents['{}']: model.context_limit must be >= 1024",
+                        s.name
+                    ));
+                }
+            }
+            // M3: a spec may re-point the model NAME/protocol/window, never the
+            // endpoint — child inference stays on the config's declared backend.
+            if let Some(m) = &s.model {
+                if m.backend.is_some() || m.base_url.is_some() || m.claude_binary.is_some() {
+                    return Err(format!(
+                        "named_subagents['{}']: model may set only model/protocol/context_limit/max_tokens (not backend/base_url/claude_binary)",
+                        s.name
+                    ));
+                }
+            }
+            // Reserved fields are inert in 3B-1 (spec §2.7 item 6).
+            if s.permissions.is_some()
+                || s.response_format.is_some()
+                || s.middleware.is_some()
+                || s.skills.is_some()
+            {
+                return Err(format!(
+                    "named_subagents['{}']: permissions/response_format/middleware/skills are not supported in 3B-1 (see 3B-1b/3B-1c)",
+                    s.name
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1412,6 +1483,95 @@ mod tests {
             c.sandbox_mode = mode.to_string();
             assert!(c.validate().is_ok(), "mode '{mode}' should be valid");
         }
+    }
+
+    fn cfg_with(specs: Vec<SubAgentSpec>) -> RuntimeConfig {
+        RuntimeConfig {
+            named_subagents: specs,
+            ..RuntimeConfig::default()
+        }
+    }
+    fn spec(name: &str) -> SubAgentSpec {
+        SubAgentSpec {
+            name: name.into(),
+            description: "d".into(),
+            system_prompt: "p".into(),
+            tools: None,
+            model: None,
+            tool_call_limit: None,
+            permissions: None,
+            response_format: None,
+            middleware: None,
+            skills: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_reserved_general_purpose_name() {
+        assert!(cfg_with(vec![spec("general-purpose")]).validate().is_err());
+    }
+    #[test]
+    fn validate_rejects_duplicate_names() {
+        assert!(cfg_with(vec![spec("a"), spec("a")]).validate().is_err());
+    }
+    #[test]
+    fn validate_rejects_empty_required_fields() {
+        let mut s = spec("a");
+        s.description = "".into();
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.system_prompt = "".into();
+        assert!(cfg_with(vec![s]).validate().is_err());
+        assert!(cfg_with(vec![spec("")]).validate().is_err());
+    }
+    #[test]
+    fn validate_rejects_oversize_system_prompt_and_bad_tool_call_limit() {
+        let mut s = spec("a");
+        s.system_prompt = "x".repeat(MAX_SUBAGENT_SYSTEM_PROMPT_CHARS + 1);
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.tool_call_limit = Some(0);
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.tool_call_limit = Some(MAX_SUBAGENT_TOOL_CALLS + 1);
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.tool_call_limit = Some(MAX_SUBAGENT_TOOL_CALLS);
+        assert!(cfg_with(vec![s]).validate().is_ok());
+    }
+    #[test]
+    fn validate_rejects_reserved_fields_and_model_endpoint_override() {
+        let mut s = spec("a");
+        s.permissions = Some(serde_json::json!({}));
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.response_format = Some(serde_json::json!({}));
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.middleware = Some(vec!["memory_recall".into()]);
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.skills = Some(vec!["x".into()]);
+        assert!(cfg_with(vec![s]).validate().is_err());
+        // model may set model/protocol/context_limit/max_tokens, NOT the endpoint.
+        let mut s = spec("a");
+        s.model = Some(ModelRef {
+            model: Some("haiku".into()),
+            ..Default::default()
+        });
+        assert!(cfg_with(vec![s]).validate().is_ok());
+        let mut s = spec("a");
+        s.model = Some(ModelRef {
+            base_url: Some("http://evil".into()),
+            ..Default::default()
+        });
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.model = Some(ModelRef {
+            backend: Some("openai".into()),
+            ..Default::default()
+        });
+        assert!(cfg_with(vec![s]).validate().is_err());
     }
 
     #[test]
