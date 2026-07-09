@@ -252,6 +252,101 @@ impl Middleware for MemoryRecallMiddleware {
     }
 }
 
+/// Scheduled context curation: loop-bottom maintain each tool turn, plus the
+/// text-only-exit maintain when no tool turn ran (spec §5.5). Ships the
+/// context tools (child-invisible; children get per-dispatch instances).
+pub struct ContextCurationMiddleware {
+    store: Arc<dyn crate::OffloadStore>,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    max_result_bytes: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct Maintained(pub(crate) bool);
+
+impl ContextCurationMiddleware {
+    pub fn new(
+        store: Arc<dyn crate::OffloadStore>,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+        max_result_bytes: usize,
+    ) -> Self {
+        Self {
+            store,
+            flag,
+            max_result_bytes,
+        }
+    }
+
+    /// `at_text_exit` selects the trace-log message so it matches the deleted
+    /// loop_.rs blocks byte-for-byte on both paths (task-5 brief).
+    async fn maintain(&self, cx: &mut RunCx<'_>, at_text_exit: bool) {
+        // Destructure first: MaintCtx borrows `sink`/`cancel`/`maint` immutably
+        // while `ctx.maintain(&deps)` needs `&mut ctx` — a live immutable
+        // borrow through `cx` as a whole would conflict otherwise (BORROW
+        // NOTE, task-5 brief). Destructuring splits `cx` into disjoint
+        // fields so the borrow checker can see they don't overlap.
+        let RunCx {
+            ctx,
+            sink,
+            cancel,
+            maint,
+            ..
+        } = cx;
+        let deps = crate::MaintCtx {
+            model_limit: maint.maint_model_limit,
+            model: maint.maint_model,
+            sink,
+            cancel,
+        };
+        let report = ctx.maintain(&deps).await;
+        if report.offloaded > 0 || report.compacted_turns > 0 {
+            if at_text_exit {
+                tracing::debug!(
+                    offloaded = report.offloaded,
+                    offloaded_bytes = report.offloaded_bytes,
+                    compacted_turns = report.compacted_turns,
+                    "context maintained at text-only exit"
+                );
+            } else {
+                tracing::debug!(
+                    offloaded = report.offloaded,
+                    offloaded_bytes = report.offloaded_bytes,
+                    compacted_turns = report.compacted_turns,
+                    "context maintained"
+                );
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Middleware for ContextCurationMiddleware {
+    fn name(&self) -> &str {
+        "context-curation"
+    }
+    fn tools(&self) -> Vec<ToolContribution> {
+        crate::context_tools(self.store.clone(), self.flag.clone(), self.max_result_bytes)
+            .into_iter()
+            .map(|tool| ToolContribution {
+                tool,
+                child_visible: false,
+            })
+            .collect()
+    }
+    async fn on_turn_end(&self, cx: &mut RunCx<'_>) -> Flow {
+        self.maintain(cx, false).await;
+        cx.state.entry::<Maintained>().0 = true;
+        Flow::Continue
+    }
+    async fn after_final_reply(&self, cx: &mut RunCx<'_>) {
+        // Text-exit maintain fires only when no tool turn maintained this run
+        // (today's run_maintained gate; spec §5.5 pins the cadence).
+        if !cx.state.get::<Maintained>().map(|m| m.0).unwrap_or(false) {
+            self.maintain(cx, true).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

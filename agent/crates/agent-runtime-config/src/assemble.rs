@@ -179,6 +179,14 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
             parts.memory_retriever.clone(),
         )));
     }
+    // Scheduled context curation (spec §5.5): loop-bottom + text-exit maintain,
+    // plus the context-management tools (child-invisible; children get their
+    // own per-dispatch instance bound to a fresh store/flag below).
+    stack.push(Arc::new(agent_core::ContextCurationMiddleware::new(
+        parts.offload_store.clone(),
+        parts.compact_flag.clone(),
+        cfg.max_tool_result_bytes,
+    )));
     // Register child-visible contributions BEFORE the child_base snapshot;
     // the rest after (spec §5.6). debug_assert: no name collisions.
     for c in stack.iter().flat_map(|m| m.tools()) {
@@ -197,21 +205,12 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     let child_base = cfg.subagents.then(|| registry.all());
 
     // Non-child-visible middleware tool contributions register after the
-    // snapshot (none yet — Task 5 adds context-curation tools here).
+    // snapshot — context-curation tools land here (child-invisible: children
+    // get their own instance in dispatch.rs, spec §5.6).
     for c in stack.iter().flat_map(|m| m.tools()) {
         if !c.child_visible {
             registry.register(c.tool.clone());
         }
-    }
-
-    // Context-management tools share the caller-owned offload store + compact flag
-    // with the frontend's CuratedContext (passed in via LoopParts).
-    for t in agent_core::context_tools(
-        parts.offload_store.clone(),
-        parts.compact_flag.clone(),
-        cfg.max_tool_result_bytes,
-    ) {
-        registry.register(t);
     }
 
     let available: HashSet<String> = skill_registry.scan().into_iter().map(|s| s.name).collect();

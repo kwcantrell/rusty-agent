@@ -666,13 +666,6 @@ impl AgentLoop {
         // claude_cli inline). Plain config still controls the tool-less case.
         let preserve_thinking = self.config.preserve_thinking || !self.tools.schemas().is_empty();
 
-        // Whether this run has already been curated by a loop-bottom maintain
-        // (i.e. completed at least one tool turn). Gates the text-exit maintain
-        // to PURE text-only runs — the structural gap — so tool-bearing runs
-        // keep the exact v3 maintenance cadence (an extra exit pass measurably
-        // wobbled locked-portmap/memory-roster; see the 2026-07-02 spec).
-        let mut run_maintained = false;
-
         for turn in 0..self.config.max_turns {
             if cancel.is_cancelled() {
                 self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
@@ -914,37 +907,11 @@ impl AgentLoop {
             ctx.append(msg);
 
             if all_calls.is_empty() {
-                // End-of-run curation for PURE text-only runs: their reply
-                // ends the run before the loop-bottom maintain, so a chat
-                // session would never be curated at all — only silently
-                // truncated by build(). Tool-bearing runs skip this: they were
-                // already maintained after each tool turn, and an extra exit
-                // pass measurably wobbled locked-portmap/memory-roster by
-                // compacting one unit deeper per run. (Start-of-turn
-                // maintenance was tried first and regressed memory-roster
-                // 10/10 -> 6/10: maintaining with the fresh user prompt
-                // already appended pushes the previous tool turn into the
-                // compactable span one run earlier, and the model imitates the
-                // visible ack-without-tool-call pattern. See the 2026-07-02
-                // maintain-start-of-turn spec.)
-                if !run_maintained {
-                    let deps = crate::MaintCtx {
-                        model_limit: self.maint_model_limit(),
-                        model: self.maint_model(),
-                        sink: &self.sink,
-                        cancel: &cancel,
-                    };
-                    let report = ctx.maintain(&deps).await;
-                    if report.offloaded > 0 || report.compacted_turns > 0 {
-                        tracing::debug!(
-                            offloaded = report.offloaded,
-                            offloaded_bytes = report.offloaded_bytes,
-                            compacted_turns = report.compacted_turns,
-                            "context maintained at text-only exit"
-                        );
-                    }
-                }
-
+                // End-of-run curation for PURE text-only runs now lives in
+                // ContextCurationMiddleware::after_final_reply (spec §5.5):
+                // it fires only when no tool turn's on_turn_end already
+                // maintained this run (the Maintained run-state marker).
+                //
                 // Node hook: after_final_reply (spec §5.1) — text-only exit only
                 // (loop_.rs J5); no Flow, the run is already ending.
                 self.fire_final_reply(ctx, &mut mw_state, &cancel, turn)
@@ -1239,23 +1206,11 @@ impl AgentLoop {
                 ));
             }
 
-            let deps = crate::MaintCtx {
-                model_limit: self.maint_model_limit(),
-                model: self.maint_model(),
-                sink: &self.sink,
-                cancel: &cancel,
-            };
-            let report = ctx.maintain(&deps).await;
-            run_maintained = true;
-            if report.offloaded > 0 || report.compacted_turns > 0 {
-                tracing::debug!(
-                    offloaded = report.offloaded,
-                    offloaded_bytes = report.offloaded_bytes,
-                    compacted_turns = report.compacted_turns,
-                    "context maintained"
-                );
-            }
-
+            // Scheduled loop-bottom maintain now lives in
+            // ContextCurationMiddleware::on_turn_end (spec §5.5), fired below;
+            // it also sets the Maintained run-state marker that gates the
+            // text-only-exit maintain in after_final_reply.
+            //
             // Node hook: on_turn_end (spec §5.1).
             let flow = self.fire_turn_end(ctx, &mut mw_state, &cancel, turn).await;
             if let crate::Flow::EndRun(reason) = flow {
@@ -5363,6 +5318,12 @@ mod tests {
     }
 
     /// Context stub recording the order of maintain() and build() calls.
+    /// `usize::MAX` is the sentinel the middleware seam's own
+    /// `assert_no_orphans` invariant self-check uses (loop_.rs
+    /// `AgentLoop::assert_no_orphans`, fired after every node hook,
+    /// independent of what that hook does) — it is not a "the loop is
+    /// building a request" event, so it is excluded from the recorded
+    /// cadence these tests pin.
     struct SeqCtx {
         history: Vec<Message>,
         calls: std::sync::Mutex<Vec<&'static str>>,
@@ -5375,8 +5336,10 @@ mod tests {
         fn set_system(&mut self, _: Message) {}
         fn set_recall(&mut self, _: Vec<String>) {}
         fn set_goal(&mut self, _: String) {}
-        fn build(&self, _limit: usize) -> Vec<Message> {
-            self.calls.lock().unwrap().push("build");
+        fn build(&self, limit: usize) -> Vec<Message> {
+            if limit != usize::MAX {
+                self.calls.lock().unwrap().push("build");
+            }
             self.history.clone()
         }
         async fn maintain(&mut self, _deps: &crate::MaintCtx<'_>) -> crate::MaintReport {
@@ -5399,6 +5362,8 @@ mod tests {
             "just a chat reply".into(),
         )]));
         let sink = Arc::new(CollectingSink::default());
+        let store: Arc<dyn crate::OffloadStore> = Arc::new(crate::InMemoryOffloadStore::new());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let agent = AgentLoop::new(
             model,
             Arc::new(PassthroughProtocol),
@@ -5417,7 +5382,10 @@ mod tests {
                 stream_idle_timeout: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
-        );
+        )
+        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(
+            store, flag, 16384,
+        ))]);
         let mut ctx = SeqCtx {
             history: vec![],
             calls: Default::default(),
@@ -5456,6 +5424,8 @@ mod tests {
             Scripted::Text("The file says FILEBODY".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
+        let store: Arc<dyn crate::OffloadStore> = Arc::new(crate::InMemoryOffloadStore::new());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let agent = AgentLoop::new(
             model,
             Arc::new(PassthroughProtocol),
@@ -5474,7 +5444,10 @@ mod tests {
                 stream_idle_timeout: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
-        );
+        )
+        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(
+            store, flag, 16384,
+        ))]);
         let mut ctx = SeqCtx {
             history: vec![],
             calls: Default::default(),

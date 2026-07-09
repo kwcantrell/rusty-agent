@@ -16,9 +16,9 @@
 
 use agent_core::testkit::{AlwaysApprove, Scripted, ScriptedModel};
 use agent_core::{
-    built_tokens, AgentEvent, AgentLoop, ContextManager, ContextRecallTool, CuratedContext,
-    EventSink, InMemoryOffloadStore, LoopConfig, MaintCtx, MaintReport, OffloadConfig,
-    OffloadEntry, OffloadKind, OffloadStore,
+    built_tokens, AgentEvent, AgentLoop, ContextCurationMiddleware, ContextManager,
+    ContextRecallTool, CuratedContext, EventSink, InMemoryOffloadStore, LoopConfig, MaintCtx,
+    MaintReport, OffloadConfig, OffloadEntry, OffloadKind, OffloadStore,
 };
 use agent_model::{Message, ModelClient, NativeProtocol, OpenAiCompatClient, Role};
 use agent_policy::RulePolicy;
@@ -149,7 +149,7 @@ async fn loop_stays_bounded_under_many_large_outputs_and_recalls() {
     // keep_recent: 1 means each turn's blob offloads once the next arrives, so by
     // the end ids 1..=BLOBS-1 are in the store. high_water_pct 2.0 disables
     // compaction so this test isolates the offload+window path.
-    let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag)
+    let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag.clone())
         .with_offload_config(OffloadConfig {
             keep_recent: 1,
             ..Default::default()
@@ -178,7 +178,12 @@ async fn loop_stays_bounded_under_many_large_outputs_and_recalls() {
             stream_idle_timeout: Duration::from_secs(120),
             ..Default::default()
         },
-    );
+    )
+    .with_middleware(vec![Arc::new(ContextCurationMiddleware::new(
+        store.clone(),
+        flag,
+        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
+    ))]);
     agent
         .run(&mut ctx, "stress the context window".into())
         .await
@@ -536,7 +541,7 @@ async fn live_window_stays_bounded_under_model_driven_volume() {
          for a given integer `n`. When you call a tool, wait for its result.",
         ),
         store.clone(),
-        flag,
+        flag.clone(),
     )
     .with_offload_config(OffloadConfig {
         keep_recent: 2,
@@ -570,7 +575,12 @@ async fn live_window_stays_bounded_under_model_driven_volume() {
             stream_idle_timeout: Duration::from_secs(120),
             ..Default::default()
         },
-    );
+    )
+    .with_middleware(vec![Arc::new(ContextCurationMiddleware::new(
+        store.clone(),
+        flag,
+        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
+    ))]);
 
     agent
         .run(

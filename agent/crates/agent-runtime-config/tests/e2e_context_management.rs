@@ -9,8 +9,8 @@
 
 use agent_core::testkit::{AlwaysApprove, Scripted, ScriptedModel};
 use agent_core::{
-    AgentEvent, AgentLoop, ContextManager, ContextRecallTool, CuratedContext, EventSink,
-    InMemoryOffloadStore, LoopConfig, OffloadConfig, OffloadStore,
+    AgentEvent, AgentLoop, ContextCurationMiddleware, ContextManager, ContextRecallTool,
+    CuratedContext, EventSink, InMemoryOffloadStore, LoopConfig, OffloadConfig, OffloadStore,
 };
 use agent_model::{Message, NativeProtocol, Role};
 use agent_policy::RulePolicy;
@@ -111,11 +111,16 @@ fn loop_config(workspace: std::path::PathBuf) -> LoopConfig {
     }
 }
 
+/// `store`/`flag` are the SAME handles the test's `CuratedContext` uses — the
+/// loop's scheduled maintain now runs via `ContextCurationMiddleware`, whose
+/// context tools must share the context's offload table (spec §5.5).
 fn build_loop(
     reg: ToolRegistry,
     model: ScriptedModel,
     sink: Arc<Capture>,
     ws: std::path::PathBuf,
+    store: Arc<dyn OffloadStore>,
+    flag: Arc<AtomicBool>,
 ) -> AgentLoop {
     AgentLoop::new(
         Arc::new(model),
@@ -130,6 +135,11 @@ fn build_loop(
         sink,
         loop_config(ws),
     )
+    .with_middleware(vec![Arc::new(ContextCurationMiddleware::new(
+        store,
+        flag,
+        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
+    ))])
 }
 
 /// The headline round-trip: a large tool error is auto-offloaded by `maintain`
@@ -162,14 +172,14 @@ async fn offload_then_recall_round_trips_through_the_loop() {
     let sink = Arc::new(Capture::default());
 
     // keep_recent: 0 makes the single turn-1 error immediately eligible to offload.
-    let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag)
+    let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag.clone())
         .with_offload_config(OffloadConfig {
             keep_recent: 0,
             error_min_bytes: 50,
             ..Default::default()
         });
 
-    build_loop(reg, model, sink.clone(), ws)
+    build_loop(reg, model, sink.clone(), ws, store.clone(), flag)
         .run(&mut ctx, "Trigger the failure, then recover it.".into())
         .await
         .unwrap();
@@ -220,9 +230,9 @@ async fn recall_unknown_id_feeds_error_back_and_continues() {
 
     // Default offload config: the short not-found error stays in the window so we
     // can assert it was fed back to the model.
-    let mut ctx = CuratedContext::new(Message::system("SYS"), store, flag);
+    let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag.clone());
 
-    build_loop(reg, model, sink.clone(), ws)
+    build_loop(reg, model, sink.clone(), ws, store, flag)
         .run(&mut ctx, "Recall entry 999.".into())
         .await
         .unwrap();

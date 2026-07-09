@@ -1,7 +1,7 @@
 //! Sub-agent dispatch: sub-agents-as-tools (spec 2026-07-01-subagent-dispatch-core).
 use crate::{
-    AgentEvent, AgentLoop, CuratedContext, EventSink, InMemoryOffloadStore, LoopConfig,
-    OffloadConfig,
+    AgentEvent, AgentLoop, ContextCurationMiddleware, CuratedContext, EventSink,
+    InMemoryOffloadStore, LoopConfig, Middleware, OffloadConfig,
 };
 use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, PolicyEngine};
@@ -473,8 +473,15 @@ impl Tool for DispatchAgentTool {
         }
         let store: Arc<dyn crate::OffloadStore> = Arc::new(InMemoryOffloadStore::new());
         let flag = Arc::new(AtomicBool::new(false));
-        for t in crate::context_tools(store.clone(), flag.clone(), self.deps.max_result_bytes) {
-            reg.register(t);
+        // Each dispatch child gets its own ContextCurationMiddleware instance,
+        // bound to THIS child's store/flag (never the parent's) — spec §5.6.
+        let curation = Arc::new(ContextCurationMiddleware::new(
+            store.clone(),
+            flag.clone(),
+            self.deps.max_result_bytes,
+        ));
+        for c in curation.tools() {
+            reg.register(c.tool.clone());
         }
         // Finding 4.1: apply the parent's description overrides to the child
         // registry (registry-level, matching assemble.rs's parent application).
@@ -509,6 +516,10 @@ impl Tool for DispatchAgentTool {
             sink.clone(),
             self.deps.loop_config.clone(),
         );
+        // Own middleware instance per child (spec §5.6): scheduled curation
+        // against THIS child's store/flag, not the parent's. StuckDetection
+        // joins this stack in Task 6.
+        let child = child.with_middleware(vec![curation]);
         // Route child-loop compaction through the dedicated model when set.
         let child = match &self.deps.compaction_model {
             Some(m) => child.with_compaction_model(m.clone()),
