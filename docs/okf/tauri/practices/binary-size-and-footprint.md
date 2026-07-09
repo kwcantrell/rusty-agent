@@ -44,8 +44,9 @@ combined size-and-security win
 Tauri publishes a benchmark repository comparing Tauri, Wry, and Electron across
 execution time, binary size, peak memory, thread count, and syscall count, run on
 GitHub Actions across the three desktop OSes with `hyperfine` (3 warm-ups, 10
-sequences) over workloads like prime computation, hello-world startup, custom
-protocol, and file transfer [3]. Useful, but do not take the memory numbers at face
+sequences) over three primary workloads: Hello World (startup time), CPU
+Intensive (prime calculation with web workers), and Custom Protocol/File
+Transfer (3MB files) [3]. Useful, but do not take the memory numbers at face
 value. GitHub issue #5889 challenges the published memory results directly: the
 methodology fails to account for shared memory in Chromium-based apps, and in
 real-world use Tauri's WebKit implementation consumed **substantially more** RAM

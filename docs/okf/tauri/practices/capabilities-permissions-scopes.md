@@ -35,8 +35,8 @@ URLs are reachable [4].
 **Capabilities** bind permissions to *frontend contexts* — specific windows and
 platforms [5]. They live in `src-tauri/capabilities/` (file-based, inline in
 `tauri.conf.json`, or hybrid) and each declares an identifier, target `windows`,
-and `permissions` [5]. Permissions only take effect once referenced by a
-capability [3].
+and `permissions` [5]. Capabilities reference permissions, and only take effect
+once capabilities are explicitly enabled in `tauri.conf.json` [3].
 
 ## Least privilege per window and per platform
 

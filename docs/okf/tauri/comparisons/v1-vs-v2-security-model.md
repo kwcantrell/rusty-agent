@@ -33,7 +33,7 @@ The limits are stated plainly. Capabilities "address frontend compromise risks b
 The move is mandatory when upgrading — the allowlist is gone, so there is no v1-compatible path forward [1]. Concretely:
 
 - **Config restructuring.** The `tauri` config key is renamed to `app`, and the allowlist configuration is replaced by the permissions model [1].
-- **Capability files.** You create capability files in `src-tauri/capabilities/`, and application-level permissions live in `src-tauri/permissions/<identifier>.toml` — TOML only for app permissions [1][3].
+- **Capability files.** You create capability files in `src-tauri/capabilities/`. Application-level permissions live in `src-tauri/permissions/<identifier>.toml` (TOML format only for app permissions), while capability files support both JSON and TOML formats [1][3].
 - **APIs became plugins.** Much of what the allowlist gated — dialog, clipboard, HTTP, notification, shell, global shortcut, CLI — moved into dedicated plugins, each shipping its own default permission set you must opt into [1]. Adding a plugin with `tauri add <plugin>` brings its permissions, which you then reference in a capability [6].
 - **Automated but not hands-off.** The `tauri migrate` command auto-converts v1 allowlist configuration into v2 capability files, but "manual review of all changes remains necessary" [1].
 
