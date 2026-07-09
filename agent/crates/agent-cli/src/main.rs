@@ -258,8 +258,7 @@ async fn main() {
         &workspace,
     );
 
-    let offload_store: Arc<dyn agent_core::OffloadStore> =
-        Arc::new(agent_core::InMemoryOffloadStore::new());
+    let artifacts = Arc::new(agent_core::SessionArtifacts::new());
     let compact_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Session-lifetime observability handles: created ONCE (a per-assemble
     // TraceWriter would mint a colliding {epoch}-{pid} session id).
@@ -281,7 +280,7 @@ async fn main() {
             memory_retriever: memory.retriever.clone(),
             stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
             base_system_prompt: BASE_SYSTEM_PROMPT.to_string(),
-            offload_store: offload_store.clone(),
+            artifacts: artifacts.clone(),
             compact_flag: compact_flag.clone(),
             sandbox: sandbox.clone(),
             stats: stats.clone(),
@@ -301,7 +300,7 @@ async fn main() {
 
     let mut ctx = CuratedContext::new(
         Message::system(built.system_prompt),
-        offload_store,
+        artifacts,
         compact_flag,
     )
     .with_recall_budget(memory.recall_token_budget)

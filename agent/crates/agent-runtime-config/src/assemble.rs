@@ -24,10 +24,11 @@ pub struct LoopParts {
     pub memory_retriever: Option<Arc<dyn Retriever>>,
     pub stream_idle_timeout: Duration,
     pub base_system_prompt: String,
-    /// Offload table the `context_recall` tool reads. The caller owns it and
-    /// shares the same handle with its `CuratedContext`. On a loop rebuild (server
-    /// settings change), pass the SAME handle so the conversation's table survives.
-    pub offload_store: Arc<dyn agent_core::OffloadStore>,
+    /// Artifact stores the curator writes offloaded content into. The caller
+    /// owns them and shares the SAME handle with its `CuratedContext`. On a loop
+    /// rebuild (server settings change), pass the SAME handle so the
+    /// conversation's offloaded artifacts survive (spec §5.3).
+    pub artifacts: Arc<agent_core::SessionArtifacts>,
     /// Flag the `context_compact` tool sets; the caller's `CuratedContext` reads it.
     pub compact_flag: Arc<std::sync::atomic::AtomicBool>,
     /// The frontend's single sandbox instance — one probe + one availability
@@ -182,9 +183,7 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     // plus the context-management tools (child-invisible; children get their
     // own per-dispatch instance bound to a fresh store/flag below).
     stack.push(Arc::new(agent_core::ContextCurationMiddleware::new(
-        parts.offload_store.clone(),
         parts.compact_flag.clone(),
-        cfg.max_tool_result_bytes,
     )));
     // Repeated-identical-call detection (spec §5.5): stateless, so a single
     // shared instance is fine on both the parent and every dispatch child.
@@ -402,6 +401,33 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     };
     let agent = agent.with_middleware(stack);
 
+    // The guarded composite tools see: two read-only artifact mounts over the
+    // caller's SessionArtifacts, backed by a HostBackend at the workspace root
+    // (spec §5.2/§5.6). Curation writes go through the UNWRAPPED handles.
+    use agent_tools::backend::{Backend, CompositeBackend, HostBackend, ReadOnlyToTools};
+    for name in ["large_tool_results", "conversation_history"] {
+        if parts.workspace.join(name).exists() {
+            tracing::warn!(
+                dir = name,
+                "workspace entry is shadowed by a reserved artifact mount (spec §5.2)"
+            );
+        }
+    }
+    let composite: Arc<dyn Backend> = Arc::new(CompositeBackend::new(
+        vec![
+            (
+                "large_tool_results/".into(),
+                Arc::new(ReadOnlyToTools(parts.artifacts.results.clone())) as Arc<dyn Backend>,
+            ),
+            (
+                "conversation_history/".into(),
+                Arc::new(ReadOnlyToTools(parts.artifacts.history.clone())) as Arc<dyn Backend>,
+            ),
+        ],
+        Arc::new(HostBackend::new(parts.workspace.clone())),
+    ));
+    let agent = agent.with_backend(composite);
+
     BuiltLoop {
         loop_: Arc::new(agent),
         system_prompt,
@@ -497,7 +523,7 @@ mod tests {
             memory_retriever: None,
             stream_idle_timeout: Duration::from_secs(99),
             base_system_prompt: "BASE".into(),
-            offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
+            artifacts: Arc::new(agent_core::SessionArtifacts::new()),
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sandbox: crate::build_sandbox(&cfg()),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),

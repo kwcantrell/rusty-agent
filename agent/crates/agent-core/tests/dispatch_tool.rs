@@ -276,10 +276,10 @@ async fn allowlist_accepts_always_available_context_tools() {
         Arc::new(FullSink::default()),
         vec![Arc::new(Echo)],
     ));
-    // context_recall is not in base_tools but IS always registered for the child.
+    // context_compact is not in base_tools but IS always registered for the child.
     let out = tool
         .execute(
-            serde_json::json!({"prompt": "p", "tools": ["context_recall"]}),
+            serde_json::json!({"prompt": "p", "tools": ["context_compact"]}),
             &tool_ctx(),
         )
         .await;
@@ -294,7 +294,7 @@ async fn allowlist_accepts_always_available_context_tools() {
         .unwrap_err();
     assert!(
         matches!(err, ToolError::InvalidArgs(ref m)
-        if m.contains("nope") && m.contains("context_recall")),
+        if m.contains("nope") && m.contains("context_compact")),
         "{err:?}"
     );
 }

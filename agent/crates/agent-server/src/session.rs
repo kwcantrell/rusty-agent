@@ -68,7 +68,7 @@ impl Session {
         let ctx = Arc::new(AsyncMutex::new(
             CuratedContext::new(
                 Message::system(params.system_prompt.clone()),
-                runtime.offload_store(),
+                runtime.artifacts(),
                 runtime.compact_flag(),
             )
             .with_recall_budget(params.recall_token_budget)
@@ -279,7 +279,7 @@ impl Session {
         let mut guard = self.ctx.lock().await;
         *guard = CuratedContext::new(
             Message::system(self.runtime.current_system_prompt()),
-            self.runtime.offload_store(),
+            self.runtime.artifacts(),
             self.runtime.compact_flag(),
         )
         .with_recall_budget(self.recall_budget)

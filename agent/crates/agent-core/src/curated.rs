@@ -5,7 +5,6 @@ use crate::context::{
     DEFAULT_RECALL_TOKEN_BUDGET,
 };
 use crate::event::{AgentEvent, ContextEvent};
-use crate::offload::OffloadStore;
 use crate::offload_policy::{
     capped_preview, placeholder_for, select_offloads, select_oversized, OffloadConfig,
 };
@@ -31,9 +30,15 @@ pub struct CuratedContext {
     /// pinned ledger block. Append-only; never re-summarized (no generation
     /// loss by construction); capped at `FOLDED_FACTS_MAX_TOKENS`.
     pub(crate) folded_facts: Vec<String>,
-    /// Offload-store ids of the verbatim originals behind `folded_facts`.
-    folded_ids: Vec<crate::OffloadId>,
-    pub(crate) store: Arc<dyn OffloadStore>,
+    pub(crate) artifacts: Arc<crate::SessionArtifacts>,
+    /// Prepended to artifact names; children get "sub{n}-" (spec §5.7).
+    artifact_prefix: String,
+    seq: u64,
+    /// History-file state for the summary pointer (spec §5.5, E4).
+    history_has_spans: bool,
+    history_incomplete: bool,
+    /// `## folded-{seq}` sections cited by the ledger (per-batch granularity).
+    folded_sections: Vec<u64>,
     pub(crate) config: OffloadConfig,
     pub(crate) high_water_pct: f32,
     pub(crate) compact_flag: Arc<AtomicBool>,
@@ -47,7 +52,7 @@ pub struct CuratedContext {
 impl CuratedContext {
     pub fn new(
         system: Message,
-        store: Arc<dyn OffloadStore>,
+        artifacts: Arc<crate::SessionArtifacts>,
         compact_flag: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -58,8 +63,12 @@ impl CuratedContext {
             recall_budget: DEFAULT_RECALL_TOKEN_BUDGET,
             compaction_summary: None,
             folded_facts: Vec::new(),
-            folded_ids: Vec::new(),
-            store,
+            artifacts,
+            artifact_prefix: String::new(),
+            seq: 0,
+            history_has_spans: false,
+            history_incomplete: false,
+            folded_sections: Vec::new(),
             config: OffloadConfig::default(),
             high_water_pct: DEFAULT_HIGH_WATER_PCT,
             compact_flag,
@@ -70,6 +79,16 @@ impl CuratedContext {
     pub fn with_recall_budget(mut self, budget: usize) -> Self {
         self.recall_budget = budget;
         self
+    }
+
+    pub fn with_artifact_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.artifact_prefix = prefix.into();
+        self
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
     }
 
     pub fn with_offload_config(mut self, config: OffloadConfig) -> Self {
@@ -108,7 +127,11 @@ impl CuratedContext {
             out.push(r);
         }
         if let Some(c) = &self.compaction_summary {
-            out.push(c.clone());
+            let mut msg = c.clone();
+            if let Some(p) = self.history_pointer() {
+                msg.content = format!("{}\n\n{p}", msg.content);
+            }
+            out.push(msg);
         }
         out
     }
@@ -120,10 +143,10 @@ impl CuratedContext {
     /// numbering makes the block a checklist and a skipped line visible.
     /// Task-conditional wording so routine turns aren't over-influenced.
     fn folded_block_body(&self) -> String {
-        let ids = self
-            .folded_ids
+        let sections = self
+            .folded_sections
             .iter()
-            .map(|i| format!("context_recall({i})"))
+            .map(|s| format!("## folded-{s}"))
             .collect::<Vec<_>>()
             .join(", ");
         let lines = self
@@ -135,10 +158,10 @@ impl CuratedContext {
             .join("\n");
         format!(
             "Ledger of earlier user instructions (facts extracted verbatim; the full \
-             original messages are stored and can be retrieved with {ids} if ever \
-             needed). When a task needs ALL earlier instructions — e.g. assembling a \
-             final list, manifest, or report — copy EVERY numbered line below, without \
-             skipping any:\n{lines}"
+             original messages are preserved in conversation_history/history.md, sections \
+             {sections} — read_file or grep it if ever needed). When a task needs ALL \
+             earlier instructions — e.g. assembling a final list, manifest, or report — \
+             copy EVERY numbered line below, without skipping any:\n{lines}"
         )
     }
 
@@ -162,7 +185,12 @@ impl CuratedContext {
             t += message_tokens(&r);
         }
         if let Some(c) = &self.compaction_summary {
-            t += message_tokens(c);
+            // Lockstep with pinned(): count the composed summary+pointer message.
+            let mut msg = c.clone();
+            if let Some(p) = self.history_pointer() {
+                msg.content = format!("{}\n\n{p}", msg.content);
+            }
+            t += message_tokens(&msg);
         }
         t
     }
@@ -252,19 +280,21 @@ impl ContextManager for CuratedContext {
         for hit in select_oversized(&self.history, &self.config) {
             let content = hit.entry.content.clone();
             let tool = hit.entry.tool_name.clone();
-            self.lift(hit, &mut report, deps, |id| {
-                capped_preview(&content, cap, id, &tool)
-            });
+            self.lift(hit, &mut report, deps, |vpath| {
+                capped_preview(&content, cap, vpath, &tool)
+            })
+            .await;
         }
 
-        // (a) Deterministic age-based offload — sync, cheap, every turn.
+        // (a) Deterministic age-based offload — every turn.
         for hit in select_offloads(&self.history, &self.config) {
             let tool = hit.entry.tool_name.clone();
             let kind = hit.entry.kind.clone();
             let bytes = hit.entry.bytes;
-            self.lift(hit, &mut report, deps, |id| {
-                placeholder_for(id, &tool, &kind, bytes)
-            });
+            self.lift(hit, &mut report, deps, |vpath| {
+                placeholder_for(vpath, &tool, &kind, bytes)
+            })
+            .await;
         }
 
         // (a') Extractive fold — when the retention plan would evict user
@@ -332,35 +362,83 @@ const TRIVIAL_CHATTER_SPAN_TOKENS: usize = 256;
 /// offloaded content, so it must survive compaction verbatim.
 fn is_durable_placeholder_unit(unit: &[Message]) -> bool {
     unit.len() >= 2
-        && unit[1..]
-            .iter()
-            .all(|m| matches!(m.role, Role::Tool) && m.content.starts_with("[tool_result#"))
+        && unit[1..].iter().all(|m| {
+            matches!(m.role, Role::Tool) && crate::offload_policy::is_placeholder(&m.content)
+        })
         && unit.iter().map(message_tokens).sum::<usize>() <= PLACEHOLDER_UNIT_MAX_TOKENS
 }
 
 impl CuratedContext {
-    /// Store a hit's full content in the offload table and replace the window
-    /// copy with whatever `replacement` renders for the assigned id. Shared by
-    /// the ingestion-cap and age-based offload passes.
-    fn lift(
+    /// Write a hit's full content to the results store and replace the window
+    /// copy with whatever `replacement` renders for the assigned virtual path.
+    /// Shared by the ingestion-cap and age-based offload passes. On write
+    /// failure it skips (message intact, retried next maintain — spec §5.5).
+    async fn lift(
         &mut self,
         hit: crate::offload_policy::OffloadHit,
         report: &mut MaintReport,
         deps: &MaintCtx<'_>,
-        replacement: impl FnOnce(crate::OffloadId) -> String,
+        replacement: impl FnOnce(&str) -> String,
     ) {
         let idx = hit.history_index;
         let tool = hit.entry.tool_name.clone();
         let bytes = hit.entry.bytes;
-        let id = self.store.put(hit.entry);
-        self.history[idx].content = replacement(id);
+        let seq = self.next_seq();
+        let key = format!(
+            "{}{}-{}",
+            self.artifact_prefix,
+            seq,
+            agent_tools::backend::sanitize_component(&hit.entry.tool_call_id)
+        );
+        let vpath = format!("large_tool_results/{key}");
+        if let Err(e) = self.artifacts.results.write(&key, &hit.entry.content).await {
+            tracing::warn!(error = %e, "artifact write failed; offload skipped this pass");
+            return;
+        }
+        self.history[idx].content = replacement(&vpath);
         report.offloaded += 1;
         report.offloaded_bytes += bytes;
         deps.sink.emit(AgentEvent::Context(ContextEvent::Offloaded {
-            id,
+            path: vpath,
             bytes,
             tool,
         }));
+    }
+
+    /// Append a `## {section}` block to the history file (spec §5.5, E4).
+    async fn append_history(
+        &self,
+        section: &str,
+        body: &str,
+    ) -> Result<(), agent_tools::backend::FsError> {
+        use agent_tools::backend::FsError;
+        let existing = match self.artifacts.history.read("history.md").await {
+            Ok(s) => s,
+            Err(FsError::NotFound(_)) => String::new(),
+            Err(e) => return Err(e),
+        };
+        let updated = format!("{existing}\n\n## {section}\n\n{body}");
+        self.artifacts
+            .history
+            .write("history.md", updated.trim_start())
+            .await
+    }
+
+    /// The transcript pointer (spec §5.5): tracked as flags, NEVER stored in
+    /// compaction_summary — the summarizer must never see or paraphrase it.
+    fn history_pointer(&self) -> Option<String> {
+        if !self.history_has_spans && !self.history_incomplete {
+            return None;
+        }
+        let prefix = if self.history_incomplete {
+            "Evicted transcripts (INCOMPLETE — at least one span failed to record)"
+        } else {
+            "Evicted transcripts"
+        };
+        Some(format!(
+            "{prefix}: conversation_history/history.md — grep it for \"## folded-\" / \
+             \"## compacted-\" section headers, then read_file from the hit's line offset."
+        ))
     }
 
     /// Fold user units the retention plan is about to evict: extract their
@@ -429,23 +507,20 @@ impl CuratedContext {
                 return;
             }
         };
-        // Verbatim originals to the offload store, one batch entry.
+        // Verbatim originals to the history file, one batch section. Write
+        // FIRST, abort-on-failure (all-or-nothing keeps its exact shape, §5.5).
         let content = folded
             .iter()
             .map(|m| format!("[user] {}", m.content))
             .collect::<Vec<_>>()
             .join("\n");
         let bytes = content.len();
-        let id = self.store.put(crate::offload::OffloadEntry {
-            id: 0,
-            tool_call_id: String::new(),
-            tool_name: "user_history".into(),
-            kind: crate::offload::OffloadKind::Output,
-            content,
-            bytes,
-            turn: 0,
-        });
-        self.folded_ids.push(id);
+        let seq = self.next_seq();
+        if let Err(e) = self.append_history(&format!("folded-{seq}"), &content).await {
+            tracing::warn!(error = %e, "history write failed; leaving fold for the next maintain");
+            return;
+        }
+        self.folded_sections.push(seq);
         self.folded_facts.extend(lines);
         // Cap the ledger, dropping OLDEST lines first (originals stay in the
         // store, so this is strictly no worse than silent eviction).
@@ -466,7 +541,7 @@ impl CuratedContext {
         report.offloaded += 1;
         report.offloaded_bytes += bytes;
         deps.sink.emit(AgentEvent::Context(ContextEvent::Offloaded {
-            id,
+            path: "conversation_history/history.md".into(),
             bytes,
             tool: "user_history".into(),
         }));
@@ -504,9 +579,10 @@ impl CuratedContext {
             let tool = hit.entry.tool_name.clone();
             let kind = hit.entry.kind.clone();
             let bytes = hit.entry.bytes;
-            self.lift(hit, report, deps, |id| {
-                placeholder_for(id, &tool, &kind, bytes)
-            });
+            self.lift(hit, report, deps, |vpath| {
+                placeholder_for(vpath, &tool, &kind, bytes)
+            })
+            .await;
         }
         // Durable anchors never enter the lossy summarizer: user turns (the
         // author-authored facts most costly to lose) and offload-placeholder
@@ -573,6 +649,30 @@ impl CuratedContext {
                 self.history.extend(recent);
                 self.compaction_summary = Some(summary);
                 report.compacted_turns = to_summarize.len();
+                // Record the summarized span verbatim to the history file so the
+                // pinned summary can point back at it (spec §5.5, E4).
+                let seq = self.next_seq();
+                let rendered: String = to_summarize
+                    .iter()
+                    .map(|m| {
+                        let role = match m.role {
+                            Role::System => "system",
+                            Role::User => "user",
+                            Role::Assistant => "assistant",
+                            Role::Tool => "tool",
+                        };
+                        format!("[{role}] {}\n", m.content)
+                    })
+                    .collect();
+                match self.append_history(&format!("compacted-{seq}"), &rendered).await {
+                    Ok(()) => self.history_has_spans = true,
+                    Err(e) => {
+                        // E4 gate decision: commit anyway; the pointer goes
+                        // permanently honest-incomplete.
+                        tracing::warn!(error = %e, "history write failed; compaction commits without this span");
+                        self.history_incomplete = true;
+                    }
+                }
                 deps.sink.emit(AgentEvent::Context(ContextEvent::Compacted {
                     turns_replaced: to_summarize.len(),
                     tokens_before,
@@ -626,7 +726,6 @@ mod tests {
     use super::*;
     use crate::context::MaintCtx;
     use crate::event::EventSink;
-    use crate::offload::{InMemoryOffloadStore, OffloadKind};
     use crate::testkit::{CollectingSink, Scripted, ScriptedModel};
     use agent_model::{ModelClient, Role};
     use tokio_util::sync::CancellationToken;
@@ -634,9 +733,14 @@ mod tests {
     fn ctx() -> CuratedContext {
         CuratedContext::new(
             Message::system("SYS"),
-            Arc::new(InMemoryOffloadStore::new()),
+            Arc::new(crate::SessionArtifacts::new()),
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    /// Count of keys in the results store (successor of `store.len()`).
+    async fn results_count(c: &CuratedContext) -> usize {
+        c.artifacts.results.ls("").await.unwrap().len()
     }
 
     #[test]
@@ -774,12 +878,17 @@ mod tests {
         let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
 
         assert_eq!(report.offloaded, 1);
-        assert_eq!(c.store.len(), 1);
+        assert_eq!(results_count(&c).await, 1);
         // Live message is now a placeholder; full content recoverable from the store.
         let built = c.build(100_000);
         let tool_msg = built.iter().find(|m| matches!(m.role, Role::Tool)).unwrap();
-        assert!(tool_msg.content.starts_with("[tool_result#1 offloaded"));
-        assert_eq!(c.store.get(1).unwrap().content, big_err);
+        assert!(tool_msg
+            .content
+            .starts_with("[tool_result offloaded to large_tool_results/1-"));
+        assert_eq!(
+            c.artifacts.results.read("1-call-1").await.unwrap(),
+            big_err
+        );
     }
 
     #[tokio::test]
@@ -800,7 +909,7 @@ mod tests {
         c.maintain(&maint_deps(&model, &sink, &cancel)).await;
         let report2 = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
         assert_eq!(report2.offloaded, 0, "second pass must not re-offload");
-        assert_eq!(c.store.len(), 1);
+        assert_eq!(results_count(&c).await, 1);
     }
 
     #[tokio::test]
@@ -907,12 +1016,23 @@ mod tests {
         assert!(matches!(block.role, Role::System));
         assert!(block.content.contains("item_0 = 0000"));
         assert!(
-            block.content.contains("context_recall(1)"),
+            block.content.contains("conversation_history/history.md"),
             "originals advertised: {}",
             block.content
         );
-        // Verbatim originals recoverable from the store.
-        assert!(c.store.get(1).unwrap().content.contains("entry number 0"));
+        assert!(
+            block.content.contains("## folded-1"),
+            "ledger cites its history section: {}",
+            block.content
+        );
+        // Verbatim originals recoverable from the history file.
+        assert!(c
+            .artifacts
+            .history
+            .read("history.md")
+            .await
+            .unwrap()
+            .contains("entry number 0"));
         // Oldest user turns left history; the newest survive verbatim.
         assert!(
             !c.history()
@@ -985,7 +1105,7 @@ mod tests {
         // Roomy window: no eviction, no fold, no ledger.
         let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
         assert_eq!(report.offloaded, 0);
-        assert_eq!(c.store.len(), 0);
+        assert_eq!(results_count(&c).await, 0);
         assert!(!c
             .build(100_000)
             .iter()
@@ -1017,7 +1137,13 @@ mod tests {
         let mut deps = maint_deps(&model, &sink, &cancel);
         deps.model_limit = 250;
         c.maintain(&deps).await;
-        assert_eq!(c.store.len(), 0, "nothing offloaded on failure");
+        assert!(
+            matches!(
+                c.artifacts.history.read("history.md").await,
+                Err(agent_tools::backend::FsError::NotFound(_))
+            ),
+            "nothing written on failure"
+        );
         assert_eq!(
             c.history()
                 .iter()
@@ -1248,7 +1374,7 @@ mod tests {
 
         assert!(report.offloaded >= 1, "departing result must be offloaded");
         assert_eq!(
-            c.store.get(1).unwrap().content,
+            c.artifacts.results.read("1-c1").await.unwrap(),
             secret,
             "full content recoverable from the store"
         );
@@ -1256,7 +1382,7 @@ mod tests {
         assert!(
             built
                 .iter()
-                .any(|m| m.content.starts_with("[tool_result#1 offloaded")),
+                .any(|m| m.content.starts_with("[tool_result offloaded to large_tool_results/1-")),
             "placeholder survives compaction as a durable anchor: {:?}",
             built.iter().map(|m| &m.content).collect::<Vec<_>>()
         );
@@ -1270,9 +1396,9 @@ mod tests {
         c.high_water_pct = 0.0; // force compaction
         c.config.keep_recent = 1;
         let ph = crate::offload_policy::placeholder_for(
-            7,
+            "large_tool_results/7-c1",
             "read_file",
-            &crate::offload::OffloadKind::Output,
+            &crate::offload_policy::OffloadKind::Output,
             5000,
         );
         c.append(parent("c1"));
@@ -1350,7 +1476,7 @@ mod tests {
     fn curated_snapshot_reports_system_recall_and_messages() {
         let mut c = CuratedContext::new(
             Message::system("SYS"),
-            Arc::new(crate::offload::InMemoryOffloadStore::new()),
+            Arc::new(crate::SessionArtifacts::new()),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         c.set_recall(vec!["user likes rust".into()]);
@@ -1541,9 +1667,9 @@ mod tests {
 
     #[tokio::test]
     async fn ingestion_cap_offloads_fresh_oversized_result_before_next_build() {
-        let store = Arc::new(InMemoryOffloadStore::new());
+        let artifacts = Arc::new(crate::SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
-        let mut ctx = CuratedContext::new(Message::system("s"), store.clone(), flag)
+        let mut ctx = CuratedContext::new(Message::system("s"), artifacts.clone(), flag)
             .with_offload_config(OffloadConfig {
                 max_result_bytes: 1024,
                 ..Default::default()
@@ -1568,15 +1694,15 @@ mod tests {
         assert!(msg.content.contains("truncated: showing first"));
         assert_eq!(msg.tool_call_id.as_deref(), Some("c1"), "id must survive");
         // Full content stored, recallable.
-        let entry = store.get(1).expect("entry stored");
-        assert_eq!(entry.content.len(), 50_000);
+        let stored = artifacts.results.read("1-c1").await.expect("entry stored");
+        assert_eq!(stored.len(), 50_000);
         // Offloaded event emitted.
         assert!(
             sink.events
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|e| e == "offloaded:1"),
+                .any(|e| e == "offloaded:large_tool_results/1-c1"),
             "Offloaded event must be emitted"
         );
         // Second pass is a no-op (idempotent).
@@ -1591,9 +1717,9 @@ mod tests {
         // ingestion cap replaces it with a bounded preview, the turn unit is
         // small enough to survive `build` under a limit far below what the
         // uncapped result needs — without orphaning the tool message.
-        let store = Arc::new(InMemoryOffloadStore::new());
+        let artifacts = Arc::new(crate::SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
-        let mut ctx = CuratedContext::new(Message::system("s"), store.clone(), flag)
+        let mut ctx = CuratedContext::new(Message::system("s"), artifacts, flag)
             .with_offload_config(OffloadConfig {
                 max_result_bytes: 1024,
                 ..Default::default()
@@ -1628,9 +1754,9 @@ mod tests {
         // eager pass stores the full content (#1), then the age pass lifts the
         // preview into a second small entry (#2) whose content still carries
         // the marker to #1 — the recall chain stays intact.
-        let store = Arc::new(InMemoryOffloadStore::new());
+        let artifacts = Arc::new(crate::SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
-        let mut ctx = CuratedContext::new(Message::system("s"), store.clone(), flag)
+        let mut ctx = CuratedContext::new(Message::system("s"), artifacts.clone(), flag)
             .with_offload_config(OffloadConfig {
                 max_result_bytes: 1024,
                 output_min_bytes: 100,
@@ -1650,30 +1776,34 @@ mod tests {
 
         assert_eq!(report.offloaded, 2, "eager + age in one pass");
         let msg = &ctx.history()[1];
-        assert!(msg.content.starts_with("[tool_result#2 offloaded:"));
-        assert!(store
-            .get(2)
-            .unwrap()
+        assert!(msg
             .content
-            .contains("context_recall(id: 1"));
-        assert_eq!(store.get(1).unwrap().content.len(), 50_000);
+            .starts_with("[tool_result offloaded to large_tool_results/2-c1"));
+        // Entry #2 is the capped preview, whose marker still points at #1.
+        assert!(artifacts
+            .results
+            .read("2-c1")
+            .await
+            .unwrap()
+            .contains("large_tool_results/1-c1"));
+        assert_eq!(
+            artifacts.results.read("1-c1").await.unwrap().len(),
+            50_000
+        );
     }
 
     #[tokio::test]
     async fn oversized_error_result_is_capped_too() {
-        let store = Arc::new(InMemoryOffloadStore::new());
+        let artifacts = Arc::new(crate::SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
-        let mut ctx = CuratedContext::new(Message::system("s"), store.clone(), flag)
+        let mut ctx = CuratedContext::new(Message::system("s"), artifacts.clone(), flag)
             .with_offload_config(OffloadConfig {
                 max_result_bytes: 1024,
                 ..Default::default()
             });
+        let err_body = format!("ERROR: {}", "e".repeat(50_000));
         ctx.append(parent("c1")); // tool results always follow a tool_calls parent
-        ctx.append(Message::tool(
-            "c1",
-            "shell",
-            format!("ERROR: {}", "e".repeat(50_000)),
-        ));
+        ctx.append(Message::tool("c1", "shell", err_body.clone()));
 
         let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![]));
         let sink_dyn: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
@@ -1684,7 +1814,8 @@ mod tests {
         ctx.maintain(&deps).await;
 
         assert!(ctx.history()[1].content.len() <= 1024);
-        assert!(matches!(store.get(1).unwrap().kind, OffloadKind::Error));
+        // The oversized ERROR body was capped and its full content preserved.
+        assert_eq!(artifacts.results.read("1-c1").await.unwrap(), err_body);
     }
 
     #[tokio::test]

@@ -5353,7 +5353,6 @@ mod tests {
             "just a chat reply".into(),
         )]));
         let sink = Arc::new(CollectingSink::default());
-        let store: Arc<dyn crate::OffloadStore> = Arc::new(crate::InMemoryOffloadStore::new());
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let agent = AgentLoop::new(
             model,
@@ -5374,9 +5373,7 @@ mod tests {
                 ..Default::default()
             },
         )
-        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(
-            store, flag, 16384,
-        ))]);
+        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(flag))]);
         let mut ctx = SeqCtx {
             history: vec![],
             calls: Default::default(),
@@ -5415,7 +5412,6 @@ mod tests {
             Scripted::Text("The file says FILEBODY".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
-        let store: Arc<dyn crate::OffloadStore> = Arc::new(crate::InMemoryOffloadStore::new());
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let agent = AgentLoop::new(
             model,
@@ -5436,9 +5432,7 @@ mod tests {
                 ..Default::default()
             },
         )
-        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(
-            store, flag, 16384,
-        ))]);
+        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(flag))]);
         let mut ctx = SeqCtx {
             history: vec![],
             calls: Default::default(),
