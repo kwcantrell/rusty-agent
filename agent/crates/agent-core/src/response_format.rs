@@ -2,6 +2,8 @@
 //! FLAT-object `response_format`; the synthetic `respond` tool validates the
 //! child's structured answer against it and writes it to a shared handle. No
 //! nesting, no regex, no recursion — validation is a single flat pass.
+use agent_tools::{Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolSchema};
+use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
@@ -168,6 +170,68 @@ fn check_value(
     }
 }
 
+/// The reserved name of the synthetic structured-response tool (spec §2.2).
+pub const RESPOND_TOOL_NAME: &str = "respond";
+
+/// The synthetic tool a named child with a `response_format` uses to return its
+/// structured answer. Validates args against the flat schema and writes the
+/// payload to the shared handle. A pure leaf: no dispatch power, no workspace
+/// side-effects (spec §3 inv. 7).
+pub struct RespondTool {
+    schema: Value,
+    handle: ResponseHandle,
+    description: String,
+}
+
+impl RespondTool {
+    pub fn new(schema: Value, handle: ResponseHandle) -> Self {
+        Self {
+            schema,
+            handle,
+            description: "Return your final answer as structured data matching this \
+                tool's schema. Call this exactly once when the task is complete; its \
+                arguments are returned to the parent as the result. If a call is \
+                rejected as invalid, correct the arguments and call it again."
+                .into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for RespondTool {
+    fn name(&self) -> &str {
+        RESPOND_TOOL_NAME
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: RESPOND_TOOL_NAME.into(),
+            description: self.description.clone(),
+            parameters: self.schema.clone(),
+        }
+    }
+    fn intent(&self, _args: &Value) -> Result<ToolIntent, ToolError> {
+        Ok(ToolIntent {
+            tool: RESPOND_TOOL_NAME.into(),
+            access: Access::Read,
+            paths: vec![],
+            command: None,
+            summary: "return the structured response".into(),
+        })
+    }
+    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        validate_payload(&self.schema, &args)
+            .map_err(|e| ToolError::InvalidArgs(format!("respond: {e}")))?;
+        *self.handle.lock().unwrap() = Some(args);
+        Ok(ToolOutput {
+            content: "response recorded".into(),
+            display: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +306,39 @@ mod tests {
         assert!(validate_payload(&s, &json!({"severity":"low","files":[3]})).is_err()); // bad array element
         assert!(validate_payload(&s, &json!({"severity":"low","files":"a.rs"})).is_err()); // not an array
         assert!(validate_payload(&s, &json!("scalar")).is_err()); // not an object
+    }
+
+    #[tokio::test]
+    async fn respond_tool_writes_handle_on_valid_and_errs_on_invalid() {
+        use agent_tools::{Tool, ToolCtx};
+        use tokio_util::sync::CancellationToken;
+        let schema = good_schema();
+        let handle: ResponseHandle = Arc::new(Mutex::new(None));
+        let tool = RespondTool::new(schema, handle.clone());
+        assert_eq!(tool.name(), RESPOND_TOOL_NAME);
+
+        let ctx = ToolCtx {
+            workspace: std::env::temp_dir(),
+            timeout: std::time::Duration::from_secs(5),
+            cancel: CancellationToken::new(),
+            sandbox: Arc::new(agent_tools::HostExecutor),
+            backend: Arc::new(agent_tools::backend::HostBackend::new(std::env::temp_dir())),
+            call_id: "r1".into(),
+        };
+
+        let ok = tool
+            .execute(json!({"severity": "low", "files": ["a.rs"]}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(ok.content, "response recorded");
+        assert_eq!(handle.lock().unwrap().as_ref().unwrap()["severity"], "low");
+
+        *handle.lock().unwrap() = None;
+        let err = tool
+            .execute(json!({"files": ["a.rs"]}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, agent_tools::ToolError::InvalidArgs(_)));
+        assert!(handle.lock().unwrap().is_none());
     }
 }
