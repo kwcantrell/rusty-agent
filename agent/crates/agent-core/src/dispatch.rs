@@ -357,26 +357,51 @@ impl Tool for DispatchAgentTool {
         )
     }
     fn schema(&self) -> ToolSchema {
+        let mut properties = serde_json::json!({
+            "prompt": {
+                "type": "string",
+                "description": "The complete, self-contained task for the sub-agent: goal, relevant paths/facts, and what to return."
+            },
+            "tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tool (context_compact) is always available. Include dispatch_agent to let the sub-agent dispatch its own (only meaningful when nesting depth allows); the restriction applies transitively to its children. Ignored when subagent_type names a registered sub-agent."
+            },
+            "role": {
+                "type": "string",
+                "description": "Optional persona/role instructions injected into the sub-agent's system prompt (stronger steering than putting them in the prompt). Max 2000 characters. Ignored when subagent_type names a registered sub-agent."
+            }
+        });
+        // Fix M1: expose registered sub-agents as a typed enum so the model can
+        // ROUTE to the right one. Present ONLY when the registry is non-empty, so
+        // an empty registry keeps the schema byte-identical to 3A.
+        if !self.deps.subagents.is_empty() {
+            let mut hints = self.deps.subagents.schema_hints();
+            hints.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut variants: Vec<String> = vec!["general-purpose".into()];
+            let mut doc = String::from(
+                "Which sub-agent to dispatch. 'general-purpose' inherits your tools/model and honors `role`/`tools`. Registered sub-agents (use their own prompt/tools/model, and IGNORE `role`/`tools`): ",
+            );
+            for (i, (name, desc)) in hints.iter().enumerate() {
+                variants.push(name.clone());
+                if i > 0 {
+                    doc.push_str("; ");
+                }
+                doc.push_str(&format!("{name} — {desc}"));
+            }
+            properties["subagent_type"] = serde_json::json!({
+                "type": "string",
+                "enum": variants,
+                "default": "general-purpose",
+                "description": doc,
+            });
+        }
         ToolSchema {
             name: "dispatch_agent".into(),
             description: self.description().into(),
             parameters: serde_json::json!({
                 "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "The complete, self-contained task for the sub-agent: goal, relevant paths/facts, and what to return."
-                    },
-                    "tools": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tool (context_compact) is always available. Include dispatch_agent to let the sub-agent dispatch its own (only meaningful when nesting depth allows); the restriction applies transitively to its children."
-                    },
-                    "role": {
-                        "type": "string",
-                        "description": "Optional persona/role instructions injected into the sub-agent's system prompt (stronger steering than putting them in the prompt). Max 2000 characters."
-                    }
-                },
+                "properties": properties,
                 "required": ["prompt"]
             }),
         }
@@ -415,6 +440,29 @@ impl Tool for DispatchAgentTool {
             .filter(|p| !p.trim().is_empty())
             .ok_or_else(|| ToolError::InvalidArgs("prompt (non-empty string) is required".into()))?
             .to_string();
+        let subagent_type = args
+            .get("subagent_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| "general-purpose".to_string());
+        let resolved: Option<&ResolvedSubAgent> = if subagent_type == "general-purpose" {
+            None
+        } else {
+            match self.deps.subagents.get(&subagent_type) {
+                Some(r) => Some(r),
+                None => {
+                    let mut names: Vec<&str> = self.deps.subagents.names();
+                    names.sort_unstable();
+                    return Err(ToolError::InvalidArgs(format!(
+                        "unknown subagent_type '{subagent_type}'; registered: general-purpose, {}",
+                        names.join(", ")
+                    )));
+                }
+            }
+        };
+        // B4 consumes `resolved` to change child construction; keep the binding
+        // (not yet read) from tripping -D warnings until then.
+        let _ = &resolved;
         let role: Option<String> = match args.get("role") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(s)) => {
@@ -1035,6 +1083,55 @@ mod tests {
             "empty registry must not add subagent_type"
         );
         assert!(props.get("prompt").is_some());
+    }
+
+    // --- Task B3: subagent_type schema enum + parse/resolve ------------------
+
+    fn one_agent_registry() -> Arc<SubAgentRegistry> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "reviewer".to_string(),
+            ResolvedSubAgent {
+                description: "reviews code".into(),
+                system_prompt: format!("You review.\n\n{}", SUBAGENT_PREAMBLE),
+                tools: None,
+                model: Arc::new(ScriptedModel::new(vec![])),
+                protocol: Arc::new(PassthroughProtocol),
+                model_limit: None,
+                max_tokens: None,
+                tool_call_limit: Some(3),
+            },
+        );
+        Arc::new(SubAgentRegistry::from_map(m))
+    }
+
+    #[test]
+    fn nonempty_registry_adds_subagent_type_enum_with_descriptions() {
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
+        deps.subagents = one_agent_registry();
+        let tool = DispatchAgentTool::new(deps);
+        let schema = tool.schema();
+        let st = schema.parameters["properties"]["subagent_type"].clone();
+        let variants: Vec<String> = serde_json::from_value(st["enum"].clone()).unwrap();
+        assert!(variants.contains(&"general-purpose".to_string()));
+        assert!(variants.contains(&"reviewer".to_string()));
+        // description mentions the registered agent's purpose (M1 discovery)
+        assert!(st["description"].as_str().unwrap().contains("reviews code"));
+    }
+
+    #[tokio::test]
+    async fn unknown_subagent_type_is_invalid_args() {
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
+        deps.subagents = one_agent_registry();
+        let tool = DispatchAgentTool::new(deps);
+        let err = tool
+            .execute(
+                serde_json::json!({"prompt":"hi","subagent_type":"nope"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
     }
 
     #[tokio::test]
