@@ -1,9 +1,11 @@
 //! Integration tests for DispatchAgentTool (spec D1-D13 core behaviors).
 use agent_core::testkit::{AlwaysApprove, PassthroughProtocol, Scripted, ScriptedModel};
 use agent_core::{
-    AgentEvent, DispatchAgentTool, DispatchDeps, EventSink, LoopConfig, SUBAGENT_PREAMBLE,
+    AgentEvent, DispatchAgentTool, DispatchDeps, EventSink, LoopConfig, SessionArtifacts,
+    SUBAGENT_PREAMBLE,
 };
 use agent_policy::{Decision, PolicyEngine, RulePolicy};
+use agent_tools::backend::{Backend, CompositeBackend, HostBackend, ReadOnlyToTools};
 use agent_tools::{Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolSchema};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -1335,4 +1337,214 @@ async fn failed_child_returns_partial_transcript() {
     // footer honestly reports "stop: Error" rather than the "failed" fallback
     // (which only fires if the child never recorded any Done at all).
     assert!(out.content.contains("stop: Error"), "{}", out.content);
+}
+
+// --- Task 10 Step 4: child-isolation pins (spec §5.7) ----------------------
+
+/// The two artifact mounts (read-only) over a HostBackend at the workspace root
+/// — exactly the composite assemble/dispatch build for a tenant.
+fn composite_over(artifacts: &Arc<SessionArtifacts>, ws: &std::path::Path) -> Arc<dyn Backend> {
+    Arc::new(CompositeBackend::new(
+        vec![
+            (
+                "large_tool_results/".into(),
+                Arc::new(ReadOnlyToTools(artifacts.results.clone())) as Arc<dyn Backend>,
+            ),
+            (
+                "conversation_history/".into(),
+                Arc::new(ReadOnlyToTools(artifacts.history.clone())) as Arc<dyn Backend>,
+            ),
+        ],
+        Arc::new(HostBackend::new(ws.to_path_buf())),
+    ))
+}
+
+/// A tenant boundary pin: the child prefixes its artifact keys with `sub{n}-`
+/// (spec §5.7), so a parent read of a child-shaped path resolves against the
+/// PARENT store and is NotFound — even when the parent's own store has entries.
+/// No cross-tenant read is possible because the two tenants back different
+/// `SessionArtifacts.results` handles, keyed disjointly.
+#[tokio::test]
+async fn parent_read_of_child_artifact_path_is_not_found_never_cross_tenant() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().to_path_buf();
+
+    // The parent tenant's store, seeded with its OWN artifact ("1-p").
+    let artifacts = Arc::new(SessionArtifacts::new());
+    artifacts
+        .results
+        .write("1-p", "the parent's own offloaded bytes")
+        .await
+        .unwrap();
+    let backend = composite_over(&artifacts, &ws);
+
+    let ctx = ToolCtx {
+        workspace: ws.clone(),
+        timeout: Duration::from_secs(30),
+        cancel: CancellationToken::new(),
+        sandbox: Arc::new(agent_tools::HostExecutor),
+        backend: backend.clone(),
+        call_id: "p1".into(),
+    };
+
+    // A child-shaped key ("sub1-1-c") is absent from the PARENT store, so the
+    // read is NotFound even though the parent store is non-empty.
+    let err = (agent_tools::fs::ReadFile {
+        max_bytes: 16 * 1024,
+    })
+    .execute(
+        serde_json::json!({"path": "large_tool_results/sub1-1-c"}),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, ToolError::NotFound(_)),
+        "a parent read of a child-shaped artifact path must be NotFound: {err:?}"
+    );
+
+    // Control: the parent CAN read its own key, proving the store is live and the
+    // NotFound above is a genuine tenant miss, not a broken mount.
+    let ok = (agent_tools::fs::ReadFile {
+        max_bytes: 16 * 1024,
+    })
+    .execute(serde_json::json!({"path": "large_tool_results/1-p"}), &ctx)
+    .await
+    .unwrap();
+    assert!(ok.content.contains("the parent's own offloaded bytes"));
+}
+
+/// Records forwarded child tool-result content by name (`sub:{name}`), which the
+/// SubagentSink carries in `output.content`.
+#[derive(Default)]
+struct ChildResultSink {
+    results: Mutex<Vec<(String, String)>>,
+}
+impl EventSink for ChildResultSink {
+    fn emit(&self, event: AgentEvent) {
+        if let AgentEvent::ToolResult { name, output, .. } = event {
+            self.results.lock().unwrap().push((name, output.content));
+        }
+    }
+}
+impl ChildResultSink {
+    fn content_for(&self, name: &str) -> Option<String> {
+        self.results
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| c.clone())
+    }
+}
+
+/// A tool that returns a fixed oversized body carrying a unique marker line —
+/// the child's curation offloads it into the CHILD store on the ingestion cap.
+struct BigMarker;
+#[async_trait::async_trait]
+impl Tool for BigMarker {
+    fn name(&self) -> &str {
+        "big_marker"
+    }
+    fn description(&self) -> &str {
+        "returns a large body with a unique marker line"
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "big_marker".into(),
+            description: "big".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+    fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+        Ok(ToolIntent {
+            tool: "big_marker".into(),
+            access: Access::Read,
+            paths: vec![],
+            command: None,
+            summary: "big".into(),
+        })
+    }
+    async fn execute(&self, _a: serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        // > 16 KiB so the child's ingestion cap offloads it whole.
+        let body = format!(
+            "CHILD_MARKER_FACT=neon-42\n{}",
+            "padding line to exceed the ingestion cap ".repeat(600)
+        );
+        Ok(ToolOutput {
+            content: body,
+            display: None,
+        })
+    }
+}
+
+/// Child self-isolation + workspace sharing (spec §5.7): a dispatched child
+/// offloads its own oversized result into its OWN store and recovers it via grep
+/// over `large_tool_results/`, and it can read a workspace file the parent wrote.
+/// Both are asserted from the child's forwarded tool-result content.
+#[tokio::test]
+async fn child_reads_its_own_artifacts_and_shares_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().to_path_buf();
+    std::fs::write(ws.join("shared.txt"), "WORKSPACE_SHARED=yes").unwrap();
+
+    let sink = Arc::new(ChildResultSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            // Turn 1: produce an oversized result → child curation offloads it.
+            Scripted::Call("c1".into(), "big_marker".into(), "{}".into()),
+            // Turn 2: recover it from the child's OWN store via grep (the child
+            // can't predict its sub{n}- prefix, so it discovers by marker).
+            Scripted::Call(
+                "c2".into(),
+                "grep".into(),
+                r#"{"pattern":"CHILD_MARKER_FACT","path":"large_tool_results/"}"#.into(),
+            ),
+            // Turn 3: read the workspace file the parent wrote (shared workspace).
+            Scripted::Call(
+                "c3".into(),
+                "read_file".into(),
+                r#"{"path":"shared.txt"}"#.into(),
+            ),
+            Scripted::Text("recovered and read".into()),
+        ]),
+        sink.clone(),
+        vec![
+            Arc::new(BigMarker),
+            Arc::new(agent_tools::fs::GrepTool),
+            Arc::new(agent_tools::fs::ReadFile {
+                max_bytes: 16 * 1024,
+            }),
+        ],
+    );
+    d.loop_config.workspace = ws.clone();
+    let mut ctx = tool_ctx();
+    ctx.workspace = ws.clone();
+    ctx.backend = Arc::new(HostBackend::new(ws.clone()));
+    let tool = DispatchAgentTool::new(d);
+    tool.execute(serde_json::json!({"prompt": "p"}), &ctx)
+        .await
+        .unwrap();
+
+    // The child grepped its OWN offloaded artifact and got the marker back —
+    // proving it reads its own store (a fresh SessionArtifacts per child).
+    let grep = sink
+        .content_for("sub:grep")
+        .expect("child grep result forwarded");
+    assert!(
+        grep.contains("CHILD_MARKER_FACT=neon-42"),
+        "child must recover its own offloaded marker from large_tool_results/: {grep}"
+    );
+    assert!(
+        grep.contains("large_tool_results/sub"),
+        "the recovered hit must carry the child's sub-prefixed key: {grep}"
+    );
+    // And the child read the parent-written workspace file (shared workspace).
+    let read = sink
+        .content_for("sub:read_file")
+        .expect("child read_file result forwarded");
+    assert!(
+        read.contains("WORKSPACE_SHARED=yes"),
+        "child must read the shared workspace file: {read}"
+    );
 }

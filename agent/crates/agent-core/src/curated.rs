@@ -1870,4 +1870,211 @@ mod tests {
             "history must be untouched on failed/empty compaction"
         );
     }
+
+    // --- Task 10 Step 3: INCOMPLETE-pointer pins (E4) ------------------------
+
+    /// A history backend whose writes always fail (E4 pin). `results` stays a
+    /// real MemBackend so offload/lift succeeds — only the history file write is
+    /// broken, isolating the E4 commit-anyway path.
+    struct FailingHistory;
+    #[async_trait::async_trait]
+    impl agent_tools::backend::Backend for FailingHistory {
+        async fn ls(
+            &self,
+            _: &str,
+        ) -> Result<Vec<agent_tools::backend::Entry>, agent_tools::backend::FsError> {
+            Ok(vec![])
+        }
+        async fn read(&self, p: &str) -> Result<String, agent_tools::backend::FsError> {
+            Err(agent_tools::backend::FsError::NotFound(p.into()))
+        }
+        async fn write(&self, _: &str, _: &str) -> Result<(), agent_tools::backend::FsError> {
+            Err(agent_tools::backend::FsError::Io("disk on fire".into()))
+        }
+        async fn glob(&self, _: &str) -> Result<Vec<String>, agent_tools::backend::FsError> {
+            Ok(vec![])
+        }
+        async fn grep(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<Vec<agent_tools::backend::GrepHit>, agent_tools::backend::FsError> {
+            Ok(vec![])
+        }
+        async fn delete(&self, p: &str) -> Result<(), agent_tools::backend::FsError> {
+            Err(agent_tools::backend::FsError::NotFound(p.into()))
+        }
+    }
+
+    /// A CuratedContext whose history writes always fail — same shape as `ctx()`
+    /// but with the `FailingHistory` handle injected (E4 fixtures).
+    fn ctx_failing_history() -> CuratedContext {
+        CuratedContext::new(
+            Message::system("SYS"),
+            Arc::new(crate::SessionArtifacts {
+                results: Arc::new(agent_tools::backend::MemBackend::new()),
+                history: Arc::new(FailingHistory),
+            }),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_history_write_still_commits_compaction_with_incomplete_pointer() {
+        // Same fixture as maintain_compacts_old_span_when_over_high_water, but the
+        // history backend fails every write. E4: compaction COMMITS anyway
+        // (compacted_turns > 0) and the pinned pointer goes permanently
+        // honest-incomplete.
+        let mut c = ctx_failing_history();
+        c.high_water_pct = 0.0; // force compaction regardless of size
+        c.config.keep_recent = 1;
+        for i in 0..6 {
+            c.append(Message::assistant(
+                format!(
+                    "turn {i} {}",
+                    "with a fair bit of padding text here ".repeat(12)
+                ),
+                None,
+            ));
+        }
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "compact summary".into(),
+        )]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+
+        assert!(
+            report.compacted_turns > 0,
+            "E4: compaction commits even when the history write fails"
+        );
+        let built = c.build(100_000);
+        let pointer = built
+            .iter()
+            .find(|m| m.content.contains("Evicted transcripts"))
+            .expect("the pinned summary carries a transcript pointer");
+        assert!(
+            pointer
+                .content
+                .contains("INCOMPLETE — at least one span failed to record"),
+            "a failed history write must render the INCOMPLETE pointer: {}",
+            pointer.content
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_compaction_renders_the_complete_pointer_and_it_survives_recompaction() {
+        // Two forced compactions over a working history backend. After each,
+        // build() carries the COMPLETE pointer and never the INCOMPLETE marker;
+        // history.md accumulates a "## compacted-" section per pass.
+        // A fresh substantial assistant span, then one forced compaction pass.
+        async fn drive(c: &mut CuratedContext) {
+            for i in 0..6 {
+                c.append(Message::assistant(
+                    format!(
+                        "chatter {i} {}",
+                        "with a fair bit of padding text here ".repeat(12)
+                    ),
+                    None,
+                ));
+            }
+            let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+                "a running compaction summary that keeps growing across passes".into(),
+            )]));
+            let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+            let cancel = CancellationToken::new();
+            c.request_compaction();
+            let report = c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+            assert!(report.compacted_turns > 0, "each forced pass must compact");
+        }
+
+        let mut c = ctx();
+        c.high_water_pct = 2.0; // size trigger off; only the explicit request fires
+        c.config.keep_recent = 1;
+
+        drive(&mut c).await;
+        let built = c.build(100_000);
+        let pointer = built
+            .iter()
+            .find(|m| m.content.contains("Evicted transcripts"))
+            .expect("pointer present after the first compaction");
+        assert!(
+            pointer
+                .content
+                .contains("Evicted transcripts: conversation_history/history.md"),
+            "the COMPLETE pointer text must be rendered: {}",
+            pointer.content
+        );
+        assert!(
+            !pointer.content.contains("INCOMPLETE"),
+            "a successful history write must never render the INCOMPLETE marker: {}",
+            pointer.content
+        );
+
+        drive(&mut c).await;
+        let built = c.build(100_000);
+        let pointer = built
+            .iter()
+            .find(|m| m.content.contains("Evicted transcripts"))
+            .expect("pointer present after re-compaction");
+        assert!(
+            pointer
+                .content
+                .contains("Evicted transcripts: conversation_history/history.md")
+                && !pointer.content.contains("INCOMPLETE"),
+            "the pointer stays COMPLETE across re-compaction: {}",
+            pointer.content
+        );
+        // Two passes → two "## compacted-" sections recorded in the history file.
+        let history = c.artifacts.history.read("history.md").await.unwrap();
+        assert_eq!(
+            history.matches("## compacted-").count(),
+            2,
+            "each compaction records its own history section: {history}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_history_write_aborts_the_fold_atomically() {
+        // Mirrors fold_extraction_failure_leaves_history_intact, but extraction
+        // SUCCEEDS and the history WRITE fails: the fold aborts all-or-nothing —
+        // nothing offloaded, history untouched, no ledger block.
+        let mut c = ctx_failing_history();
+        c.config.keep_recent = 1;
+        for i in 0..12 {
+            c.append(Message::user(format!(
+                "ledger entry number {i}: setting item_{i} is assigned value {i}{i}{i}{i} for the manifest"
+            )));
+        }
+        c.append(Message::assistant("working on it", None));
+        // Extraction returns real lines, so only the history WRITE can fail.
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "item_0 = 0000\nitem_1 = 1111\nitem_2 = 2222".into(),
+        )]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        let mut deps = maint_deps(&model, &sink, &cancel);
+        deps.model_limit = 250; // user turns alone exceed the budget
+        let report = c.maintain(&deps).await;
+
+        assert_eq!(
+            report.offloaded, 0,
+            "a failed history write must store nothing (atomic fold)"
+        );
+        assert_eq!(results_count(&c).await, 0, "no artifact stored on abort");
+        assert_eq!(
+            c.history()
+                .iter()
+                .filter(|m| matches!(m.role, Role::User))
+                .count(),
+            12,
+            "history untouched on history-write failure"
+        );
+        assert!(
+            !c.build(100_000)
+                .iter()
+                .any(|m| m.content.starts_with("Ledger of earlier user instructions")),
+            "no ledger block when the fold aborted"
+        );
+    }
 }

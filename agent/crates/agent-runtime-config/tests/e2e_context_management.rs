@@ -48,6 +48,9 @@ fn composite_over(artifacts: &Arc<SessionArtifacts>, ws: &std::path::Path) -> Ar
 #[derive(Default)]
 struct Capture {
     tool_results: Mutex<Vec<(String, String)>>,
+    /// Every ToolResult regardless of status — the denial pin needs the
+    /// non-Ok write_file result BEFORE curation can offload it out of the window.
+    all_results: Mutex<Vec<(String, String)>>,
     done: Mutex<bool>,
 }
 impl EventSink for Capture {
@@ -58,13 +61,20 @@ impl EventSink for Capture {
             AgentEvent::ToolResult {
                 name,
                 output,
-                status: agent_core::ToolStatus::Ok,
+                status,
                 ..
-            } => self
-                .tool_results
-                .lock()
-                .unwrap()
-                .push((name, output.content)),
+            } => {
+                self.all_results
+                    .lock()
+                    .unwrap()
+                    .push((name.clone(), output.content.clone()));
+                if matches!(status, agent_core::ToolStatus::Ok) {
+                    self.tool_results
+                        .lock()
+                        .unwrap()
+                        .push((name, output.content));
+                }
+            }
             AgentEvent::Done(_) => *self.done.lock().unwrap() = true,
             _ => {}
         }
@@ -77,6 +87,15 @@ impl Capture {
             .unwrap()
             .iter()
             .find(|(n, _)| n == "read_file")
+            .map(|(_, c)| c.clone())
+    }
+    /// The content of the first tool result emitted for `name`, any status.
+    fn first_result(&self, name: &str) -> Option<String> {
+        self.all_results
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(n, _)| n == name)
             .map(|(_, c)| c.clone())
     }
 }
@@ -271,5 +290,210 @@ async fn read_missing_artifact_feeds_error_back_and_continues() {
     assert!(
         fed_back,
         "the not-found error must be fed back as a read_file tool result"
+    );
+}
+
+/// Guard pin (spec §5.2 ReadOnlyToTools; §7 guard pin): turn 1 offloads a big
+/// result; turn 2 the model tries to overwrite the artifact and is denied by the
+/// read-only mount; turn 3 reads it back and gets the ORIGINAL bytes, not the
+/// forgery. Cloned from `offload_then_read_file_round_trips_through_the_loop`
+/// (same build_loop, same oversized first result) with two extra scripted calls.
+#[tokio::test]
+async fn model_write_into_artifacts_is_denied_and_bytes_survive() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().to_path_buf();
+
+    let artifacts = Arc::new(SessionArtifacts::new());
+    let flag = Arc::new(AtomicBool::new(false));
+
+    let big_message = format!("disk exploded at sector {}", "9".repeat(300));
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(BoomTool {
+        message: big_message.clone(),
+    }));
+    reg.register(Arc::new(agent_tools::fs::ReadFile {
+        max_bytes: 16 * 1024,
+    }));
+    reg.register(Arc::new(agent_tools::fs::WriteFile));
+
+    let model = ScriptedModel::new(vec![
+        Scripted::Call("c1".into(), "boom".into(), "{}".into()),
+        // Turn 2: try to overwrite the offloaded artifact with a forgery.
+        Scripted::Call(
+            "c2".into(),
+            "write_file".into(),
+            r#"{"path":"large_tool_results/1-c1","content":"forged"}"#.into(),
+        ),
+        // Turn 3: read the artifact back — must be the original, not "forged".
+        Scripted::Call(
+            "c3".into(),
+            "read_file".into(),
+            r#"{"path":"large_tool_results/1-c1"}"#.into(),
+        ),
+        Scripted::Text("Tried to overwrite; read it back.".into()),
+    ]);
+    let sink = Arc::new(Capture::default());
+
+    let mut ctx = CuratedContext::new(Message::system("SYS"), artifacts.clone(), flag.clone())
+        .with_offload_config(OffloadConfig {
+            keep_recent: 0,
+            error_min_bytes: 50,
+            ..Default::default()
+        });
+
+    build_loop(reg, model, sink.clone(), ws, artifacts.clone(), flag)
+        .run(
+            &mut ctx,
+            "Trigger the failure, overwrite it, read it back.".into(),
+        )
+        .await
+        .unwrap();
+
+    let expected = format!("ERROR: failed: {big_message}");
+    // The write into the read-only artifact mount was denied — the guard message
+    // reached the model as the write_file tool result (ERROR: denied: …). Captured
+    // at emit time, before curation can offload this error out of the window.
+    let write_result = sink
+        .first_result("write_file")
+        .expect("write_file tool result emitted");
+    assert!(
+        write_result.starts_with("ERROR: denied:"),
+        "the artifact write must be denied: {write_result}"
+    );
+    assert!(
+        write_result.contains("read-only records of offloaded context"),
+        "the denial must carry the guard message: {write_result}"
+    );
+    // The forgery never landed — the stored artifact is the original bytes.
+    assert_eq!(
+        artifacts.results.read("1-c1").await.unwrap(),
+        expected,
+        "stored artifact bytes must survive the denied overwrite"
+    );
+    // And the model's read-back returned the original, byte-for-byte.
+    assert_eq!(
+        sink.recall_content().as_deref(),
+        Some(expected.as_str()),
+        "read_file after the denied write must return the original bytes"
+    );
+    assert!(*sink.done.lock().unwrap(), "the run reached completion");
+}
+
+/// Deep-recovery pin (spec §5.5): grep-then-read_file in exactly two tool calls
+/// recovers an evicted span. A CuratedContext-owned history.md is seeded with
+/// three `## folded-N` sections via three real fold passes, then a `GrepTool`
+/// locates `## folded-2` (one hit, carrying a line number) and a `ReadFile`
+/// at that line offset returns the span's marker fact. Tool-level over the same
+/// composite the loop uses — fast and sufficient.
+#[tokio::test]
+async fn deep_recovery_is_grep_then_read_file_in_two_calls() {
+    use agent_core::testkit::CollectingSink;
+    use agent_core::MaintCtx;
+    use agent_model::ModelClient;
+    use tokio_util::sync::CancellationToken;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().to_path_buf();
+
+    let artifacts = Arc::new(SessionArtifacts::new());
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut ctx = CuratedContext::new(Message::system("SYS"), artifacts.clone(), flag)
+        .with_offload_config(OffloadConfig {
+            keep_recent: 1,
+            ..Default::default()
+        });
+
+    let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+    let cancel = CancellationToken::new();
+
+    // Three fold passes → three `## folded-{1,2,3}` sections in history.md. Each
+    // pass appends a fresh batch of oversized user units, then a tiny model_limit
+    // forces the oldest to fold (facts → ledger, verbatim originals → history.md).
+    for batch in 0..3 {
+        for i in 0..12 {
+            ctx.append(Message::user(format!(
+                "batch {batch} entry {i}: setting item_{batch}_{i} is assigned \
+                 value {batch}{batch}{i}{i} for the manifest marker"
+            )));
+        }
+        ctx.append(Message::assistant("working on it", None));
+        // A distinct extraction line per pass so each fold commits a section.
+        let model: Arc<dyn ModelClient> = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            format!("fold_{batch}_fact = {batch}"),
+        )]));
+        let deps = MaintCtx {
+            model_limit: 250,
+            model: &model,
+            sink: &sink,
+            cancel: &cancel,
+        };
+        ctx.maintain(&deps).await;
+    }
+
+    // Sanity: history.md carries all three fold sections.
+    let history = artifacts.history.read("history.md").await.unwrap();
+    for s in ["## folded-1", "## folded-2", "## folded-3"] {
+        assert!(history.contains(s), "history.md missing {s}:\n{history}");
+    }
+
+    // The composite the loop's file tools see (the same shape as build_loop's).
+    let backend = composite_over(&artifacts, &ws);
+    let tool_ctx = |backend: Arc<dyn Backend>| ToolCtx {
+        workspace: ws.clone(),
+        timeout: Duration::from_secs(30),
+        cancel: CancellationToken::new(),
+        sandbox: Arc::new(agent_tools::HostExecutor),
+        backend,
+        call_id: "t1".into(),
+    };
+
+    // Call 1: grep for the middle section header, scoped to conversation_history/.
+    let grep = agent_tools::fs::GrepTool
+        .execute(
+            serde_json::json!({"pattern": "## folded-2", "path": "conversation_history/"}),
+            &tool_ctx(backend.clone()),
+        )
+        .await
+        .unwrap();
+    // Exactly one hit, rendered `path:line: text`, carrying a line number.
+    let lines: Vec<&str> = grep.content.lines().collect();
+    assert_eq!(lines.len(), 1, "exactly one hit: {}", grep.content);
+    let hit = lines[0];
+    assert!(
+        hit.starts_with("conversation_history/history.md:"),
+        "hit re-prefixed to the mount path: {hit}"
+    );
+    // Parse `conversation_history/history.md:<line>: ## folded-2`.
+    let after_path = hit
+        .strip_prefix("conversation_history/history.md:")
+        .unwrap();
+    let line: usize = after_path
+        .split(':')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("hit carries a numeric line offset");
+    assert!(line >= 1, "1-based line offset: {line}");
+
+    // Call 2: read_file from the hit's line offset — the span's marker fact is
+    // in the following lines (the verbatim [user] originals of batch 1).
+    let read = (agent_tools::fs::ReadFile {
+        max_bytes: 16 * 1024,
+    })
+    .execute(
+        serde_json::json!({"path": "conversation_history/history.md", "offset": line}),
+        &tool_ctx(backend),
+    )
+    .await
+    .unwrap();
+    assert!(
+        read.content.contains("## folded-2"),
+        "read starts at the section header: {}",
+        read.content
+    );
+    assert!(
+        read.content.contains("batch 1 entry 0"),
+        "the section's verbatim span marker fact is recovered: {}",
+        read.content
     );
 }
