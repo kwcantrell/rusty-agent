@@ -296,6 +296,7 @@ impl AgentLoop {
         state: &mut crate::RunState,
         cancel: &CancellationToken,
         input: &str,
+        shared: &crate::RunShared,
     ) -> crate::Flow {
         for mw in self.middleware.iter() {
             let mut cx = crate::RunCx {
@@ -305,6 +306,7 @@ impl AgentLoop {
                 state: &mut *state,
                 turn: None,
                 maint: self.maint_view(),
+                shared,
             };
             let flow = mw.on_run_start(&mut cx, input).await;
             Self::assert_no_orphans(ctx, mw.name());
@@ -323,6 +325,7 @@ impl AgentLoop {
         cancel: &CancellationToken,
         turn: usize,
         turn_view: &crate::TurnView,
+        shared: &crate::RunShared,
     ) -> crate::Flow {
         for mw in self.middleware.iter().rev() {
             let mut cx = crate::RunCx {
@@ -332,6 +335,7 @@ impl AgentLoop {
                 state: &mut *state,
                 turn: Some(turn),
                 maint: self.maint_view(),
+                shared,
             };
             let flow = mw.after_model(&mut cx, turn_view).await;
             Self::assert_no_orphans(ctx, mw.name());
@@ -350,6 +354,7 @@ impl AgentLoop {
         state: &mut crate::RunState,
         cancel: &CancellationToken,
         turn: usize,
+        shared: &crate::RunShared,
     ) -> crate::Flow {
         for mw in self.middleware.iter().rev() {
             let mut cx = crate::RunCx {
@@ -359,6 +364,7 @@ impl AgentLoop {
                 state: &mut *state,
                 turn: Some(turn),
                 maint: self.maint_view(),
+                shared,
             };
             let flow = mw.after_tools(&mut cx).await;
             Self::assert_no_orphans(ctx, mw.name());
@@ -376,6 +382,7 @@ impl AgentLoop {
         state: &mut crate::RunState,
         cancel: &CancellationToken,
         turn: usize,
+        shared: &crate::RunShared,
     ) -> crate::Flow {
         for mw in self.middleware.iter().rev() {
             let mut cx = crate::RunCx {
@@ -385,6 +392,7 @@ impl AgentLoop {
                 state: &mut *state,
                 turn: Some(turn),
                 maint: self.maint_view(),
+                shared,
             };
             let flow = mw.on_turn_end(&mut cx).await;
             Self::assert_no_orphans(ctx, mw.name());
@@ -403,6 +411,7 @@ impl AgentLoop {
         state: &mut crate::RunState,
         cancel: &CancellationToken,
         turn: usize,
+        shared: &crate::RunShared,
     ) {
         for mw in self.middleware.iter().rev() {
             let mut cx = crate::RunCx {
@@ -412,6 +421,7 @@ impl AgentLoop {
                 state: &mut *state,
                 turn: Some(turn),
                 maint: self.maint_view(),
+                shared,
             };
             mw.after_final_reply(&mut cx).await;
             Self::assert_no_orphans(ctx, mw.name());
@@ -656,8 +666,11 @@ impl AgentLoop {
         // middleware stay stateless `&self` objects. Empty `self.middleware`
         // makes every `fire_*` hook method below a no-op loop (behavior unchanged).
         let mut mw_state = crate::RunState::default();
+        // Per-run wrap/node shared state (spec §5.2), fresh per invocation so
+        // middleware stay stateless. Empty stacks never touch it.
+        let run_shared = crate::RunShared::default();
         let flow = self
-            .fire_run_start(ctx, &mut mw_state, &cancel, &user_input)
+            .fire_run_start(ctx, &mut mw_state, &cancel, &user_input, &run_shared)
             .await;
         if let crate::Flow::EndRun(reason) = flow {
             self.sink.emit(AgentEvent::Done(reason));
@@ -699,6 +712,7 @@ impl AgentLoop {
                     loop_: self,
                     chain: &self.middleware,
                     cancel: &cancel,
+                    shared: &run_shared,
                 }
                 .run(base.clone())
                 .await;
@@ -831,7 +845,7 @@ impl AgentLoop {
                     .collect(),
             };
             let flow = self
-                .fire_after_model(ctx, &mut mw_state, &cancel, turn, &turn_view)
+                .fire_after_model(ctx, &mut mw_state, &cancel, turn, &turn_view, &run_shared)
                 .await;
             if let crate::Flow::EndRun(reason) = flow {
                 self.sink.emit(AgentEvent::Done(reason));
@@ -872,7 +886,7 @@ impl AgentLoop {
                 //
                 // Node hook: after_final_reply (spec §5.1) — text-only exit only
                 // (spec §6 J5); no Flow, the run is already ending.
-                self.fire_final_reply(ctx, &mut mw_state, &cancel, turn)
+                self.fire_final_reply(ctx, &mut mw_state, &cancel, turn, &run_shared)
                     .await;
 
                 self.sink.emit(AgentEvent::Done(assistant.stop));
@@ -956,6 +970,7 @@ impl AgentLoop {
                     // timeout_override, not the loop default) — logged on timeout.
                     let timeout = ctx.timeout;
                     let middleware = &self.middleware;
+                    let shared = &run_shared;
                     async move {
                         let started = std::time::Instant::now();
                         // The gate already ran (Phase 1); this call is the
@@ -971,6 +986,7 @@ impl AgentLoop {
                             tctx: &ctx,
                             chain: middleware,
                             call: &call,
+                            shared,
                         }
                         .run(args)
                         .await;
@@ -1146,7 +1162,7 @@ impl AgentLoop {
 
             // Node hook: after_tools (spec §5.1).
             let flow = self
-                .fire_after_tools(ctx, &mut mw_state, &cancel, turn)
+                .fire_after_tools(ctx, &mut mw_state, &cancel, turn, &run_shared)
                 .await;
             if let crate::Flow::EndRun(reason) = flow {
                 self.sink.emit(AgentEvent::Done(reason));
@@ -1159,7 +1175,9 @@ impl AgentLoop {
             // text-only-exit maintain in after_final_reply.
             //
             // Node hook: on_turn_end (spec §5.1).
-            let flow = self.fire_turn_end(ctx, &mut mw_state, &cancel, turn).await;
+            let flow = self
+                .fire_turn_end(ctx, &mut mw_state, &cancel, turn, &run_shared)
+                .await;
             if let crate::Flow::EndRun(reason) = flow {
                 self.sink.emit(AgentEvent::Done(reason));
                 return Ok(());
@@ -2735,6 +2753,50 @@ mod tests {
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 4);
         let events = sink.events.lock().unwrap().clone();
         assert!(events.iter().any(|e| e.contains("5 turns in a row")));
+    }
+
+    /// `RunShared` (spec §5.2) threads from the wrap-tool-call seam
+    /// (`ToolNext::shared`) to the node-hook seam (`RunCx::shared`) through
+    /// the SAME per-run store: a write in `wrap_tool_call` must be visible to
+    /// `after_tools` on that same run.
+    #[tokio::test]
+    async fn run_shared_write_in_wrap_is_readable_in_node_hook() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct WrapCount(usize);
+        // Records what after_tools observed, so the assertion can read it out.
+        struct Probe(Arc<Mutex<Option<usize>>>);
+        #[async_trait::async_trait]
+        impl crate::Middleware for Probe {
+            fn name(&self) -> &str {
+                "probe"
+            }
+            async fn wrap_tool_call(
+                &self,
+                call: agent_tools::ToolCall,
+                next: crate::ToolNext<'_>,
+            ) -> crate::Executed {
+                next.shared().with::<WrapCount, _>(|c| c.0 += 1);
+                next.run(call.args).await
+            }
+            async fn after_tools(&self, cx: &mut crate::RunCx<'_>) -> crate::Flow {
+                let seen = cx.shared().with::<WrapCount, _>(|c| c.0);
+                *self.0.lock().unwrap() = Some(seen);
+                crate::Flow::Continue
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into()),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, _count) = counter_agent(model, sink, 10);
+        let agent = agent.with_middleware(vec![Arc::new(Probe(seen.clone()))]);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), Some(1));
     }
 
     struct FakeRetriever(Vec<String>);

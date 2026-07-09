@@ -118,6 +118,7 @@ pub struct RunCx<'a> {
     /// 0-based turn index; None pre-loop (on_run_start).
     pub turn: Option<usize>,
     pub(crate) maint: MaintView<'a>,
+    pub(crate) shared: &'a RunShared,
 }
 
 impl RunCx<'_> {
@@ -130,6 +131,9 @@ impl RunCx<'_> {
     pub fn effective_model_limit(&self) -> usize {
         self.maint.effective_model_limit
     }
+    pub fn shared(&self) -> &RunShared {
+        self.shared
+    }
 }
 
 /// Continuation for `wrap_model_call`: remaining chain, then the loop's
@@ -139,9 +143,13 @@ pub struct ModelNext<'a> {
     pub(crate) loop_: &'a crate::AgentLoop,
     pub(crate) chain: &'a [Arc<dyn Middleware>],
     pub(crate) cancel: &'a CancellationToken,
+    pub(crate) shared: &'a RunShared,
 }
 
 impl<'a> ModelNext<'a> {
+    pub fn shared(&self) -> &RunShared {
+        self.shared
+    }
     pub fn run(
         self,
         req: agent_model::CompletionRequest,
@@ -155,6 +163,7 @@ impl<'a> ModelNext<'a> {
                             loop_: self.loop_,
                             chain: rest,
                             cancel: self.cancel,
+                            shared: self.shared,
                         },
                     )
                     .await
@@ -173,9 +182,13 @@ pub struct ToolNext<'a> {
     pub(crate) tctx: &'a agent_tools::ToolCtx,
     pub(crate) chain: &'a [Arc<dyn Middleware>],
     pub(crate) call: &'a ToolCall,
+    pub(crate) shared: &'a RunShared,
 }
 
 impl<'a> ToolNext<'a> {
+    pub fn shared(&self) -> &RunShared {
+        self.shared
+    }
     pub fn run(self, args: serde_json::Value) -> BoxFuture<'a, crate::Executed> {
         Box::pin(async move {
             match self.chain.split_first() {
