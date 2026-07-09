@@ -933,6 +933,7 @@ mod tests {
             timeout: Duration::from_secs(600),
             cancel: CancellationToken::new(),
             sandbox: Arc::new(agent_tools::HostExecutor),
+            backend: Arc::new(agent_tools::backend::HostBackend::new(std::env::temp_dir())),
             call_id: "d1".into(),
         }
     }

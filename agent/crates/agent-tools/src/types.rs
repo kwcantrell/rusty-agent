@@ -144,6 +144,9 @@ pub struct ToolCtx {
     pub timeout: Duration,
     pub cancel: CancellationToken,
     pub sandbox: Arc<dyn SandboxStrategy>,
+    /// The virtual filesystem this call's file tools operate on (spec §5.3).
+    /// Mirrors `sandbox`: loop-scoped, set from LoopConfig-derived state.
+    pub backend: Arc<dyn crate::backend::Backend>,
     /// The tool_call id this execution serves (`gate_tool` fills it from the
     /// model's call). Lineage root for sub-agent attribution (spec E2).
     pub call_id: String,

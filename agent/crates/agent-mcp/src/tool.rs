@@ -225,6 +225,9 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             // stopgap; Task 3 replaces this with the config-driven strategy
             sandbox: std::sync::Arc::new(agent_tools::HostExecutor),
+            backend: std::sync::Arc::new(agent_tools::backend::HostBackend::new(PathBuf::from(
+                "/work",
+            ))),
             call_id: "test".into(),
         };
         let out = tool.execute(json!({"title":"bug"}), &ctx).await.unwrap();
@@ -249,6 +252,9 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             // stopgap; Task 3 replaces this with the config-driven strategy
             sandbox: std::sync::Arc::new(agent_tools::HostExecutor),
+            backend: std::sync::Arc::new(agent_tools::backend::HostBackend::new(PathBuf::from(
+                "/work",
+            ))),
             call_id: "test".into(),
         };
         let err = tool.execute(json!({}), &ctx).await.unwrap_err();

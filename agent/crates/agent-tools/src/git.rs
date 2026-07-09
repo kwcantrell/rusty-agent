@@ -199,10 +199,11 @@ mod tests {
     fn ctx(ws: std::path::PathBuf) -> ToolCtx {
         use std::sync::Arc;
         ToolCtx {
-            workspace: ws,
+            workspace: ws.clone(),
             timeout: Duration::from_secs(10),
             cancel: CancellationToken::new(),
             sandbox: Arc::new(crate::HostExecutor),
+            backend: Arc::new(crate::backend::HostBackend::new(ws)),
             call_id: "test".into(),
         }
     }
@@ -250,12 +251,13 @@ mod tests {
     fn recording_ctx(ws: std::path::PathBuf) -> (ToolCtx, Arc<Mutex<Vec<crate::CommandSpec>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let ctx = ToolCtx {
-            workspace: ws,
+            workspace: ws.clone(),
             timeout: Duration::from_secs(10),
             cancel: CancellationToken::new(),
             sandbox: Arc::new(RecordingExecutor {
                 calls: calls.clone(),
             }),
+            backend: Arc::new(crate::backend::HostBackend::new(ws)),
             call_id: "test".into(),
         };
         (ctx, calls)

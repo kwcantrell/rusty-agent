@@ -167,10 +167,11 @@ mod tests {
     fn ctx(ws: std::path::PathBuf) -> ToolCtx {
         use std::sync::Arc;
         ToolCtx {
-            workspace: ws,
+            workspace: ws.clone(),
             timeout: Duration::from_secs(5),
             cancel: CancellationToken::new(),
             sandbox: Arc::new(crate::HostExecutor),
+            backend: Arc::new(crate::backend::HostBackend::new(ws)),
             call_id: "test".into(),
         }
     }
