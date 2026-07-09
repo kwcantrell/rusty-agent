@@ -5,6 +5,7 @@ use crate::{ContextManager, EventSink};
 use agent_model::{ModelClient, StopReason};
 use agent_tools::ToolCall;
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -93,6 +94,71 @@ impl RunCx<'_> {
     }
 }
 
+/// Continuation for `wrap_model_call`: remaining chain, then the loop's
+/// `completion_with_retry` as the base case. Wraps ONE invocation; overflow
+/// recovery happens outside and re-enters a fresh chain (spec §5.1/J3).
+pub struct ModelNext<'a> {
+    pub(crate) loop_: &'a crate::AgentLoop,
+    pub(crate) chain: &'a [Arc<dyn Middleware>],
+    pub(crate) cancel: &'a CancellationToken,
+}
+
+impl<'a> ModelNext<'a> {
+    pub fn run(
+        self,
+        req: agent_model::CompletionRequest,
+    ) -> BoxFuture<'a, Result<agent_model::AssistantTurn, crate::CompletionFailure>> {
+        Box::pin(async move {
+            match self.chain.split_first() {
+                Some((mw, rest)) => {
+                    mw.wrap_model_call(
+                        req,
+                        ModelNext {
+                            loop_: self.loop_,
+                            chain: rest,
+                            cancel: self.cancel,
+                        },
+                    )
+                    .await
+                }
+                None => self.loop_.completion_with_retry(&req, self.cancel).await,
+            }
+        })
+    }
+}
+
+/// Continuation for `wrap_tool_call`: base case is `execute_isolated` on the
+/// already-gated call (spec §5.4 — the gate is unreachable from here).
+pub struct ToolNext<'a> {
+    pub(crate) tool: Arc<dyn agent_tools::Tool>,
+    pub(crate) name: &'a str,
+    pub(crate) tctx: &'a agent_tools::ToolCtx,
+    pub(crate) chain: &'a [Arc<dyn Middleware>],
+    pub(crate) call: &'a ToolCall,
+}
+
+impl<'a> ToolNext<'a> {
+    pub fn run(self, args: serde_json::Value) -> BoxFuture<'a, crate::Executed> {
+        Box::pin(async move {
+            match self.chain.split_first() {
+                Some((mw, rest)) => {
+                    let mut call = self.call.clone();
+                    call.args = args;
+                    mw.wrap_tool_call(
+                        call,
+                        ToolNext {
+                            chain: rest,
+                            ..self
+                        },
+                    )
+                    .await
+                }
+                None => crate::execute_isolated(self.tool, args, self.name, self.tctx).await,
+            }
+        })
+    }
+}
+
 /// The middleware seam. Hook-point firing rules are normative — see the spec
 /// §5.1 doc comments; the loop, not the middleware, guarantees them.
 /// Hooks are trusted in-process code: NOT panic-isolated or timeout-bounded
@@ -125,6 +191,24 @@ pub trait Middleware: Send + Sync {
     }
     /// Only on the text-only exit path (loop_.rs:751); see spec §5.1/J5.
     async fn after_final_reply(&self, _cx: &mut RunCx<'_>) {}
+
+    /// Wraps one `completion_with_retry` invocation (spec §5.1/J3, Task 3).
+    /// The default is a pure pass-through. Invoked twice, independently,
+    /// across an overflow rebuild — each invocation gets a fresh chain.
+    async fn wrap_model_call(
+        &self,
+        req: agent_model::CompletionRequest,
+        next: ModelNext<'_>,
+    ) -> Result<agent_model::AssistantTurn, crate::CompletionFailure> {
+        next.run(req).await
+    }
+    /// Wraps one `execute_isolated` invocation, one per gated tool call
+    /// inside the parallel executor (spec §5.4, Task 3). Sits AFTER the
+    /// gate (policy/approval), so it cannot weaken policy. The default is a
+    /// pure pass-through.
+    async fn wrap_tool_call(&self, call: ToolCall, next: ToolNext<'_>) -> crate::Executed {
+        next.run(call.args).await
+    }
 }
 
 #[cfg(test)]

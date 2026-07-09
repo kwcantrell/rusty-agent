@@ -71,9 +71,10 @@ fn jittered_backoff(attempt: usize) -> Duration {
     base + Duration::from_millis(jitter)
 }
 
-/// Why `completion_with_retry` gave up. Loop-private: the turn loop maps
-/// these onto events + `AgentError`.
-enum RetryFailure {
+/// Why `completion_with_retry` gave up. `pub` so the wrap-chain base case in
+/// `middleware.rs` can name it (provisional contract, Task 3); the turn loop
+/// maps it onto events + `AgentError`.
+pub enum CompletionFailure {
     /// Fatal on first sight, or retryable and retries exhausted.
     Fatal(String),
     /// Cancellation observed (token or `ModelError::Cancelled`).
@@ -514,11 +515,13 @@ impl AgentLoop {
     /// Stream with classified retry: transient errors retry with exponential
     /// backoff; permanent request errors fail on first sight; context
     /// overflow is deferred to the turn loop (retrying verbatim cannot help).
-    async fn completion_with_retry(
+    /// `pub(crate)`: the base case of the model wrap chain in
+    /// `middleware.rs::ModelNext::run` calls this directly (Task 3).
+    pub(crate) async fn completion_with_retry(
         &self,
         base: &CompletionRequest,
         cancel: &CancellationToken,
-    ) -> Result<AssistantTurn, RetryFailure> {
+    ) -> Result<AssistantTurn, CompletionFailure> {
         let mut attempt = 0;
         loop {
             let mut req = base.clone();
@@ -528,10 +531,10 @@ impl AgentLoop {
             let mut emitted = (0usize, 0usize);
             match self.one_completion(req, cancel, &mut emitted).await {
                 Ok(turn) => return Ok(turn),
-                Err(ModelError::Cancelled) => return Err(RetryFailure::Cancelled),
+                Err(ModelError::Cancelled) => return Err(CompletionFailure::Cancelled),
                 Err(e) => {
                     if cancel.is_cancelled() {
-                        return Err(RetryFailure::Cancelled);
+                        return Err(CompletionFailure::Cancelled);
                     }
                     match e.class() {
                         ErrorClass::ContextOverflow => {
@@ -539,17 +542,17 @@ impl AgentLoop {
                                 "context overflow; deferring to turn-level recovery");
                             // Defer retraction to the turn loop: only its FIRST
                             // overflow arm re-attempts; a second overflow is terminal.
-                            return Err(RetryFailure::Overflow(e.to_string(), emitted));
+                            return Err(CompletionFailure::Overflow(e.to_string(), emitted));
                         }
                         ErrorClass::Fatal => {
                             self.sink.emit(AgentEvent::Error(e.to_string()));
-                            return Err(RetryFailure::Fatal(e.to_string()));
+                            return Err(CompletionFailure::Fatal(e.to_string()));
                         }
                         ErrorClass::Retryable => {
                             attempt += 1;
                             if attempt > self.config.max_retries {
                                 self.sink.emit(AgentEvent::Error(e.to_string()));
-                                return Err(RetryFailure::Fatal(e.to_string()));
+                                return Err(CompletionFailure::Fatal(e.to_string()));
                             }
                             // Another attempt follows: retract any partial output this
                             // attempt already streamed, before the backoff sleep and
@@ -706,13 +709,20 @@ impl AgentLoop {
             let turn_started = std::time::Instant::now();
             let mut overflow_recovered = false;
             let assistant = loop {
-                match self.completion_with_retry(&base, &cancel).await {
+                let model_result = crate::ModelNext {
+                    loop_: self,
+                    chain: &self.middleware,
+                    cancel: &cancel,
+                }
+                .run(base.clone())
+                .await;
+                match model_result {
                     Ok(t) => break t,
-                    Err(RetryFailure::Cancelled) => {
+                    Err(CompletionFailure::Cancelled) => {
                         self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
                         return Ok(());
                     }
-                    Err(RetryFailure::Overflow(_, emitted)) if !overflow_recovered => {
+                    Err(CompletionFailure::Overflow(_, emitted)) if !overflow_recovered => {
                         overflow_recovered = true;
                         // A partial answer streamed before the overflow is abandoned
                         // by the compaction rebuild; retract it before the rebuilt
@@ -747,14 +757,14 @@ impl AgentLoop {
                         });
                         base = self.completion_request(messages, preserve_thinking);
                     }
-                    Err(RetryFailure::Overflow(msg, _)) => {
+                    Err(CompletionFailure::Overflow(msg, _)) => {
                         // Second overflow in the turn — terminal, no further attempt,
                         // so no StreamRetry (the partial stays; Done explains).
                         self.sink.emit(AgentEvent::Error(msg.clone()));
                         self.sink.emit(AgentEvent::Done(StopReason::Error));
                         return Err(AgentError::Model(msg));
                     }
-                    Err(RetryFailure::Fatal(msg)) => {
+                    Err(CompletionFailure::Fatal(msg)) => {
                         self.sink.emit(AgentEvent::Done(StopReason::Error));
                         return Err(AgentError::Model(msg));
                     }
@@ -1035,9 +1045,25 @@ impl AgentLoop {
                     // The effective per-call deadline (may be a tool's
                     // timeout_override, not the loop default) — logged on timeout.
                     let timeout = ctx.timeout;
+                    let middleware = &self.middleware;
                     async move {
                         let started = std::time::Instant::now();
-                        let ex = execute_isolated(tool, args, &name, &ctx).await;
+                        // The gate already ran (Phase 1); this call is the
+                        // already-approved ToolCall the wrap-tool chain sees.
+                        let call = ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            args: args.clone(),
+                        };
+                        let ex = crate::ToolNext {
+                            tool,
+                            name: &name,
+                            tctx: &ctx,
+                            chain: middleware,
+                            call: &call,
+                        }
+                        .run(args)
+                        .await;
                         (
                             id,
                             name,
@@ -1466,9 +1492,10 @@ enum Resolved {
 }
 
 /// Outcome of an isolated tool execution: the terminal result plus a tag the
-/// caller uses to decide how loudly to surface it.
+/// caller uses to decide how loudly to surface it. `pub` so the wrap-chain
+/// base case in `middleware.rs` can name it (provisional contract, Task 3).
 #[derive(Debug)]
-enum Executed {
+pub enum Executed {
     Ok(agent_tools::ToolOutput),
     /// Tool returned `Err` — a normal outcome, surfaced only to the model.
     ToolErr(String),
@@ -1586,8 +1613,9 @@ fn truncate_on_char_boundary(s: &str, cap: usize) -> String {
 /// bounds so it is unit-testable without driving the loop; the caller owns event
 /// emission. `catch_unwind` keeps a panicking tool from unwinding the loop's task;
 /// `timeout` bounds a tool that ignores `ctx.timeout` so one hang can't wedge the
-/// whole `buffer_unordered` batch.
-async fn execute_isolated(
+/// whole `buffer_unordered` batch. `pub(crate)`: the base case of the tool
+/// wrap chain in `middleware.rs::ToolNext::run` calls this directly (Task 3).
+pub(crate) async fn execute_isolated(
     tool: Arc<dyn Tool>,
     args: serde_json::Value,
     name: &str,
@@ -5524,6 +5552,163 @@ mod tests {
             "expected pre-request + post-rebuild Usage events: {events:?}"
         );
         assert_eq!(events.last().map(String::as_str), Some("done"));
+    }
+
+    /// Counting wrapper: logs enter/exit so nesting order is observable.
+    struct Wrapping {
+        name: &'static str,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::Middleware for Wrapping {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn wrap_model_call(
+            &self,
+            req: agent_model::CompletionRequest,
+            next: crate::ModelNext<'_>,
+        ) -> Result<agent_model::AssistantTurn, crate::CompletionFailure> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:model_enter", self.name));
+            let r = next.run(req).await;
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:model_exit", self.name));
+            r
+        }
+        async fn wrap_tool_call(
+            &self,
+            call: agent_tools::ToolCall,
+            next: crate::ToolNext<'_>,
+        ) -> crate::Executed {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:tool_enter", self.name));
+            let r = next.run(call.args).await;
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:tool_exit", self.name));
+            r
+        }
+    }
+
+    /// First middleware outermost, for both chains (spec §5.4).
+    #[tokio::test]
+    async fn wrap_chains_nest_first_outermost() {
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into()),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, _c) = counter_agent(model, sink, 5);
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = agent.with_middleware(vec![
+            Arc::new(Wrapping {
+                name: "a",
+                log: log.clone(),
+            }),
+            Arc::new(Wrapping {
+                name: "b",
+                log: log.clone(),
+            }),
+        ]);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        let l = log.lock().unwrap().clone();
+        // Turn 1 model call, then its tool call, then turn 2 model call.
+        assert_eq!(
+            l,
+            vec![
+                "a:model_enter",
+                "b:model_enter",
+                "b:model_exit",
+                "a:model_exit",
+                "a:tool_enter",
+                "b:tool_enter",
+                "b:tool_exit",
+                "a:tool_exit",
+                "a:model_enter",
+                "b:model_enter",
+                "b:model_exit",
+                "a:model_exit",
+            ]
+        );
+    }
+
+    /// The model wrap chain is invoked twice, independently, across an overflow
+    /// rebuild (spec §5.1/J3) — pins composition semantics, not signatures.
+    /// Mirrors the ScriptedModel arrangement of
+    /// `overflow_compacts_rebuilds_and_recovers_once` verbatim, adding the
+    /// Wrapping middleware; asserts the log contains exactly TWO
+    /// "a:model_enter" entries and the run recovers (same terminal
+    /// assertions as the source test).
+    #[tokio::test]
+    async fn model_wrap_chain_fires_twice_across_overflow_rebuild() {
+        let ws = std::env::temp_dir();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![
+            Scripted::Fail(ModelError::Status {
+                code: 400,
+                body: "maximum context length exceeded".into(),
+                retry_after: None,
+            }),
+            Scripted::Text("recovered after compaction".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 0, // proving overflow recovery does NOT consume retry budget
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = agent.with_middleware(vec![Arc::new(Wrapping {
+            name: "a",
+            log: log.clone(),
+        })]);
+        let mut ctx = OverflowCtx {
+            history: vec![],
+            compaction_requests: 0,
+            maintains: 0,
+        };
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(ctx.compaction_requests, 1);
+        assert!(ctx.maintains >= 1);
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e == "overflow_recovery"),
+            "recovery must be observable as a context event: {events:?}"
+        );
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+        let enters = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.as_str() == "a:model_enter")
+            .count();
+        assert_eq!(
+            enters, 2,
+            "the model wrap chain fires once per completion_with_retry \
+             invocation: the overflowing attempt, then the rebuilt attempt"
+        );
     }
 
     #[tokio::test]
