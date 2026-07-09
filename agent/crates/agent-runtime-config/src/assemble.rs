@@ -398,17 +398,25 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 spec.name.clone(),
                 agent_core::ResolvedSubAgent {
                     description: spec.description.clone(),
-                    system_prompt: format!(
-                        "{}\n\n{}",
-                        spec.system_prompt,
-                        agent_core::SUBAGENT_PREAMBLE
-                    ),
+                    system_prompt: {
+                        let base = format!(
+                            "{}\n\n{}",
+                            spec.system_prompt,
+                            agent_core::SUBAGENT_PREAMBLE
+                        );
+                        if spec.response_format.is_some() {
+                            format!("{base}\n\n{}", agent_core::RESPONSE_FORMAT_CLAUSE)
+                        } else {
+                            base
+                        }
+                    },
                     tools: spec.tools.clone(),
                     model: s_model,
                     protocol: s_protocol,
                     model_limit: s_model_limit,
                     max_tokens: s_max_tokens,
                     tool_call_limit: spec.tool_call_limit,
+                    response_format: spec.response_format.clone(),
                 },
             );
         }
@@ -1077,6 +1085,34 @@ mod tests {
         assert!(r.system_prompt.contains("You review Rust."));
         assert!(r.system_prompt.contains(agent_core::SUBAGENT_PREAMBLE));
         assert_eq!(r.tool_call_limit, Some(5));
+    }
+
+    #[test]
+    fn response_format_resolves_and_appends_prompt_clause() {
+        use crate::runtime_config::SubAgentSpec;
+        let ws = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.named_subagents = vec![SubAgentSpec {
+            name: "triage".into(),
+            description: "Triage failures".into(),
+            system_prompt: "You triage.".into(),
+            tools: None,
+            model: None,
+            tool_call_limit: None,
+            permissions: None,
+            response_format: Some(serde_json::json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"summary": {"type": "string"}}
+            })),
+            middleware: None,
+            skills: None,
+        }];
+        let built = assemble_loop(&c, parts(ws.path().into(), vec![]));
+        let reg = built.subagent_registry.expect("registry built");
+        let r = reg.get("triage").unwrap();
+        assert_eq!(r.response_format.as_ref().unwrap()["type"], "object");
+        assert!(r.system_prompt.contains(agent_core::RESPONSE_FORMAT_CLAUSE));
+        assert!(r.system_prompt.contains(agent_core::SUBAGENT_PREAMBLE));
     }
 
     #[test]

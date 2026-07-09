@@ -18,6 +18,15 @@ agent to complete one self-contained task. Work autonomously: no one can answer 
 questions. Your final message is returned verbatim to the parent as the task \
 result, so end with a complete, standalone answer.";
 
+/// Appended to a named child's composed system prompt when its spec declares a
+/// `response_format` (spec 3B-1b §2.2): the child returns its result by calling
+/// the `respond` tool, not in prose.
+pub const RESPONSE_FORMAT_CLAUSE: &str = "You MUST finish this task by calling the \
+`respond` tool exactly once, passing your final answer as its arguments in the shape \
+the tool's schema requires. Do not put your final answer in prose — only the \
+`respond` call is returned to the parent. If a `respond` call is rejected as invalid, \
+read the error and call `respond` again with corrected arguments.";
+
 /// Upper bound on the `role` arg (system-prompt injection; spec G6).
 pub const MAX_ROLE_CHARS: usize = 2000;
 
@@ -42,6 +51,9 @@ pub struct ResolvedSubAgent {
     pub model_limit: Option<usize>,
     pub max_tokens: Option<u32>,
     pub tool_call_limit: Option<usize>,
+    /// The resolved flat `response_format` schema (spec 3B-1b §2.1); `None` ⇒ the
+    /// child returns free prose as today.
+    pub response_format: Option<serde_json::Value>,
 }
 
 /// Dispatch-facing named sub-agent registry (spec §2.2). `general-purpose` is
@@ -1132,6 +1144,7 @@ mod tests {
                 model_limit: None,
                 max_tokens: None,
                 tool_call_limit: Some(3),
+                response_format: None,
             },
         );
         Arc::new(SubAgentRegistry::from_map(m))
@@ -1236,6 +1249,7 @@ mod tests {
                     model_limit: r.model_limit,
                     max_tokens: r.max_tokens,
                     tool_call_limit: r.tool_call_limit,
+                    response_format: r.response_format.clone(),
                 },
             );
         }
@@ -1302,6 +1316,7 @@ mod tests {
                 model_limit: None,
                 max_tokens: None,
                 tool_call_limit: None,
+                response_format: None,
             },
         );
         let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
