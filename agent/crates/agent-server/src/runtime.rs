@@ -229,7 +229,7 @@ impl RuntimeState {
     // the loop/prompt, so a concurrent apply() can produce old-cfg + new-loop values in
     // one snapshot — read-only, self-heals on refresh (same accepted pattern as settings_state()).
     pub fn architecture(&self, recall_budget: usize) -> ArchitectureSnapshot {
-        const CONTEXT_TOOLS: [&str; 2] = ["context_recall", "context_compact"];
+        const CONTEXT_TOOLS: [&str; 1] = ["context_compact"];
         const SKILL_TOOLS: [&str; 4] = [
             "list_skills",
             "use_skill",
@@ -494,11 +494,15 @@ mod tests {
         };
         assert_eq!(kind_of("mcp_x"), "mcp");
         assert_eq!(kind_of("remember"), "memory");
-        // context tools registered by the loop are classified "context"
+        // Only context_compact is classified "context" now that context_recall
+        // is retired (offload recovery moved to the ordinary file tools).
+        assert_eq!(kind_of("context_compact"), "context");
         assert!(
-            snap.tools.iter().any(|t| t.kind == "context"),
-            "context_recall/context_compact must be classified context"
+            !snap.tools.iter().any(|t| t.name == "context_recall"),
+            "context_recall must not be registered post-retirement"
         );
+        // grep lands in the same bucket as read_file (both plain file tools).
+        assert_eq!(kind_of("grep"), kind_of("read_file"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ export const archFixture: ArchitectureSnapshot = {
   tools: [
     { name: "render", summary: "Render an artifact", kind: "builtin" },
     { name: "remember", summary: "Store a memory", kind: "memory" },
-    { name: "context_recall", summary: "Recall an offloaded result", kind: "context" },
+    { name: "grep", summary: "Search file contents", kind: "builtin" },
   ],
   policy: { allowlist: ["ls"], denylist: ["rm -rf /"], hard_floor: ["rm -rf /"], http_allow_hosts: [] },
   sandbox: { mode: "auto", mechanism: "docker", image: "agent-sandbox-dev:latest",

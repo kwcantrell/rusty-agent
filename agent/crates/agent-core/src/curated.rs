@@ -358,8 +358,9 @@ const TRIVIAL_CHATTER_SPAN_TOKENS: usize = 256;
 
 /// A turn unit whose tool results are all age-offload placeholders and whose
 /// total estimated size stays anchor-small. Like user turns, these are durable:
-/// each placeholder is the model's only pointer for `context_recall`ing the
-/// offloaded content, so it must survive compaction verbatim.
+/// each placeholder is the model's only pointer for recovering the offloaded
+/// content (via `read_file`/`grep` under `large_tool_results/`), so it must
+/// survive compaction verbatim.
 fn is_durable_placeholder_unit(unit: &[Message]) -> bool {
     unit.len() >= 2
         && unit[1..].iter().all(|m| {

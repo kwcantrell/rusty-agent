@@ -907,12 +907,7 @@ mod tests {
         let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
         let base = built.dispatch_base_names.expect("subagents on by default");
         assert!(!base.iter().any(|n| n == "dispatch_agent"), "{base:?}");
-        assert!(
-            !base
-                .iter()
-                .any(|n| n == "context_recall" || n == "context_compact"),
-            "{base:?}"
-        );
+        assert!(!base.iter().any(|n| n == "context_compact"), "{base:?}");
         // Sanity: real tools are in the snapshot.
         assert!(base.iter().any(|n| n == "read_file"), "{base:?}");
     }

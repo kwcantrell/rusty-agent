@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { initialState, reduce } from "./state";
+import { describeContext, initialState, reduce } from "./state";
 import type { Inbound } from "./wire";
 
 const frame = (payload: unknown): Inbound =>
@@ -38,6 +38,16 @@ describe("error event closes the turn", () => {
     const errors = s.items.filter((i) => i.kind === "error");
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({ kind: "error", message: "model overloaded" });
+  });
+});
+
+describe("describeContext for offloaded events", () => {
+  it("renders offloaded events by path, falling back to legacy id", () => {
+    expect(describeContext("offloaded", { tool: "shell", path: "large_tool_results/1-c1" }))
+      .toBe("offloaded shell result → large_tool_results/1-c1");
+    // Pre-Phase-2 trace replay: old events carry a numeric id, no path.
+    expect(describeContext("offloaded", { tool: "shell", id: 4 }))
+      .toBe("offloaded shell result → #4");
   });
 });
 

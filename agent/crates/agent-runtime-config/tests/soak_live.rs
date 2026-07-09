@@ -5,7 +5,7 @@
 //! Exercised end-to-end: the agent loop, streaming model client, the policy +
 //! approval gate, the sandbox (host mode), the real fs/shell tools, AND the whole
 //! context-management subsystem (offload → placeholder, compaction, re-grounding,
-//! context_recall / context_compact) over a single growing `CuratedContext`.
+//! context_compact) over a single growing `CuratedContext`.
 //!
 //! Safety: runs in a throwaway temp workspace, host sandbox, and a `SafeApproval`
 //! gate that only permits read-only / workspace-bounded operations no matter what
