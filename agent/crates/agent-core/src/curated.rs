@@ -42,6 +42,9 @@ pub struct CuratedContext {
     pub(crate) config: OffloadConfig,
     pub(crate) high_water_pct: f32,
     pub(crate) compact_flag: Arc<AtomicBool>,
+    /// Shared plan list (spec §5.4). Rendered as the LAST pinned block; default
+    /// is an empty handle (no block) until a caller wires `with_todos`.
+    todos: crate::TodoHandle,
     /// `(messages, est_tokens)` omitted by eviction at the last maintain pass;
     /// dedups repeated identical Evicted events while the window stays saturated,
     /// yet re-emits when either the count OR the token estimate changes (offload
@@ -73,6 +76,7 @@ impl CuratedContext {
             high_water_pct: DEFAULT_HIGH_WATER_PCT,
             compact_flag,
             last_evicted: (0, 0),
+            todos: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -83,6 +87,13 @@ impl CuratedContext {
 
     pub fn with_artifact_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.artifact_prefix = prefix.into();
+        self
+    }
+
+    /// Wire the shared todos handle (the same one `TodoListMiddleware`'s
+    /// `write_todos` tool sets), so the current plan renders as a pinned block.
+    pub fn with_todos(mut self, todos: crate::TodoHandle) -> Self {
+        self.todos = todos;
         self
     }
 
@@ -132,6 +143,12 @@ impl CuratedContext {
                 msg.content = format!("{}\n\n{p}", msg.content);
             }
             out.push(msg);
+        }
+        // The todos plan is the LAST pinned block — after goal/ledger → recall →
+        // summary+pointer (existing order byte-identical), nearest the windowed
+        // conversation (spec §5.4/E3). Empty list → nothing.
+        if let Some(t) = crate::render_todos_block(&self.todos.lock().unwrap()) {
+            out.push(t);
         }
         out
     }
@@ -192,7 +209,21 @@ impl CuratedContext {
             }
             t += message_tokens(&msg);
         }
+        // Lockstep with pinned(): the todos block is the LAST pinned block.
+        {
+            let todos = self.todos.lock().unwrap();
+            if let Some(block) = crate::render_todos_block(&todos) {
+                t += message_tokens(&block);
+            }
+        }
         t
+    }
+
+    /// Test accessor for the pinned-block token estimate (the field itself and
+    /// `pinned_tokens` are private).
+    #[cfg(test)]
+    pub(crate) fn pinned_tokens_for_test(&self) -> usize {
+        self.pinned_tokens()
     }
 
     /// Borrow history (used by the compaction-failure test).
@@ -205,6 +236,7 @@ impl CuratedContext {
     /// Token figures are estimates; the faithful total comes from server usage.
     pub fn snapshot(&self, model_limit: usize, turn: usize) -> crate::ContextSnapshot {
         let ledger = (!self.folded_facts.is_empty()).then(|| self.folded_block());
+        let todos = self.todos.lock().unwrap().clone();
         crate::snapshot::build_snapshot(
             turn,
             model_limit,
@@ -216,6 +248,7 @@ impl CuratedContext {
             self.recall_budget,
             self.compaction_summary.as_ref(),
             &self.history,
+            &todos,
         )
     }
 }
@@ -2075,6 +2108,127 @@ mod tests {
                 .iter()
                 .any(|m| m.content.starts_with("Ledger of earlier user instructions")),
             "no ledger block when the fold aborted"
+        );
+    }
+
+    // --- Task B3: durable pinned todos block (E3) ---------------------------
+
+    #[test]
+    fn todos_render_as_the_last_pinned_block_after_existing_order() {
+        // The existing pinned order (system → goal/ledger → recall → summary+pointer)
+        // stays byte-identical; todos is APPENDED after it (spec §5.4/E3).
+        let handle: Arc<std::sync::Mutex<Vec<crate::TodoItem>>> =
+            Arc::new(std::sync::Mutex::new(vec![crate::TodoItem {
+                content: "do the thing".into(),
+                status: crate::TodoStatus::InProgress,
+            }]));
+        let mut with = ctx().with_todos(handle.clone());
+        with.set_goal("ship it".into());
+        with.set_recall(vec!["a memory".into()]);
+        with.compaction_summary = Some(Message::system("Summary: earlier"));
+        with.append(Message::user("hello"));
+        let built = with.build(100_000);
+
+        // Same prefix as without todos:
+        let mut without = ctx();
+        without.set_goal("ship it".into());
+        without.set_recall(vec!["a memory".into()]);
+        without.compaction_summary = Some(Message::system("Summary: earlier"));
+        without.append(Message::user("hello"));
+        let base = without.build(100_000);
+
+        // The todos block is the LAST pinned message (before windowed history), and
+        // the pinned prefix up to it matches `base`'s pinned prefix byte-for-byte.
+        let todo_msg = built
+            .iter()
+            .find(|m| {
+                m.content
+                    .starts_with("Current task plan (from write_todos)")
+            })
+            .expect("todos block present");
+        assert!(todo_msg.content.contains("[in_progress] do the thing"));
+        // Existing pinned order preserved: system/goal/recall/summary identical.
+        assert_eq!(built[0].content, base[0].content); // system
+        assert_eq!(built[1].content, base[1].content); // goal
+        assert!(built[2].content.starts_with("Relevant memories")); // recall
+                                                                    // history tail unchanged
+        assert_eq!(built.last().unwrap().content, "hello");
+    }
+
+    #[test]
+    fn empty_todos_render_nothing() {
+        let mut c = ctx().with_todos(Arc::new(std::sync::Mutex::new(Vec::new())));
+        c.append(Message::user("hi"));
+        assert!(!c
+            .build(100_000)
+            .iter()
+            .any(|m| m.content.starts_with("Current task plan")));
+    }
+
+    #[test]
+    fn pinned_tokens_accounts_for_the_todos_block_in_lockstep() {
+        let items = vec![crate::TodoItem {
+            content: "a longish task description to make the block non-trivial".into(),
+            status: crate::TodoStatus::Pending,
+        }];
+        let handle = Arc::new(std::sync::Mutex::new(items.clone()));
+        let empty = ctx();
+        let with = ctx().with_todos(handle);
+        let block = crate::render_todos_block(&items).unwrap();
+        assert_eq!(
+            with.pinned_tokens_for_test(),
+            empty.pinned_tokens_for_test() + message_tokens(&block),
+            "pinned_tokens() extends by exactly the todos block (lockstep with pinned())"
+        );
+    }
+
+    #[tokio::test]
+    async fn todos_block_survives_offload_and_compaction() {
+        // Pinned → unconditionally in-window until overwritten (the hard guarantee
+        // exclude_tools could not give — spec §7 durability pin).
+        let handle = Arc::new(std::sync::Mutex::new(vec![crate::TodoItem {
+            content: "durable plan".into(),
+            status: crate::TodoStatus::InProgress,
+        }]));
+        let mut c = ctx().with_todos(handle);
+        c.high_water_pct = 0.0; // force compaction
+        c.config.keep_recent = 1;
+        for i in 0..6 {
+            c.append(Message::assistant(
+                format!("turn {i} {}", "padding ".repeat(12)),
+                None,
+            ));
+        }
+        let model: Arc<dyn ModelClient> =
+            Arc::new(ScriptedModel::new(vec![Scripted::Text("summary".into())]));
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
+        let cancel = CancellationToken::new();
+        c.maintain(&maint_deps(&model, &sink, &cancel)).await;
+        assert!(
+            c.build(100_000)
+                .iter()
+                .any(|m| m.content.contains("durable plan")),
+            "the todos block is pinned and survives compaction"
+        );
+    }
+
+    #[test]
+    fn snapshot_est_total_stays_consistent_with_pinned_todos() {
+        // S5: a non-empty todos plan adds a `todos` segment so est_total keeps
+        // matching the budget math (audit 7.3), exactly like the ledger segment.
+        let items = vec![crate::TodoItem {
+            content: "plan the work in several steps".into(),
+            status: crate::TodoStatus::InProgress,
+        }];
+        let mut c = ctx().with_todos(Arc::new(std::sync::Mutex::new(items)));
+        c.append(Message::user("do the thing"));
+        c.append(Message::assistant("on it", None));
+        let snap = c.snapshot(100_000, 1);
+        let history_tokens: usize = c.history().iter().map(message_tokens).sum();
+        assert_eq!(snap.est_total, c.pinned_tokens_for_test() + history_tokens);
+        assert!(
+            snap.segments.iter().any(|s| s.category == "todos"),
+            "a non-empty plan surfaces a todos segment"
         );
     }
 }
