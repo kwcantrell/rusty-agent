@@ -5,3 +5,13 @@ model = "default"
 protocol = "native"   # or "prompted"
 workspace = "."
 context_limit = 8192
+
+# Named sub-agents (Phase 3B-1). Each becomes a `subagent_type` the model can
+# pick via dispatch_agent. Only name/description/system_prompt are required.
+# [[named_subagents]]
+# name = "reviewer"
+# description = "Reviews Rust changes for correctness and style."
+# system_prompt = "You are a meticulous Rust reviewer. Report concrete findings."
+# tools = ["read_file", "grep", "git_status"]   # optional allowlist (default: all)
+# tool_call_limit = 50                            # optional runaway bound (1..=1000)
+# # model = { model = "haiku" }                   # optional; same endpoint only
