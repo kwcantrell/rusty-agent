@@ -2,11 +2,11 @@
 //! One trait behind every file tool; backends are mount-location-transparent:
 //! they always receive paths relative to their own root (the composite strips
 //! the mount prefix on the way in and re-prefixes results on the way out, E6).
-// mod composite; // Task 3
+mod composite;
 pub mod conformance;
 mod host;
 mod mem;
-// pub use composite::{CompositeBackend, ReadOnlyToTools, ARTIFACTS_READONLY_MSG}; // Task 3
+pub use composite::{CompositeBackend, ReadOnlyToTools, ARTIFACTS_READONLY_MSG};
 pub use host::HostBackend;
 pub use mem::MemBackend;
 
