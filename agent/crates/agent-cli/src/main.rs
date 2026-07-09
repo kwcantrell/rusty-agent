@@ -260,6 +260,7 @@ async fn main() {
 
     let artifacts = Arc::new(agent_core::SessionArtifacts::new());
     let compact_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let todos: agent_core::TodoHandle = Arc::new(std::sync::Mutex::new(Vec::new()));
     // Session-lifetime observability handles: created ONCE (a per-assemble
     // TraceWriter would mint a colliding {epoch}-{pid} session id).
     let stats = Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default()));
@@ -282,6 +283,7 @@ async fn main() {
             base_system_prompt: BASE_SYSTEM_PROMPT.to_string(),
             artifacts: artifacts.clone(),
             compact_flag: compact_flag.clone(),
+            todos: todos.clone(),
             sandbox: sandbox.clone(),
             stats: stats.clone(),
             trace,
@@ -307,7 +309,8 @@ async fn main() {
     .with_offload_config(agent_core::OffloadConfig {
         max_result_bytes: rt.max_tool_result_bytes,
         ..Default::default()
-    });
+    })
+    .with_todos(todos);
 
     println!("agent ready. Type a task, or 'exit'.");
     let stdin = std::io::stdin();

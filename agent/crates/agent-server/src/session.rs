@@ -75,7 +75,8 @@ impl Session {
             .with_offload_config(agent_core::OffloadConfig {
                 max_result_bytes: max_tool_result_bytes,
                 ..Default::default()
-            }),
+            })
+            .with_todos(runtime.todos()),
         ));
         Arc::new(Self {
             runtime,
@@ -286,7 +287,8 @@ impl Session {
         .with_offload_config(agent_core::OffloadConfig {
             max_result_bytes: self.runtime.settings_state().settings.max_tool_result_bytes,
             ..Default::default()
-        });
+        })
+        .with_todos(self.runtime.todos());
     }
 
     #[cfg(test)]

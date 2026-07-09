@@ -2,6 +2,7 @@
 use crate::{
     AgentEvent, AgentLoop, ContextCurationMiddleware, CuratedContext, EventSink, LoopConfig,
     Middleware, OffloadConfig, RepairMiddleware, SessionArtifacts, StuckDetectionMiddleware,
+    TodoHandle, WriteTodosTool,
 };
 use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, PolicyEngine};
@@ -479,6 +480,16 @@ impl Tool for DispatchAgentTool {
         for c in curation.tools() {
             reg.register(c.tool.clone());
         }
+        // Per-child todos handle (deepagents contract, spec §5.6): fresh, never
+        // the parent's. If write_todos is in the child's filtered base snapshot
+        // (a parent-bound instance reached via child_visible = true), rebind it
+        // to the child's OWN handle (last-wins registry) so the child plans for
+        // itself and its plan is never merged back to the parent. Guardrails and
+        // TodoListMiddleware stay OUT of the child stack — only the tool rebinds.
+        let todos: TodoHandle = Arc::new(Mutex::new(Vec::new()));
+        if filtered_base.iter().any(|t| t.name() == "write_todos") {
+            reg.register(Arc::new(WriteTodosTool::new(todos.clone())));
+        }
         // Finding 4.1: apply the parent's description overrides to the child
         // registry (registry-level, matching assemble.rs's parent application).
         // Names not in THIS child's registry (e.g. allowlist-filtered tools)
@@ -493,7 +504,8 @@ impl Tool for DispatchAgentTool {
                 max_result_bytes: self.deps.max_result_bytes,
                 ..OffloadConfig::default()
             })
-            .with_artifact_prefix(format!("sub{n}-"));
+            .with_artifact_prefix(format!("sub{n}-"))
+            .with_todos(todos);
 
         // Visible parent id: at top level this is the raw call id; nested, the
         // prefix makes it the child row's on-wire id (spec G8 attribution).
@@ -1215,5 +1227,155 @@ mod tests {
                  is never installed on a dispatch child: {text}"
             );
         }
+    }
+
+    // --- Task B4: per-child write_todos isolation ----------------------------
+
+    /// A child that calls `write_todos` updates ITS OWN handle/pinned block; the
+    /// parent's todos handle is never touched (deepagents contract, spec §5.6).
+    /// `base_tools` carries a `write_todos` instance bound to the PARENT's
+    /// handle (the same channel real middleware-contributed tools use); dispatch
+    /// must rebind it to a fresh per-child handle (last-wins registry) so the
+    /// child's own plan never reaches the parent's handle.
+    #[tokio::test]
+    async fn child_write_todos_is_isolated_from_the_parent() {
+        struct RequestTextCapturingModel {
+            inner: ScriptedModel,
+            request_texts: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl agent_model::ModelClient for RequestTextCapturingModel {
+            async fn stream(
+                &self,
+                req: agent_model::CompletionRequest,
+            ) -> Result<
+                futures::stream::BoxStream<
+                    'static,
+                    Result<agent_model::Chunk, agent_model::ModelError>,
+                >,
+                agent_model::ModelError,
+            > {
+                self.request_texts.lock().unwrap().push(
+                    req.messages
+                        .iter()
+                        .map(|m| m.content.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                self.inner.stream(req).await
+            }
+        }
+        let parent_handle: crate::TodoHandle = Arc::new(Mutex::new(Vec::new()));
+        let model = Arc::new(RequestTextCapturingModel {
+            inner: ScriptedModel::new(vec![
+                Scripted::Call(
+                    "c1".into(),
+                    "write_todos".into(),
+                    r#"{"todos":[{"content":"child task","status":"in_progress"}]}"#.into(),
+                ),
+                Scripted::Text("done".into()),
+            ]),
+            request_texts: Default::default(),
+        });
+        let mut d = exec_deps(ScriptedModel::new(vec![]), 5);
+        d.model = model.clone();
+        // Parent-bound instance in base_tools — the channel real
+        // TodoListMiddleware-contributed tools use (child_visible = true lands
+        // it in the assembled parent's base snapshot, spec §5.6).
+        d.base_tools = vec![Arc::new(crate::WriteTodosTool::new(parent_handle.clone()))];
+        let tool = DispatchAgentTool::new(d);
+        tool.execute(serde_json::json!({"prompt": "p"}), &exec_ctx())
+            .await
+            .unwrap();
+
+        // The parent's handle must stay empty — the child's plan is never
+        // merged back (deepagents contract, spec §5.6).
+        assert!(
+            parent_handle.lock().unwrap().is_empty(),
+            "parent todos handle must never be touched by a child's write_todos call"
+        );
+
+        // The child's OWN plan renders in the child's own context: the pinned
+        // block appears in a later request the child's own model receives.
+        let texts = model.request_texts.lock().unwrap().clone();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("child task") && t.contains("in_progress")),
+            "the child's own plan must render as a pinned block in its own \
+             request history: {texts:?}"
+        );
+    }
+
+    /// Child stack is `[curation, stuck, repair]` (Task A3): a malformed child
+    /// turn re-asks exactly once with the byte-identical message, then resolves
+    /// (spec §5.6, global-constraints byte-identical repair message).
+    #[tokio::test]
+    async fn dispatched_child_repairs_a_malformed_turn_once() {
+        struct RequestTextCapturingModel {
+            inner: ScriptedModel,
+            request_texts: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl agent_model::ModelClient for RequestTextCapturingModel {
+            async fn stream(
+                &self,
+                req: agent_model::CompletionRequest,
+            ) -> Result<
+                futures::stream::BoxStream<
+                    'static,
+                    Result<agent_model::Chunk, agent_model::ModelError>,
+                >,
+                agent_model::ModelError,
+            > {
+                self.request_texts.lock().unwrap().push(
+                    req.messages
+                        .iter()
+                        .map(|m| m.content.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                self.inner.stream(req).await
+            }
+        }
+        let model = Arc::new(RequestTextCapturingModel {
+            inner: ScriptedModel::new(vec![
+                // Malformed JSON args on a registered tool name (no `Malformed`
+                // variant in testkit — the same shape loop_.rs's malformed-turn
+                // tests use).
+                Scripted::Call("c1".into(), "remember".into(), r#"{"k": "#.into()),
+                Scripted::Text("recovered".into()),
+            ]),
+            request_texts: Default::default(),
+        });
+        let mut d = exec_deps(ScriptedModel::new(vec![]), 5);
+        d.model = model.clone();
+        d.base_tools = vec![Arc::new(RememberStub)];
+        let tool = DispatchAgentTool::new(d);
+        let out = tool
+            .execute(serde_json::json!({"prompt": "p"}), &exec_ctx())
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("recovered"),
+            "the child must resolve past the malformed turn: {}",
+            out.content
+        );
+
+        // Exactly one re-ask with the byte-identical repair message, then the
+        // recovered text turn: 2 requests total (malformed turn + re-ask turn).
+        let texts = model.request_texts.lock().unwrap().clone();
+        assert_eq!(
+            texts.len(),
+            2,
+            "malformed turn + one re-ask turn, no more: {texts:?}"
+        );
+        assert!(
+            texts[1].contains("Your tool call could not be parsed: ")
+                && texts[1].contains("Re-emit it correctly."),
+            "re-ask message must be byte-identical to the loop-resident repair \
+             wording: {}",
+            texts[1]
+        );
     }
 }

@@ -39,6 +39,10 @@ pub struct RuntimeState {
     /// so a settings change never orphans the artifact stores from their tools.
     artifacts: Arc<SessionArtifacts>,
     compact_flag: Arc<AtomicBool>,
+    /// Conversation-stable plan list (shared with the session's `CuratedContext`,
+    /// the `compact_flag` shape). Reused across loop rebuilds so a settings
+    /// change never orphans the plan from `write_todos` (spec §5.4/§5.6).
+    todos: agent_core::TodoHandle,
     /// Session-stable observability handles. Created ONCE here and reused across
     /// every loop rebuild — a per-rebuild TraceWriter would mint a colliding
     /// `{epoch}-{pid}` session id and interleave two writers into one file.
@@ -73,6 +77,7 @@ impl RuntimeState {
         }
         let artifacts = Arc::new(SessionArtifacts::new());
         let compact_flag = Arc::new(AtomicBool::new(false));
+        let todos: agent_core::TodoHandle = Arc::new(Mutex::new(Vec::new()));
         let stats: Arc<std::sync::RwLock<agent_core::SessionStats>> = Arc::default();
         let trace = agent_runtime_config::build_trace(&config);
         let persisted_file = Mutex::new(std::fs::read_to_string(&config_path).ok());
@@ -89,6 +94,7 @@ impl RuntimeState {
             &base_system_prompt,
             &artifacts,
             &compact_flag,
+            &todos,
             &stats,
             &trace,
         );
@@ -110,6 +116,7 @@ impl RuntimeState {
             base_system_prompt,
             artifacts,
             compact_flag,
+            todos,
             stats,
             trace,
             persisted_file,
@@ -129,6 +136,11 @@ impl RuntimeState {
     /// Conversation-stable compaction-request flag (shared with the session's context).
     pub fn compact_flag(&self) -> Arc<AtomicBool> {
         self.compact_flag.clone()
+    }
+
+    /// Conversation-stable plan list (shared with the session's context).
+    pub fn todos(&self) -> agent_core::TodoHandle {
+        self.todos.clone()
     }
 
     /// Clone the current loop `Arc` (lock held only for the clone, never across await).
@@ -171,6 +183,7 @@ impl RuntimeState {
             &self.base_system_prompt,
             &self.artifacts,
             &self.compact_flag,
+            &self.todos,
             &self.stats,
             &self.trace,
         );
@@ -354,6 +367,7 @@ fn build_loop(
     base_system_prompt: &str,
     artifacts: &Arc<SessionArtifacts>,
     compact_flag: &Arc<AtomicBool>,
+    todos: &agent_core::TodoHandle,
     stats: &Arc<std::sync::RwLock<agent_core::SessionStats>>,
     trace: &Option<Arc<agent_runtime_config::TraceWriter>>,
 ) -> BuiltLoop {
@@ -379,6 +393,7 @@ fn build_loop(
             base_system_prompt: base_system_prompt.to_string(),
             artifacts: artifacts.clone(),
             compact_flag: compact_flag.clone(),
+            todos: todos.clone(),
             sandbox: build_sandbox(cfg),
             stats: stats.clone(),
             trace: trace.clone(),
@@ -774,6 +789,7 @@ mod tests {
         // build_loop must succeed — off → HostExecutor, no Docker required.
         let artifacts = Arc::new(SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
+        let todos = Arc::new(Mutex::new(Vec::new()));
         let result = build_loop(
             &cfg,
             &sink,
@@ -787,6 +803,7 @@ mod tests {
             crate::daemon::SYSTEM_PROMPT,
             &artifacts,
             &flag,
+            &todos,
             &Arc::default(),
             &None,
         );
@@ -830,6 +847,7 @@ mod tests {
         cfg.sandbox_mode = "auto".into();
         let artifacts = Arc::new(SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
+        let todos = Arc::new(Mutex::new(Vec::new()));
         let result = build_loop(
             &cfg,
             &sink,
@@ -843,6 +861,7 @@ mod tests {
             crate::daemon::SYSTEM_PROMPT,
             &artifacts,
             &flag,
+            &todos,
             &Arc::default(),
             &None,
         );

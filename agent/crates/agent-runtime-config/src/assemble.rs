@@ -31,6 +31,9 @@ pub struct LoopParts {
     pub artifacts: Arc<agent_core::SessionArtifacts>,
     /// Flag the `context_compact` tool sets; the caller's `CuratedContext` reads it.
     pub compact_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared plan list the `write_todos` tool sets; the caller's `CuratedContext`
+    /// reads it (the `compact_flag` shape, spec §5.4/§5.6).
+    pub todos: agent_core::TodoHandle,
     /// The frontend's single sandbox instance — one probe + one availability
     /// cache per frontend (audit 3.5). Callers that also connect MCP must
     /// pass the SAME Arc they gave `connect_mcp`.
@@ -173,6 +176,12 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     // The middleware stack. Built here so its tool contributions can register
     // before the child_base snapshot below (spec §5.5/§5.6).
     let mut stack: Vec<Arc<dyn agent_core::Middleware>> = Vec::new();
+    // Planning-by-recitation (spec §5.4/§5.6): first in the stack (convention;
+    // hookless, so position affects only tool-registration precedence — child-
+    // visible `write_todos` collides with nothing). Default-on (plan S4).
+    stack.push(Arc::new(agent_core::TodoListMiddleware::new(
+        parts.todos.clone(),
+    )));
     if cfg.memory {
         stack.push(Arc::new(agent_core::MemoryRecallMiddleware::new(
             parts.memory_tools.clone(),
@@ -534,6 +543,7 @@ mod tests {
             base_system_prompt: "BASE".into(),
             artifacts: Arc::new(agent_core::SessionArtifacts::new()),
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            todos: Arc::new(std::sync::Mutex::new(Vec::new())),
             sandbox: crate::build_sandbox(&cfg()),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
             trace: None,
@@ -674,6 +684,16 @@ mod tests {
             .iter()
             .any(|n| n == "context_compact"));
         assert!(!built.registered_names.iter().any(|n| n == "context_recall"));
+    }
+
+    #[test]
+    fn registers_write_todos_child_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        assert!(built.registered_names.iter().any(|n| n == "write_todos"));
+        // child-visible: it is in the child base snapshot (registered before it).
+        let base = built.dispatch_base_names.expect("subagents on by default");
+        assert!(base.iter().any(|n| n == "write_todos"), "{base:?}");
     }
 
     #[test]

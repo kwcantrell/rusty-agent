@@ -223,6 +223,7 @@ async fn soak_all_components_live() {
 
     let artifacts = Arc::new(SessionArtifacts::new());
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let todos = Arc::new(std::sync::Mutex::new(Vec::new()));
     let monitor = Arc::new(SoakMonitor::default());
     let approval = Arc::new(SafeApproval {
         denied: Mutex::new(Vec::new()),
@@ -252,6 +253,7 @@ async fn soak_all_components_live() {
                     .into(),
             artifacts: artifacts.clone(),
             compact_flag: flag.clone(),
+            todos: todos.clone(),
             sandbox: agent_runtime_config::build_sandbox(&cfg),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
             trace: None,
