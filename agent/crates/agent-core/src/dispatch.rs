@@ -1,7 +1,7 @@
 //! Sub-agent dispatch: sub-agents-as-tools (spec 2026-07-01-subagent-dispatch-core).
 use crate::{
-    AgentEvent, AgentLoop, ContextCurationMiddleware, CuratedContext, EventSink,
-    InMemoryOffloadStore, LoopConfig, Middleware, OffloadConfig, StuckDetectionMiddleware,
+    AgentEvent, AgentLoop, ContextCurationMiddleware, CuratedContext, EventSink, LoopConfig,
+    Middleware, OffloadConfig, SessionArtifacts, StuckDetectionMiddleware,
 };
 use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, PolicyEngine};
@@ -322,7 +322,7 @@ impl Tool for DispatchAgentTool {
                     "tools": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tools (context_recall, context_compact) are always available. Include dispatch_agent to let the sub-agent dispatch its own (only meaningful when nesting depth allows); the restriction applies transitively to its children."
+                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tool (context_compact) is always available. Include dispatch_agent to let the sub-agent dispatch its own (only meaningful when nesting depth allows); the restriction applies transitively to its children."
                     },
                     "role": {
                         "type": "string",
@@ -400,7 +400,7 @@ impl Tool for DispatchAgentTool {
                 ))
             }
         };
-        const IMPLICIT_CHILD_TOOLS: [&str; 2] = ["context_recall", "context_compact"];
+        const IMPLICIT_CHILD_TOOLS: [&str; 1] = ["context_compact"];
         // "dispatch_agent" is a valid allowlist name ONLY while the child could
         // itself dispatch (depth < max_depth). At the depth floor it is unknown
         // — naming it there is an error, keeping the allowlist contract coherent
@@ -471,15 +471,11 @@ impl Tool for DispatchAgentTool {
             }
             reg.register(Arc::new(DispatchAgentTool::new(nested)));
         }
-        let store: Arc<dyn crate::OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+        let artifacts = Arc::new(SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
         // Each dispatch child gets its own ContextCurationMiddleware instance,
-        // bound to THIS child's store/flag (never the parent's) — spec §5.6.
-        let curation = Arc::new(ContextCurationMiddleware::new(
-            store.clone(),
-            flag.clone(),
-            self.deps.max_result_bytes,
-        ));
+        // bound to THIS child's flag (never the parent's) — spec §5.6.
+        let curation = Arc::new(ContextCurationMiddleware::new(flag.clone()));
         for c in curation.tools() {
             reg.register(c.tool.clone());
         }
@@ -492,11 +488,12 @@ impl Tool for DispatchAgentTool {
             Some(r) => format!("{}\n\nRole: {r}", self.deps.child_system_prompt),
             None => self.deps.child_system_prompt.clone(),
         };
-        let mut child_ctx = CuratedContext::new(Message::system(system), store, flag)
+        let mut child_ctx = CuratedContext::new(Message::system(system), artifacts.clone(), flag)
             .with_offload_config(OffloadConfig {
                 max_result_bytes: self.deps.max_result_bytes,
                 ..OffloadConfig::default()
-            });
+            })
+            .with_artifact_prefix(format!("sub{n}-"));
 
         // Visible parent id: at top level this is the raw call id; nested, the
         // prefix makes it the child row's on-wire id (spec G8 attribution).
@@ -520,7 +517,31 @@ impl Tool for DispatchAgentTool {
         // against THIS child's store/flag, not the parent's. StuckDetection is
         // stateless, so a fresh instance per child (rather than sharing the
         // parent's) is just as correct and keeps ownership uniform.
-        let child = child.with_middleware(vec![curation, Arc::new(StuckDetectionMiddleware)]);
+        // Child tools see the guarded composite: the two artifact mounts
+        // (read-only) over a HostBackend at the parent workspace root (spec §5.6).
+        let child_backend: Arc<dyn agent_tools::backend::Backend> =
+            Arc::new(agent_tools::backend::CompositeBackend::new(
+                vec![
+                    (
+                        "large_tool_results/".into(),
+                        Arc::new(agent_tools::backend::ReadOnlyToTools(
+                            artifacts.results.clone(),
+                        )) as Arc<dyn agent_tools::backend::Backend>,
+                    ),
+                    (
+                        "conversation_history/".into(),
+                        Arc::new(agent_tools::backend::ReadOnlyToTools(
+                            artifacts.history.clone(),
+                        )) as Arc<dyn agent_tools::backend::Backend>,
+                    ),
+                ],
+                Arc::new(agent_tools::backend::HostBackend::new(
+                    self.deps.loop_config.workspace.clone(),
+                )),
+            ));
+        let child = child
+            .with_middleware(vec![curation, Arc::new(StuckDetectionMiddleware)])
+            .with_backend(child_backend);
         // Route child-loop compaction through the dedicated model when set.
         let child = match &self.deps.compaction_model {
             Some(m) => child.with_compaction_model(m.clone()),
@@ -933,6 +954,7 @@ mod tests {
             timeout: Duration::from_secs(600),
             cancel: CancellationToken::new(),
             sandbox: Arc::new(agent_tools::HostExecutor),
+            backend: Arc::new(agent_tools::backend::HostBackend::new(std::env::temp_dir())),
             call_id: "d1".into(),
         }
     }
@@ -980,7 +1002,7 @@ mod tests {
     }
 
     /// Finding 4.1: registry-level description overrides must reach the CHILD
-    /// registry too (the seam spec's uniformity claim). context_recall is
+    /// registry too (the seam spec's uniformity claim). context_compact is
     /// always-registered for children, so overriding it needs no base tool.
     #[tokio::test]
     async fn description_overrides_reach_child_registry() {
@@ -1014,10 +1036,11 @@ mod tests {
         });
         let mut d = exec_deps(ScriptedModel::new(vec![]), 5);
         d.model = model.clone();
-        d.description_overrides = [("context_recall".to_string(), "OVERRIDDEN".to_string())].into();
+        d.description_overrides =
+            [("context_compact".to_string(), "OVERRIDDEN".to_string())].into();
         // Clone-propagation pin: nested deps are self.deps.clone() in execute().
         assert_eq!(
-            d.clone().description_overrides.get("context_recall"),
+            d.clone().description_overrides.get("context_compact"),
             Some(&"OVERRIDDEN".to_string())
         );
         let tool = DispatchAgentTool::new(d);
@@ -1027,7 +1050,7 @@ mod tests {
         let seen = model.seen.lock().unwrap();
         assert!(
             seen.iter()
-                .any(|(n, desc)| n == "context_recall" && desc.starts_with("OVERRIDDEN")),
+                .any(|(n, desc)| n == "context_compact" && desc.starts_with("OVERRIDDEN")),
             "child request schemas must carry the override: {seen:?}"
         );
     }
@@ -1083,7 +1106,7 @@ mod tests {
     ///     spec D4/§5.6 channel real memory tools use — `ToolContribution {
     ///     child_visible: true }` in the assembled parent's base snapshot)
     ///     reaches the child's registered tool schemas alongside the
-    ///     context-curation tools (`context_recall`/`context_compact`), proving
+    ///     context-curation tool (`context_compact`), proving
     ///     `filtered_base` + `curation.tools()` both land in the child registry.
     /// (b) stuck-detection is LIVE: three identical calls trip the spec §5.5
     ///     nudge inside the child's own turn loop (only reachable if
@@ -1146,7 +1169,7 @@ mod tests {
             .await
             .unwrap();
 
-        // (a) tool-surface: the memory tool AND both context-curation tools
+        // (a) tool-surface: the memory tool AND the context-curation tool
         // reached the child's registered schemas.
         let seen = model.seen.lock().unwrap();
         let seen_names: std::collections::HashSet<&str> =
@@ -1156,8 +1179,8 @@ mod tests {
             "memory tool from base_tools must reach the child registry: {seen_names:?}"
         );
         assert!(
-            seen_names.contains("context_recall") && seen_names.contains("context_compact"),
-            "context-curation's tools must reach the child registry: {seen_names:?}"
+            seen_names.contains("context_compact"),
+            "context-curation's tool must reach the child registry: {seen_names:?}"
         );
         assert!(
             !seen_names.contains("dispatch_agent"),

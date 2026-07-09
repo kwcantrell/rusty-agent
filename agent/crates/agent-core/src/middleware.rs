@@ -262,25 +262,15 @@ impl Middleware for MemoryRecallMiddleware {
 /// text-only-exit maintain when no tool turn ran (spec §5.5). Ships the
 /// context tools (child-invisible; children get per-dispatch instances).
 pub struct ContextCurationMiddleware {
-    store: Arc<dyn crate::OffloadStore>,
     flag: Arc<std::sync::atomic::AtomicBool>,
-    max_result_bytes: usize,
 }
 
 #[derive(Default)]
 pub(crate) struct Maintained(pub(crate) bool);
 
 impl ContextCurationMiddleware {
-    pub fn new(
-        store: Arc<dyn crate::OffloadStore>,
-        flag: Arc<std::sync::atomic::AtomicBool>,
-        max_result_bytes: usize,
-    ) -> Self {
-        Self {
-            store,
-            flag,
-            max_result_bytes,
-        }
+    pub fn new(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { flag }
     }
 
     /// `at_text_exit` selects the trace-log message so it matches the deleted
@@ -331,7 +321,7 @@ impl Middleware for ContextCurationMiddleware {
         "context-curation"
     }
     fn tools(&self) -> Vec<ToolContribution> {
-        crate::context_tools(self.store.clone(), self.flag.clone(), self.max_result_bytes)
+        crate::context_tools(self.flag.clone())
             .into_iter()
             .map(|tool| ToolContribution {
                 tool,

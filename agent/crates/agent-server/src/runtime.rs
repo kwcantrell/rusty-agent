@@ -5,7 +5,7 @@ use crate::wire::{
     PolicyInfo, PromptInfo, SandboxInfo, SettingsState, ToolEntry,
 };
 use agent_core::{
-    estimate_tokens, AgentLoop, OffloadStore, Retriever, DEFAULT_STREAM_IDLE_TIMEOUT,
+    estimate_tokens, AgentLoop, Retriever, SessionArtifacts, DEFAULT_STREAM_IDLE_TIMEOUT,
 };
 use agent_runtime_config::{
     assemble_loop, build_model, build_sandbox, claude_cli_opts, BuiltLoop, LoopParts,
@@ -36,8 +36,8 @@ pub struct RuntimeState {
     base_system_prompt: String,
     system_prompt: Mutex<String>,
     /// Conversation-stable context-management handles. Reused across loop rebuilds
-    /// so a settings change never orphans the offload table from its tools.
-    offload_store: Arc<dyn OffloadStore>,
+    /// so a settings change never orphans the artifact stores from their tools.
+    artifacts: Arc<SessionArtifacts>,
     compact_flag: Arc<AtomicBool>,
     /// Session-stable observability handles. Created ONCE here and reused across
     /// every loop rebuild — a per-rebuild TraceWriter would mint a colliding
@@ -71,8 +71,7 @@ impl RuntimeState {
         for w in config.warnings() {
             tracing::warn!(target: "config", "{w}");
         }
-        let offload_store: Arc<dyn OffloadStore> =
-            Arc::new(agent_core::InMemoryOffloadStore::new());
+        let artifacts = Arc::new(SessionArtifacts::new());
         let compact_flag = Arc::new(AtomicBool::new(false));
         let stats: Arc<std::sync::RwLock<agent_core::SessionStats>> = Arc::default();
         let trace = agent_runtime_config::build_trace(&config);
@@ -88,7 +87,7 @@ impl RuntimeState {
             &memory_tools,
             memory_retriever.as_ref(),
             &base_system_prompt,
-            &offload_store,
+            &artifacts,
             &compact_flag,
             &stats,
             &trace,
@@ -109,7 +108,7 @@ impl RuntimeState {
             memory_tools,
             memory_retriever,
             base_system_prompt,
-            offload_store,
+            artifacts,
             compact_flag,
             stats,
             trace,
@@ -122,9 +121,9 @@ impl RuntimeState {
         self.stats.clone()
     }
 
-    /// Conversation-stable offload table (shared with the session's `CuratedContext`).
-    pub fn offload_store(&self) -> Arc<dyn OffloadStore> {
-        self.offload_store.clone()
+    /// Conversation-stable artifact stores (shared with the session's `CuratedContext`).
+    pub fn artifacts(&self) -> Arc<SessionArtifacts> {
+        self.artifacts.clone()
     }
 
     /// Conversation-stable compaction-request flag (shared with the session's context).
@@ -170,7 +169,7 @@ impl RuntimeState {
             &self.memory_tools,
             self.memory_retriever.as_ref(),
             &self.base_system_prompt,
-            &self.offload_store,
+            &self.artifacts,
             &self.compact_flag,
             &self.stats,
             &self.trace,
@@ -230,7 +229,7 @@ impl RuntimeState {
     // the loop/prompt, so a concurrent apply() can produce old-cfg + new-loop values in
     // one snapshot — read-only, self-heals on refresh (same accepted pattern as settings_state()).
     pub fn architecture(&self, recall_budget: usize) -> ArchitectureSnapshot {
-        const CONTEXT_TOOLS: [&str; 2] = ["context_recall", "context_compact"];
+        const CONTEXT_TOOLS: [&str; 1] = ["context_compact"];
         const SKILL_TOOLS: [&str; 4] = [
             "list_skills",
             "use_skill",
@@ -353,7 +352,7 @@ fn build_loop(
     memory_tools: &[Arc<dyn Tool>],
     memory_retriever: Option<&Arc<dyn Retriever>>,
     base_system_prompt: &str,
-    offload_store: &Arc<dyn OffloadStore>,
+    artifacts: &Arc<SessionArtifacts>,
     compact_flag: &Arc<AtomicBool>,
     stats: &Arc<std::sync::RwLock<agent_core::SessionStats>>,
     trace: &Option<Arc<agent_runtime_config::TraceWriter>>,
@@ -378,7 +377,7 @@ fn build_loop(
             memory_retriever: memory_retriever.cloned(),
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             base_system_prompt: base_system_prompt.to_string(),
-            offload_store: offload_store.clone(),
+            artifacts: artifacts.clone(),
             compact_flag: compact_flag.clone(),
             sandbox: build_sandbox(cfg),
             stats: stats.clone(),
@@ -495,11 +494,15 @@ mod tests {
         };
         assert_eq!(kind_of("mcp_x"), "mcp");
         assert_eq!(kind_of("remember"), "memory");
-        // context tools registered by the loop are classified "context"
+        // Only context_compact is classified "context" now that context_recall
+        // is retired (offload recovery moved to the ordinary file tools).
+        assert_eq!(kind_of("context_compact"), "context");
         assert!(
-            snap.tools.iter().any(|t| t.kind == "context"),
-            "context_recall/context_compact must be classified context"
+            !snap.tools.iter().any(|t| t.name == "context_recall"),
+            "context_recall must not be registered post-retirement"
         );
+        // grep lands in the same bucket as read_file (both plain file tools).
+        assert_eq!(kind_of("grep"), kind_of("read_file"));
     }
 
     #[test]
@@ -769,7 +772,7 @@ mod tests {
         );
         cfg.sandbox_mode = "off".into();
         // build_loop must succeed — off → HostExecutor, no Docker required.
-        let store: Arc<dyn OffloadStore> = Arc::new(agent_core::InMemoryOffloadStore::new());
+        let artifacts = Arc::new(SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
         let result = build_loop(
             &cfg,
@@ -782,7 +785,7 @@ mod tests {
             &[],
             None,
             crate::daemon::SYSTEM_PROMPT,
-            &store,
+            &artifacts,
             &flag,
             &Arc::default(),
             &None,
@@ -825,7 +828,7 @@ mod tests {
             8192,
         );
         cfg.sandbox_mode = "auto".into();
-        let store: Arc<dyn OffloadStore> = Arc::new(agent_core::InMemoryOffloadStore::new());
+        let artifacts = Arc::new(SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
         let result = build_loop(
             &cfg,
@@ -838,7 +841,7 @@ mod tests {
             &[],
             None,
             crate::daemon::SYSTEM_PROMPT,
-            &store,
+            &artifacts,
             &flag,
             &Arc::default(),
             &None,

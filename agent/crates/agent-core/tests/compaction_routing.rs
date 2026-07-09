@@ -11,8 +11,8 @@ use agent_core::testkit::{
     AlwaysApprove, CollectingSink, PassthroughProtocol, Scripted, ScriptedModel,
 };
 use agent_core::{
-    AgentLoop, ContextCurationMiddleware, ContextManager, CuratedContext, InMemoryOffloadStore,
-    LoopConfig,
+    AgentLoop, ContextCurationMiddleware, ContextManager, CuratedContext, LoopConfig,
+    SessionArtifacts,
 };
 use agent_model::Message;
 use agent_policy::RulePolicy;
@@ -74,7 +74,7 @@ async fn routed_compaction_model_serves_the_summary_call() {
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(Echo));
 
-    let store: Arc<dyn agent_core::OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+    let artifacts = Arc::new(SessionArtifacts::new());
     let flag = Arc::new(AtomicBool::new(false));
 
     let agent = AgentLoop::new(
@@ -99,13 +99,9 @@ async fn routed_compaction_model_serves_the_summary_call() {
         },
     )
     .with_compaction_model(compactor.clone())
-    .with_middleware(vec![Arc::new(ContextCurationMiddleware::new(
-        store.clone(),
-        flag.clone(),
-        16384,
-    ))]);
+    .with_middleware(vec![Arc::new(ContextCurationMiddleware::new(flag.clone()))]);
 
-    let mut ctx = CuratedContext::new(Message::system("s"), store, flag);
+    let mut ctx = CuratedContext::new(Message::system("s"), artifacts, flag);
     // Seed enough closed history that a forced compaction has a span to replace,
     // then request compaction so the post-turn maintain() runs the compactor.
     for i in 0..6 {

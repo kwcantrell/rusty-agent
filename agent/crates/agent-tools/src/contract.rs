@@ -6,16 +6,18 @@ pub const WHEN_NOT_TO_CALL_MARKER: &str = "When NOT to call:";
 
 /// Tools genuinely confusable with a sibling that MUST carry `when_not_to_call`
 /// prose. A maintained ratchet — add a new confusable tool here by hand.
-/// Clusters: recall/context_recall (semantic memory vs offload rehydration),
-/// read_file/read_skill_file (workspace vs skill dir), write_file/edit_file
-/// (create-or-overwrite vs unique-substring replace),
+/// Clusters: read_file/read_skill_file (workspace vs skill dir),
+/// write_file/edit_file (create-or-overwrite vs unique-substring replace),
 /// execute_command/read_file+list_directory+git_* (a shell subsumes the
-/// dedicated Read-tier tools but at Write-tier friction).
+/// dedicated Read-tier tools but at Write-tier friction), recall/grep
+/// (semantic search over saved memories vs regex search of file contents,
+/// including offloaded tool results under large_tool_results/).
 /// NOTE: `recall` is runtime-injected, so it is enforced in agent-memory's own
-/// test rather than the agent-runtime-config enforcement test.
+/// test rather than the agent-runtime-config enforcement test. `context_recall`
+/// was retired in Phase 2 (offload recovery is read_file/grep now, spec §5.4).
 pub const CONFUSABLE_TOOLS: &[&str] = &[
     "recall",
-    "context_recall",
+    "grep",
     "read_file",
     "read_skill_file",
     "write_file",

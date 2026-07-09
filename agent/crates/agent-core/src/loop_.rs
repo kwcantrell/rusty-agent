@@ -161,6 +161,10 @@ pub struct AgentLoop {
     /// default: every dispatch point is then a no-op and behavior is
     /// bit-identical to pre-middleware runs.
     middleware: Vec<Arc<dyn crate::Middleware>>,
+    /// The virtual filesystem handed to tools via `ToolCtx` (spec §5.3).
+    /// Default (see `new`): a `HostBackend` rooted at `config.workspace` —
+    /// bare-loop parity with pre-backend-seam behavior.
+    backend: Arc<dyn agent_tools::backend::Backend>,
 }
 
 impl AgentLoop {
@@ -174,6 +178,9 @@ impl AgentLoop {
         sink: Arc<dyn EventSink>,
         config: LoopConfig,
     ) -> Self {
+        let backend: Arc<dyn agent_tools::backend::Backend> = Arc::new(
+            agent_tools::backend::HostBackend::new(config.workspace.clone()),
+        );
         Self {
             model,
             protocol,
@@ -185,6 +192,7 @@ impl AgentLoop {
             compaction_model: None,
             calib_ratio_micros: std::sync::atomic::AtomicU64::new(1_000_000),
             middleware: Vec::new(),
+            backend,
         }
     }
 
@@ -202,6 +210,13 @@ impl AgentLoop {
     /// (spec 2026-07-02 sub-spec #3, G4). None = the session model.
     pub fn with_compaction_model(mut self, model: Arc<dyn ModelClient>) -> Self {
         self.compaction_model = Some(model);
+        self
+    }
+
+    /// Replace the virtual filesystem the loop hands to tools (spec §5.3).
+    /// Default: a HostBackend rooted at `config.workspace` — bare-loop parity.
+    pub fn with_backend(mut self, backend: Arc<dyn agent_tools::backend::Backend>) -> Self {
+        self.backend = backend;
         self
     }
 
@@ -1315,6 +1330,7 @@ impl AgentLoop {
             timeout: tool.timeout_override().unwrap_or(self.config.tool_timeout),
             cancel: cancel.clone(),
             sandbox: self.config.sandbox.clone(),
+            backend: self.backend.clone(),
             call_id: call.id.clone(),
         };
         GateOutcome::Ready(ReadyCall {
@@ -1600,7 +1616,9 @@ mod tests {
 
     fn registry() -> Arc<ToolRegistry> {
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(ReadFile));
+        r.register(Arc::new(ReadFile {
+            max_bytes: 16 * 1024,
+        }));
         Arc::new(r)
     }
 
@@ -4659,6 +4677,7 @@ mod tests {
             timeout,
             cancel: CancellationToken::new(),
             sandbox: Arc::new(agent_tools::HostExecutor),
+            backend: Arc::new(agent_tools::backend::HostBackend::new(std::env::temp_dir())),
             call_id: "test".into(),
         }
     }
@@ -5334,7 +5353,6 @@ mod tests {
             "just a chat reply".into(),
         )]));
         let sink = Arc::new(CollectingSink::default());
-        let store: Arc<dyn crate::OffloadStore> = Arc::new(crate::InMemoryOffloadStore::new());
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let agent = AgentLoop::new(
             model,
@@ -5355,9 +5373,7 @@ mod tests {
                 ..Default::default()
             },
         )
-        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(
-            store, flag, 16384,
-        ))]);
+        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(flag))]);
         let mut ctx = SeqCtx {
             history: vec![],
             calls: Default::default(),
@@ -5396,7 +5412,6 @@ mod tests {
             Scripted::Text("The file says FILEBODY".into()),
         ]));
         let sink = Arc::new(CollectingSink::default());
-        let store: Arc<dyn crate::OffloadStore> = Arc::new(crate::InMemoryOffloadStore::new());
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let agent = AgentLoop::new(
             model,
@@ -5417,9 +5432,7 @@ mod tests {
                 ..Default::default()
             },
         )
-        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(
-            store, flag, 16384,
-        ))]);
+        .with_middleware(vec![Arc::new(crate::ContextCurationMiddleware::new(flag))]);
         let mut ctx = SeqCtx {
             history: vec![],
             calls: Default::default(),

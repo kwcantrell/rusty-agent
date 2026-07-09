@@ -158,8 +158,8 @@ impl EventSink for TerminalSink {
             AgentEvent::Context(c) => {
                 use agent_core::ContextEvent as CE;
                 let note = match c {
-                    CE::Offloaded { id, bytes, tool } =>
-                        format!("⟲ offloaded {tool} result #{id} ({} KB)", bytes / 1024),
+                    CE::Offloaded { path, bytes, tool } =>
+                        format!("⟲ offloaded {tool} result → {path} ({} KB)", bytes / 1024),
                     CE::Compacted { turns_replaced, tokens_before, tokens_after } =>
                         format!("⟲ compacted {turns_replaced} turns: {tokens_before} → {tokens_after} tokens"),
                     CE::CompactionFailed { reason } => format!("⚠ compaction failed: {reason}"),

@@ -185,6 +185,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancel: CancellationToken::new(),
             sandbox: Arc::new(crate::HostExecutor),
+            backend: Arc::new(crate::backend::HostBackend::new(std::env::temp_dir())),
             call_id: "test".into(),
         }
     }

@@ -344,9 +344,9 @@ fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
             reason: stop_reason_str(r),
         },
         AgentEvent::Context(c) => match c {
-            ContextEvent::Offloaded { id, bytes, tool } => TraceEvent::Context {
+            ContextEvent::Offloaded { path, bytes, tool } => TraceEvent::Context {
                 kind: "offloaded",
-                detail: serde_json::json!({"id": id, "bytes": bytes, "tool": tool}),
+                detail: serde_json::json!({"path": path, "bytes": bytes, "tool": tool}),
             },
             ContextEvent::Compacted {
                 turns_replaced,

@@ -26,7 +26,7 @@ use agent_model::{
 };
 use agent_sandbox::{validate_mount, DockerSandbox, SandboxPolicy};
 use agent_skills::{CreateSkill, ListSkills, ReadSkillFile, SkillRegistry, UseSkill};
-use agent_tools::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
+use agent_tools::fs::{EditFile, GrepTool, ListDirectory, ReadFile, WriteFile};
 use agent_tools::{
     git::{GitCommit, GitDiff, GitStatus},
     shell::ExecuteCommand,
@@ -123,12 +123,15 @@ pub fn build_routed_model(
     )
 }
 
-pub fn build_registry(http_allow_hosts: &[String]) -> ToolRegistry {
+pub fn build_registry(http_allow_hosts: &[String], max_read_bytes: usize) -> ToolRegistry {
     let mut r = ToolRegistry::new();
-    r.register(Arc::new(ReadFile));
+    r.register(Arc::new(ReadFile {
+        max_bytes: max_read_bytes,
+    }));
     r.register(Arc::new(WriteFile));
     r.register(Arc::new(EditFile));
     r.register(Arc::new(ListDirectory));
+    r.register(Arc::new(GrepTool));
     r.register(Arc::new(ExecuteCommand));
     r.register(Arc::new(GitStatus));
     r.register(Arc::new(GitDiff));
@@ -459,7 +462,7 @@ mod tests {
 
     #[test]
     fn build_registry_includes_render() {
-        let r = build_registry(&[]);
+        let r = build_registry(&[], 16 * 1024);
         assert!(r.get("render").is_some(), "render tool must be registered");
     }
 
@@ -477,12 +480,13 @@ mod tests {
     }
     #[test]
     fn registry_has_all_core_tools() {
-        let r = build_registry(&[]);
+        let r = build_registry(&[], 16 * 1024);
         for name in [
             "read_file",
             "write_file",
             "edit_file",
             "list_directory",
+            "grep",
             "execute_command",
             "git_status",
             "git_diff",

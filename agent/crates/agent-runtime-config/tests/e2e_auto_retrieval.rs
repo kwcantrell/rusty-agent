@@ -123,7 +123,7 @@ async fn auto_retrieval_feeds_a_seeded_fact_to_the_real_model() {
             stream_idle_timeout: Duration::from_secs(120),
             base_system_prompt: "You are a helpful assistant. Use any relevant memories provided."
                 .into(),
-            offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
+            artifacts: Arc::new(agent_core::SessionArtifacts::new()),
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sandbox: agent_runtime_config::build_sandbox(&cfg),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
@@ -189,7 +189,7 @@ async fn memory_off_suppresses_recall() {
             stream_idle_timeout: Duration::from_secs(120),
             base_system_prompt: "You are a helpful assistant. Use any relevant memories provided."
                 .into(),
-            offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
+            artifacts: Arc::new(agent_core::SessionArtifacts::new()),
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sandbox: agent_runtime_config::build_sandbox(&cfg),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
@@ -252,7 +252,7 @@ async fn assemble_loop_drives_a_real_tool_call() {
             stream_idle_timeout: Duration::from_secs(120),
             base_system_prompt:
                 "You are a coding agent. Use the provided tools to inspect the workspace.".into(),
-            offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
+            artifacts: Arc::new(agent_core::SessionArtifacts::new()),
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sandbox: agent_runtime_config::build_sandbox(&cfg),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),

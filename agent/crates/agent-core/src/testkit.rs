@@ -205,7 +205,9 @@ impl EventSink for CollectingSink {
             AgentEvent::Approval(_) => "approval".into(),
             AgentEvent::Error(e) => format!("error:{e}"),
             AgentEvent::Done(_) => "done".into(),
-            AgentEvent::Context(ContextEvent::Offloaded { id, .. }) => format!("offloaded:{id}"),
+            AgentEvent::Context(ContextEvent::Offloaded { path, .. }) => {
+                format!("offloaded:{path}")
+            }
             AgentEvent::Context(ContextEvent::Compacted { turns_replaced, .. }) => {
                 format!("compacted:{turns_replaced}")
             }

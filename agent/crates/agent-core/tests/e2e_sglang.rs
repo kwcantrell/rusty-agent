@@ -29,7 +29,9 @@ async fn reads_a_file_against_real_server() {
     let ws = dir.path().to_path_buf();
 
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(ReadFile));
+    reg.register(Arc::new(ReadFile {
+        max_bytes: 16 * 1024,
+    }));
     let sink = Arc::new(Capture(Mutex::new(vec![])));
     let agent = AgentLoop::new(
         Arc::new(OpenAiCompatClient::new(

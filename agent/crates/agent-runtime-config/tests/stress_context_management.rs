@@ -16,12 +16,12 @@
 
 use agent_core::testkit::{AlwaysApprove, Scripted, ScriptedModel};
 use agent_core::{
-    built_tokens, AgentEvent, AgentLoop, ContextCurationMiddleware, ContextManager,
-    ContextRecallTool, CuratedContext, EventSink, InMemoryOffloadStore, LoopConfig, MaintCtx,
-    MaintReport, OffloadConfig, OffloadEntry, OffloadKind, OffloadStore,
+    built_tokens, AgentEvent, AgentLoop, ContextCurationMiddleware, ContextManager, CuratedContext,
+    EventSink, LoopConfig, MaintCtx, MaintReport, OffloadConfig, SessionArtifacts,
 };
 use agent_model::{Message, ModelClient, NativeProtocol, OpenAiCompatClient, Role};
 use agent_policy::RulePolicy;
+use agent_tools::backend::{Backend, CompositeBackend, HostBackend, MemBackend, ReadOnlyToTools};
 use agent_tools::{
     Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema,
 };
@@ -29,6 +29,28 @@ use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// The guarded composite the loop's file tools see (matches assemble.rs).
+fn composite_over(artifacts: &Arc<SessionArtifacts>, ws: &std::path::Path) -> Arc<dyn Backend> {
+    Arc::new(CompositeBackend::new(
+        vec![
+            (
+                "large_tool_results/".into(),
+                Arc::new(ReadOnlyToTools(artifacts.results.clone())) as Arc<dyn Backend>,
+            ),
+            (
+                "conversation_history/".into(),
+                Arc::new(ReadOnlyToTools(artifacts.history.clone())) as Arc<dyn Backend>,
+            ),
+        ],
+        Arc::new(HostBackend::new(ws.to_path_buf())),
+    ))
+}
+
+/// Count of keys in a results store (successor of `store.len()`).
+async fn results_count(artifacts: &Arc<SessionArtifacts>) -> usize {
+    artifacts.results.ls("").await.unwrap().len()
+}
 
 /// ~1.4 KB of body so each output crosses `output_min_bytes` (1024) and is
 /// eligible to offload. A unique `<<n=K>>` marker lets a recall assert exact bytes.
@@ -97,7 +119,7 @@ impl EventSink for StressSink {
                 output,
                 status: agent_core::ToolStatus::Ok,
                 ..
-            } if name == "context_recall" => self.recalls.lock().unwrap().push(output.content),
+            } if name == "read_file" => self.recalls.lock().unwrap().push(output.content),
             AgentEvent::ToolResult {
                 name,
                 status: agent_core::ToolStatus::Ok,
@@ -120,18 +142,19 @@ async fn loop_stays_bounded_under_many_large_outputs_and_recalls() {
 
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().to_path_buf();
-    let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+    let artifacts = Arc::new(SessionArtifacts::new());
     let flag = Arc::new(AtomicBool::new(false));
 
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(BlobTool));
-    reg.register(Arc::new(ContextRecallTool::new(
-        store.clone(),
-        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
-    )));
+    reg.register(Arc::new(agent_tools::fs::ReadFile {
+        max_bytes: 16 * 1024,
+    }));
+    reg.register(Arc::new(agent_tools::fs::GrepTool));
 
     // Script: BLOBS turns each calling blob(n=i), then recall a spread of ids that
-    // are guaranteed to have been offloaded, then finish.
+    // are guaranteed to have been offloaded, then finish. blob i offloads once
+    // (keep_recent 1), so its results key is `{i}-b{i}` (seq == i).
     let mut script: Vec<Scripted> = (1..=BLOBS)
         .map(|i| Scripted::Call(format!("b{i}"), "blob".into(), format!(r#"{{"n":{i}}}"#)))
         .collect();
@@ -139,8 +162,8 @@ async fn loop_stays_bounded_under_many_large_outputs_and_recalls() {
     for id in recall_ids {
         script.push(Scripted::Call(
             format!("r{id}"),
-            "context_recall".into(),
-            format!(r#"{{"id":{id}}}"#),
+            "read_file".into(),
+            format!(r#"{{"path":"large_tool_results/{id}-b{id}"}}"#),
         ));
     }
     script.push(Scripted::Text("done".into()));
@@ -149,7 +172,7 @@ async fn loop_stays_bounded_under_many_large_outputs_and_recalls() {
     // keep_recent: 1 means each turn's blob offloads once the next arrives, so by
     // the end ids 1..=BLOBS-1 are in the store. high_water_pct 2.0 disables
     // compaction so this test isolates the offload+window path.
-    let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag.clone())
+    let mut ctx = CuratedContext::new(Message::system("SYS"), artifacts.clone(), flag.clone())
         .with_offload_config(OffloadConfig {
             keep_recent: 1,
             ..Default::default()
@@ -179,11 +202,8 @@ async fn loop_stays_bounded_under_many_large_outputs_and_recalls() {
             ..Default::default()
         },
     )
-    .with_middleware(vec![Arc::new(ContextCurationMiddleware::new(
-        store.clone(),
-        flag,
-        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
-    ))]);
+    .with_middleware(vec![Arc::new(ContextCurationMiddleware::new(flag))])
+    .with_backend(composite_over(&artifacts, &ws));
     agent
         .run(&mut ctx, "stress the context window".into())
         .await
@@ -198,10 +218,10 @@ async fn loop_stays_bounded_under_many_large_outputs_and_recalls() {
     );
 
     // INVARIANT 2: lots actually got offloaded (not a trivially-passing test).
+    let stored = results_count(&artifacts).await;
     assert!(
-        store.len() >= (BLOBS as usize) - 2,
-        "most blobs should have offloaded; got {}",
-        store.len()
+        stored >= (BLOBS as usize) - 2,
+        "most blobs should have offloaded; got {stored}"
     );
 
     // INVARIANT 3: each interleaved recall returned the exact bytes for that id.
@@ -247,9 +267,9 @@ async fn offload_table_recovers_every_entry_over_hundreds_of_cycles() {
     const TURNS: u64 = 500;
     const MODEL_LIMIT: usize = 6000;
 
-    let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+    let artifacts = Arc::new(SessionArtifacts::new());
     let flag = Arc::new(AtomicBool::new(false));
-    let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag)
+    let mut ctx = CuratedContext::new(Message::system("SYS"), artifacts.clone(), flag)
         .with_offload_config(OffloadConfig {
             keep_recent: 0,
             error_min_bytes: 20,
@@ -301,18 +321,21 @@ async fn offload_table_recovers_every_entry_over_hundreds_of_cycles() {
         "each turn must offload its one large result"
     );
     assert_eq!(
-        store.len(),
+        results_count(&artifacts).await,
         TURNS as usize,
         "store must hold every offloaded entry"
     );
 
     // INVARIANT: every entry recovers to its exact bytes (spot-check the full range).
+    // keep_recent 0 offloads each result in turn order, so entry i has key `i-call-i`.
     for i in 1..=TURNS {
-        let entry = store
-            .get(i)
-            .unwrap_or_else(|| panic!("entry #{i} vanished"));
+        let content = artifacts
+            .results
+            .read(&format!("{i}-call-{i}"))
+            .await
+            .unwrap_or_else(|_| panic!("entry #{i} vanished"));
         assert_eq!(
-            entry.content,
+            content,
             format!("ERROR: {}", blob_body(i)),
             "entry #{i} corrupted"
         );
@@ -349,9 +372,9 @@ async fn repeated_compaction_keeps_history_bounded_and_coherent() {
     const MODEL_LIMIT: usize = 50_000;
     const KEEP: usize = 2;
 
-    let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+    let artifacts = Arc::new(SessionArtifacts::new());
     let flag = Arc::new(AtomicBool::new(false));
-    let mut ctx = CuratedContext::new(Message::system("SYS"), store, flag)
+    let mut ctx = CuratedContext::new(Message::system("SYS"), artifacts, flag)
         .with_offload_config(OffloadConfig {
             keep_recent: KEEP,
             ..Default::default()
@@ -447,31 +470,26 @@ async fn repeated_compaction_keeps_history_bounded_and_coherent() {
     );
 }
 
-/// 4. CONCURRENCY STRESS — 16 tasks pounding the shared store at once.
-/// Invariants: ids are globally unique, nothing is lost, every entry reads back.
+/// 4. CONCURRENCY STRESS — 16 tasks pounding the shared results backend at once.
+/// Invariants: keys are globally unique, nothing is lost, every entry reads back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn store_is_safe_and_lossless_under_concurrent_writers() {
     const WRITERS: u64 = 16;
     const PER_WRITER: u64 = 200;
 
-    let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+    // The results store is now a Backend (MemBackend). Curation mints unique keys
+    // per lift; here each writer mints its own unique `w{w}-k{k}` key directly.
+    let store: Arc<dyn Backend> = Arc::new(MemBackend::new());
     let mut handles = Vec::new();
     for w in 0..WRITERS {
         let s = store.clone();
         handles.push(tokio::spawn(async move {
             let mut mine = Vec::new();
             for k in 0..PER_WRITER {
+                let key = format!("w{w}-k{k}");
                 let content = format!("w{w}-k{k}");
-                let id = s.put(OffloadEntry {
-                    id: 0,
-                    tool_call_id: format!("w{w}k{k}"),
-                    tool_name: "blob".into(),
-                    kind: OffloadKind::Output,
-                    content: content.clone(),
-                    bytes: content.len(),
-                    turn: 0,
-                });
-                mine.push((id, content));
+                s.write(&key, &content).await.unwrap();
+                mine.push((key, content));
             }
             mine
         }));
@@ -483,20 +501,24 @@ async fn store_is_safe_and_lossless_under_concurrent_writers() {
     }
 
     let total = (WRITERS * PER_WRITER) as usize;
-    // INVARIANT: no id collisions across threads.
-    let ids: HashSet<u64> = all.iter().map(|(id, _)| *id).collect();
+    // INVARIANT: no key collisions across threads.
+    let keys: HashSet<String> = all.iter().map(|(k, _)| k.clone()).collect();
     assert_eq!(
-        ids.len(),
+        keys.len(),
         total,
-        "every put must get a unique id (no races)"
+        "every write uses a unique key (no races)"
     );
-    assert_eq!(store.len(), total, "store must hold every concurrent write");
+    assert_eq!(
+        store.ls("").await.unwrap().len(),
+        total,
+        "store must hold every concurrent write"
+    );
     // INVARIANT: every write reads back with the exact content the writer stored.
-    for (id, content) in &all {
+    for (key, content) in &all {
         assert_eq!(
-            store.get(*id).unwrap().content,
+            store.read(key).await.unwrap(),
             *content,
-            "entry #{id} corrupted under contention"
+            "entry {key} corrupted under contention"
         );
     }
 }
@@ -522,15 +544,15 @@ async fn live_window_stays_bounded_under_model_driven_volume() {
 
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().to_path_buf();
-    let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+    let artifacts = Arc::new(SessionArtifacts::new());
     let flag = Arc::new(AtomicBool::new(false));
 
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(BlobTool));
-    reg.register(Arc::new(ContextRecallTool::new(
-        store.clone(),
-        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
-    )));
+    reg.register(Arc::new(agent_tools::fs::ReadFile {
+        max_bytes: 16 * 1024,
+    }));
+    reg.register(Arc::new(agent_tools::fs::GrepTool));
 
     let sink = Arc::new(StressSink::default());
     // keep_recent 2; compaction disabled so the live model only drives blob/recall
@@ -540,7 +562,7 @@ async fn live_window_stays_bounded_under_model_driven_volume() {
             "You are a tool-using agent. The `blob` tool returns a large block of text \
          for a given integer `n`. When you call a tool, wait for its result.",
         ),
-        store.clone(),
+        artifacts.clone(),
         flag.clone(),
     )
     .with_offload_config(OffloadConfig {
@@ -576,19 +598,17 @@ async fn live_window_stays_bounded_under_model_driven_volume() {
             ..Default::default()
         },
     )
-    .with_middleware(vec![Arc::new(ContextCurationMiddleware::new(
-        store.clone(),
-        flag,
-        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
-    ))]);
+    .with_middleware(vec![Arc::new(ContextCurationMiddleware::new(flag))])
+    .with_backend(composite_over(&artifacts, &ws));
 
     agent
         .run(
             &mut ctx,
             format!(
                 "Call the `blob` tool {ASK} times, once per turn, with n = 1, 2, 3, … up to {ASK}. \
-                 After all {ASK} calls are done, call `context_recall` with id 1 to pull back the \
-                 first blob, and reply with the exact `<<n=...>>` marker you find in it."
+                 After all {ASK} calls are done, read_file the large_tool_results/ path named in \
+                 the placeholder for the first blob, and reply with the exact `<<n=...>>` marker \
+                 you find in it."
             ),
         )
         .await
@@ -597,7 +617,7 @@ async fn live_window_stays_bounded_under_model_driven_volume() {
     let peak = *sink.max_prompt_tokens.lock().unwrap();
     let blobs = *sink.blob_results.lock().unwrap();
     let recalls = sink.recalls.lock().unwrap().clone();
-    let offloaded = store.len();
+    let offloaded = results_count(&artifacts).await;
     eprintln!(
         "[live stress] peak_prompt_tokens={peak} blob_calls={blobs} offloaded={offloaded} \
          recalls={} done={}",

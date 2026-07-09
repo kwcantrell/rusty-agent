@@ -1,4 +1,3 @@
-use crate::fs::paths::resolve_in_workspace;
 use crate::{Access, Display, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolSchema};
 use async_trait::async_trait;
 use serde_json::json;
@@ -62,22 +61,11 @@ impl Tool for WriteFile {
     ) -> Result<ToolOutput, ToolError> {
         let path = str_arg(&args, "path")?;
         let content = str_arg(&args, "content")?;
-        let full = resolve_in_workspace(&ctx.workspace, &path)?;
-        let before = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        if let Some(parent) = full.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ToolError::Failed {
-                    message: e.to_string(),
-                    stderr: None,
-                })?;
-        }
-        tokio::fs::write(&full, &content)
+        let before = ctx.backend.read(&path).await.unwrap_or_default();
+        ctx.backend
+            .write(&path, &content)
             .await
-            .map_err(|e| ToolError::Failed {
-                message: e.to_string(),
-                stderr: None,
-            })?;
+            .map_err(crate::fs::fs_err)?;
         Ok(ToolOutput {
             content: format!("wrote {} bytes to {path}", content.len()),
             display: Some(diff(&path, &before, &content)),
@@ -130,27 +118,14 @@ impl Tool for EditFile {
         let path = str_arg(&args, "path")?;
         let old = str_arg(&args, "old")?;
         let new = str_arg(&args, "new")?;
-        let full = resolve_in_workspace(&ctx.workspace, &path)?;
-        let before = tokio::fs::read_to_string(&full)
+        let edited = ctx
+            .backend
+            .edit(&path, &old, &new)
             .await
-            .map_err(|e| ToolError::NotFound(format!("{path}: {e}")))?;
-        let count = before.matches(&old).count();
-        if count != 1 {
-            return Err(ToolError::Failed {
-                message: format!("`old` matched {count} times; must match exactly once"),
-                stderr: None,
-            });
-        }
-        let after = before.replacen(&old, &new, 1);
-        tokio::fs::write(&full, &after)
-            .await
-            .map_err(|e| ToolError::Failed {
-                message: e.to_string(),
-                stderr: None,
-            })?;
+            .map_err(crate::fs::fs_err)?;
         Ok(ToolOutput {
             content: format!("edited {path}"),
-            display: Some(diff(&path, &before, &after)),
+            display: Some(diff(&path, &edited.before, &edited.after)),
         })
     }
 }
@@ -167,10 +142,11 @@ mod tests {
     fn ctx(ws: std::path::PathBuf) -> ToolCtx {
         use std::sync::Arc;
         ToolCtx {
-            workspace: ws,
+            workspace: ws.clone(),
             timeout: Duration::from_secs(5),
             cancel: CancellationToken::new(),
             sandbox: Arc::new(crate::HostExecutor),
+            backend: Arc::new(crate::backend::HostBackend::new(ws)),
             call_id: "test".into(),
         }
     }

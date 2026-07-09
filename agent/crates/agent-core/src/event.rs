@@ -6,7 +6,7 @@ use agent_tools::ToolOutput;
 #[derive(Debug, Clone)]
 pub enum ContextEvent {
     Offloaded {
-        id: u64,
+        path: String,
         bytes: usize,
         tool: String,
     },

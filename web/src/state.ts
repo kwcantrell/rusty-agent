@@ -53,9 +53,9 @@ export function initialState(userMsgs: string[]): ConversationState {
 }
 
 /** One-line human summary of a context-management event, keyed by kind. */
-function describeContext(kind: string, detail: Record<string, unknown>): string {
+export function describeContext(kind: string, detail: Record<string, unknown>): string {
   switch (kind) {
-    case "offloaded": return `offloaded ${detail.tool} result #${detail.id}`;
+    case "offloaded": return `offloaded ${detail.tool} result → ${detail.path ?? `#${detail.id}`}`;
     case "compacted":
       return `compacted ${detail.turns_replaced} turns: ${detail.tokens_before} → ${detail.tokens_after} tokens`;
     case "compaction_failed": return `compaction failed: ${detail.reason}`;

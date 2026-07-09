@@ -246,8 +246,9 @@ impl Tool for Recall {
     }
     fn when_not_to_call(&self) -> Option<&str> {
         Some(
-            "Not for rehydrating offloaded conversation context — use context_recall. \
-              Use recall only for semantic search over saved long-term memories.",
+            "Not for rehydrating offloaded conversation context — offloaded tool \
+             results live as read-only files under large_tool_results/; use \
+             read_file or grep there. Use recall for semantic search of saved memories.",
         )
     }
     fn schema(&self) -> ToolSchema {
@@ -720,6 +721,9 @@ pub(crate) mod test_support {
             timeout: std::time::Duration::from_secs(5),
             cancel: tokio_util::sync::CancellationToken::new(),
             sandbox: Arc::new(agent_tools::HostExecutor),
+            backend: Arc::new(agent_tools::backend::HostBackend::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
             call_id: "test".into(),
         }
     }
@@ -744,10 +748,10 @@ mod recall_contract_tests {
         assert!(agent_tools::CONFUSABLE_TOOLS.contains(&"recall"));
         let wntc = rec
             .when_not_to_call()
-            .expect("recall must disambiguate vs context_recall");
+            .expect("recall must disambiguate vs file-based offload recovery");
         assert!(
-            wntc.contains("context_recall"),
-            "prose names the sibling: {wntc}"
+            wntc.contains("large_tool_results/"),
+            "recall must disambiguate vs file-based offload recovery"
         );
         // Required param `query` is described.
         assert!(

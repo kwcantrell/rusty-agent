@@ -317,9 +317,9 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
         AgentEvent::Context(c) => {
             use agent_core::ContextEvent as CE;
             let (kind, detail) = match c {
-                CE::Offloaded { id, bytes, tool } => (
+                CE::Offloaded { path, bytes, tool } => (
                     "offloaded",
-                    serde_json::json!({"id": id, "bytes": bytes, "tool": tool}),
+                    serde_json::json!({"path": path, "bytes": bytes, "tool": tool}),
                 ),
                 CE::Compacted {
                     turns_replaced,
@@ -639,7 +639,7 @@ mod tests {
         for (ev, kind) in [
             (
                 ContextEvent::Offloaded {
-                    id: 4,
+                    path: "large_tool_results/1-c1".into(),
                     bytes: 2048,
                     tool: "read_file".into(),
                 },

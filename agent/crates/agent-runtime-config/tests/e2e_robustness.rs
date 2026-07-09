@@ -81,7 +81,7 @@ fn assemble_test(
             memory_retriever: None,
             stream_idle_timeout: Duration::from_secs(10),
             base_system_prompt: "You are a test agent.".into(),
-            offload_store: Arc::new(agent_core::InMemoryOffloadStore::new()),
+            artifacts: Arc::new(agent_core::SessionArtifacts::new()),
             compact_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sandbox: agent_runtime_config::build_sandbox(&cfg),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),

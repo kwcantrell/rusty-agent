@@ -3,7 +3,7 @@
 use agent_core::testkit::{
     AlwaysApprove, CollectingSink, PassthroughProtocol, Scripted, ScriptedModel,
 };
-use agent_core::{AgentLoop, CuratedContext, InMemoryOffloadStore, LoopConfig};
+use agent_core::{AgentLoop, CuratedContext, LoopConfig, SessionArtifacts};
 use agent_model::Message;
 use agent_policy::RulePolicy;
 use agent_tools::{
@@ -93,7 +93,7 @@ fn run_probe(probe: Arc<TimeoutProbe>) {
         );
         let mut ctx = CuratedContext::new(
             Message::system("s"),
-            Arc::new(InMemoryOffloadStore::new()),
+            Arc::new(SessionArtifacts::new()),
             Arc::new(AtomicBool::new(false)),
         );
         agent.run(&mut ctx, "go".into()).await.unwrap();
