@@ -1,7 +1,7 @@
 ---
 type: Practice
 title: Planning by recitation (the no-op todo tool)
-description: Give the agent a write_todos tool that performs no computation — its entire value is context engineering: rewriting the plan into recent context keeps long-horizon goals in the attention window.
+description: "Give the agent a write_todos tool that performs no computation — its entire value is context engineering: rewriting the plan into recent context keeps long-horizon goals in the attention window."
 tags: [deepagents-refactor]
 timestamp: 2026-07-08T00:00:00Z
 ---

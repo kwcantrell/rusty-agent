@@ -1,6 +1,6 @@
 ---
 type: Source
-title: τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains
+title: "τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"
 description: Academic research material on the SDLC of AI agents.
 resource: https://arxiv.org/abs/2406.12045
 org: Academic research

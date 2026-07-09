@@ -1,6 +1,6 @@
 ---
 type: Source
-title: SWE-Bench Pro: Can AI Agents Solve Long-Horizon Software Engineering Tasks?
+title: "SWE-Bench Pro: Can AI Agents Solve Long-Horizon Software Engineering Tasks?"
 description: OpenAI research community material on the SDLC of AI agents.
 resource: https://arxiv.org/abs/2509.16941
 org: OpenAI research community

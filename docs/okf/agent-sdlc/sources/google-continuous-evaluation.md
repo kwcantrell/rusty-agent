@@ -1,6 +1,6 @@
 ---
 type: Source
-title: From 'Vibe Checks' to Continuous Evaluation: Engineering Reliable AI Agents
+title: "From 'Vibe Checks' to Continuous Evaluation: Engineering Reliable AI Agents"
 description: Google Cloud material on the SDLC of AI agents.
 resource: https://cloud.google.com/blog/topics/developers-practitioners/from-vibe-checks-to-continuous-evaluation-engineering-reliable-ai-agents
 org: Google Cloud

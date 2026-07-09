@@ -1,6 +1,6 @@
 ---
 type: Source
-title: AgentBench: Evaluating LLMs as Agents
+title: "AgentBench: Evaluating LLMs as Agents"
 description: Tsinghua University (THUDM) material on the SDLC of AI agents.
 resource: https://arxiv.org/abs/2308.03688
 org: Tsinghua University (THUDM)
