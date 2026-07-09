@@ -1,8 +1,13 @@
 # Per-sub-agent permissions — floor-only narrowing (deepagents refactor, Phase 3B-1c) — design
 
-**Status:** BRAINSTORM-APPROVED 2026-07-09 (dialect = flat two lists; Ask-under-
-unattended = rely on channel; placement = wrap-at-dispatch). Adversarial spec panel
-pending; owner gate pending.
+**Status:** PANEL-REVIEWED 2026-07-09. Brainstorm decisions (dialect = flat two
+lists; Ask-under-unattended = rely on channel; placement = wrap-at-dispatch) held.
+Adversarial panel (4 reviewers, distinct mandates): all **APPROVE-WITH-FIXES, no
+BLOCKER**; the Failure reviewer confirmed **no path for a child to exceed its
+parent's effective policy**. All majors folded in (see Panel & review log —
+notably §2.6 reworked to parse-at-dispatch, and the `respond` conflict rule
+demoted to an advisory lint). Owner gate pending: **one escalation (E1: cut or
+keep the `Suffix` pattern variant)** + sign-off on the two folded reworks.
 **Governing goal (owner, carried from Phase 2/3):** deepagents-style **modularity** —
 a custom sub-agent changes runtime behavior via configuration, not code. This slice
 adds one configured capability: a named sub-agent may declare a **permission floor**
@@ -37,8 +42,10 @@ nothing else. `middleware` and `skills` stay validated-inert (dropped, 3B-1 §9)
 - Dispatch wiring: a named child with rules gets its loop policy wrapped over the
   **caller's effective** policy, and the **nested dispatch deps carry the wrapped
   Arc** so narrowing composes monotonically down every chain (§2.5).
-- Config validation (dialect + conflict rules) at `RuntimeConfig::validate()`;
-  assembly stays infallible with a fail-closed can't-happen arm (§2.6).
+- Config validation (dialect rules) at `RuntimeConfig::validate()` + advisory
+  `warnings()` lints; assembly stays infallible by carrying the **raw** lists;
+  the dialect parse runs once at dispatch and **fails closed** with a dispatch
+  error on the lenient-boot path (§2.6).
 - The §9-mandated monotonicity invariant test + unit/validation/dispatch tests (§6).
 - `config.example.toml` gains a commented permissions example.
 
@@ -60,7 +67,8 @@ nothing else. `middleware` and `skills` stay validated-inert (dropped, 3B-1 §9)
   Ask rides the existing `Approval` event. 3B-2 typed stream is separate.
 - **No cross-validation of patterns against the live tool set** (§4): a pattern
   naming a nonexistent tool is a silent no-op, same posture as 3B-1's unknown
-  `tools` ref. Documented residual.
+  `tools` ref. Partially mitigated by non-fatal `warnings()` lints (§2.2);
+  remainder is a documented residual.
 
 ## 1. Problem
 
@@ -130,18 +138,40 @@ Semantics and validation (all violations are config errors naming the spec, in
 1. **Both lists match a tool → Deny wins** (most restrictive).
 2. Every pattern must parse under the §2.3 dialect (empty string, interior `*`,
    multiple `*` → error).
-3. Unknown keys in the block (e.g. `allow`) fail file parse
-   (`deny_unknown_fields`) — widening is unrepresentable.
+3. Unknown keys in the block (e.g. `allow`) are rejected by
+   `deny_unknown_fields` — widening is unrepresentable: no `allow` term can
+   ever reach the floor. **Precise consequence (panel A-MAJOR):** the persisted
+   runtime config is **JSON** (`rt.json`; `config.example.toml` is
+   documentation-only, never parsed), loaded via the lenient
+   `PartialRuntimeConfig` overlay — a `deny_unknown_fields` trip aborts the
+   *whole overlay*, and the daemon silently boots on the flag-derived base with
+   only a stderr/log warning. That empties `named_subagents` entirely: **no
+   named children exist at all** (dispatching one errors as an unknown
+   `subagent_type`), so nothing runs *unfloored* — the runtime reverts to the
+   pre-registry baseline. The CLI path and IPC `apply()` DO hard-reject via
+   `validate()`. Accepted residual: this is the pre-existing lenient-load
+   posture, not a new escalation surface (§4).
 4. Duplicate patterns are accepted (harmless; matches 3B-1b's residual posture).
 5. `permissions = {}` (both lists empty) is valid: no floors. Treated as
    rule-less at dispatch (§2.5) — the child gets the caller's policy Arc
    untouched, so empty-block behavior is *identical* to omitting the block.
-6. **Conflict rule:** a spec with `response_format` whose `deny` or `ask` list
-   *explicitly names* `respond` (exact pattern) is a config error — installing a
-   structured-response tool and dead-bolting it is always a mistake. A wildcard
-   that happens to cover `respond` is accepted (§4, footgun documented).
+6. **`respond` coverage is an advisory lint, not an error** (panel rework: the
+   original exact-name-only hard error was asymmetric — a wildcard covering
+   `respond` produced the identical dead-bolt silently). A spec with
+   `response_format` whose `deny` or `ask` patterns cover `respond` — exact
+   **or** wildcard — triggers a non-fatal `RuntimeConfig::warnings()` entry:
+   the structured child is guaranteed to hit the marked free-text fallback.
+   Uniform with §4's fail-closed posture; a broad wildcard may legitimately
+   mean "lock this child down hard".
 7. The reserved-field rejection narrows: `permissions` accepted+validated;
    `middleware`/`skills` still hard-rejected non-null.
+8. **Advisory `warnings()` lints** (non-fatal, surfaced on CLI stderr / server
+   `tracing::warn` — the existing audit-5.2 machinery): (a) an *exact* `deny`/
+   `ask` pattern naming a tool that the spec's own `tools` allowlist excludes
+   (the rule is inert — the gate never sees that tool); (b) a pattern whose
+   affix contains characters the MCP name sanitizer would rewrite (it can
+   never match a live MCP name — §2.3); (c) the `respond`-coverage lint of
+   rule 6.
 
 ### 2.3 Pattern dialect (flat, not `globset`)
 
@@ -167,6 +197,24 @@ impl ToolPattern {
   `github__*` floors one server's whole tool set. (The 3B-1 §9 note said
   `mcp__*`; that prefix does not exist in this runtime — server-name prefix is
   the real convention.)
+- **MCP sanitizer divergence (panel F-MAJOR-2/3, documented):** floors match the
+  **sanitized** name `{clean(server)}__{clean(tool)}` — `clean()` rewrites every
+  char outside `[a-zA-Z0-9-]` to `_`, and matching is case-sensitive. A floor
+  `github__*` misses server spellings `GitHub`, `git.hub` (→ `git_hub__…`), or
+  a renamed/reconnected variant. This is floor-*evasion vs author intent*, never
+  escalation above the parent (the child still gets the base decision). Lint
+  (b) of §2.2 rule 8 catches unsanitizable affixes; the residual (cosmetic
+  server-name variants, and the pre-existing `__`-boundary ambiguity — server
+  `a__b`+tool `c` and server `a`+tool `b__c` both namespace to `a__b__c` under
+  last-wins registration) is documented in §4 and `config.example.toml`.
+- **GATE DECISION E1 (escalated, not folded):** whether to **cut
+  `ToolPattern::Suffix`** from this slice. Two reviewers found it net-negative:
+  the only real suffix family is `*_file`, which spans `read_file` + two
+  mutators — a security author writing `deny=["*_file"]` to block mutations
+  also blocks reads. Prefix+exact+`Any` cover every documented use-case.
+  Recommendation: cut (defer behind the same future gate as command/path
+  floors, §5). If kept: add the `*_file`-spans-reads footgun note here and in
+  `config.example.toml`.
 - `Prefix("")`/`Suffix("")` cannot arise: `"*"` alone parses as `Any`, so every
   `Prefix`/`Suffix` affix is non-empty by construction (no accidental
   match-everything from a malformed affix).
@@ -182,11 +230,10 @@ pub struct ToolPermissions {
     ask: Vec<ToolPattern>,
 }
 impl ToolPermissions {
-    /// Parses both lists; Err on any dialect violation (used by validate() AND assembly).
+    /// Parses both lists; Err on any dialect violation. Called by validate()
+    /// (config-load gate) and by dispatch (the only gate on the lenient-boot
+    /// path — §2.6). NOT called at assembly.
     pub fn parse(agent_name: &str, deny: &[String], ask: &[String]) -> Result<Self, String>;
-    /// Fail-closed sentinel for the assembly can't-happen arm (§2.6).
-    pub fn deny_all(agent_name: &str) -> Self;
-    pub fn is_empty(&self) -> bool;
     /// None = no floor. Some(Ask) / Some(Deny(reason)) = floor for this tool.
     fn floor(&self, tool: &str) -> Option<Decision>;
 }
@@ -214,10 +261,13 @@ impl PolicyEngine for SubAgentPolicy {
   keying on `Access::Read` would wrongly trust `write_todos`/`context_compact`/
   `respond`, which declare Read yet mutate.
 - **`intent.tool` == registry name is a convention, verified at baseline** for
-  every in-tree tool (each `intent()` hardcodes its registry name) and for MCP
-  (`tool: self.namespaced.clone()`). §6 adds a conformance test over the
-  assembled tool set so a future tool that breaks the convention fails loudly —
-  a mismatch would make a configured floor silently miss.
+  every in-tree tool (panel-swept: all 21 tools' `intent()` literals match
+  their `name()`) and for MCP (`tool: self.namespaced.clone()`). §6 adds a
+  conformance test over the **assembled** tool set *including an MCP-shaped
+  tool* so a future tool that breaks the convention fails loudly — a mismatch
+  would make a configured floor silently miss. This test also stands guard on
+  the §2.3 sanitizer residual: identity-keyed floors are only as good as name
+  identity.
 - The floor scans `deny` before `ask` (deny short-circuits; rule 1 of §2.2 falls
   out of evaluation order).
 
@@ -226,8 +276,16 @@ impl PolicyEngine for SubAgentPolicy {
 In `DispatchAgentTool::execute()` (named-resolution region, `dispatch.rs`):
 
 ```rust
+// Parse-at-dispatch (§2.6): the raw lists ride ResolvedSubAgent; a dialect
+// error here fails the WHOLE dispatch call, closed and loud.
 let child_policy: Arc<dyn PolicyEngine> = match resolved.and_then(|r| r.permissions.as_ref()) {
-    Some(rules) => Arc::new(SubAgentPolicy::new(self.deps.policy.clone(), rules.clone())),
+    Some(raw) => {
+        let rules = ToolPermissions::parse(&type_name, &raw.deny, &raw.ask)
+            .map_err(|e| ToolError::InvalidArgs(format!(
+                "named sub-agent '{type_name}': invalid permissions: {e}"
+            )))?;
+        Arc::new(SubAgentPolicy::new(self.deps.policy.clone(), rules))
+    }
     None => self.deps.policy.clone(), // general-purpose & rule-less named: same Arc
 };
 // `Some` is non-empty by construction: assembly normalized empty blocks to None (§2.6).
@@ -246,9 +304,12 @@ let child_policy: Arc<dyn PolicyEngine> = match resolved.and_then(|r| r.permissi
   gets `SubAgentPolicy(base, Rx)` unchanged. Every hop is `narrow`, so the
   effective decision for any intent is monotonically non-decreasing in
   restrictiveness down any chain — named or ad-hoc, any depth.
-- `ResolvedSubAgent` gains `permissions: Option<agent_policy::ToolPermissions>`
-  (`ToolPermissions: Clone`, two small vecs — no Arc needed). Per the 3B-1
-  borrow rule, clone it into an owned local before any `.await`.
+- `ResolvedSubAgent` gains `permissions: Option<agent_policy::PermissionLists>`
+  — a **raw** two-list carrier struct (`pub deny: Vec<String>, pub ask:
+  Vec<String>`, `Clone`) defined in `agent-policy` so `agent-core` never
+  depends on the config crate. Mirrors 3B-1b, which carries the raw
+  `response_format` Value on `ResolvedSubAgent` unparsed. Per the 3B-1 borrow
+  rule, clone it into an owned local before any `.await`.
 - The approval channel stays the shared parent Arc — an `ask`-floored call
   prompts exactly like any Ask today; children already emit `Approval` through
   `SubagentSink` (unchanged).
@@ -256,21 +317,31 @@ let child_policy: Arc<dyn PolicyEngine> = match resolved.and_then(|r| r.permissi
   rule-less named specs, and empty-block specs all take the `None`/same-Arc arm
   — no behavior change for any existing config.
 
-### 2.6 Assembly & fallibility posture
+### 2.6 Assembly & fallibility posture (panel-reworked)
 
 `assemble_loop` stays **infallible** (3B-1 BLOCKER precedent — no `.expect()`
-panics in the lenient-boot server path). Resolution:
+panics in the lenient-boot server path). **Verified boot-path fact (panel):
+the server boots WITHOUT `validate()`** (`RuntimeState::new` is deliberately
+lenient); only the CLI and IPC `apply()` validate. So validation is *not* a
+guarantee at assembly time, and the original draft's "can't-happen fail-closed
+`deny_all` arm at assembly" was both mis-attributed to the 3B-1b precedent
+(which carries the raw value and never re-parses at assembly) and falsely
+framed as unreachable. Reworked posture:
 
-- `RuntimeConfig::validate()` calls `ToolPermissions::parse` per spec and rejects
-  the config on any dialect error (the *real* gate).
-- Assembly (`assemble.rs` spec-resolution loop) calls the same
-  `ToolPermissions::parse`; the `Err` arm is unreachable post-validate and is
-  handled **fail-closed**: substitute `ToolPermissions::deny_all(name)` and emit
-  a `tracing::error!`. A can't-happen bug thus degrades to an over-restrictive
-  child, never an over-permissive one.
+- `RuntimeConfig::validate()` calls `ToolPermissions::parse` per spec and
+  rejects the config on any dialect error — the fail-fast gate on the CLI and
+  `apply()` paths.
+- **Assembly does not parse.** It clones the raw `deny`/`ask` lists into
+  `ResolvedSubAgent.permissions` (as `PermissionLists`, §2.5) — trivially
+  infallible, matching 3B-1b's raw-`response_format` handling exactly.
+- **Dispatch parses once per named-child launch** (§2.5 snippet). On the
+  lenient-boot path this is the *only* dialect gate, and it **fails closed**:
+  a dialect-invalid block makes the named child **undispatchable** (the
+  dispatch call errors with the parse reason) rather than running unfloored.
+  Same surface-at-dispatch posture as 3B-1's unknown-`tools` precedent.
 - `None` permissions and empty-block permissions resolve to `None` on
-  `ResolvedSubAgent` (assembly normalizes `is_empty` blocks away, keeping the
-  §2.5 same-Arc fast path honest).
+  `ResolvedSubAgent` (assembly normalizes empty blocks away, keeping the §2.5
+  same-Arc fast path honest).
 
 ### 2.7 Ask under unattended runs (§9 item — resolved by owner decision)
 
@@ -279,18 +350,26 @@ mechanism is added: both production channels already resolve unanswered prompts
 to Deny — `TerminalApproval` times out (300 s default) to Deny;
 `IpcApprovalChannel` denies immediately when no UI is attached and times out to
 Deny otherwise. The safety property (unanswered ⇒ never executes) holds
-structurally; the cost is a bounded wait in a truly unattended terminal run.
-Revisit with a knob only if a real headless deployment needs fail-fast.
+structurally; the cost is a bounded wait in a truly unattended terminal run —
+note that N concurrently-dispatched ask-floored children make the aggregate
+unattended stall up to N×300 s of serialized Deny latency (prompts are
+map-keyed with independent timeouts; nothing wedges). Revisit with a knob only
+if a real headless deployment needs fail-fast.
 
 ## 3. Invariants (do-not-regress)
 
 1. **Empty-config byte-identical:** a config with no `named_subagents`, or named
    specs without `permissions`, constructs children exactly as 68e846b (same
    policy Arc, no wrapper).
-2. **Monotonicity (the §9 invariant):** for every intent `i` and every rule set
-   `R`, `rank(SubAgentPolicy(base, R).check(i)) ≥ rank(base.check(i))` under
-   `Allow < Ask < Deny`. Pinned by tests (§6) exhaustively and over a real
-   `RulePolicy` corpus.
+2. **Monotonicity (the §9 invariant) — two complementary, both-required
+   guards** (panel R-MAJOR-2): (a) *policy-level* — for every intent `i` and
+   every rule set `R`, `rank(SubAgentPolicy(base, R).check(i)) ≥
+   rank(base.check(i))` under `Allow < Ask < Deny`, pinned exhaustively and
+   over a real `RulePolicy` corpus (§6); (b) *wiring-level* — a grandchild
+   (named or ad-hoc) dispatched by a floored child is itself subject to that
+   child's floor: the delegation-escape test (§6) pins `nested.policy =
+   child_policy`. (a) proves `narrow` is monotone; (b) proves the monotone
+   policy actually reaches every descendant. Neither substitutes for the other.
 3. **No approval-channel change:** trait, impls, timeouts untouched.
 4. **Identity-keyed only:** no `Access`/path/command keying in the floor
    (3A residual honored).
@@ -298,7 +377,9 @@ Revisit with a knob only if a real headless deployment needs fail-fast.
 6. **Parent loop untouched:** no `LoopConfig` field, no gate change in
    `loop_.rs`.
 7. **Widening unrepresentable:** no `allow` key exists; `deny_unknown_fields`
-   pins it.
+   pins it. (Consequence of tripping it under the lenient JSON overlay is the
+   whole-file fallback documented in §2.2 rule 3 — flag-derived base, empty
+   registry, no named children at all; never an unfloored named child.)
 8. **Prior-phase invariants preserved:** 3B-1 registry semantics, 3B-1b respond
    machinery (subject only to the §2.2 conflict rule), 3A child-stack quarantine.
 
@@ -306,8 +387,22 @@ Revisit with a knob only if a real headless deployment needs fail-fast.
 
 - **Typo'd pattern = silent no-op.** A `deny` naming a tool that never appears
   does nothing; no cross-validation against the live tool set (MCP names are
-  runtime-dynamic; matches 3B-1's unknown-`tools` posture). Accepted residual —
-  the panel may propose an advisory `warnings()` lint (non-fatal) if it disagrees.
+  runtime-dynamic; matches 3B-1's unknown-`tools` posture). Mitigated by the
+  §2.2 rule-8 lints (inert-vs-allowlist, unsanitizable MCP affix); the
+  remainder (plain misspelling of an existing tool) stays an accepted residual.
+- **Misspelled `permissions` key = spec loads unfloored** (panel F-MINOR-6).
+  `SubAgentSpec` deliberately has no `deny_unknown_fields` (the lenient-overlay
+  forward-compat depends on outer tolerance; adding it would convert any typo
+  into the §2.2 rule-3 whole-file fallback — strictly worse). So `permision =
+  {…}` is silently dropped and the named child runs at parent privilege.
+  Fail-open **relative to author intent only** — never above the parent.
+  Accepted residual, documented in `config.example.toml`.
+- **MCP identity residuals** (panel F-MAJOR-2/3): floors inherit the name
+  sanitizer's divergence (cosmetic server-name variants miss a prefix floor)
+  and the `__`-boundary ambiguity under last-wins registration (§2.3). Both are
+  floor-evasion vs author intent, never escalation above the parent. Lint (b)
+  + the §6 conformance-over-assembled-set test are the guards; the rest is
+  documented residual on the pre-existing MCP registration surface.
 - **`deny = ["dispatch_agent"]`** is legitimate: the nested tool stays registered
   but every call is gate-denied with the reasoned error.
 - **`tools` allowlist vs `permissions` are orthogonal narrowings:** the allowlist
@@ -332,6 +427,13 @@ Revisit with a knob only if a real headless deployment needs fail-fast.
   same monotone contract; nothing here precludes it.
 - Path-scoped floors (per-sub-agent workspace subsets) — same story.
 - Parent-level / global permission profiles.
+- **deepagents parity, recorded divergence** (panel R-MINOR-3): deepagents'
+  per-sub-agent permissions are path+operation glob keyed, offer
+  `allow|deny|interrupt` with replace-on-declare semantics, and HITL
+  approve/edit/reject/respond decisions. This surface is deliberately
+  tool-name identity keyed and **narrow-only** — replace semantics *are* the
+  escalation BLOCKER this slice closes (§1). An author expecting path-scoped
+  rules or an `allow` override will find neither, by design.
 
 ## 6. Testing
 
@@ -355,9 +457,11 @@ Revisit with a knob only if a real headless deployment needs fail-fast.
 **Config validation — `agent-runtime-config`:**
 - Dialect accept/reject through `RuntimeConfig::validate()` (error names the
   spec and the bad pattern).
-- Unknown key in the block fails parse (`deny_unknown_fields` pin).
-- `respond` × `response_format` conflict (exact name rejected; `re*` wildcard
-  accepted).
+- Unknown key in the block fails the overlay parse (`deny_unknown_fields`
+  pin) — test documents the lenient-load fallback consequence (§2.2 rule 3).
+- `warnings()` lints fire: inert-vs-allowlist exact rule; unsanitizable MCP
+  affix; `respond` coverage (exact AND wildcard) on a `response_format` spec.
+  None are fatal.
 - Empty block valid and normalized away (assembly sets `permissions: None`).
 - `middleware`/`skills` still rejected; `permissions` no longer rejected
   (the 3B-1 reserved-field test updates).
@@ -368,11 +472,16 @@ tests, extended in 3B-1 B4):**
   continues (not aborted).
 - Ask-floored tool: `Approval` event emitted (RecordingApproval double);
   approve ⇒ executes, deny ⇒ rejected.
-- Rule-less named spec + `general-purpose`: the child loop receives the **same
-  policy Arc** (`Arc::ptr_eq` pin) — byte-identical path.
-- **Transitivity:** named child with a `deny` floor dispatches a grandchild;
-  the grandchild's call to the denied tool is denied (pins `nested.policy =
-  child_policy`).
+- Rule-less named spec, **empty-block spec** (panel R-MINOR-4), and
+  `general-purpose`: the child loop receives the **same policy Arc**
+  (`Arc::ptr_eq` pin, all three cases) — byte-identical path.
+- **Transitivity (invariant 2b, required guard):** named child with a `deny`
+  floor dispatches a grandchild; the grandchild's call to the denied tool is
+  denied (pins `nested.policy = child_policy`).
+- **Lenient-boot fail-closed (panel F-MAJOR-1):** a dialect-invalid
+  permissions block driven through assembly + dispatch **without**
+  `validate()` makes the named child undispatchable (dispatch errors with the
+  parse reason) — pins the §2.6 parse-at-dispatch gate.
 - Tool-name conformance: for the assembled default tool set (+ a fake MCP
   tool), `tool.name() == tool.intent(args).tool` (§2.4 convention pin).
 
@@ -389,5 +498,75 @@ live-model soak needed (pure policy mechanics, no model-behavior dependence).
 
 ## Panel & review log
 
-_(pending — adversarial spec panel to be run before the owner gate; dispositions
-will be recorded here in the three standard buckets.)_
+### 2026-07-09 — Adversarial spec panel (4 reviewers) — all APPROVE-WITH-FIXES, no BLOCKER
+
+Four skeptical reviewers with distinct mandates (requirements / assumptions /
+failure-&-abuse / scope-&-simpler-design), opus-tier, each reading the spec at
+1f5d579 + live source at HEAD (68e846b). **Headline:** the Failure reviewer
+found **no path for a child to exceed its parent's effective policy** — the
+floor-only construction is sound; every found weakness is floor-*evasion vs
+author intent* (child ≤ parent always). The Assumptions reviewer verified 16/16
+load-bearing source claims (one PARTIAL, see A1); all 21 in-tree tools +
+MCP satisfy `intent.tool == name()`.
+
+**A. Blockers/majors — FIXED IN PLACE:**
+- **S-MAJOR (scope) × F-MAJOR-1 (failure) × A-MINOR-3, converged:** the draft's
+  assembly re-parse + `deny_all` "can't-happen" arm was (i) mis-attributed to
+  the 3B-1b precedent (which carries the raw value, never re-parses at
+  assembly) and (ii) falsely framed unreachable — the **server boots without
+  `validate()`** (verified `RuntimeState::new`, lenient by design). → §2.6
+  REWORKED: assembly carries raw `PermissionLists`; **parse once at dispatch**,
+  failing closed (named child undispatchable with the parse reason);
+  `deny_all` deleted; new §6 lenient-boot fail-closed test.
+- **A-MAJOR (assumptions):** "widening unrepresentable → fails file parse"
+  hid the lenient-JSON-overlay consequence: an unknown key discards the WHOLE
+  file → flag-derived base + empty registry (stderr/log warning only). Not an
+  escalation (no named children exist at all, nothing runs unfloored) but the
+  spec framed a fallback as a strength. → §2.2 rule 3 + invariant 7 rewritten
+  with the precise consequence; JSON-vs-TOML framing fixed
+  (`config.example.toml` is doc-only); accepted residual recorded.
+- **R-MAJOR-1 (requirements):** a `deny`/`ask` rule naming a tool excluded by
+  the spec's own `tools` allowlist is silently inert — author's
+  defense-in-depth intent voided. → §2.2 rule 8 advisory `warnings()` lint (a).
+- **R-MAJOR-2 (requirements):** the §9 invariant as drafted covered only the
+  policy-level half; the delegation-escape (wiring) half was an incidental
+  test bullet. → §3 invariant 2 split into (a) policy-level + (b) wiring-level,
+  both REQUIRED.
+- **F-MAJOR-2/3 (failure):** MCP sanitizer divergence (`GitHub`/`git.hub` dodge
+  a `github__*` floor) + `__`-boundary ambiguity under last-wins registration
+  can silently evade an intended floor (never exceed the parent). → §2.3
+  documented; lint (b); conformance test extended over the assembled set incl.
+  MCP; residual recorded in §4.
+
+**B. Escalated to the owner gate:**
+- **E1 — cut or keep `ToolPattern::Suffix`** (S-MINOR + F-footgun convergence):
+  only real suffix family is `*_file`, which spans `read_file` + two mutators;
+  prefix+exact+`Any` cover every documented use-case. Panel + synthesis
+  recommendation: **CUT** (defer with command/path floors, §5). *(decision
+  pending)*
+- **Gate sign-off on the two folded reworks** (they alter brainstorm-approved
+  sections): §2.6 parse-at-dispatch (was fail-closed-at-assembly) and §2.2
+  rule 6 hard-error → advisory lint (S-MINOR "drop rule 6" × F-MINOR-4 "keep +
+  warn" resolved as: uniform non-fatal lint covering exact AND wildcard).
+  *(decision pending)*
+
+**C. Minors — accepted as residual / folded:**
+- R-MINOR-3 deepagents parity divergence → recorded in §5 (folded).
+- R-MINOR-4 `Arc::ptr_eq` pin extended to the empty-block case → §6 (folded).
+- F-MINOR-5 N×300 s aggregate unattended stall → §2.7 sentence (folded).
+- F-MINOR-6 misspelled `permissions` key loads the spec unfloored; outer
+  `deny_unknown_fields` rejected as strictly-worse (whole-file fallback) →
+  §4 residual (accepted).
+- A-MINOR-2 web UI does not edit `named_subagents` — no UI round-trip
+  obligation; serde round-trip pin kept for persistence (accepted, no spec
+  text carried it).
+- S-cleared: empty-block normalization, same-Arc fast path, dual invariant
+  tests, and the conformance test are load-bearing, not ceremony (explicitly
+  probed and upheld; "gate matches on call.name" alternative REJECTED — it
+  would widen the `PolicyEngine` seam that approach (C) was rejected to
+  protect).
+
+**Honest positives confirmed:** `narrow`-as-max is the minimal monotone
+operator; wrap-at-dispatch is the only chain-monotone placement; §2.7 channel
+posture holds structurally (map-keyed prompts, independent timeouts, nothing
+wedges); the §9 escalation BLOCKER stays closed under every probed attack.
