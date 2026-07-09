@@ -133,8 +133,9 @@ deny = ["execute_command", "github__*"]  # never runs commands / touches GitHub 
 ask  = ["write_file", "edit_file"]       # mutations always prompt, even in-workspace
 ```
 
-Semantics and validation (all violations are config errors naming the spec, in
-`RuntimeConfig::validate()` alongside the existing per-spec checks):
+Semantics and validation (hard violations are config errors naming the spec, in
+`RuntimeConfig::validate()` alongside the existing per-spec checks; rules 6 and
+8 are non-fatal advisory lints):
 
 1. **Both lists match a tool → Deny wins** (most restrictive).
 2. Every pattern must parse under the §2.3 dialect (empty string, interior `*`,
@@ -185,7 +186,7 @@ pub enum ToolPattern {
 }
 impl ToolPattern {
     pub fn parse(s: &str) -> Result<Self, String>; // dialect errors are strings
-    pub fn matches(&self, tool: &str) -> bool;     // plain str prefix/suffix/eq
+    pub fn matches(&self, tool: &str) -> bool;     // plain str prefix/eq
 }
 ```
 
@@ -411,8 +412,8 @@ if a real headless deployment needs fail-fast.
   `context_compact`, `write_todos`, `dispatch_agent` too — fail-closed against
   the child's own functionality, not an escalation. Uniformity is deliberate:
   carve-outs would be a widening path. Documented footgun in
-  `config.example.toml`; only the explicit `respond`-vs-`response_format`
-  conflict is a validation error (§2.2 rule 6).
+  `config.example.toml`; `respond`-vs-`response_format` coverage (exact or
+  wildcard) is flagged by the non-fatal advisory lint of §2.2 rule 6.
 - **A denied call surfaces to the child model** as the existing
   `ERROR: Denied(...)` tool result; the child adapts or reports failure. The
   parent sees whatever the child hands off — no new parent-facing signal (3B-2's
