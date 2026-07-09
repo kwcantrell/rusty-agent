@@ -394,13 +394,14 @@ impl RunShared {
 - **Poison isolation (panel Fa-F6, corrected — the draft's claim here was
   WRONG and is the sharpest fix in this revision).** The parallel path is the
   whole reason `RunShared` exists, and that path makes naive poisoning *worse*
-  than today, not equal: `execute_isolated` catches a tool/wrap panic and
-  returns `Executed::Panicked` (containment by design), but if that panic
-  fired *inside* a `with()` closure while the guard was held, a naive
-  `.lock().unwrap()` in every sibling `wrap_tool_call` still in the
-  `buffer_unordered` batch — and in the `after_tools` guardrail (node hooks are
-  NOT panic-isolated) — would re-panic on `PoisonError` and unwind the whole
-  run. That escapes the containment `execute_isolated` was built to provide.
+  than today, not equal: `execute_isolated` catches only a **tool-body** panic
+  (`tool.execute(...)`) and returns `Executed::Panicked` — it does **not** wrap
+  `wrap_tool_call` closures (S1 / the §7 correction note below), so a panic
+  fired *inside* a `with()` closure while the guard was held is uncontained.
+  With a naive `.lock().unwrap()`, that poisons the shared `Mutex`, and every
+  sibling `wrap_tool_call` still in the `buffer_unordered` batch — and the
+  `after_tools` guardrail (node hooks are NOT panic-isolated) — would then
+  re-panic on `PoisonError`, a poison *cascade* on top of the original unwind.
   **Decision:** `with()` recovers via `into_inner()` and never propagates
   poison. The counters are monotonic, so a torn value can only *over*-count,
   which for a guardrail **fails safe** (it stops the run slightly early, never
@@ -876,6 +877,20 @@ not perturb them), calibration pins.
   already re-opened once by E2; the subagent subsystem is 3B's; residual
   recorded as a 3B input). **E5** keep the **typed `RunShared` map** (panel-
   cleared on Phase-1 precedent).
+- **2026-07-09 — §7 wording correction (owner-approved at the plan-review gate,
+  discrepancy S1).** The §7 poison-test bullet's clause *"the panicking call is
+  contained as `Executed::Panicked`"* is **inaccurate** and is NOT a shipped
+  test assertion. `execute_isolated` wraps **only** `tool.execute(args, ctx)` in
+  `catch_unwind` (it is the base case inside the `ToolNext` chain); a panic in a
+  `wrap_tool_call` closure — e.g. inside `RunShared::with` — fires *outside* that
+  `catch_unwind`, propagates up through `buffer_unordered` → `collect().await`,
+  and **unwinds the whole run** rather than becoming `Executed::Panicked`. The
+  **true, achievable** poison property (which the plan's Task A1 pins) is:
+  `RunShared::with` recovers a poisoned mutex via `into_inner()` and never
+  re-panics on `PoisonError`, so a later `with()` returns the recovered value —
+  preventing a *poison cascade*, not tool-panic containment. 3A's guardrail
+  closures (`|c| c.0 += 1`) never panic anyway (monotonic increments fail safe).
+  This corrects the §7/§5.2 wording; no design change.
 - **Post-gate design change flagged for a consistency read (per AGENTS.md).**
   E3's switch from `exclude_tools` to a stateful pin/recall block is more than
   disposition prose — it adds a `CuratedContext` field, a shared handle, a
