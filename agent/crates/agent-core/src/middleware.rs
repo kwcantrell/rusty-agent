@@ -652,6 +652,33 @@ impl Middleware for ModelCallLimit {
     }
 }
 
+/// Planning-by-recitation (spec §5.4): a hookless tool-contributing middleware
+/// (the `ContextCurationMiddleware`+flag shape). Holds the shared todos handle,
+/// contributes a CHILD-VISIBLE `write_todos`; the curator renders the list as a
+/// durable pinned block. No node/wrap hooks.
+pub struct TodoListMiddleware {
+    handle: crate::TodoHandle,
+}
+
+impl TodoListMiddleware {
+    pub fn new(handle: crate::TodoHandle) -> Self {
+        Self { handle }
+    }
+}
+
+#[async_trait]
+impl Middleware for TodoListMiddleware {
+    fn name(&self) -> &str {
+        "todo-list"
+    }
+    fn tools(&self) -> Vec<ToolContribution> {
+        vec![ToolContribution {
+            tool: Arc::new(crate::WriteTodosTool::new(self.handle.clone())),
+            child_visible: true,
+        }]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
