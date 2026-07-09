@@ -516,7 +516,10 @@ impl CuratedContext {
             .join("\n");
         let bytes = content.len();
         let seq = self.next_seq();
-        if let Err(e) = self.append_history(&format!("folded-{seq}"), &content).await {
+        if let Err(e) = self
+            .append_history(&format!("folded-{seq}"), &content)
+            .await
+        {
             tracing::warn!(error = %e, "history write failed; leaving fold for the next maintain");
             return;
         }
@@ -664,7 +667,10 @@ impl CuratedContext {
                         format!("[{role}] {}\n", m.content)
                     })
                     .collect();
-                match self.append_history(&format!("compacted-{seq}"), &rendered).await {
+                match self
+                    .append_history(&format!("compacted-{seq}"), &rendered)
+                    .await
+                {
                     Ok(()) => self.history_has_spans = true,
                     Err(e) => {
                         // E4 gate decision: commit anyway; the pointer goes
@@ -885,10 +891,7 @@ mod tests {
         assert!(tool_msg
             .content
             .starts_with("[tool_result offloaded to large_tool_results/1-"));
-        assert_eq!(
-            c.artifacts.results.read("1-call-1").await.unwrap(),
-            big_err
-        );
+        assert_eq!(c.artifacts.results.read("1-call-1").await.unwrap(), big_err);
     }
 
     #[tokio::test]
@@ -1380,9 +1383,9 @@ mod tests {
         );
         let built = c.build(100_000);
         assert!(
-            built
-                .iter()
-                .any(|m| m.content.starts_with("[tool_result offloaded to large_tool_results/1-")),
+            built.iter().any(|m| m
+                .content
+                .starts_with("[tool_result offloaded to large_tool_results/1-")),
             "placeholder survives compaction as a durable anchor: {:?}",
             built.iter().map(|m| &m.content).collect::<Vec<_>>()
         );
@@ -1786,10 +1789,7 @@ mod tests {
             .await
             .unwrap()
             .contains("large_tool_results/1-c1"));
-        assert_eq!(
-            artifacts.results.read("1-c1").await.unwrap().len(),
-            50_000
-        );
+        assert_eq!(artifacts.results.read("1-c1").await.unwrap().len(), 50_000);
     }
 
     #[tokio::test]

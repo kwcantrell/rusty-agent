@@ -3,17 +3,19 @@
 //! per-crate unit tests (offload policy, store, curated build) and the
 //! `assemble.rs` registration test by exercising the full live round-trip:
 //! a tool result is offloaded out of the window by `maintain`, then the model
-//! pulls it back with `context_recall` and the loop re-injects the exact bytes.
+//! pulls it back with `read_file` over the artifact path and the loop re-injects
+//! the exact bytes.
 //!
 //! See docs/superpowers/specs/2026-06-25-context-management-design.md.
 
 use agent_core::testkit::{AlwaysApprove, Scripted, ScriptedModel};
 use agent_core::{
-    AgentEvent, AgentLoop, ContextCurationMiddleware, ContextManager, ContextRecallTool,
-    CuratedContext, EventSink, InMemoryOffloadStore, LoopConfig, OffloadConfig, OffloadStore,
+    AgentEvent, AgentLoop, ContextCurationMiddleware, ContextManager, CuratedContext, EventSink,
+    LoopConfig, OffloadConfig, SessionArtifacts,
 };
 use agent_model::{Message, NativeProtocol, Role};
 use agent_policy::RulePolicy;
+use agent_tools::backend::{Backend, CompositeBackend, HostBackend, ReadOnlyToTools};
 use agent_tools::{
     Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema,
 };
@@ -21,8 +23,27 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// The guarded composite the loop's file tools see: the two artifact mounts
+/// (read-only) over a HostBackend at the workspace root — exactly as assemble
+/// builds it, so migrated `read_file large_tool_results/…` calls resolve.
+fn composite_over(artifacts: &Arc<SessionArtifacts>, ws: &std::path::Path) -> Arc<dyn Backend> {
+    Arc::new(CompositeBackend::new(
+        vec![
+            (
+                "large_tool_results/".into(),
+                Arc::new(ReadOnlyToTools(artifacts.results.clone())) as Arc<dyn Backend>,
+            ),
+            (
+                "conversation_history/".into(),
+                Arc::new(ReadOnlyToTools(artifacts.history.clone())) as Arc<dyn Backend>,
+            ),
+        ],
+        Arc::new(HostBackend::new(ws.to_path_buf())),
+    ))
+}
+
 /// Records each successful `ToolResult` as (name, content) so a test can assert
-/// the exact bytes a tool returned — `context_recall` returns the rehydrated
+/// the exact bytes a tool returned — `read_file` returns the rehydrated
 /// content as its result, captured here before any later re-offload.
 #[derive(Default)]
 struct Capture {
@@ -55,7 +76,7 @@ impl Capture {
             .lock()
             .unwrap()
             .iter()
-            .find(|(n, _)| n == "context_recall")
+            .find(|(n, _)| n == "read_file")
             .map(|(_, c)| c.clone())
     }
 }
@@ -111,17 +132,18 @@ fn loop_config(workspace: std::path::PathBuf) -> LoopConfig {
     }
 }
 
-/// `store`/`flag` are the SAME handles the test's `CuratedContext` uses — the
-/// loop's scheduled maintain now runs via `ContextCurationMiddleware`, whose
-/// context tools must share the context's offload table (spec §5.5).
+/// `artifacts`/`flag` are the SAME handles the test's `CuratedContext` uses.
+/// The loop carries a composite over `artifacts` so the model's migrated
+/// `read_file large_tool_results/…` recovery resolves (spec §5.5/§5.6).
 fn build_loop(
     reg: ToolRegistry,
     model: ScriptedModel,
     sink: Arc<Capture>,
     ws: std::path::PathBuf,
-    store: Arc<dyn OffloadStore>,
+    artifacts: Arc<SessionArtifacts>,
     flag: Arc<AtomicBool>,
 ) -> AgentLoop {
+    let backend = composite_over(&artifacts, &ws);
     AgentLoop::new(
         Arc::new(model),
         Arc::new(NativeProtocol),
@@ -135,23 +157,20 @@ fn build_loop(
         sink,
         loop_config(ws),
     )
-    .with_middleware(vec![Arc::new(ContextCurationMiddleware::new(
-        store,
-        flag,
-        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
-    ))])
+    .with_middleware(vec![Arc::new(ContextCurationMiddleware::new(flag))])
+    .with_backend(backend)
 }
 
 /// The headline round-trip: a large tool error is auto-offloaded by `maintain`
-/// after turn 1; on turn 2 the model calls `context_recall(1)` and the loop
-/// returns the original error verbatim.
+/// after turn 1; on turn 2 the model calls `read_file` on the artifact path and
+/// the loop returns the original error verbatim (spec §5.5/§5.6).
 #[tokio::test]
-async fn offload_then_recall_round_trips_through_the_loop() {
+async fn offload_then_read_file_round_trips_through_the_loop() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().to_path_buf();
 
-    // Shared store: the same handle the recall tool reads and the context offloads into.
-    let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+    // Shared artifacts: the same handle the composite reads and the context offloads into.
+    let artifacts = Arc::new(SessionArtifacts::new());
     let flag = Arc::new(AtomicBool::new(false));
 
     let big_message = format!("disk exploded at sector {}", "9".repeat(300));
@@ -159,46 +178,45 @@ async fn offload_then_recall_round_trips_through_the_loop() {
     reg.register(Arc::new(BoomTool {
         message: big_message.clone(),
     }));
-    reg.register(Arc::new(ContextRecallTool::new(
-        store.clone(),
-        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
-    )));
+    reg.register(Arc::new(agent_tools::fs::ReadFile {
+        max_bytes: 16 * 1024,
+    }));
 
     let model = ScriptedModel::new(vec![
         Scripted::Call("c1".into(), "boom".into(), "{}".into()),
-        Scripted::Call("c2".into(), "context_recall".into(), r#"{"id":1}"#.into()),
+        Scripted::Call(
+            "c2".into(),
+            "read_file".into(),
+            r#"{"path":"large_tool_results/1-c1"}"#.into(),
+        ),
         Scripted::Text("Recovered the error; all done.".into()),
     ]);
     let sink = Arc::new(Capture::default());
 
     // keep_recent: 0 makes the single turn-1 error immediately eligible to offload.
-    let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag.clone())
+    let mut ctx = CuratedContext::new(Message::system("SYS"), artifacts.clone(), flag.clone())
         .with_offload_config(OffloadConfig {
             keep_recent: 0,
             error_min_bytes: 50,
             ..Default::default()
         });
 
-    build_loop(reg, model, sink.clone(), ws, store.clone(), flag)
+    build_loop(reg, model, sink.clone(), ws, artifacts.clone(), flag)
         .run(&mut ctx, "Trigger the failure, then recover it.".into())
         .await
         .unwrap();
 
-    // The boom error was offloaded (entry #1) and recall returned it verbatim.
+    // The boom error was offloaded (key 1-c1) and read_file returned it verbatim.
     let expected = format!("ERROR: failed: {big_message}");
-    assert!(
-        store.get(1).is_some(),
-        "the large error must have been offloaded as entry #1"
-    );
     assert_eq!(
-        store.get(1).unwrap().content,
+        artifacts.results.read("1-c1").await.unwrap(),
         expected,
         "stored content must be the raw error"
     );
     assert_eq!(
         sink.recall_content().as_deref(),
         Some(expected.as_str()),
-        "context_recall must return the exact offloaded bytes"
+        "read_file must return the exact offloaded bytes"
     );
     assert!(
         *sink.done.lock().unwrap(),
@@ -206,51 +224,52 @@ async fn offload_then_recall_round_trips_through_the_loop() {
     );
 }
 
-/// The error path: recalling an id that was never offloaded feeds a normal tool
-/// error back to the model, which continues rather than crashing.
+/// The error path: reading an artifact path that was never written feeds a
+/// normal tool error back to the model, which continues rather than crashing.
 #[tokio::test]
-async fn recall_unknown_id_feeds_error_back_and_continues() {
+async fn read_missing_artifact_feeds_error_back_and_continues() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().to_path_buf();
 
-    let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+    let artifacts = Arc::new(SessionArtifacts::new());
     let flag = Arc::new(AtomicBool::new(false));
 
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(ContextRecallTool::new(
-        store.clone(),
-        agent_core::DEFAULT_MAX_TOOL_RESULT_BYTES,
-    )));
+    reg.register(Arc::new(agent_tools::fs::ReadFile {
+        max_bytes: 16 * 1024,
+    }));
 
     let model = ScriptedModel::new(vec![
-        Scripted::Call("c1".into(), "context_recall".into(), r#"{"id":999}"#.into()),
+        Scripted::Call(
+            "c1".into(),
+            "read_file".into(),
+            r#"{"path":"large_tool_results/999-nope"}"#.into(),
+        ),
         Scripted::Text("Nothing there; carrying on.".into()),
     ]);
     let sink = Arc::new(Capture::default());
 
-    // Default offload config: the short not-found error stays in the window so we
-    // can assert it was fed back to the model.
-    let mut ctx = CuratedContext::new(Message::system("SYS"), store.clone(), flag.clone());
+    let mut ctx = CuratedContext::new(Message::system("SYS"), artifacts.clone(), flag.clone());
 
-    build_loop(reg, model, sink.clone(), ws, store, flag)
-        .run(&mut ctx, "Recall entry 999.".into())
+    build_loop(reg, model, sink.clone(), ws, artifacts, flag)
+        .run(&mut ctx, "Read the missing artifact.".into())
         .await
         .unwrap();
 
-    // The loop continued to a clean finish despite the recall error.
+    // The loop continued to a clean finish despite the read error.
     assert!(
         *sink.done.lock().unwrap(),
-        "an unknown-id recall must not abort the run"
+        "a missing-artifact read must not abort the run"
     );
     // The not-found error was appended to the transcript as a tool message.
     let built = ctx.build(100_000);
     let fed_back = built.iter().any(|m| {
         matches!(m.role, Role::Tool)
-            && m.name.as_deref() == Some("context_recall")
-            && m.content.contains("no offloaded entry #999")
+            && m.name.as_deref() == Some("read_file")
+            && m.content.contains("999-nope")
     });
     assert!(
         fed_back,
-        "the unknown-id error must be fed back as a context_recall tool result"
+        "the not-found error must be fed back as a read_file tool result"
     );
 }

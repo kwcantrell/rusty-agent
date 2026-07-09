@@ -14,9 +14,7 @@
 //!   SOAK_SECS=300 cargo test -p agent-runtime-config --test soak_live \
 //!     -- --ignored --nocapture
 
-use agent_core::{
-    AgentEvent, ContextEvent, CuratedContext, EventSink, InMemoryOffloadStore, OffloadStore,
-};
+use agent_core::{AgentEvent, ContextEvent, CuratedContext, EventSink, SessionArtifacts};
 use agent_model::{Message, OpenAiCompatClient};
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse};
 use agent_runtime_config::{assemble_loop, LoopParts, RuntimeConfig};
@@ -36,7 +34,7 @@ impl ApprovalChannel for SafeApproval {
     async fn request(&self, r: ApprovalRequest) -> ApprovalResponse {
         let allow = match r.intent.tool.as_str() {
             "read_file" | "list_directory" | "write_file" | "edit_file" | "render"
-            | "git_status" | "git_diff" | "context_recall" | "context_compact" => true,
+            | "git_status" | "git_diff" | "grep" | "context_compact" => true,
             "execute_command" => r
                 .intent
                 .command
@@ -98,7 +96,9 @@ impl EventSink for SoakMonitor {
                 self.peak_prompt.fetch_max(prompt_tokens, Ordering::Relaxed);
             }
             AgentEvent::ToolResult { name, .. } => {
-                if name == "context_recall" {
+                // Offload recovery now goes through read_file (Phase 2); count it
+                // as the recall proxy for the diagnostic report.
+                if name == "read_file" {
                     self.recalls.fetch_add(1, Ordering::Relaxed);
                 }
                 *self.tool_results.lock().unwrap().entry(name).or_insert(0) += 1;
@@ -126,6 +126,11 @@ impl EventSink for SoakMonitor {
     }
 }
 
+/// Count of keys in the results store (successor of `store.len()`).
+async fn results_count(artifacts: &Arc<SessionArtifacts>) -> usize {
+    artifacts.results.ls("").await.unwrap().len()
+}
+
 fn lcg(state: &mut u64) -> u64 {
     *state = state
         .wrapping_mul(6364136223846793005)
@@ -133,18 +138,19 @@ fn lcg(state: &mut u64) -> u64 {
     *state >> 33
 }
 
-/// A varied, tool-exercising task. `store_len` lets recall pick a real id.
+/// A varied, tool-exercising task. `store_len` gates recall coverage (only ask
+/// once something has actually been offloaded).
 // Legacy lint, unrelated to this branch.
 #[allow(clippy::manual_is_multiple_of)]
 fn make_task(rng: &mut u64, i: usize, store_len: usize) -> String {
     // Guarantee recall coverage: every 5th step (once something is offloaded),
-    // ask the model to pull an offloaded entry back. Otherwise pick at random.
+    // ask the model to pull an offloaded artifact back. Otherwise pick at random.
     if store_len > 0 && i % 5 == 0 {
-        let id = 1 + (lcg(rng) as usize % store_len);
-        return format!(
-            "Some earlier tool output was offloaded out of context. Call context_recall with \
-             id {id} and quote the first 40 characters of what you get back."
-        );
+        return "Some earlier tool output was offloaded out of context, leaving a \
+             [tool_result offloaded to large_tool_results/…] placeholder. read_file the \
+             large_tool_results/ path named in the placeholder (or grep large_tool_results/ \
+             to find it) and quote the first 40 characters of what you get back."
+            .into();
     }
     let pick = lcg(rng) % 8;
     let f = 1 + (lcg(rng) % 3); // big1..big3
@@ -160,13 +166,11 @@ fn make_task(rng: &mut u64, i: usize, store_len: usize) -> String {
               then give me the first line of each."
             .into(),
         5 => "Use execute_command to run `head -3 data.csv` and report the rows.".into(),
-        6 if store_len > 0 => {
-            let id = 1 + (lcg(rng) as usize % store_len);
-            format!(
-                "Some earlier tool output was offloaded out of context. Call context_recall with \
-                 id {id} and quote the first 40 characters of what you get back."
-            )
-        }
+        6 if store_len > 0 => "Some earlier tool output was offloaded out of context, leaving a \
+             [tool_result offloaded to large_tool_results/…] placeholder. read_file the \
+             large_tool_results/ path named in the placeholder (or grep large_tool_results/ \
+             to find it) and quote the first 40 characters of what you get back."
+            .into(),
         7 => "This conversation is getting long. Call context_compact to compress older history, \
               then briefly confirm you did."
             .into(),
@@ -217,7 +221,7 @@ async fn soak_all_components_live() {
     cfg.sandbox_mode = "off".into(); // host executor — no docker needed
     cfg.max_turns = 8; // bound a single task
 
-    let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+    let artifacts = Arc::new(SessionArtifacts::new());
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let monitor = Arc::new(SoakMonitor::default());
     let approval = Arc::new(SafeApproval {
@@ -242,10 +246,11 @@ async fn soak_all_components_live() {
             base_system_prompt:
                 "You are a coding agent operating in a sandboxed workspace. Use the \
                 provided tools (read_file, list_directory, write_file, execute_command, \
-                context_recall, context_compact) to complete each task, then give a short final \
-                reply. Keep replies concise."
+                grep, context_compact) to complete each task, then give a short final \
+                reply. Offloaded tool output is recovered with read_file/grep over the \
+                large_tool_results/ path in its placeholder. Keep replies concise."
                     .into(),
-            offload_store: store.clone(),
+            artifacts: artifacts.clone(),
             compact_flag: flag.clone(),
             sandbox: agent_runtime_config::build_sandbox(&cfg),
             stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
@@ -257,8 +262,12 @@ async fn soak_all_components_live() {
     let agent = built.loop_;
 
     // One long-lived conversation so context management accumulates across tasks.
-    let mut ctx = CuratedContext::new(Message::system(built.system_prompt), store.clone(), flag)
-        .with_recall_budget(256);
+    let mut ctx = CuratedContext::new(
+        Message::system(built.system_prompt),
+        artifacts.clone(),
+        flag,
+    )
+    .with_recall_budget(256);
 
     let mut rng = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -275,7 +284,8 @@ async fn soak_all_components_live() {
     );
     while start.elapsed() < budget {
         tasks += 1;
-        let task = make_task(&mut rng, tasks, store.len());
+        let store_len = results_count(&artifacts).await;
+        let task = make_task(&mut rng, tasks, store_len);
         let cancel = tokio_util::sync::CancellationToken::new();
         // Bound each task so one stuck turn can't eat the whole budget.
         let run = agent.run_with_cancel(&mut ctx, task.clone(), cancel.clone());
@@ -302,7 +312,7 @@ async fn soak_all_components_live() {
             monitor.recalls.load(Ordering::Relaxed),
             monitor.peak_prompt.load(Ordering::Relaxed),
             CONTEXT_LIMIT,
-            store.len(),
+            store_len,
             monitor.errors.lock().unwrap().len(),
             task.chars().take(48).collect::<String>(),
         );
@@ -326,10 +336,11 @@ async fn soak_all_components_live() {
     eprintln!("tasks started   : {tasks}  (completed={done}, timeouts={task_timeouts})");
     eprintln!("model turns      : {turns}");
     eprintln!("peak prompt tok  : {peak} / {CONTEXT_LIMIT}");
+    let store_entries = results_count(&artifacts).await;
     eprintln!("offloads         : {offloads}  ({offload_kb} KB lifted out)");
-    eprintln!("store entries    : {}", store.len());
+    eprintln!("store entries    : {store_entries}");
     eprintln!("compactions      : {compactions}  (failed={compaction_fails})");
-    eprintln!("context_recalls  : {recalls}");
+    eprintln!("read_file recalls: {recalls}");
     eprintln!("tool results     : {tool_results:?}");
     eprintln!(
         "policy-denied    : {} {:?}",
@@ -342,12 +353,23 @@ async fn soak_all_components_live() {
         &errors[..errors.len().min(5)]
     );
 
-    // Recoverability spot-check: a sample of offloaded entries still read back intact.
+    // Recoverability spot-check: a sample of offloaded artifacts still read back intact.
+    let sample_keys: Vec<String> = artifacts
+        .results
+        .ls("")
+        .await
+        .unwrap()
+        .into_iter()
+        .take(8)
+        .map(|e| e.name)
+        .collect();
     let mut recovered = 0;
-    for id in 1..=store.len().min(8) as u64 {
-        if store
-            .get(id)
-            .map(|e| !e.content.is_empty())
+    for key in &sample_keys {
+        if artifacts
+            .results
+            .read(key)
+            .await
+            .map(|c| !c.is_empty())
             .unwrap_or(false)
         {
             recovered += 1;
@@ -378,7 +400,7 @@ async fn soak_all_components_live() {
     // Everything offloaded is still recoverable.
     assert_eq!(
         recovered,
-        store.len().min(8),
+        sample_keys.len(),
         "every sampled offloaded entry must still read back"
     );
     // No compaction should have hard-failed.

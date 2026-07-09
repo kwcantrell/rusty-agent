@@ -656,13 +656,15 @@ mod tests {
 
     #[test]
     fn registers_context_management_tools() {
+        // Phase 2 (spec G5): context_compact is the only context tool; offload
+        // recovery goes through the ordinary file tools (read_file / grep).
         let dir = tempfile::tempdir().unwrap();
         let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
-        assert!(built.registered_names.iter().any(|n| n == "context_recall"));
         assert!(built
             .registered_names
             .iter()
             .any(|n| n == "context_compact"));
+        assert!(!built.registered_names.iter().any(|n| n == "context_recall"));
     }
 
     #[test]

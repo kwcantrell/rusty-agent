@@ -319,7 +319,12 @@ mod tests {
 
     #[test]
     fn placeholder_preserves_path_and_tool() {
-        let p = placeholder_for("large_tool_results/7-c1", "shell", &OffloadKind::Error, 3100);
+        let p = placeholder_for(
+            "large_tool_results/7-c1",
+            "shell",
+            &OffloadKind::Error,
+            3100,
+        );
         assert!(p.contains("offloaded to large_tool_results/7-c1"));
         assert!(p.contains("read_file the path"));
         assert!(p.contains("shell"));
@@ -433,7 +438,12 @@ mod tests {
         // conscious decision.
         let echoed = format!(
             "{}\n{}",
-            placeholder_for("large_tool_results/9-cX", "shell", &OffloadKind::Output, 9000),
+            placeholder_for(
+                "large_tool_results/9-cX",
+                "shell",
+                &OffloadKind::Output,
+                9000
+            ),
             "y".repeat(5000)
         );
         let history = vec![Message::tool("c1", "shell", &echoed)];

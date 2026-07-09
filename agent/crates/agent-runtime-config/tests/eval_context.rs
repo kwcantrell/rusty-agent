@@ -5,9 +5,7 @@
 //!   AGENT_E2E_URL=http://localhost:8080 AGENT_E2E_MODEL=qwen3.6-35b-a3b \
 //!   TASK_JSON=task.json CONFIG_JSON=cfg.json HIDDEN_TESTS_DIR=hidden_tests \
 //!   cargo test -p agent-runtime-config --test eval_context -- --ignored --nocapture
-use agent_core::{
-    AgentEvent, CuratedContext, EventSink, InMemoryOffloadStore, OffloadStore, Retriever,
-};
+use agent_core::{AgentEvent, CuratedContext, EventSink, Retriever, SessionArtifacts};
 use agent_memory::{
     build_tools_with, project_scope, Embedder, FastEmbedEmbedder, MemoryConfig, MemoryRetriever,
     MemoryScope, MemoryStore, SqliteStore, StubEmbedder,
@@ -274,7 +272,7 @@ async fn eval_context_run() {
             (vec![], None)
         };
 
-        let offload: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
+        let artifacts = Arc::new(SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
         let built = assemble_loop(
             &cfg,
@@ -292,7 +290,7 @@ async fn eval_context_run() {
                 memory_retriever: retriever,
                 stream_idle_timeout: Duration::from_secs(120),
                 base_system_prompt: cc.resolved_system_prompt(EVAL_DEFAULT_PROMPT).to_string(),
-                offload_store: offload.clone(),
+                artifacts: artifacts.clone(),
                 compact_flag: flag.clone(),
                 sandbox: agent_runtime_config::build_sandbox(&cfg),
                 stats: Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default())),
@@ -302,11 +300,14 @@ async fn eval_context_run() {
             },
         );
         let agent = built.loop_;
-        let mut ctx =
-            CuratedContext::new(Message::system(built.system_prompt), offload.clone(), flag)
-                .with_recall_budget(cc.recall_budget)
-                .with_offload_config(cc.offload_config())
-                .with_high_water_pct(cc.high_water_pct);
+        let mut ctx = CuratedContext::new(
+            Message::system(built.system_prompt),
+            artifacts.clone(),
+            flag,
+        )
+        .with_recall_budget(cc.recall_budget)
+        .with_offload_config(cc.offload_config())
+        .with_high_water_pct(cc.high_water_pct);
 
         let per_prompt = Duration::from_secs(task.prompt_timeout_secs.unwrap_or(120));
         for prompt in &session.prompts {

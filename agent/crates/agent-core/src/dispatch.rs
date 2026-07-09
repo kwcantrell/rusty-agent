@@ -524,13 +524,15 @@ impl Tool for DispatchAgentTool {
                 vec![
                     (
                         "large_tool_results/".into(),
-                        Arc::new(agent_tools::backend::ReadOnlyToTools(artifacts.results.clone()))
-                            as Arc<dyn agent_tools::backend::Backend>,
+                        Arc::new(agent_tools::backend::ReadOnlyToTools(
+                            artifacts.results.clone(),
+                        )) as Arc<dyn agent_tools::backend::Backend>,
                     ),
                     (
                         "conversation_history/".into(),
-                        Arc::new(agent_tools::backend::ReadOnlyToTools(artifacts.history.clone()))
-                            as Arc<dyn agent_tools::backend::Backend>,
+                        Arc::new(agent_tools::backend::ReadOnlyToTools(
+                            artifacts.history.clone(),
+                        )) as Arc<dyn agent_tools::backend::Backend>,
                     ),
                 ],
                 Arc::new(agent_tools::backend::HostBackend::new(
