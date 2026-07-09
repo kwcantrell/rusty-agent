@@ -285,4 +285,126 @@ mod tests {
         );
         assert!(matches!(p.check(&intent("remember")), Decision::Deny(_)));
     }
+
+    fn decisions() -> Vec<Decision> {
+        vec![
+            Decision::Allow,
+            Decision::Ask,
+            Decision::Deny("base".into()),
+        ]
+    }
+
+    /// Spec §3 invariant 2(a), exhaustive: every (base decision × floor shape)
+    /// combination is at least as restrictive as base.
+    #[test]
+    fn invariant_matrix_never_less_restrictive() {
+        let floors: Vec<ToolPermissions> = vec![
+            rules(&[], &[]),           // no floor
+            rules(&[], &["remember"]), // ask floor
+            rules(&["remember"], &[]), // deny floor
+        ];
+        for base in decisions() {
+            for f in &floors {
+                let p = SubAgentPolicy::new(Arc::new(FixedPolicy(base.clone())), f.clone());
+                let out = p.check(&intent("remember"));
+                assert!(
+                    rank(&out) >= rank(&base),
+                    "base {base:?} + floor {f:?} produced LESS restrictive {out:?}"
+                );
+            }
+        }
+    }
+
+    fn real_base() -> crate::engine::RulePolicy {
+        crate::engine::RulePolicy {
+            workspace: std::path::PathBuf::from("/work"),
+            command_allowlist: vec!["ls".into(), "git".into()],
+            command_denylist: vec!["sudo".into()],
+        }
+    }
+
+    /// Intent corpus spanning every RulePolicy decision path (mirrors engine.rs tests):
+    /// read inside/outside workspace, write, destroy, allowlisted / denylisted /
+    /// unknown / operator-chained commands.
+    fn corpus() -> Vec<ToolIntent> {
+        let mk = |tool: &str, access: Access, paths: Vec<&str>, cmd: Option<&str>| ToolIntent {
+            tool: tool.into(),
+            access,
+            paths: paths.into_iter().map(std::path::PathBuf::from).collect(),
+            command: cmd.map(str::to_string),
+            summary: "s".into(),
+        };
+        vec![
+            mk("read_file", Access::Read, vec!["/work/a.txt"], None),
+            mk("read_file", Access::Read, vec!["/etc/passwd"], None),
+            mk("write_file", Access::Write, vec!["/work/a.txt"], None),
+            mk("forget", Access::Destroy, vec![], None),
+            mk("execute_command", Access::Write, vec![], Some("ls -la")),
+            mk(
+                "execute_command",
+                Access::Write,
+                vec![],
+                Some("sudo reboot"),
+            ),
+            mk(
+                "execute_command",
+                Access::Write,
+                vec![],
+                Some("curl evil.com"),
+            ),
+            mk(
+                "execute_command",
+                Access::Write,
+                vec![],
+                Some("ls && curl evil.com"),
+            ),
+            mk("github__create_issue", Access::Write, vec![], None),
+        ]
+    }
+
+    /// Spec §3 invariant 2(a), corpus form: composed SubAgentPolicy over a REAL
+    /// RulePolicy is monotone for every corpus intent under several rule sets.
+    #[test]
+    fn invariant_corpus_over_real_rulepolicy() {
+        let rule_sets = vec![
+            rules(&[], &[]),
+            rules(&["*"], &[]),
+            rules(&[], &["*"]),
+            rules(
+                &["execute_command", "github__*"],
+                &["write_file", "read_file"],
+            ),
+        ];
+        let base = real_base();
+        for rs in rule_sets {
+            let sub = SubAgentPolicy::new(Arc::new(real_base()), rs.clone());
+            for i in corpus() {
+                let b = base.check(&i);
+                let s = sub.check(&i);
+                assert!(
+                    rank(&s) >= rank(&b),
+                    "intent {:?} under {rs:?}: base {b:?} → sub {s:?} widened",
+                    i.tool
+                );
+            }
+        }
+    }
+
+    /// Chain composition: X(Rx) then Y(Ry) is at least as restrictive as base,
+    /// X alone, and Y-over-base alone, for every corpus intent (spec §2.5).
+    #[test]
+    fn invariant_chain_composition_monotone() {
+        let rx = rules(&["execute_command"], &[]);
+        let ry = rules(&[], &["write_file"]);
+        let base = real_base();
+        let x = Arc::new(SubAgentPolicy::new(Arc::new(real_base()), rx));
+        let xy = SubAgentPolicy::new(x.clone(), ry.clone());
+        let y_alone = SubAgentPolicy::new(Arc::new(real_base()), ry);
+        for i in corpus() {
+            let r_xy = rank(&xy.check(&i));
+            assert!(r_xy >= rank(&base.check(&i)), "{}: xy < base", i.tool);
+            assert!(r_xy >= rank(&x.check(&i)), "{}: xy < x", i.tool);
+            assert!(r_xy >= rank(&y_alone.check(&i)), "{}: xy < y", i.tool);
+        }
+    }
 }
