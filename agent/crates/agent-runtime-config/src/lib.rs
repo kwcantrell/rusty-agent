@@ -575,4 +575,96 @@ mod tests {
         assert_eq!(mb.tools.len(), 3);
         assert!(mb.retriever.is_some());
     }
+
+    /// Spec 3B-1c §2.4: permission floors key on `intent.tool`; every registered
+    /// tool must author it equal to its registry name or a configured floor
+    /// silently misses. (MCP tools pin this in agent-mcp: `tool: self.namespaced`.)
+    #[test]
+    fn tool_intent_names_match_registry_names() {
+        let reg = build_registry(&[], 65_536);
+        let fixtures: std::collections::HashMap<&str, serde_json::Value> = [
+            ("read_file", serde_json::json!({"path": "a.txt"})),
+            (
+                "write_file",
+                serde_json::json!({"path": "a.txt", "content": ""}),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path": "a.txt", "old_string": "a", "new_string": "b"}),
+            ),
+            ("list_directory", serde_json::json!({"path": "."})),
+            ("grep", serde_json::json!({"pattern": "x"})),
+            ("execute_command", serde_json::json!({"command": "ls"})),
+            ("git_status", serde_json::json!({})),
+            ("git_diff", serde_json::json!({})),
+            ("git_commit", serde_json::json!({"message": "m"})),
+            // MANDATORY (plan review): these two REJECT empty args — the test
+            // panics without them. render's intent() requires "kind"; fetch_url's
+            // requires a parseable "url". Adjust values to each intent() impl.
+            (
+                "render",
+                serde_json::json!({"kind": "markdown", "content": "x"}),
+            ),
+            ("fetch_url", serde_json::json!({"url": "http://localhost/"})),
+        ]
+        .into_iter()
+        .collect();
+        // MCP-shaped stub (spec §2.4/§6 "+ a fake MCP tool"): pins the namespaced
+        // convention (`tool: self.namespaced.clone()` in agent-mcp) in THIS suite.
+        struct McpShapedStub;
+        #[async_trait::async_trait]
+        impl agent_tools::Tool for McpShapedStub {
+            fn name(&self) -> &str {
+                "github__create_issue"
+            }
+            fn description(&self) -> &str {
+                "mcp-shaped stub"
+            }
+            fn schema(&self) -> agent_tools::ToolSchema {
+                agent_tools::ToolSchema {
+                    name: "github__create_issue".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            fn intent(
+                &self,
+                _a: &serde_json::Value,
+            ) -> Result<agent_tools::ToolIntent, agent_tools::ToolError> {
+                Ok(agent_tools::ToolIntent {
+                    tool: "github__create_issue".into(),
+                    access: agent_tools::Access::Write,
+                    paths: vec![],
+                    command: None,
+                    summary: "stub".into(),
+                })
+            }
+            async fn execute(
+                &self,
+                _a: serde_json::Value,
+                _c: &agent_tools::ToolCtx,
+            ) -> Result<agent_tools::ToolOutput, agent_tools::ToolError> {
+                Ok(agent_tools::ToolOutput {
+                    content: "ok".into(),
+                    display: None,
+                })
+            }
+        }
+        let mut reg = reg;
+        reg.register(std::sync::Arc::new(McpShapedStub));
+        for t in reg.all() {
+            let args = fixtures
+                .get(t.name())
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            let intent = t
+                .intent(&args)
+                .unwrap_or_else(|e| panic!("intent({}) rejected fixture args: {e}", t.name()));
+            assert_eq!(
+                intent.tool,
+                t.name(),
+                "identity-keyed floors require intent.tool == registry name"
+            );
+        }
+    }
 }
