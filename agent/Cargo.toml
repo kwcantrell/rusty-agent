@@ -12,15 +12,18 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
+globset = "0.4"
 tokio-util = "0.7"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+regex = "1"
 similar = "2"
 shell-words = "1"
 clap = { version = "4", features = ["derive", "env"] }
+walkdir = "2"
 # dev
 wiremock = "0.6"
 tempfile = "3"

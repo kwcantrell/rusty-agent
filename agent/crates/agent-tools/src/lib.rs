@@ -1,4 +1,5 @@
 //! Shared tool vocabulary and the `Tool` trait.
+pub mod backend;
 mod contract;
 pub mod fs;
 pub mod git;
