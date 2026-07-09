@@ -577,10 +577,12 @@ over `pub permissions: Option<serde_json::Value>`) to:
 (`agent-runtime-config` already depends on `agent-policy` — see `assemble.rs`'s
 `use agent_policy::{ApprovalChannel, RulePolicy};`. Add `use` or fully qualify as shown.)
 
-- [ ] **Step 3: Fix the two existing tests this breaks.** The reserved-field test near
-  L1555 sets `s.permissions = Some(serde_json::json!({}))` and expects `Err` — it no longer
-  compiles. Update it (and the `accepts_valid_response_format_still_rejects_others` block
-  near L1606) so `permissions` uses the new type and is now ACCEPTED:
+- [ ] **Step 3: Fix the two existing tests this breaks — BOTH sites.**
+  `validate_rejects_reserved_fields_and_model_endpoint_override` (near L1555) and
+  `accepts_valid_response_format_still_rejects_others` (near L1608) each set
+  `s.permissions = Some(serde_json::json!({}))` and assert `is_err()` — neither compiles
+  after the type change. In BOTH test bodies, switch to the new type and flip the
+  empty-permissions assertion `is_err()` → `is_ok()`:
 
 ```rust
         // permissions is now accepted (3B-1c); middleware/skills still rejected.
@@ -758,6 +760,11 @@ infers the new type) and any other `permissions: None` literal (grep the crate; 
 
 ```rust
         // 3B-1c advisory lints (spec §2.2 rule 8) — non-fatal by design.
+        // DELIBERATELY broader than dispatch.rs's 1-element IMPLICIT_CHILD_TOOLS
+        // (which gates allowlist-name VALIDITY): this set suppresses false-positive
+        // inert-rule warnings for every tool that can be injected into a child
+        // OUTSIDE its `tools` allowlist (`respond` is allowlist-exempt; write_todos
+        // rebinds when present; dispatch_agent is depth-gated). Do not unify them.
         const IMPLICIT_CHILD_TOOLS: [&str; 4] =
             ["context_compact", "respond", "write_todos", "dispatch_agent"];
         for s in &self.named_subagents {
@@ -840,8 +847,14 @@ original.)
     pub permissions: Option<agent_policy::PermissionLists>,
 ```
 
-Update the `resolved_with` test helper (near L1170) and every other `ResolvedSubAgent`
-literal in `dispatch.rs` tests with `permissions: None,`.
+Update the `ResolvedSubAgent` literals in `dispatch.rs` tests **per-site** (plan-review
+MAJOR — do NOT blanket-`None`):
+- The three FRESH fixtures — `resolved_with` (near L1170) and the two standalone
+  literals (near L1415 and L1587) — get `permissions: None,`.
+- The **capturing-child wrapper** literal inside `deps_with_capturing_child` (near
+  L1520) clones every field from an existing `r: &ResolvedSubAgent` — there it MUST be
+  `permissions: r.permissions.clone(),`. Writing `None` would make the wrapper silently
+  strip floors from any future test that wraps a floored registry entry.
 
 - [ ] **Step 2: Thread at assembly.** In `assemble.rs`'s resolution loop (the
   `resolved.insert(spec.name.clone(), agent_core::ResolvedSubAgent { ... })` literal near
@@ -905,11 +918,13 @@ literal in `dispatch.rs` tests with `permissions: None,`.
     }
 ```
 
-**Implementer note:** `base_test_config` / `test_spec` / `assemble_registry_for` above
-name the *roles* of the existing fixtures — locate the actual helper names by content in
-the `named_subagents` assembly tests near L1068 (they construct a `RuntimeConfig`, a
-`SubAgentSpec`, and reach the built `SubAgentRegistry` via `assemble_loop`'s parts /
-`#[cfg(test)]` accessors added in 3B-1 B2). Reuse those, do not invent new plumbing.
+**Implementer note (plan-review corrected):** the role-names above map to the REAL
+fixtures in the `named_subagents` assembly tests near L1064-1116: `base_test_config()`
+= the existing `cfg()` helper; `test_spec("x")` = a **full inline `SubAgentSpec { ... }`
+struct literal** (all fields — there is NO one-line spec helper in assemble.rs tests);
+`assemble_registry_for(&c)` =
+`assemble_loop(&c, parts(ws.path().into(), vec![])).subagent_registry.expect(...)` then
+`.get(name)`. Reuse those exact fixtures; do not invent new plumbing.
 
 - [ ] **Step 5: Run** — `cargo test -p agent-runtime-config assembly_threads` then the
   full `cargo test -p agent-runtime-config`. Expected: PASS.
@@ -1073,15 +1088,20 @@ Then in the child construction (locate `AgentLoop::new(` with
     }
 ```
 
-**Implementer note (deny reason observation):** additionally assert the denial REASON
-surfaced to the child: the child's tool-result event carries
-`denied by sub-agent 'triage' permissions` — read it back from the `FullSink` the deps
-sink wraps, reusing the event-reading pattern of the forwarding tests earlier in this
-module (the ones indexing `got` tuples of forwarded child events). If the forwarded
-event shape makes the content string awkward to reach, assert it via a second scripted
-child turn instead: script the child to echo its previous tool result and assert the
-reason appears in `out.content`. One of the two forms MUST land — the reasoned string is
-spec §6's "returns the reasoned error string" requirement.
+**Implementer note (deny reason observation — plan-review corrected):** additionally
+assert the denial REASON surfaced to the child (spec §6 "returns the reasoned error
+string"). The ONLY viable mechanism in this harness: the denied tool result becomes a
+message in the child's NEXT completion request, so capture child request contents with
+the `SchemaCapturingModel`-style pattern already in this module (see
+`description_overrides_reach_child_registry` near L1772 — it records
+`req.messages[].content` into a shared `request_texts` vec). Install the capturing
+model AS THE TRIAGE CHILD'S model (`resolved_with(...)` then
+`m.get_mut("triage").unwrap().model = Arc::new(capturing)` — the named child runs
+`resolved.model`, NOT `deps.model`), script `[Call(probe), Text("done")]`, and assert
+some captured request text contains `denied by sub-agent 'triage' permissions`.
+Do NOT try (a) reading the reason from `FullSink` — it captures only
+`("tool_result:{status}", id, name, parent_id)` and drops content; or (b) scripting the
+child to "echo" the result — `ScriptedModel` ignores incoming requests entirely.
 
 ```rust
 
@@ -1246,9 +1266,44 @@ this test module).
             ("git_status", serde_json::json!({})),
             ("git_diff", serde_json::json!({})),
             ("git_commit", serde_json::json!({"message": "m"})),
+            // MANDATORY (plan review): these two REJECT empty args — the test
+            // panics without them. render's intent() requires "kind"; fetch_url's
+            // requires a parseable "url". Adjust values to each intent() impl.
+            ("render", serde_json::json!({"kind": "markdown", "content": "x"})),
+            ("fetch_url", serde_json::json!({"url": "http://localhost/"})),
         ]
         .into_iter()
         .collect();
+        // MCP-shaped stub (spec §2.4/§6 "+ a fake MCP tool"): pins the namespaced
+        // convention (`tool: self.namespaced.clone()` in agent-mcp) in THIS suite.
+        struct McpShapedStub;
+        #[async_trait::async_trait]
+        impl agent_tools::Tool for McpShapedStub {
+            fn name(&self) -> &str { "github__create_issue" }
+            fn description(&self) -> &str { "mcp-shaped stub" }
+            fn schema(&self) -> agent_tools::ToolSchema {
+                agent_tools::ToolSchema {
+                    name: "github__create_issue".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            fn intent(&self, _a: &serde_json::Value) -> Result<agent_tools::ToolIntent, agent_tools::ToolError> {
+                Ok(agent_tools::ToolIntent {
+                    tool: "github__create_issue".into(),
+                    access: agent_tools::Access::Write,
+                    paths: vec![],
+                    command: None,
+                    summary: "stub".into(),
+                })
+            }
+            async fn execute(&self, _a: serde_json::Value, _c: &agent_tools::ToolCtx)
+                -> Result<agent_tools::ToolOutput, agent_tools::ToolError> {
+                Ok(agent_tools::ToolOutput { content: "ok".into(), display: None })
+            }
+        }
+        let mut reg = reg;
+        reg.register(std::sync::Arc::new(McpShapedStub));
         for t in reg.all() {
             let args = fixtures
                 .get(t.name())
@@ -1266,13 +1321,15 @@ this test module).
     }
 ```
 
-**Implementer note:** if a tool's `intent()` rejects its fixture (e.g. `render` or
-`fetch_url` require specific keys), read that tool's `intent()` impl and adjust the
-fixture to the minimal args it accepts — the assertion under test is the name equality,
-and the test must cover EVERY tool `build_registry` returns (no skips).
+**Implementer note:** if a tool's `intent()` rejects its fixture, read that tool's
+`intent()` impl and adjust the fixture to the minimal args it accepts — the assertion
+under test is the name equality, and the test must cover EVERY tool `build_registry`
+returns plus the MCP-shaped stub (no skips).
 
 - [ ] **Step 2: Run** — `cargo test -p agent-runtime-config tool_intent_names`. Expected:
-  PASS (convention verified at baseline by the panel; this pins it against future drift).
+  PASS once the `render`/`fetch_url` fixtures match their `intent()` impls (first run may
+  panic with "rejected fixture args" — fix the fixture values, not the assertion; the
+  convention itself was verified at baseline by the panel).
 
 - [ ] **Step 3: Commit** —
   `git commit -am "test(config): pin intent.tool == registry name across the assembled set (3B-1c C3)"`
@@ -1315,6 +1372,24 @@ want `&str` over `&String` in lint loops) — behavior-preserving fixes only.
   `git commit -am "docs(config): permissions example + footgun notes; ci green (3B-1c D)"`
 
 ---
+
+## Plan review log
+
+**2026-07-09 — 2 reviewers (opus): coverage/buildability APPROVE-WITH-FIXES;
+adversarial architecture SOUND-WITH-NOTES. All findings FOLDED IN:** (MAJOR-1,
+coverage) deny-reason observation rewritten — `SchemaCapturingModel`/`request_texts`
+on the TRIAGE child's model is the only viable mechanism (`FullSink` drops result
+content; `ScriptedModel` ignores requests). (MAJOR-2, architecture) C1 per-site
+`ResolvedSubAgent` literal guidance — `r.permissions.clone()` in the capturing-child
+wrapper (~L1520), `None` only in the three fresh fixtures. (MINORS) C3 `render`/
+`fetch_url` fixtures mandatory + MCP-shaped stub added per spec §2.4/§6 + honest
+Step-2 wording; B1 Step 3 both-sites `is_err→is_ok`; B2 const-divergence comment
+(deliberately ≠ dispatch.rs's allowlist-validity const); C1 Step 4 real fixture names
+(`cfg()`, inline `SubAgentSpec` literals, `assemble_loop(...).subagent_registry`).
+Reviewers verified: full spec-coverage table (every §2.2-§7 requirement mapped to a
+task), ~20 buildability claims at source (helper signatures, derives, coercions,
+visibility), task ordering compiles at every boundary, and the C2 transitivity
+mutation check genuinely flips.
 
 ## Post-plan process (not plan tasks — SDLC per AGENTS.md)
 
