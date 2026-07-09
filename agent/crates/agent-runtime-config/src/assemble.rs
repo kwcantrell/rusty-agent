@@ -77,6 +77,10 @@ pub struct BuiltLoop {
     /// None when subagents are disabled. Pins ModelRef limit inheritance.
     #[cfg(test)]
     pub child_loop_knobs: Option<(usize, Option<u32>)>,
+    /// The resolved named-subagent registry built from `cfg.named_subagents`;
+    /// None when subagents are disabled (mirrors `dispatch_base_names`).
+    #[cfg(test)]
+    pub subagent_registry: Option<std::sync::Arc<agent_core::SubAgentRegistry>>,
 }
 
 /// Resolve the tool-call protocol name for a routed child loop (spec G5).
@@ -332,6 +336,8 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     let mut subagent_model_routed: Option<bool> = None;
     #[cfg(test)]
     let mut child_loop_knobs: Option<(usize, Option<u32>)> = None;
+    #[cfg(test)]
+    let mut subagent_registry: Option<std::sync::Arc<agent_core::SubAgentRegistry>> = None;
     if let Some(child_base) = child_base {
         // Child protocol resolves through child_protocol_name (spec G5/M-1): a
         // ModelRef that switches the child backend to claude-cli defaults to
@@ -370,6 +376,48 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         {
             child_loop_knobs = Some((child_config.model_limit, child_config.max_tokens));
         }
+
+        // Resolve config specs into dispatch-facing ResolvedSubAgent (spec 2.2/2.4).
+        // Infallible: unknown-tool refs surface at dispatch time (see design note).
+        let mut resolved: std::collections::HashMap<String, agent_core::ResolvedSubAgent> =
+            std::collections::HashMap::new();
+        for spec in &cfg.named_subagents {
+            // Model: None → inherit the child default (child_model/child_protocol
+            // + child_config knobs). Some → build a routed model on the SAME
+            // endpoint (validation guarantees no backend/base_url override).
+            let (s_model, s_protocol, s_model_limit, s_max_tokens) = match &spec.model {
+                None => (child_model.clone(), child_protocol.clone(), None, None),
+                Some(r) => (
+                    crate::build_routed_model(cfg, r, &parts.claude_binary, parts.api_key.clone()),
+                    pick_protocol(&child_protocol_name(cfg, Some(r))),
+                    r.context_limit,
+                    r.max_tokens,
+                ),
+            };
+            resolved.insert(
+                spec.name.clone(),
+                agent_core::ResolvedSubAgent {
+                    description: spec.description.clone(),
+                    system_prompt: format!(
+                        "{}\n\n{}",
+                        spec.system_prompt,
+                        agent_core::SUBAGENT_PREAMBLE
+                    ),
+                    tools: spec.tools.clone(),
+                    model: s_model,
+                    protocol: s_protocol,
+                    model_limit: s_model_limit,
+                    max_tokens: s_max_tokens,
+                    tool_call_limit: spec.tool_call_limit,
+                },
+            );
+        }
+        let subagents_reg = Arc::new(agent_core::SubAgentRegistry::from_map(resolved));
+        #[cfg(test)]
+        {
+            subagent_registry = Some(subagents_reg.clone());
+        }
+
         registry.register(Arc::new(agent_core::DispatchAgentTool::new(
             agent_core::DispatchDeps {
                 model: child_model,
@@ -393,7 +441,7 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 max_depth: cfg.subagent_max_depth.max(1),
                 id_prefix: String::new(),
                 description_overrides: cfg.tool_description_overrides.clone(),
-                subagents: Arc::new(agent_core::SubAgentRegistry::default()),
+                subagents: subagents_reg.clone(),
             },
         )));
     }
@@ -463,6 +511,8 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         compaction_model_routed,
         #[cfg(test)]
         child_loop_knobs,
+        #[cfg(test)]
+        subagent_registry,
     }
 }
 
@@ -1001,6 +1051,32 @@ mod tests {
             HashSet::from(["recall"]),
             "unexpected confusable tools missing from the assembled registry: {absent:?}"
         );
+    }
+
+    #[test]
+    fn named_subagent_resolves_into_dispatch_registry() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.named_subagents = vec![crate::runtime_config::SubAgentSpec {
+            name: "reviewer".into(),
+            description: "reviews code".into(),
+            system_prompt: "You review Rust.".into(),
+            tools: None,
+            model: None,
+            tool_call_limit: Some(5),
+            permissions: None,
+            response_format: None,
+            middleware: None,
+            skills: None,
+        }];
+        let built = assemble_loop(&c, parts(ws.path().into(), vec![]));
+        let reg = built
+            .subagent_registry
+            .expect("registry present when subagents on");
+        let r = reg.get("reviewer").expect("reviewer resolved");
+        assert!(r.system_prompt.contains("You review Rust."));
+        assert!(r.system_prompt.contains(agent_core::SUBAGENT_PREAMBLE));
+        assert_eq!(r.tool_call_limit, Some(5));
     }
 
     #[test]
