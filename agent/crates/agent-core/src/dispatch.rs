@@ -1221,6 +1221,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_child_response_format_severs_pre_respond_prose() {
+        // Child reasons aloud (assistant text) in the SAME turn it calls `respond`
+        // (a real tool-calling model can emit text alongside tool_calls in one
+        // turn — Scripted::Text/Call would instead stop the loop after the text
+        // turn via StopReason::Stop, never reaching the call). The prose must
+        // NOT appear in the handoff — only the JSON payload + footer (sever).
+        use agent_model::{Chunk, RawToolCall};
+        let child = ScriptedModel::new(vec![Scripted::Chunks(vec![
+            Chunk::Text("Let me think... the severity is clearly low.".into()),
+            Chunk::ToolCallDelta(RawToolCall {
+                index: None,
+                id: Some("c1".into()),
+                name: Some("respond".into()),
+                args_fragment: r#"{"summary":"done"}"#.into(),
+            }),
+            Chunk::Done(StopReason::ToolCalls),
+        ])]);
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 4);
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(resolved_with(
+            Some(rf_schema()),
+            child,
+            None,
+        )));
+        let out = DispatchAgentTool::new(deps)
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        // Line 1 is the JSON payload.
+        let v: serde_json::Value =
+            serde_json::from_str(out.content.lines().next().unwrap()).unwrap();
+        assert_eq!(v["summary"], "done");
+        // The child's pre-respond prose is severed — absent from the ENTIRE handoff.
+        assert!(
+            !out.content.contains("Let me think"),
+            "pre-respond prose leaked: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("severity is clearly low"),
+            "pre-respond prose leaked: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_respond_retries_then_succeeds() {
         let child = ScriptedModel::new(vec![
             Scripted::Call("c1".into(), "respond".into(), r#"{"wrong":1}"#.into()),

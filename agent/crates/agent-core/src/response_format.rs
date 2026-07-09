@@ -310,7 +310,6 @@ mod tests {
 
     #[tokio::test]
     async fn respond_tool_writes_handle_on_valid_and_errs_on_invalid() {
-        use agent_tools::{Tool, ToolCtx};
         use tokio_util::sync::CancellationToken;
         let schema = good_schema();
         let handle: ResponseHandle = Arc::new(Mutex::new(None));
