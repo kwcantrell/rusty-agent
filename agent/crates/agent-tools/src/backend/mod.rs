@@ -3,11 +3,11 @@
 //! they always receive paths relative to their own root (the composite strips
 //! the mount prefix on the way in and re-prefixes results on the way out, E6).
 // mod composite; // Task 3
-// mod host; // Task 2
 pub mod conformance;
+mod host;
 mod mem;
 // pub use composite::{CompositeBackend, ReadOnlyToTools, ARTIFACTS_READONLY_MSG}; // Task 3
-// pub use host::HostBackend; // Task 2
+pub use host::HostBackend;
 pub use mem::MemBackend;
 
 use async_trait::async_trait;
