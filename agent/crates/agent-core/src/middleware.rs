@@ -21,6 +21,11 @@ pub const STUCK_ABORT_AFTER: usize = 4;
 /// `protocol_repairs < 1` (spec §5.3). Named so a future knob is one line.
 pub const MAX_REPAIRS: usize = 1;
 
+/// Generous order-of-magnitude backstops (spec §5.5). Named so a future knob is
+/// a one-line change; NOT runtime-configurable (matches the stuck precedent).
+pub const TOOL_CALL_LIMIT: usize = 1000;
+pub const MODEL_CALL_LIMIT: usize = 500;
+
 /// Node-hook outcome. `EndRun` short-circuits remaining hooks at that point;
 /// the loop maps it to `emit(Done(reason)); return Ok(())` (spec §5.2).
 #[derive(Debug, Clone, PartialEq)]
@@ -541,6 +546,109 @@ impl Middleware for RepairMiddleware {
         } else {
             Repair::GiveUp
         }
+    }
+}
+
+/// Tool-call tally in `RunShared`. `pub` so the loop's pre-turn guard reads it
+/// (spec §5.7); stays 0 unless a counting middleware is in the stack.
+#[derive(Default)]
+pub struct ToolCallCount(pub usize);
+
+#[derive(Default)]
+struct ModelCallCount(usize);
+
+/// Always-on runaway backstop (spec §5.5): a runaway that VARIES its args each
+/// turn slips past `StuckDetection` and can burn the whole turn budget. Counts
+/// every tool execution in `wrap_tool_call`, enforces at `after_tools`.
+pub struct ToolCallLimit {
+    cap: usize,
+}
+
+impl ToolCallLimit {
+    pub fn new() -> Self {
+        Self {
+            cap: TOOL_CALL_LIMIT,
+        }
+    }
+    pub fn with_cap(cap: usize) -> Self {
+        Self { cap }
+    }
+}
+
+impl Default for ToolCallLimit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Middleware for ToolCallLimit {
+    fn name(&self) -> &str {
+        "tool-call-limit"
+    }
+    async fn wrap_tool_call(&self, call: ToolCall, next: ToolNext<'_>) -> crate::Executed {
+        // Count BEFORE execution: a panicked/timed-out/denied call still costs an
+        // orchestration round-trip, so count-on-failure is intentional (Fa-F3).
+        next.shared().with::<ToolCallCount, _>(|c| c.0 += 1);
+        next.run(call.args).await
+    }
+    async fn after_tools(&self, cx: &mut RunCx<'_>) -> Flow {
+        if cx.shared().with::<ToolCallCount, _>(|c| c.0) >= self.cap {
+            cx.sink.emit(crate::AgentEvent::Error(
+                "tool-call guardrail: the run exceeded the maximum number of tool \
+                 calls; aborting"
+                    .into(),
+            ));
+            return Flow::EndRun(StopReason::Error);
+        }
+        Flow::Continue
+    }
+}
+
+/// Model-call cap (spec §5.5, E1). Ships DEFAULT-OFF: always counts in
+/// `wrap_model_call` (so `wrap_model_call` has a real consumer and both wrap
+/// surfaces are exercised), enforces at `after_model` only when enabled. It is
+/// subsumed by `max_turns`, hence opt-in, not imposed.
+pub struct ModelCallLimit {
+    cap: usize,
+    enabled: bool,
+}
+
+impl ModelCallLimit {
+    pub fn disabled() -> Self {
+        Self {
+            cap: MODEL_CALL_LIMIT,
+            enabled: false,
+        }
+    }
+    pub fn enabled_with_cap(cap: usize) -> Self {
+        Self { cap, enabled: true }
+    }
+}
+
+#[async_trait]
+impl Middleware for ModelCallLimit {
+    fn name(&self) -> &str {
+        "model-call-limit"
+    }
+    async fn wrap_model_call(
+        &self,
+        req: agent_model::CompletionRequest,
+        next: ModelNext<'_>,
+    ) -> Result<agent_model::AssistantTurn, crate::CompletionFailure> {
+        next.shared().with::<ModelCallCount, _>(|c| c.0 += 1);
+        next.run(req).await
+    }
+    async fn after_model(&self, cx: &mut RunCx<'_>, _turn: &TurnView) -> Flow {
+        if self.enabled && cx.shared().with::<ModelCallCount, _>(|c| c.0) >= self.cap {
+            cx.sink.emit(crate::AgentEvent::Error(
+                "model-call guardrail: the run exceeded the maximum number of model \
+                 calls; aborting"
+                    .into(),
+            ));
+            return Flow::EndRun(StopReason::Error);
+        }
+        Flow::Continue
     }
 }
 

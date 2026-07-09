@@ -188,6 +188,12 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     // Repeated-identical-call detection (spec §5.5): stateless, so a single
     // shared instance is fine on both the parent and every dispatch child.
     stack.push(Arc::new(agent_core::StuckDetectionMiddleware));
+    // Guardrail siblings of StuckDetection (spec §5.5/§5.6). ModelCallLimit is
+    // default-off (a wrap_model_call consumer; opt-in). ToolCallLimit is
+    // always-on: the varying-args runaway backstop. Both after StuckDetection so
+    // a co-firing guardrail EndRun resolves before stuck's nudge (Fa-F5).
+    stack.push(Arc::new(agent_core::ModelCallLimit::disabled()));
+    stack.push(Arc::new(agent_core::ToolCallLimit::new()));
     // Malformed-tool-call repair as a pluggable unit (spec §5.3). Reproduces
     // the loop-resident one-shot re-ask byte-identically; last in the stack.
     stack.push(Arc::new(agent_core::RepairMiddleware));
