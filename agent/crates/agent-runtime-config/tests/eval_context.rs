@@ -307,6 +307,7 @@ async fn eval_context_run() {
             artifacts.clone(),
             flag,
         )
+        .with_todos(todos.clone())
         .with_recall_budget(cc.recall_budget)
         .with_offload_config(cc.offload_config())
         .with_high_water_pct(cc.high_water_pct);

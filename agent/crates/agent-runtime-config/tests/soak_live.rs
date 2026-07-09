@@ -269,6 +269,7 @@ async fn soak_all_components_live() {
         artifacts.clone(),
         flag,
     )
+    .with_todos(todos.clone())
     .with_recall_budget(256);
 
     let mut rng = SystemTime::now()

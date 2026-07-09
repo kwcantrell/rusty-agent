@@ -67,6 +67,52 @@ impl ModelRef {
     }
 }
 
+/// Upper bound on a named sub-agent's `system_prompt` (prepended to every child
+/// turn; mirrors `MAX_ROLE_CHARS` for the ad-hoc `role` path). Panel fix M3.
+pub const MAX_SUBAGENT_SYSTEM_PROMPT_CHARS: usize = 20_000;
+/// Upper bound on a named sub-agent's `tool_call_limit` (panel fix M3; the field
+/// exists to BOUND runaway, so it must itself be bounded).
+pub const MAX_SUBAGENT_TOOL_CALLS: usize = 1_000;
+
+/// A config-declared, named sub-agent (deepagents `SubAgent`, minimal-viable
+/// subset; spec §2.1). Reserved fields are inert in 3B-1 (validation rejects
+/// any non-null value; see `validate`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubAgentSpec {
+    /// Unique registry key; the model selects by this via `dispatch_agent`'s
+    /// `subagent_type`. Reserved: `"general-purpose"` is not overridable.
+    pub name: String,
+    /// "When to use me" — surfaced as the `subagent_type` enum value's doc.
+    pub description: String,
+    /// Replaces the parent-derived child prompt; the `SUBAGENT_PREAMBLE` is
+    /// still always composed in (see assembly).
+    pub system_prompt: String,
+    /// Tool allowlist over the parent snapshot; `None` = full snapshot.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Routed model override; `None` = the child default (`subagent_model`).
+    /// May set only `model`/`protocol`/`context_limit`/`max_tokens` (validated).
+    #[serde(default)]
+    pub model: Option<ModelRef>,
+    /// Child `ToolCallLimit` cap (3A residual E4); bounded `1..=MAX_SUBAGENT_TOOL_CALLS`.
+    #[serde(default)]
+    pub tool_call_limit: Option<usize>,
+
+    // ---- RESERVED (inert in 3B-1; validation rejects any non-null value) ----
+    /// → 3B-1c (per-sub-agent permissions).
+    #[serde(default)]
+    pub permissions: Option<serde_json::Value>,
+    /// → 3B-1b (structured-response handoff).
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
+    /// Dropped (no committed follow-on); see spec §9.
+    #[serde(default)]
+    pub middleware: Option<Vec<String>>,
+    /// Dropped (no committed follow-on); see spec §9.
+    #[serde(default)]
+    pub skills: Option<Vec<String>>,
+}
+
 /// The editable runtime surface, persisted to disk and mirrored on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeConfig {
@@ -113,6 +159,9 @@ pub struct RuntimeConfig {
     /// clamp to >= 1; "no sub-agents at all" is `subagents: false`.
     #[serde(default = "default_subagent_max_depth")]
     pub subagent_max_depth: usize,
+    /// Config-declared named sub-agents (spec 2026-07-09-named-subagent-registry).
+    #[serde(default)]
+    pub named_subagents: Vec<SubAgentSpec>,
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -199,6 +248,8 @@ struct PartialRuntimeConfig {
     subagent_model: Option<ModelRef>,
     compaction_model: Option<ModelRef>,
     subagent_max_depth: Option<usize>,
+    #[serde(default)]
+    named_subagents: Option<Vec<SubAgentSpec>>,
     top_p: Option<f32>,
     top_k: Option<u32>,
     min_p: Option<f32>,
@@ -311,6 +362,7 @@ impl RuntimeConfig {
             subagent_model: None,
             compaction_model: None,
             subagent_max_depth: default_subagent_max_depth(),
+            named_subagents: Vec::new(),
             top_p: None,
             top_k: None,
             min_p: None,
@@ -443,6 +495,77 @@ impl RuntimeConfig {
                 self.sandbox_mode
             ));
         }
+        // ---- Named sub-agents (spec §2.7) ----
+        let mut seen = std::collections::HashSet::new();
+        for s in &self.named_subagents {
+            if s.name.trim().is_empty() {
+                return Err("named_subagents: name must be non-empty".into());
+            }
+            if s.name == "general-purpose" {
+                return Err(
+                    "named_subagents: 'general-purpose' is a reserved name and cannot be redefined"
+                        .into(),
+                );
+            }
+            if !seen.insert(s.name.clone()) {
+                return Err(format!("named_subagents: duplicate name '{}'", s.name));
+            }
+            if s.description.trim().is_empty() {
+                return Err(format!(
+                    "named_subagents['{}']: description must be non-empty",
+                    s.name
+                ));
+            }
+            if s.system_prompt.trim().is_empty() {
+                return Err(format!(
+                    "named_subagents['{}']: system_prompt must be non-empty",
+                    s.name
+                ));
+            }
+            if s.system_prompt.chars().count() > MAX_SUBAGENT_SYSTEM_PROMPT_CHARS {
+                return Err(format!(
+                    "named_subagents['{}']: system_prompt exceeds {MAX_SUBAGENT_SYSTEM_PROMPT_CHARS} chars",
+                    s.name
+                ));
+            }
+            if let Some(n) = s.tool_call_limit {
+                if !(1..=MAX_SUBAGENT_TOOL_CALLS).contains(&n) {
+                    return Err(format!(
+                        "named_subagents['{}']: tool_call_limit must be 1..={MAX_SUBAGENT_TOOL_CALLS}",
+                        s.name
+                    ));
+                }
+            }
+            if let Some(cl) = s.model.as_ref().and_then(|m| m.context_limit) {
+                if cl < 1024 {
+                    return Err(format!(
+                        "named_subagents['{}']: model.context_limit must be >= 1024",
+                        s.name
+                    ));
+                }
+            }
+            // M3: a spec may re-point the model NAME/protocol/window, never the
+            // endpoint — child inference stays on the config's declared backend.
+            if let Some(m) = &s.model {
+                if m.backend.is_some() || m.base_url.is_some() || m.claude_binary.is_some() {
+                    return Err(format!(
+                        "named_subagents['{}']: model may set only model/protocol/context_limit/max_tokens (not backend/base_url/claude_binary)",
+                        s.name
+                    ));
+                }
+            }
+            // Reserved fields are inert in 3B-1 (spec §2.7 item 6).
+            if s.permissions.is_some()
+                || s.response_format.is_some()
+                || s.middleware.is_some()
+                || s.skills.is_some()
+            {
+                return Err(format!(
+                    "named_subagents['{}']: permissions/response_format/middleware/skills are not supported in 3B-1 (see 3B-1b/3B-1c)",
+                    s.name
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -545,6 +668,9 @@ impl RuntimeConfig {
         }
         if let Some(v) = p.subagent_max_depth {
             self.subagent_max_depth = v;
+        }
+        if let Some(v) = p.named_subagents {
+            self.named_subagents = v;
         }
         if let Some(v) = p.top_p {
             self.top_p = Some(v);
@@ -803,6 +929,23 @@ mod tests {
     }
 
     #[test]
+    fn named_subagents_default_empty_and_roundtrip() {
+        let c = RuntimeConfig::default();
+        assert!(c.named_subagents.is_empty());
+
+        let json = r#"{"named_subagents":[{"name":"reviewer","description":"reviews code","system_prompt":"You review Rust.","tools":["read_file","grep"]}]}"#;
+        let parsed = base().merge(serde_json::from_str::<PartialRuntimeConfig>(json).unwrap());
+        assert_eq!(parsed.named_subagents.len(), 1);
+        let s = &parsed.named_subagents[0];
+        assert_eq!(s.name, "reviewer");
+        assert_eq!(
+            s.tools.as_deref(),
+            Some(&["read_file".to_string(), "grep".to_string()][..])
+        );
+        assert!(s.model.is_none() && s.tool_call_limit.is_none() && s.permissions.is_none());
+    }
+
+    #[test]
     fn max_parallel_tools_partial_file_overrides_only_that_field() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("partial.json");
@@ -1002,6 +1145,18 @@ mod tests {
                 ..Default::default()
             }),
             subagent_max_depth: 2,
+            named_subagents: vec![SubAgentSpec {
+                name: "reviewer".into(),
+                description: "reviews code".into(),
+                system_prompt: "You review Rust.".into(),
+                tools: Some(vec!["read_file".into()]),
+                model: None,
+                tool_call_limit: None,
+                permissions: None,
+                response_format: None,
+                middleware: None,
+                skills: None,
+            }],
             top_p: Some(0.9),
             top_k: Some(40),
             min_p: Some(0.05),
@@ -1328,6 +1483,95 @@ mod tests {
             c.sandbox_mode = mode.to_string();
             assert!(c.validate().is_ok(), "mode '{mode}' should be valid");
         }
+    }
+
+    fn cfg_with(specs: Vec<SubAgentSpec>) -> RuntimeConfig {
+        RuntimeConfig {
+            named_subagents: specs,
+            ..RuntimeConfig::default()
+        }
+    }
+    fn spec(name: &str) -> SubAgentSpec {
+        SubAgentSpec {
+            name: name.into(),
+            description: "d".into(),
+            system_prompt: "p".into(),
+            tools: None,
+            model: None,
+            tool_call_limit: None,
+            permissions: None,
+            response_format: None,
+            middleware: None,
+            skills: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_reserved_general_purpose_name() {
+        assert!(cfg_with(vec![spec("general-purpose")]).validate().is_err());
+    }
+    #[test]
+    fn validate_rejects_duplicate_names() {
+        assert!(cfg_with(vec![spec("a"), spec("a")]).validate().is_err());
+    }
+    #[test]
+    fn validate_rejects_empty_required_fields() {
+        let mut s = spec("a");
+        s.description = "".into();
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.system_prompt = "".into();
+        assert!(cfg_with(vec![s]).validate().is_err());
+        assert!(cfg_with(vec![spec("")]).validate().is_err());
+    }
+    #[test]
+    fn validate_rejects_oversize_system_prompt_and_bad_tool_call_limit() {
+        let mut s = spec("a");
+        s.system_prompt = "x".repeat(MAX_SUBAGENT_SYSTEM_PROMPT_CHARS + 1);
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.tool_call_limit = Some(0);
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.tool_call_limit = Some(MAX_SUBAGENT_TOOL_CALLS + 1);
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.tool_call_limit = Some(MAX_SUBAGENT_TOOL_CALLS);
+        assert!(cfg_with(vec![s]).validate().is_ok());
+    }
+    #[test]
+    fn validate_rejects_reserved_fields_and_model_endpoint_override() {
+        let mut s = spec("a");
+        s.permissions = Some(serde_json::json!({}));
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.response_format = Some(serde_json::json!({}));
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.middleware = Some(vec!["memory_recall".into()]);
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.skills = Some(vec!["x".into()]);
+        assert!(cfg_with(vec![s]).validate().is_err());
+        // model may set model/protocol/context_limit/max_tokens, NOT the endpoint.
+        let mut s = spec("a");
+        s.model = Some(ModelRef {
+            model: Some("haiku".into()),
+            ..Default::default()
+        });
+        assert!(cfg_with(vec![s]).validate().is_ok());
+        let mut s = spec("a");
+        s.model = Some(ModelRef {
+            base_url: Some("http://evil".into()),
+            ..Default::default()
+        });
+        assert!(cfg_with(vec![s]).validate().is_err());
+        let mut s = spec("a");
+        s.model = Some(ModelRef {
+            backend: Some("openai".into()),
+            ..Default::default()
+        });
+        assert!(cfg_with(vec![s]).validate().is_err());
     }
 
     #[test]

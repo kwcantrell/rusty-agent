@@ -2,7 +2,7 @@
 use crate::{
     AgentEvent, AgentLoop, ContextCurationMiddleware, CuratedContext, EventSink, LoopConfig,
     Middleware, OffloadConfig, RepairMiddleware, SessionArtifacts, StuckDetectionMiddleware,
-    TodoHandle, WriteTodosTool,
+    TodoHandle, ToolCallLimit, WriteTodosTool,
 };
 use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
 use agent_policy::{ApprovalChannel, PolicyEngine};
@@ -27,6 +27,50 @@ static DISPATCH_ORDINAL: AtomicU64 = AtomicU64::new(1);
 /// parallel siblings and across the parent's own tool-call ids (spec D9).
 pub fn next_dispatch_n() -> u64 {
     DISPATCH_ORDINAL.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A `SubAgentSpec` resolved at assembly into everything the dispatch tool needs
+/// to spawn a named child (models are pre-built here because agent-core cannot
+/// call `build_routed_model`). Spec §2.1/§2.4/§2.5.
+pub struct ResolvedSubAgent {
+    pub description: String,
+    /// Already includes `SUBAGENT_PREAMBLE` (composed at assembly).
+    pub system_prompt: String,
+    pub tools: Option<Vec<String>>,
+    pub model: Arc<dyn ModelClient>,
+    pub protocol: Arc<dyn ToolCallProtocol>,
+    pub model_limit: Option<usize>,
+    pub max_tokens: Option<u32>,
+    pub tool_call_limit: Option<usize>,
+}
+
+/// Dispatch-facing named sub-agent registry (spec §2.2). `general-purpose` is
+/// implicit (the default ad-hoc path) and never stored here.
+#[derive(Default)]
+pub struct SubAgentRegistry {
+    map: std::collections::HashMap<String, ResolvedSubAgent>,
+}
+
+impl SubAgentRegistry {
+    pub fn from_map(map: std::collections::HashMap<String, ResolvedSubAgent>) -> Self {
+        Self { map }
+    }
+    pub fn get(&self, name: &str) -> Option<&ResolvedSubAgent> {
+        self.map.get(name)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+    pub fn names(&self) -> Vec<&str> {
+        self.map.keys().map(String::as_str).collect()
+    }
+    /// `(name, description)` pairs for the `subagent_type` enum docs.
+    pub fn schema_hints(&self) -> Vec<(String, String)> {
+        self.map
+            .iter()
+            .map(|(n, r)| (n.clone(), r.description.clone()))
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -260,6 +304,9 @@ pub struct DispatchDeps {
     /// registry too so the tool vocabulary stays uniform across depths
     /// (finding 4.1; seam spec 2026-07-02-tool-description-override-seam).
     pub description_overrides: std::collections::HashMap<String, String>,
+    /// Named sub-agent registry (spec §2.2). Empty ⇒ only `general-purpose`
+    /// exists and the tool schema is byte-identical to 3A.
+    pub subagents: Arc<SubAgentRegistry>,
 }
 
 pub struct DispatchAgentTool {
@@ -310,26 +357,51 @@ impl Tool for DispatchAgentTool {
         )
     }
     fn schema(&self) -> ToolSchema {
+        let mut properties = serde_json::json!({
+            "prompt": {
+                "type": "string",
+                "description": "The complete, self-contained task for the sub-agent: goal, relevant paths/facts, and what to return."
+            },
+            "tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tool (context_compact) is always available. Include dispatch_agent to let the sub-agent dispatch its own (only meaningful when nesting depth allows); the restriction applies transitively to its children. Ignored when subagent_type names a registered sub-agent."
+            },
+            "role": {
+                "type": "string",
+                "description": "Optional persona/role instructions injected into the sub-agent's system prompt (stronger steering than putting them in the prompt). Max 2000 characters. Ignored when subagent_type names a registered sub-agent."
+            }
+        });
+        // Fix M1: expose registered sub-agents as a typed enum so the model can
+        // ROUTE to the right one. Present ONLY when the registry is non-empty, so
+        // an empty registry keeps the schema byte-identical to 3A.
+        if !self.deps.subagents.is_empty() {
+            let mut hints = self.deps.subagents.schema_hints();
+            hints.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut variants: Vec<String> = vec!["general-purpose".into()];
+            let mut doc = String::from(
+                "Which sub-agent to dispatch. 'general-purpose' inherits your tools/model and honors `role`/`tools`. Registered sub-agents (use their own prompt/tools/model, and IGNORE `role`/`tools`): ",
+            );
+            for (i, (name, desc)) in hints.iter().enumerate() {
+                variants.push(name.clone());
+                if i > 0 {
+                    doc.push_str("; ");
+                }
+                doc.push_str(&format!("{name} — {desc}"));
+            }
+            properties["subagent_type"] = serde_json::json!({
+                "type": "string",
+                "enum": variants,
+                "default": "general-purpose",
+                "description": doc,
+            });
+        }
         ToolSchema {
             name: "dispatch_agent".into(),
             description: self.description().into(),
             parameters: serde_json::json!({
                 "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "The complete, self-contained task for the sub-agent: goal, relevant paths/facts, and what to return."
-                    },
-                    "tools": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional allowlist restricting which tools the sub-agent may use (default: all). For focus, not safety — permissions are inherited either way. The child's context tool (context_compact) is always available. Include dispatch_agent to let the sub-agent dispatch its own (only meaningful when nesting depth allows); the restriction applies transitively to its children."
-                    },
-                    "role": {
-                        "type": "string",
-                        "description": "Optional persona/role instructions injected into the sub-agent's system prompt (stronger steering than putting them in the prompt). Max 2000 characters."
-                    }
-                },
+                "properties": properties,
                 "required": ["prompt"]
             }),
         }
@@ -368,6 +440,26 @@ impl Tool for DispatchAgentTool {
             .filter(|p| !p.trim().is_empty())
             .ok_or_else(|| ToolError::InvalidArgs("prompt (non-empty string) is required".into()))?
             .to_string();
+        let subagent_type = args
+            .get("subagent_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| "general-purpose".to_string());
+        let resolved: Option<&ResolvedSubAgent> = if subagent_type == "general-purpose" {
+            None
+        } else {
+            match self.deps.subagents.get(&subagent_type) {
+                Some(r) => Some(r),
+                None => {
+                    let mut names: Vec<&str> = self.deps.subagents.names();
+                    names.sort_unstable();
+                    return Err(ToolError::InvalidArgs(format!(
+                        "unknown subagent_type '{subagent_type}'; registered: general-purpose, {}",
+                        names.join(", ")
+                    )));
+                }
+            }
+        };
         let role: Option<String> = match args.get("role") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(s)) => {
@@ -400,6 +492,12 @@ impl Tool for DispatchAgentTool {
                     "tools must be an array of strings".into(),
                 ))
             }
+        };
+        // Named type: its allowlist REPLACES per-call tools (deepagents replace
+        // semantics). general-purpose keeps the per-call `allow` computed above.
+        let allow = match resolved {
+            Some(r) => r.tools.clone(),
+            None => allow,
         };
         const IMPLICIT_CHILD_TOOLS: [&str; 1] = ["context_compact"];
         // "dispatch_agent" is a valid allowlist name ONLY while the child could
@@ -495,9 +593,15 @@ impl Tool for DispatchAgentTool {
         // Names not in THIS child's registry (e.g. allowlist-filtered tools)
         // just warn — same posture as the parent path.
         reg.set_description_overrides(self.deps.description_overrides.clone());
-        let system = match &role {
-            Some(r) => format!("{}\n\nRole: {r}", self.deps.child_system_prompt),
-            None => self.deps.child_system_prompt.clone(),
+        // Named type replaces the parent-derived prompt (preamble already baked
+        // into resolved.system_prompt) and ignores `role`. general-purpose keeps
+        // the parent child_system_prompt + optional role (byte-identical to 3A).
+        let system = match resolved {
+            Some(r) => r.system_prompt.clone(),
+            None => match &role {
+                Some(rl) => format!("{}\n\nRole: {rl}", self.deps.child_system_prompt),
+                None => self.deps.child_system_prompt.clone(),
+            },
         };
         let mut child_ctx = CuratedContext::new(Message::system(system), artifacts.clone(), flag)
             .with_offload_config(OffloadConfig {
@@ -516,14 +620,33 @@ impl Tool for DispatchAgentTool {
             parent_id,
             self.deps.child_trace.clone(),
         ));
+        // Named type may route its own model/protocol/window; general-purpose
+        // uses the parent-configured child defaults (byte-identical to 3A).
+        let (child_model, child_protocol, child_loop_config) = match resolved {
+            Some(r) => {
+                let mut lc = self.deps.loop_config.clone();
+                if let Some(ml) = r.model_limit {
+                    lc.model_limit = ml;
+                }
+                if r.max_tokens.is_some() {
+                    lc.max_tokens = r.max_tokens;
+                }
+                (r.model.clone(), r.protocol.clone(), lc)
+            }
+            None => (
+                self.deps.model.clone(),
+                self.deps.protocol.clone(),
+                self.deps.loop_config.clone(),
+            ),
+        };
         let child = AgentLoop::new(
-            self.deps.model.clone(),
-            self.deps.protocol.clone(),
+            child_model,
+            child_protocol,
             Arc::new(reg),
             self.deps.policy.clone(),
             self.deps.approval.clone(),
             sink.clone(),
-            self.deps.loop_config.clone(),
+            child_loop_config,
         );
         // Own middleware instance per child (spec §5.6): scheduled curation
         // against THIS child's store/flag, not the parent's. StuckDetection is
@@ -551,13 +674,17 @@ impl Tool for DispatchAgentTool {
                     self.deps.loop_config.workspace.clone(),
                 )),
             ));
-        let child = child
-            .with_middleware(vec![
-                curation,
-                Arc::new(StuckDetectionMiddleware),
-                Arc::new(RepairMiddleware),
-            ])
-            .with_backend(child_backend);
+        // 3A default child stack; a named type with tool_call_limit appends the
+        // 3A ToolCallLimit guardrail (E4). Aborts via EndRun(StopReason::Error).
+        let mut child_mw: Vec<Arc<dyn Middleware>> = vec![
+            curation,
+            Arc::new(StuckDetectionMiddleware),
+            Arc::new(RepairMiddleware),
+        ];
+        if let Some(cap) = resolved.and_then(|r| r.tool_call_limit) {
+            child_mw.push(Arc::new(ToolCallLimit::with_cap(cap)));
+        }
+        let child = child.with_middleware(child_mw).with_backend(child_backend);
         // Route child-loop compaction through the dedicated model when set.
         let child = match &self.deps.compaction_model {
             Some(m) => child.with_compaction_model(m.clone()),
@@ -961,6 +1088,7 @@ mod tests {
             max_depth: 1,
             id_prefix: String::new(),
             description_overrides: Default::default(),
+            subagents: Arc::new(SubAgentRegistry::default()),
         }
     }
 
@@ -973,6 +1101,220 @@ mod tests {
             backend: Arc::new(agent_tools::backend::HostBackend::new(std::env::temp_dir())),
             call_id: "d1".into(),
         }
+    }
+
+    #[test]
+    fn empty_registry_omits_subagent_type_from_schema() {
+        // A DispatchAgentTool built with an empty registry has a schema byte-identical
+        // to 3A (no `subagent_type` property).
+        let tool = DispatchAgentTool::new(exec_deps(ScriptedModel::new(vec![]), 1));
+        let schema = tool.schema();
+        let props = schema.parameters.get("properties").unwrap();
+        assert!(
+            props.get("subagent_type").is_none(),
+            "empty registry must not add subagent_type"
+        );
+        assert!(props.get("prompt").is_some());
+    }
+
+    // --- Task B3: subagent_type schema enum + parse/resolve ------------------
+
+    fn one_agent_registry() -> Arc<SubAgentRegistry> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "reviewer".to_string(),
+            ResolvedSubAgent {
+                description: "reviews code".into(),
+                system_prompt: format!("You review.\n\n{}", SUBAGENT_PREAMBLE),
+                tools: None,
+                model: Arc::new(ScriptedModel::new(vec![])),
+                protocol: Arc::new(PassthroughProtocol),
+                model_limit: None,
+                max_tokens: None,
+                tool_call_limit: Some(3),
+            },
+        );
+        Arc::new(SubAgentRegistry::from_map(m))
+    }
+
+    #[test]
+    fn nonempty_registry_adds_subagent_type_enum_with_descriptions() {
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
+        deps.subagents = one_agent_registry();
+        let tool = DispatchAgentTool::new(deps);
+        let schema = tool.schema();
+        let st = schema.parameters["properties"]["subagent_type"].clone();
+        let variants: Vec<String> = serde_json::from_value(st["enum"].clone()).unwrap();
+        assert!(variants.contains(&"general-purpose".to_string()));
+        assert!(variants.contains(&"reviewer".to_string()));
+        // description mentions the registered agent's purpose (M1 discovery)
+        assert!(st["description"].as_str().unwrap().contains("reviews code"));
+    }
+
+    #[tokio::test]
+    async fn unknown_subagent_type_is_invalid_args() {
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
+        deps.subagents = one_agent_registry();
+        let tool = DispatchAgentTool::new(deps);
+        let err = tool
+            .execute(
+                serde_json::json!({"prompt":"hi","subagent_type":"nope"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+    }
+
+    // --- Task B4: named-type resolution applied to child construction -------
+
+    /// `DispatchDeps` wired so that whichever model actually runs the child —
+    /// `deps.model` (general-purpose path) OR a named type's own
+    /// `resolved.model` (named path) — records the child's OWN system message
+    /// (`Role::System`) into a shared `Arc<Mutex<Option<String>>>`. Rebuilds
+    /// `registry` with each entry's model wrapped by the same capturing
+    /// client, so callers can pass `one_agent_registry()` unmodified and this
+    /// harness stays agnostic to which path a given test exercises. Reuses the
+    /// `SchemaCapturingModel`/`RequestTextCapturingModel` idiom already used
+    /// above, specialized to pull out exactly the system message content so
+    /// prompt/preamble assertions don't have to parse the joined transcript.
+    fn deps_with_capturing_child(
+        registry: Arc<SubAgentRegistry>,
+    ) -> (DispatchDeps, Arc<Mutex<Option<String>>>) {
+        struct SystemCapturingModel {
+            inner: Arc<dyn ModelClient>,
+            captured_system: Arc<Mutex<Option<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl agent_model::ModelClient for SystemCapturingModel {
+            async fn stream(
+                &self,
+                req: agent_model::CompletionRequest,
+            ) -> Result<
+                futures::stream::BoxStream<
+                    'static,
+                    Result<agent_model::Chunk, agent_model::ModelError>,
+                >,
+                agent_model::ModelError,
+            > {
+                {
+                    let mut guard = self.captured_system.lock().unwrap();
+                    if guard.is_none() {
+                        if let Some(m) = req
+                            .messages
+                            .iter()
+                            .find(|m| m.role == agent_model::Role::System)
+                        {
+                            *guard = Some(m.content.clone());
+                        }
+                    }
+                }
+                self.inner.stream(req).await
+            }
+        }
+        let captured_system: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let wrap = |inner: Arc<dyn ModelClient>| -> Arc<dyn ModelClient> {
+            Arc::new(SystemCapturingModel {
+                inner,
+                captured_system: captured_system.clone(),
+            })
+        };
+        let model: Arc<dyn ModelClient> = wrap(Arc::new(ScriptedModel::new(vec![Scripted::Text(
+            "done".into(),
+        )])));
+        let mut wrapped_map = std::collections::HashMap::new();
+        for name in registry.names() {
+            let r = registry.get(name).unwrap();
+            wrapped_map.insert(
+                name.to_string(),
+                ResolvedSubAgent {
+                    description: r.description.clone(),
+                    system_prompt: r.system_prompt.clone(),
+                    tools: r.tools.clone(),
+                    model: wrap(r.model.clone()),
+                    protocol: r.protocol.clone(),
+                    model_limit: r.model_limit,
+                    max_tokens: r.max_tokens,
+                    tool_call_limit: r.tool_call_limit,
+                },
+            );
+        }
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 5);
+        deps.model = model;
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(wrapped_map));
+        (deps, captured_system)
+    }
+
+    #[tokio::test]
+    async fn named_type_uses_spec_prompt_and_preamble_ignoring_role_tools() {
+        // A capturing model records the child's system prompt; assert it is the
+        // spec prompt + preamble, NOT the parent child_system_prompt or the role.
+        let (deps, captured_system) = deps_with_capturing_child(one_agent_registry());
+        let tool = DispatchAgentTool::new(deps);
+        let _ = tool
+            .execute(
+                serde_json::json!({
+                    "prompt":"do it","subagent_type":"reviewer",
+                    "role":"IGNORED ROLE","tools":["IGNORED"]
+                }),
+                &exec_ctx(),
+            )
+            .await;
+        let sys = captured_system.lock().unwrap().clone().expect("child ran");
+        assert!(sys.starts_with("You review."));
+        assert!(sys.contains(SUBAGENT_PREAMBLE));
+        assert!(!sys.contains("IGNORED ROLE"));
+    }
+
+    // Pin m-3 / architecture item (b): with a NON-EMPTY registry, selecting
+    // general-purpose still yields the 3A child (parent prompt + role appended) —
+    // the headline byte-identical invariant (spec §3 invariant 1) on the `None` arm.
+    #[tokio::test]
+    async fn general_purpose_under_nonempty_registry_is_unchanged() {
+        let (deps, captured_system) = deps_with_capturing_child(one_agent_registry());
+        let parent_prompt = deps.child_system_prompt.clone();
+        let tool = DispatchAgentTool::new(deps);
+        let _ = tool
+            .execute(
+                serde_json::json!({
+                    "prompt":"do it","subagent_type":"general-purpose","role":"R"
+                }),
+                &exec_ctx(),
+            )
+            .await;
+        let sys = captured_system.lock().unwrap().clone().expect("child ran");
+        assert!(sys.starts_with(&parent_prompt)); // parent-derived prompt, not a spec's
+        assert!(sys.contains("Role: R")); // role honored on the general-purpose path
+    }
+
+    // Unknown-tool refs surface at DISPATCH time (Task B2 design note), not assembly.
+    #[tokio::test]
+    async fn named_type_unknown_tool_errors_at_dispatch() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "bad".to_string(),
+            ResolvedSubAgent {
+                description: "d".into(),
+                system_prompt: format!("p\n\n{}", SUBAGENT_PREAMBLE),
+                tools: Some(vec!["no_such_tool".into()]), // not in the (empty) base snapshot
+                model: Arc::new(ScriptedModel::new(vec![])),
+                protocol: Arc::new(PassthroughProtocol),
+                model_limit: None,
+                max_tokens: None,
+                tool_call_limit: None,
+            },
+        );
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(m));
+        let tool = DispatchAgentTool::new(deps);
+        let err = tool
+            .execute(
+                serde_json::json!({"prompt":"hi","subagent_type":"bad"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
     }
 
     #[tokio::test]

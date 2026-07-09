@@ -2,7 +2,7 @@
 use agent_core::testkit::{AlwaysApprove, PassthroughProtocol, Scripted, ScriptedModel};
 use agent_core::{
     AgentEvent, DispatchAgentTool, DispatchDeps, EventSink, LoopConfig, SessionArtifacts,
-    SUBAGENT_PREAMBLE,
+    SubAgentRegistry, SUBAGENT_PREAMBLE,
 };
 use agent_policy::{Decision, PolicyEngine, RulePolicy};
 use agent_tools::backend::{Backend, CompositeBackend, HostBackend, ReadOnlyToTools};
@@ -173,6 +173,7 @@ fn deps(model: ScriptedModel, sink: Arc<dyn EventSink>, base: Vec<Arc<dyn Tool>>
         max_depth: 1,
         id_prefix: String::new(),
         description_overrides: Default::default(),
+        subagents: Arc::new(SubAgentRegistry::default()),
     }
 }
 
