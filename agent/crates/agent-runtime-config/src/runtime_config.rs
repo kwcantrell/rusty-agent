@@ -74,6 +74,21 @@ pub const MAX_SUBAGENT_SYSTEM_PROMPT_CHARS: usize = 20_000;
 /// exists to BOUND runaway, so it must itself be bounded).
 pub const MAX_SUBAGENT_TOOL_CALLS: usize = 1_000;
 
+/// Floor-only permission lists (spec 3B-1c §2.2). Only these two keys exist —
+/// widening is unrepresentable; an unknown key (e.g. `allow`) trips
+/// `deny_unknown_fields`, which under the lenient overlay discards the WHOLE
+/// file (flag-derived base, empty registry — no named children at all).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubAgentPermissions {
+    /// Patterns whose matching tools floor at Deny.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Patterns whose matching tools floor at Ask.
+    #[serde(default)]
+    pub ask: Vec<String>,
+}
+
 /// A config-declared, named sub-agent (deepagents `SubAgent`, minimal-viable
 /// subset; spec §2.1). Reserved fields are inert in 3B-1 (validation rejects
 /// any non-null value; see `validate`).
@@ -99,9 +114,10 @@ pub struct SubAgentSpec {
     pub tool_call_limit: Option<usize>,
 
     // ---- RESERVED (inert in 3B-1; validation rejects any non-null value) ----
-    /// → 3B-1c (per-sub-agent permissions).
+    /// Floor-only per-child permissions (3B-1c): can only TIGHTEN the base
+    /// policy for this child and its descendants, never loosen it.
     #[serde(default)]
-    pub permissions: Option<serde_json::Value>,
+    pub permissions: Option<SubAgentPermissions>,
     /// → 3B-1b (structured-response handoff).
     #[serde(default)]
     pub response_format: Option<serde_json::Value>,
@@ -554,12 +570,17 @@ impl RuntimeConfig {
                     ));
                 }
             }
-            // permissions/middleware/skills remain inert (3B-1c / dropped, spec §0).
-            if s.permissions.is_some() || s.middleware.is_some() || s.skills.is_some() {
+            // middleware/skills remain inert (dropped, 3B-1 spec §9).
+            if s.middleware.is_some() || s.skills.is_some() {
                 return Err(format!(
-                    "named_subagents['{}']: permissions/middleware/skills are not supported (see 3B-1c)",
+                    "named_subagents['{}']: middleware/skills are not supported",
                     s.name
                 ));
+            }
+            // 3B-1c: permissions accepted; dialect-validated (floor-only lists).
+            if let Some(p) = &s.permissions {
+                agent_policy::ToolPermissions::parse(&s.name, &p.deny, &p.ask)
+                    .map_err(|e| format!("named_subagents['{}']: permissions {e}", s.name))?;
             }
             // 3B-1b: response_format is accepted, validated as a flat-object schema.
             if let Some(rf) = &s.response_format {
@@ -597,6 +618,67 @@ impl RuntimeConfig {
                 ));
             }
         }
+
+        // 3B-1c advisory lints (spec §2.2 rule 8) — non-fatal by design.
+        // DELIBERATELY broader than dispatch.rs's 1-element IMPLICIT_CHILD_TOOLS
+        // (which gates allowlist-name VALIDITY): this set suppresses false-positive
+        // inert-rule warnings for every tool that can be injected into a child
+        // OUTSIDE its `tools` allowlist (`respond` is allowlist-exempt; write_todos
+        // rebinds when present; dispatch_agent is depth-gated). Do not unify them.
+        const IMPLICIT_CHILD_TOOLS: [&str; 4] = [
+            "context_compact",
+            "respond",
+            "write_todos",
+            "dispatch_agent",
+        ];
+        for s in &self.named_subagents {
+            let Some(p) = &s.permissions else { continue };
+            let all_patterns = p.deny.iter().chain(p.ask.iter());
+            for pat in all_patterns.clone() {
+                // (a) inert exact rule: names a tool the spec's own allowlist excludes.
+                let is_exact = !pat.contains('*');
+                if is_exact {
+                    if let Some(tools) = &s.tools {
+                        if !tools.iter().any(|t| t == pat)
+                            && !IMPLICIT_CHILD_TOOLS.contains(&pat.as_str())
+                        {
+                            out.push(format!(
+                                "named_subagents['{}']: permissions rule '{pat}' names a tool \
+                                 the spec's tools allowlist excludes — the floor is inert",
+                                s.name
+                            ));
+                        }
+                    }
+                }
+                // (b) affix the MCP sanitizer can never produce (`clean()` maps
+                // non-[a-zA-Z0-9-] to '_'; '_' itself survives via the separator).
+                let affix = pat.strip_suffix('*').unwrap_or(pat);
+                if !affix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    out.push(format!(
+                        "named_subagents['{}']: permissions pattern '{pat}' contains characters \
+                         no registered tool name can carry — it can never match",
+                        s.name
+                    ));
+                }
+            }
+            // (c) respond coverage on a response_format spec (exact or wildcard).
+            if s.response_format.is_some() {
+                let covers_respond = all_patterns
+                    .filter_map(|pat| agent_policy::ToolPattern::parse(pat).ok())
+                    .any(|tp| tp.matches("respond"));
+                if covers_respond {
+                    out.push(format!(
+                        "named_subagents['{}']: permissions cover the `respond` tool — this \
+                         structured-response child will always hit the marked free-text fallback",
+                        s.name
+                    ));
+                }
+            }
+        }
+
         out
     }
 
@@ -1551,9 +1633,10 @@ mod tests {
     }
     #[test]
     fn validate_rejects_reserved_fields_and_model_endpoint_override() {
+        // permissions is now accepted (3B-1c); middleware/skills still rejected.
         let mut s = spec("a");
-        s.permissions = Some(serde_json::json!({}));
-        assert!(cfg_with(vec![s]).validate().is_err());
+        s.permissions = Some(SubAgentPermissions::default());
+        assert!(cfg_with(vec![s]).validate().is_ok());
         let mut s = spec("a");
         s.middleware = Some(vec!["memory_recall".into()]);
         assert!(cfg_with(vec![s]).validate().is_err());
@@ -1603,17 +1686,71 @@ mod tests {
         let e = cfg_with(vec![s2]).validate().unwrap_err();
         assert!(e.contains("response_format") && e.contains("triage"), "{e}");
 
-        // permissions / middleware / skills still rejected.
-        let mut sp = spec("triage");
-        sp.permissions = Some(serde_json::json!({}));
-        assert!(cfg_with(vec![sp]).validate().is_err());
-        let mut sm = spec("triage");
+        // permissions is now accepted (3B-1c); middleware/skills still rejected.
+        let mut sp = spec("p");
+        sp.permissions = Some(SubAgentPermissions::default());
+        assert!(cfg_with(vec![sp]).validate().is_ok());
+        let mut sm = spec("m");
         sm.middleware = Some(vec!["x".into()]);
         assert!(cfg_with(vec![sm]).validate().is_err());
-        let mut sk = spec("triage");
+        let mut sk = spec("k");
         sk.skills = Some(vec!["x".into()]);
         assert!(cfg_with(vec![sk]).validate().is_err());
     }
+    #[test]
+    fn permissions_dialect_validated_per_spec() {
+        // good: exact + prefix + bare *
+        let mut s = spec("triage");
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec!["execute_command".into(), "github__*".into()],
+            ask: vec!["*".into()],
+        });
+        assert!(cfg_with(vec![s]).validate().is_ok());
+
+        // bad: leading * (suffix form — cut at gate E1); error names spec + pattern
+        let mut s = spec("triage");
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec!["*_file".into()],
+            ask: vec![],
+        });
+        let e = cfg_with(vec![s]).validate().unwrap_err();
+        assert!(e.contains("triage") && e.contains("*_file"), "{e}");
+
+        // bad: interior *
+        let mut s = spec("triage");
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec![],
+            ask: vec!["a*b".into()],
+        });
+        assert!(cfg_with(vec![s]).validate().is_err());
+
+        // duplicates accepted (spec §2.2 rule 4 — harmless, 3B-1b residual posture)
+        let mut s = spec("triage");
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec!["probe".into(), "probe".into()],
+            ask: vec![],
+        });
+        assert!(cfg_with(vec![s]).validate().is_ok());
+    }
+
+    #[test]
+    fn permissions_empty_block_is_valid() {
+        let mut s = spec("triage");
+        s.permissions = Some(SubAgentPermissions::default());
+        assert!(cfg_with(vec![s]).validate().is_ok());
+    }
+
+    /// Widening is unrepresentable: an `allow` key fails the block's serde parse
+    /// (`deny_unknown_fields`). NOTE the real-world consequence (spec §2.2 rule 3):
+    /// in the lenient overlay this discards the WHOLE file — flag-derived base,
+    /// EMPTY registry (no named children at all) — never an unfloored named child.
+    #[test]
+    fn permissions_unknown_key_fails_block_parse() {
+        let r: Result<SubAgentPermissions, _> =
+            serde_json::from_str(r#"{"deny": [], "allow": ["execute_command"]}"#);
+        assert!(r.is_err(), "an `allow` key must be unrepresentable");
+    }
+
     #[test]
     fn reserves_respond_tool_name() {
         let mut s = spec("triage");
@@ -1793,6 +1930,84 @@ mod tests {
         );
         c.command_allowlist = crate::default_allowlist();
         assert!(c.warnings().is_empty());
+    }
+
+    fn warn_of(specs: Vec<SubAgentSpec>) -> Vec<String> {
+        cfg_with(specs).warnings()
+    }
+
+    #[test]
+    fn lint_inert_exact_rule_vs_tools_allowlist() {
+        let mut s = spec("triage");
+        s.tools = Some(vec!["read_file".into()]);
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec!["execute_command".into()],
+            ask: vec![],
+        });
+        let w = warn_of(vec![s]);
+        assert!(
+            w.iter().any(|m| m.contains("triage")
+                && m.contains("execute_command")
+                && m.contains("inert")),
+            "{w:?}"
+        );
+        // NOT linted: exact rule naming an allowlisted tool, prefix rules, or
+        // the always-available implicit child tools.
+        let mut s = spec("triage");
+        s.tools = Some(vec!["read_file".into()]);
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec![
+                "read_file".into(),
+                "github__*".into(),
+                "context_compact".into(),
+            ],
+            ask: vec![],
+        });
+        assert!(warn_of(vec![s]).is_empty());
+    }
+
+    #[test]
+    fn lint_unsanitizable_mcp_affix() {
+        let mut s = spec("triage");
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec!["git.hub__*".into()],
+            ask: vec![],
+        });
+        let w = warn_of(vec![s]);
+        assert!(
+            w.iter()
+                .any(|m| m.contains("git.hub__*") && m.contains("never match")),
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn lint_respond_coverage_on_response_format_spec() {
+        for pat in ["respond", "re*", "*"] {
+            let mut s = spec("triage");
+            s.response_format = Some(serde_json::json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}}
+            }));
+            s.permissions = Some(SubAgentPermissions {
+                deny: vec![pat.into()],
+                ask: vec![],
+            });
+            let w = warn_of(vec![s]);
+            assert!(
+                w.iter()
+                    .any(|m| m.contains("respond") && m.contains("fallback")),
+                "pattern {pat}: {w:?}"
+            );
+        }
+        // no response_format → no lint even with deny=["*"]
+        let mut s = spec("triage");
+        s.permissions = Some(SubAgentPermissions {
+            deny: vec!["*".into()],
+            ask: vec![],
+        });
+        assert!(warn_of(vec![s]).is_empty());
     }
 
     #[test]

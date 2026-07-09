@@ -575,4 +575,149 @@ mod tests {
         assert_eq!(mb.tools.len(), 3);
         assert!(mb.retriever.is_some());
     }
+
+    /// Spec 3B-1c §2.4: permission floors key on `intent.tool`; every registered
+    /// tool must author it equal to its registry name or a configured floor
+    /// silently misses. (MCP tools pin this in agent-mcp: `tool: self.namespaced`.)
+    ///
+    /// Coverage note: this test constructs every tool family that is cheap and
+    /// hermetic to build in THIS crate — the 11 core tools, the 4 skill tools
+    /// (`build_skills`), `write_todos` (`agent_core::WriteTodosTool`), `respond`
+    /// (`agent_core::RespondTool`), and `context_compact`
+    /// (`agent_core::context_tools`) — plus an MCP-shaped stub for the
+    /// namespaced convention. `dispatch_agent` needs a full `DispatchDeps` and
+    /// is instead covered by
+    /// `agent_core::dispatch::tests::dispatch_agent_intent_name_matches_registry_name`
+    /// in agent-core. The 3 memory tools (`remember`/`recall`/`forget`,
+    /// `agent_memory::build_tools`) need a real embedding model/DB to
+    /// construct (see the `#[ignore]`d `build_memory_enabled_returns_three_tools`
+    /// test above) and are NOT construction-covered here — verified
+    /// conformant at source (`agent-memory`'s tool `intent()` impls each set
+    /// `tool:` to their own registry name) but recorded as a gap rather than
+    /// silently assumed.
+    #[test]
+    fn tool_intent_names_match_registry_names() {
+        let mut reg = build_registry(&[], 65_536);
+        let (_skills_registry, skill_tools) = build_skills(&[], std::env::temp_dir().as_path());
+        for t in skill_tools {
+            reg.register(t);
+        }
+        let todos_handle: agent_core::TodoHandle =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        reg.register(std::sync::Arc::new(agent_core::WriteTodosTool::new(
+            todos_handle,
+        )));
+        let response_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "summary": { "type": "string" } }
+        });
+        let response_handle: agent_core::ResponseHandle =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        reg.register(std::sync::Arc::new(agent_core::RespondTool::new(
+            response_schema,
+            response_handle,
+        )));
+        let compact_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for t in agent_core::context_tools(compact_flag) {
+            reg.register(t);
+        }
+        let fixtures: std::collections::HashMap<&str, serde_json::Value> = [
+            ("read_file", serde_json::json!({"path": "a.txt"})),
+            (
+                "write_file",
+                serde_json::json!({"path": "a.txt", "content": ""}),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path": "a.txt", "old_string": "a", "new_string": "b"}),
+            ),
+            ("list_directory", serde_json::json!({"path": "."})),
+            ("grep", serde_json::json!({"pattern": "x"})),
+            ("execute_command", serde_json::json!({"command": "ls"})),
+            ("git_status", serde_json::json!({})),
+            ("git_diff", serde_json::json!({})),
+            ("git_commit", serde_json::json!({"message": "m"})),
+            // MANDATORY (plan review): these two REJECT empty args — the test
+            // panics without them. render's intent() requires "kind"; fetch_url's
+            // requires a parseable "url". Adjust values to each intent() impl.
+            (
+                "render",
+                serde_json::json!({"kind": "markdown", "content": "x"}),
+            ),
+            ("fetch_url", serde_json::json!({"url": "http://localhost/"})),
+            (
+                "use_skill",
+                serde_json::json!({"name": "nonexistent-skill"}),
+            ),
+            (
+                "read_skill_file",
+                serde_json::json!({"skill": "nonexistent-skill", "path": "SKILL.md"}),
+            ),
+            (
+                "create_skill",
+                serde_json::json!({"name": "x", "description": "d", "body": "b"}),
+            ),
+            ("respond", serde_json::json!({"summary": "done"})),
+        ]
+        .into_iter()
+        .collect();
+        // MCP-shaped stub (spec §2.4/§6 "+ a fake MCP tool"): pins the namespaced
+        // convention (`tool: self.namespaced.clone()` in agent-mcp) in THIS suite.
+        struct McpShapedStub;
+        #[async_trait::async_trait]
+        impl agent_tools::Tool for McpShapedStub {
+            fn name(&self) -> &str {
+                "github__create_issue"
+            }
+            fn description(&self) -> &str {
+                "mcp-shaped stub"
+            }
+            fn schema(&self) -> agent_tools::ToolSchema {
+                agent_tools::ToolSchema {
+                    name: "github__create_issue".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            fn intent(
+                &self,
+                _a: &serde_json::Value,
+            ) -> Result<agent_tools::ToolIntent, agent_tools::ToolError> {
+                Ok(agent_tools::ToolIntent {
+                    tool: "github__create_issue".into(),
+                    access: agent_tools::Access::Write,
+                    paths: vec![],
+                    command: None,
+                    summary: "stub".into(),
+                })
+            }
+            async fn execute(
+                &self,
+                _a: serde_json::Value,
+                _c: &agent_tools::ToolCtx,
+            ) -> Result<agent_tools::ToolOutput, agent_tools::ToolError> {
+                Ok(agent_tools::ToolOutput {
+                    content: "ok".into(),
+                    display: None,
+                })
+            }
+        }
+        let mut reg = reg;
+        reg.register(std::sync::Arc::new(McpShapedStub));
+        for t in reg.all() {
+            let args = fixtures
+                .get(t.name())
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            let intent = t
+                .intent(&args)
+                .unwrap_or_else(|e| panic!("intent({}) rejected fixture args: {e}", t.name()));
+            assert_eq!(
+                intent.tool,
+                t.name(),
+                "identity-keyed floors require intent.tool == registry name"
+            );
+        }
+    }
 }

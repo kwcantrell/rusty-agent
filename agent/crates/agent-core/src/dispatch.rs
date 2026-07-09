@@ -6,7 +6,9 @@ use crate::{
     RESPOND_TOOL_NAME,
 };
 use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
-use agent_policy::{ApprovalChannel, PolicyEngine};
+use agent_policy::{
+    ApprovalChannel, PermissionLists, PolicyEngine, SubAgentPolicy, ToolPermissions,
+};
 use agent_tools::{
     Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema,
 };
@@ -55,6 +57,10 @@ pub struct ResolvedSubAgent {
     /// The resolved flat `response_format` schema (spec 3B-1b §2.1); `None` ⇒ the
     /// child returns free prose as today.
     pub response_format: Option<serde_json::Value>,
+    /// RAW floor lists (3B-1c §2.5) — parsed at dispatch, not at assembly; `None`
+    /// ⇒ the child gets the caller's policy Arc untouched. Assembly normalizes
+    /// empty blocks to `None`, so `Some` is non-empty by construction.
+    pub permissions: Option<PermissionLists>,
 }
 
 /// Dispatch-facing named sub-agent registry (spec §2.2). `general-purpose` is
@@ -342,14 +348,41 @@ impl DispatchAgentTool {
         };
         let description = format!(
             "Delegate an independent, multi-step subtask to an isolated sub-agent with \
-             its own fresh context window. The sub-agent has the same permissions and \
-             tools as you {caps}, works autonomously on the \
+             its own fresh context window. The sub-agent has at most the same \
+             permissions and tools as you {caps}, works autonomously on the \
              prompt you give it, and its final answer is returned as this tool's \
              result. Make the prompt self-contained: the sub-agent cannot see this \
              conversation. You may dispatch several sub-agents in one message by \
              issuing multiple dispatch_agent calls — they run concurrently."
         );
         Self { deps, description }
+    }
+
+    /// 3B-1c §2.5/§2.6: the child's effective policy. Named child with floors →
+    /// SubAgentPolicy over the CALLER'S effective policy (monotone down chains);
+    /// everything else → the same Arc (byte-identical). Parse failure = the
+    /// named child is undispatchable (fail-closed; the only dialect gate on the
+    /// lenient-boot path, where validate() never ran).
+    fn child_policy(
+        &self,
+        subagent_type: &str,
+        resolved: Option<&ResolvedSubAgent>,
+    ) -> Result<Arc<dyn PolicyEngine>, ToolError> {
+        match resolved.and_then(|r| r.permissions.as_ref()) {
+            Some(raw) => {
+                let rules =
+                    ToolPermissions::parse(subagent_type, &raw.deny, &raw.ask).map_err(|e| {
+                        ToolError::InvalidArgs(format!(
+                            "named sub-agent '{subagent_type}': invalid permissions: {e}"
+                        ))
+                    })?;
+                Ok(Arc::new(SubAgentPolicy::new(
+                    self.deps.policy.clone(),
+                    rules,
+                )))
+            }
+            None => Ok(self.deps.policy.clone()),
+        }
     }
 }
 
@@ -473,6 +506,10 @@ impl Tool for DispatchAgentTool {
                 }
             }
         };
+        // Child policy BEFORE nested-deps cloning (spec §2.5 ordering requirement:
+        // grandchildren must gate against THIS child's effective policy, or a
+        // denied child could delegate around its floor).
+        let child_policy = self.child_policy(&subagent_type, resolved)?;
         let role: Option<String> = match args.get("role") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(s)) => {
@@ -575,6 +612,7 @@ impl Tool for DispatchAgentTool {
             let mut nested = self.deps.clone();
             nested.depth = self.deps.depth + 1;
             nested.id_prefix = format!("sub{n}:");
+            nested.policy = child_policy.clone();
             // Transitive scope: when an allowlist filtered the base, the nested
             // tool sees only that filtered set (grandchild ⊆ child). Without an
             // allowlist, the full snapshot passes through unchanged.
@@ -675,7 +713,7 @@ impl Tool for DispatchAgentTool {
             child_model,
             child_protocol,
             Arc::new(reg),
-            self.deps.policy.clone(),
+            child_policy.clone(),
             self.deps.approval.clone(),
             sink.clone(),
             child_loop_config,
@@ -1185,9 +1223,24 @@ mod tests {
                 max_tokens: None,
                 tool_call_limit: tcl,
                 response_format: rf,
+                permissions: None,
             },
         );
         m
+    }
+
+    /// Spec 3B-1c §2.4 (lib.rs conformance guard's sibling): `dispatch_agent`
+    /// itself must satisfy the identity contract permission floors key on —
+    /// `tool.intent(args).tool == tool.name()`. Cheap here (exec_deps/
+    /// ScriptedModel are hermetic); the lib.rs guard can't construct this tool
+    /// (needs full DispatchDeps) so it's covered in this crate instead.
+    #[test]
+    fn dispatch_agent_intent_name_matches_registry_name() {
+        let tool = DispatchAgentTool::new(exec_deps(ScriptedModel::new(vec![]), 1));
+        let intent = tool
+            .intent(&serde_json::json!({"prompt": "x"}))
+            .expect("intent() must accept a minimal prompt-only call");
+        assert_eq!(intent.tool, tool.name());
     }
 
     #[tokio::test]
@@ -1422,6 +1475,7 @@ mod tests {
                 max_tokens: None,
                 tool_call_limit: Some(3),
                 response_format: None,
+                permissions: None,
             },
         );
         Arc::new(SubAgentRegistry::from_map(m))
@@ -1527,6 +1581,7 @@ mod tests {
                     max_tokens: r.max_tokens,
                     tool_call_limit: r.tool_call_limit,
                     response_format: r.response_format.clone(),
+                    permissions: r.permissions.clone(),
                 },
             );
         }
@@ -1594,6 +1649,7 @@ mod tests {
                 max_tokens: None,
                 tool_call_limit: None,
                 response_format: None,
+                permissions: None,
             },
         );
         let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
@@ -2011,5 +2067,349 @@ mod tests {
              wording: {}",
             texts[1]
         );
+    }
+
+    // --- 3B-1c C2: dispatch wiring — parse-at-dispatch, nested threading -----
+
+    /// Executable probe: flips a flag when it actually runs. Access::Read with no
+    /// paths ⇒ base RulePolicy says Allow — so ONLY a floor can stop it.
+    struct ProbeTool {
+        name: &'static str,
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for ProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "probe"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.name.into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<ToolIntent, ToolError> {
+            Ok(ToolIntent {
+                tool: self.name.into(),
+                access: Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "probe".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _a: serde_json::Value,
+            _c: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutput {
+                content: "ok".into(),
+                display: None,
+            })
+        }
+    }
+
+    struct CountingApproval {
+        count: Arc<std::sync::atomic::AtomicUsize>,
+        resp: agent_policy::ApprovalResponse,
+    }
+    #[async_trait::async_trait]
+    impl agent_policy::ApprovalChannel for CountingApproval {
+        async fn request(
+            &self,
+            _r: agent_policy::ApprovalRequest,
+        ) -> agent_policy::ApprovalResponse {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.resp
+        }
+    }
+
+    /// deps + registry entry "triage" with the given floors, probe in base_tools,
+    /// child scripted to call the probe then finish.
+    fn floored_deps(probe: Arc<ProbeTool>, perms: Option<PermissionLists>) -> DispatchDeps {
+        let child = ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), probe.name.to_string(), "{}".into()),
+            Scripted::Text("child done".into()),
+        ]);
+        let mut m = resolved_with(None, child, None);
+        m.get_mut("triage").unwrap().permissions = perms;
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 4);
+        deps.base_tools = vec![probe];
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(m));
+        deps
+    }
+
+    #[tokio::test]
+    async fn deny_floor_blocks_child_tool_with_reason() {
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = Arc::new(ProbeTool {
+            name: "probe",
+            executed: executed.clone(),
+        });
+        let deps = floored_deps(
+            probe,
+            Some(PermissionLists {
+                deny: vec!["probe".into()],
+                ask: vec![],
+            }),
+        );
+        let tool = DispatchAgentTool::new(deps);
+        let out = tool
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "floored tool must not run"
+        );
+        assert!(
+            out.content.contains("child done"),
+            "child run continues after the denial"
+        );
+    }
+
+    /// Implementer note (deny reason observation — plan-review corrected): the
+    /// ONLY viable mechanism in this harness to observe the denial REASON is
+    /// via the child's NEXT completion request (the denied tool result becomes
+    /// a message in it). `FullSink` drops content; `ScriptedModel` ignores
+    /// incoming requests entirely — neither can see the reason string. Install
+    /// a request-text-capturing model AS THE TRIAGE CHILD'S model.
+    #[tokio::test]
+    async fn deny_floor_reason_reaches_child_next_request() {
+        struct RequestTextCapturingModel {
+            inner: ScriptedModel,
+            request_texts: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl agent_model::ModelClient for RequestTextCapturingModel {
+            async fn stream(
+                &self,
+                req: agent_model::CompletionRequest,
+            ) -> Result<
+                futures::stream::BoxStream<
+                    'static,
+                    Result<agent_model::Chunk, agent_model::ModelError>,
+                >,
+                agent_model::ModelError,
+            > {
+                self.request_texts.lock().unwrap().push(
+                    req.messages
+                        .iter()
+                        .map(|m| m.content.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                self.inner.stream(req).await
+            }
+        }
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = Arc::new(ProbeTool {
+            name: "probe",
+            executed: executed.clone(),
+        });
+        let capturing = Arc::new(RequestTextCapturingModel {
+            inner: ScriptedModel::new(vec![
+                Scripted::Call("c1".into(), "probe".into(), "{}".into()),
+                Scripted::Text("done".into()),
+            ]),
+            request_texts: Default::default(),
+        });
+        let mut m = resolved_with(None, ScriptedModel::new(vec![]), None);
+        m.get_mut("triage").unwrap().permissions = Some(PermissionLists {
+            deny: vec!["probe".into()],
+            ask: vec![],
+        });
+        // The named child runs `resolved.model`, NOT `deps.model` — install the
+        // capturing model there (kept alive via `capturing.clone()`) so its own
+        // next request is observed after `execute()` returns.
+        m.get_mut("triage").unwrap().model = capturing.clone();
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 4);
+        deps.base_tools = vec![probe];
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(m));
+        let tool = DispatchAgentTool::new(deps);
+        tool.execute(
+            serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+            &exec_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+
+        let texts = capturing.request_texts.lock().unwrap().clone();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("denied by sub-agent 'triage' permissions")),
+            "the denial reason must reach the child's next completion request: {texts:?}"
+        );
+    }
+
+    /// §3 invariant 1 pins: rule-less named, and general-purpose, get the SAME
+    /// policy Arc — no wrapper. (Empty-block → None is pinned at assembly, C1.)
+    #[tokio::test]
+    async fn ruleless_and_general_purpose_share_the_policy_arc() {
+        let deps = exec_deps(ScriptedModel::new(vec![]), 2);
+        let base = deps.policy.clone();
+        let m = resolved_with(None, ScriptedModel::new(vec![]), None); // permissions: None
+        let mut deps = deps;
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(m));
+        let tool = DispatchAgentTool::new(deps);
+        let gp = tool.child_policy("general-purpose", None).unwrap();
+        assert!(Arc::ptr_eq(&gp, &base));
+        let named = tool
+            .child_policy("triage", tool.deps.subagents.get("triage"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&named, &base));
+    }
+
+    #[tokio::test]
+    async fn mcp_shaped_prefix_floor_blocks_child_tool() {
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = Arc::new(ProbeTool {
+            name: "github__create_issue",
+            executed: executed.clone(),
+        });
+        let deps = floored_deps(
+            probe,
+            Some(PermissionLists {
+                deny: vec!["github__*".into()],
+                ask: vec![],
+            }),
+        );
+        let tool = DispatchAgentTool::new(deps);
+        tool.execute(
+            serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+            &exec_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn ask_floor_routes_through_approval_channel() {
+        for (resp, should_run) in [
+            (agent_policy::ApprovalResponse::Approve, true),
+            (agent_policy::ApprovalResponse::Deny, false),
+        ] {
+            let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let probe = Arc::new(ProbeTool {
+                name: "probe",
+                executed: executed.clone(),
+            });
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut deps = floored_deps(
+                probe,
+                Some(PermissionLists {
+                    deny: vec![],
+                    ask: vec!["probe".into()],
+                }),
+            );
+            deps.approval = Arc::new(CountingApproval {
+                count: count.clone(),
+                resp,
+            });
+            let tool = DispatchAgentTool::new(deps);
+            tool.execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "exactly one prompt"
+            );
+            assert_eq!(
+                executed.load(std::sync::atomic::Ordering::SeqCst),
+                should_run
+            );
+        }
+    }
+
+    /// §2.6 lenient-boot fail-closed: a dialect-invalid block (validate() never
+    /// ran) makes the named child undispatchable — NEVER unfloored.
+    #[tokio::test]
+    async fn invalid_permissions_fail_dispatch_closed() {
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = Arc::new(ProbeTool {
+            name: "probe",
+            executed: executed.clone(),
+        });
+        let deps = floored_deps(
+            probe,
+            Some(PermissionLists {
+                deny: vec!["a*b".into()],
+                ask: vec![],
+            }),
+        );
+        let tool = DispatchAgentTool::new(deps);
+        let err = tool
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid permissions"), "{err}");
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// §3 invariant 2(b) — the delegation-escape guard: a floored child's
+    /// general-purpose GRANDCHILD is still floored (nested.policy threading).
+    #[tokio::test]
+    async fn transitivity_floor_reaches_grandchild() {
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = Arc::new(ProbeTool {
+            name: "probe",
+            executed: executed.clone(),
+        });
+        // Grandchild (general-purpose, from nested deps' default child model):
+        // tries the floored probe, then finishes.
+        let grandchild = ScriptedModel::new(vec![
+            Scripted::Call("g1".into(), "probe".into(), "{}".into()),
+            Scripted::Text("grandchild done".into()),
+        ]);
+        // Named child: dispatches the grandchild, then finishes.
+        let child = ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"delegate"}"#.into(),
+            ),
+            Scripted::Text("child done".into()),
+        ]);
+        let mut m = resolved_with(None, child, None);
+        m.get_mut("triage").unwrap().permissions = Some(PermissionLists {
+            deny: vec!["probe".into()],
+            ask: vec![],
+        });
+        let mut deps = exec_deps(grandchild, 4);
+        deps.base_tools = vec![probe];
+        deps.max_depth = 2; // allow one nested dispatch level
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(m));
+        let tool = DispatchAgentTool::new(deps);
+        let out = tool
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "grandchild must inherit the child's floor — delegation must not escape it"
+        );
+        assert!(out.content.contains("child done"));
     }
 }
