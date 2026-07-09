@@ -1,6 +1,6 @@
 ---
 type: Source
-title: Agentic Problem Frames: A Systematic Approach to Engineering Reliable Domain Agents
+title: "Agentic Problem Frames: A Systematic Approach to Engineering Reliable Domain Agents"
 description: Academic research material on the SDLC of AI agents.
 resource: https://arxiv.org/abs/2602.19065
 org: Academic research

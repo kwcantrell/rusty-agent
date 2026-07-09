@@ -1,5 +1,6 @@
 # Log
 
+- 2026-07-09 — **Update** — quoted colon-containing `title:`/`description:` frontmatter values in 1 practice file for the YAML-strict checker upgrade (PyYAML). Syntax-only; no semantic change. See docs/superpowers/specs/2026-07-09-tauri-okf-bundle-design.md (Deliverable 1, gate decision E3).
 - 2026-07-08 — Final consistency + completeness review (independent
   read-only pass over the whole bundle, facts and design judgments out of
   scope). Verdict: no blockers; all 8 prior corrections propagated cleanly,

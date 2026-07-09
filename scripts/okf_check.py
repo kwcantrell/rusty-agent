@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["pyyaml"]
+# ///
 """Validate an OKF v0.1 bundle (the subset of the spec this repo's bundles use).
 
 Checks:
@@ -6,38 +10,45 @@ Checks:
 2. index.md files carry no frontmatter, except the bundle-root index.md, which may
    declare only `okf_version`; log.md carries no frontmatter
 3. all intra-bundle markdown links resolve to existing files inside the bundle
-4. every concept under phases/, practices/, perspectives/, comparisons/ has a
-   `# Citations` section containing at least one resolving link into /sources/
-5. `type` is one of the authoring vocabulary (Source, Practice, Lifecycle Phase,
-   Perspective, Comparison)
+4. every concept under capabilities/, phases/, practices/, perspectives/,
+   comparisons/ has a `# Citations` section containing at least one resolving
+   link into /sources/
+5. `type` is one of the authoring vocabulary (Source, Capability, Practice,
+   Lifecycle Phase, Perspective, Comparison)
 6. every `type: Source` node carries a non-empty `resource:` URL
 7. body `[n]` citation markers resolve to a numbered entry in # Citations
+   (fenced code blocks and inline code spans are ignored)
 8. every non-root directory index.md lists every non-reserved node in its directory
 
 NOT checked (human duty): whether a node's claims still match its live source —
 semantic drift needs periodic human re-verification, recorded as a dated log.md entry.
 
-Frontmatter is parsed with a minimal flat parser: `key: value` and `key: [a, b]`
-lines only (bundles produced by this repo use inline list syntax). This is
-deliberately stricter than the OKF spec, so the checker is not a general-purpose
-validator for third-party bundles.
+Frontmatter is parsed with PyYAML (yaml.safe_load) and must be a mapping. House
+authoring style remains inline lists with colon-containing values quoted; the
+parser is merely tolerant of any valid YAML. This checker is still deliberately
+stricter than the OKF spec — not a general-purpose validator for third-party
+bundles.
 
-Usage: python3 scripts/okf_check.py <bundle-dir>
+Usage: uv run scripts/okf_check.py <bundle-dir>
 Exits 0 and prints OK on success; exits 1 with one error per line otherwise.
 """
 import re
 import sys
 from pathlib import Path
 
+import yaml
+
 RESERVED = {"index.md", "log.md"}
-CITATION_DIRS = {"phases", "practices", "perspectives", "comparisons"}
-ALLOWED_TYPES = {"Source", "Practice", "Lifecycle Phase", "Perspective", "Comparison"}
+CITATION_DIRS = {"capabilities", "phases", "practices", "perspectives", "comparisons"}
+ALLOWED_TYPES = {"Source", "Capability", "Practice", "Lifecycle Phase",
+                 "Perspective", "Comparison"}
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
-KV_RE = re.compile(r"^([A-Za-z_][\w-]*):\s*(.*)$")
 CITATIONS_HEADING_RE = re.compile(r"^#{1,3}\s+Citations\s*$", re.MULTILINE)
 NEXT_HEADING_RE = re.compile(r"^#{1,3}\s+\S", re.MULTILINE)
 MARKER_RE = re.compile(r"\[(\d+)\](?!\()")          # [3] but not [3](link)
 CITATION_ENTRY_RE = re.compile(r"^\s*(\d+)\.\s", re.MULTILINE)
+FENCE_RE = re.compile(r"^(```|~~~).*?^\1\s*$", re.MULTILINE | re.DOTALL)
+INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 
 
 def split_frontmatter(text):
@@ -51,20 +62,17 @@ def split_frontmatter(text):
 
 
 def parse_frontmatter(fm_text):
-    """Return a dict, or None if any non-blank line fails to parse."""
-    data = {}
-    for line in fm_text.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        m = KV_RE.match(line)
-        if not m:
-            return None
-        key, val = m.group(1), m.group(2).strip()
-        if val.startswith("[") and val.endswith("]"):
-            data[key] = [v.strip().strip("\"'") for v in val[1:-1].split(",") if v.strip()]
-        else:
-            data[key] = val.strip("\"'")
-    return data
+    """Return a dict, or None if the block is not valid YAML or not a mapping."""
+    try:
+        data = yaml.safe_load(fm_text)
+    except yaml.YAMLError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def strip_code(text):
+    """Remove fenced code blocks and inline code spans before marker scanning."""
+    return INLINE_CODE_RE.sub("", FENCE_RE.sub("", text))
 
 
 def iter_links(text):
@@ -139,7 +147,7 @@ def check_bundle(root):
                 cites = [t for t in iter_links(section) if t.startswith("/sources/")]
                 if not cites:
                     errors.append(f"{rel}: # Citations has no /sources/ links")
-                markers = set(MARKER_RE.findall(body[:m.start()]))
+                markers = set(MARKER_RE.findall(strip_code(body[:m.start()])))
                 entries = set(CITATION_ENTRY_RE.findall(section))
                 missing = sorted(markers - entries, key=int)
                 if missing:

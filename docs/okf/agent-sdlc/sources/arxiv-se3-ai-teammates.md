@@ -1,6 +1,6 @@
 ---
 type: Source
-title: The Rise of AI Teammates in Software Engineering (SE) 3.0: How Autonomous Coding Agents Are Reshaping Software Engineering
+title: "The Rise of AI Teammates in Software Engineering (SE) 3.0: How Autonomous Coding Agents Are Reshaping Software Engineering"
 description: Academic research material on the SDLC of AI agents.
 resource: https://arxiv.org/abs/2507.15003
 org: Academic research

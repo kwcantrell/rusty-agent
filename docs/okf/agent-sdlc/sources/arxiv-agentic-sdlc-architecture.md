@@ -1,6 +1,6 @@
 ---
 type: Source
-title: Agentic AI in the Software Development Lifecycle: Architecture, Empirical Evidence, and the Reshaping of Software Engineering
+title: "Agentic AI in the Software Development Lifecycle: Architecture, Empirical Evidence, and the Reshaping of Software Engineering"
 description: Anthropic, OpenAI, Google DeepMind, Microsoft Research, Princeton, Stanford material on the SDLC of AI agents.
 resource: https://arxiv.org/abs/2604.26275
 org: Anthropic, OpenAI, Google DeepMind, Microsoft Research, Princeton, Stanford

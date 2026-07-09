@@ -1,6 +1,6 @@
 ---
 type: Source
-title: LangGraph: Multi-Agent Workflows
+title: "LangGraph: Multi-Agent Workflows"
 description: LangChain material on the SDLC of AI agents.
 resource: https://www.langchain.com/blog/langgraph-multi-agent-workflows
 org: LangChain

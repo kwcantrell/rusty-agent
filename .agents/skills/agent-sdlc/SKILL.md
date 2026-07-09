@@ -26,7 +26,7 @@ question.
 **Do not** use this skill to *do* harness design/build/audit work in this
 repo — that is `harness-engineering`'s playbooks; this bundle is the evidence
 layer behind them. **Do not** edit bundle files without reading
-[authoring.md](authoring.md) and re-running `python3 scripts/okf_check.py
+[authoring.md](authoring.md) and re-running `uv run scripts/okf_check.py
 docs/okf/agent-sdlc` — frontmatter, citation, and link rules are
 machine-checked.
 
