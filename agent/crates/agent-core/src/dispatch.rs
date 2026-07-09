@@ -29,6 +29,50 @@ pub fn next_dispatch_n() -> u64 {
     DISPATCH_ORDINAL.fetch_add(1, Ordering::Relaxed)
 }
 
+/// A `SubAgentSpec` resolved at assembly into everything the dispatch tool needs
+/// to spawn a named child (models are pre-built here because agent-core cannot
+/// call `build_routed_model`). Spec §2.1/§2.4/§2.5.
+pub struct ResolvedSubAgent {
+    pub description: String,
+    /// Already includes `SUBAGENT_PREAMBLE` (composed at assembly).
+    pub system_prompt: String,
+    pub tools: Option<Vec<String>>,
+    pub model: Arc<dyn ModelClient>,
+    pub protocol: Arc<dyn ToolCallProtocol>,
+    pub model_limit: Option<usize>,
+    pub max_tokens: Option<u32>,
+    pub tool_call_limit: Option<usize>,
+}
+
+/// Dispatch-facing named sub-agent registry (spec §2.2). `general-purpose` is
+/// implicit (the default ad-hoc path) and never stored here.
+#[derive(Default)]
+pub struct SubAgentRegistry {
+    map: std::collections::HashMap<String, ResolvedSubAgent>,
+}
+
+impl SubAgentRegistry {
+    pub fn from_map(map: std::collections::HashMap<String, ResolvedSubAgent>) -> Self {
+        Self { map }
+    }
+    pub fn get(&self, name: &str) -> Option<&ResolvedSubAgent> {
+        self.map.get(name)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+    pub fn names(&self) -> Vec<&str> {
+        self.map.keys().map(String::as_str).collect()
+    }
+    /// `(name, description)` pairs for the `subagent_type` enum docs.
+    pub fn schema_hints(&self) -> Vec<(String, String)> {
+        self.map
+            .iter()
+            .map(|(n, r)| (n.clone(), r.description.clone()))
+            .collect()
+    }
+}
+
 #[derive(Default)]
 struct Capture {
     /// Token text split into segments at ToolResult boundaries; the last
@@ -260,6 +304,9 @@ pub struct DispatchDeps {
     /// registry too so the tool vocabulary stays uniform across depths
     /// (finding 4.1; seam spec 2026-07-02-tool-description-override-seam).
     pub description_overrides: std::collections::HashMap<String, String>,
+    /// Named sub-agent registry (spec §2.2). Empty ⇒ only `general-purpose`
+    /// exists and the tool schema is byte-identical to 3A.
+    pub subagents: Arc<SubAgentRegistry>,
 }
 
 pub struct DispatchAgentTool {
@@ -961,6 +1008,7 @@ mod tests {
             max_depth: 1,
             id_prefix: String::new(),
             description_overrides: Default::default(),
+            subagents: Arc::new(SubAgentRegistry::default()),
         }
     }
 
@@ -973,6 +1021,20 @@ mod tests {
             backend: Arc::new(agent_tools::backend::HostBackend::new(std::env::temp_dir())),
             call_id: "d1".into(),
         }
+    }
+
+    #[test]
+    fn empty_registry_omits_subagent_type_from_schema() {
+        // A DispatchAgentTool built with an empty registry has a schema byte-identical
+        // to 3A (no `subagent_type` property).
+        let tool = DispatchAgentTool::new(exec_deps(ScriptedModel::new(vec![]), 1));
+        let schema = tool.schema();
+        let props = schema.parameters.get("properties").unwrap();
+        assert!(
+            props.get("subagent_type").is_none(),
+            "empty registry must not add subagent_type"
+        );
+        assert!(props.get("prompt").is_some());
     }
 
     #[tokio::test]
