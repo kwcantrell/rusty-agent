@@ -264,6 +264,12 @@ Conventional commits throughout; no push without an explicit ask.
 
 ## Panel & review log
 
+### 2026-07-09 — post-gate consistency read (light tier)
+
+After gate decisions E1–E3 were applied as targeted edits, a light-tier consistency
+reviewer swept the final document (stale pre-decision language, disposition/prose
+contradictions, broken cross-references, draft artifacts): **clean, no findings.**
+
 ### 2026-07-09 — adversarial spec panel (4 reviewers: requirements, assumptions, failure & abuse, scope/YAGNI)
 
 Panel calibrated skeptical per AGENTS.md. Orchestrator independently verified the
