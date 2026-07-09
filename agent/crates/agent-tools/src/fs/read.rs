@@ -1,4 +1,3 @@
-use crate::fs::paths::resolve_in_workspace;
 use crate::{Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolSchema};
 use async_trait::async_trait;
 use serde_json::json;
@@ -53,10 +52,7 @@ impl Tool for ReadFile {
         ctx: &ToolCtx,
     ) -> Result<ToolOutput, ToolError> {
         let path = arg_path(&args)?;
-        let full = resolve_in_workspace(&ctx.workspace, &path)?;
-        let content = tokio::fs::read_to_string(&full)
-            .await
-            .map_err(|e| ToolError::NotFound(format!("{path}: {e}")))?;
+        let content = ctx.backend.read(&path).await.map_err(crate::fs::fs_err)?;
         let offset = args
             .get("offset")
             .and_then(|v| v.as_u64())
@@ -135,18 +131,8 @@ impl Tool for ListDirectory {
         ctx: &ToolCtx,
     ) -> Result<ToolOutput, ToolError> {
         let path = arg_path(&args)?;
-        let full = resolve_in_workspace(&ctx.workspace, &path)?;
-        let mut entries = tokio::fs::read_dir(&full)
-            .await
-            .map_err(|e| ToolError::NotFound(format!("{path}: {e}")))?;
-        let mut names = Vec::new();
-        while let Some(e) = entries.next_entry().await.map_err(|e| ToolError::Failed {
-            message: e.to_string(),
-            stderr: None,
-        })? {
-            names.push(e.file_name().to_string_lossy().into_owned());
-        }
-        names.sort();
+        let entries = ctx.backend.ls(&path).await.map_err(crate::fs::fs_err)?;
+        let names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
         Ok(ToolOutput {
             content: names.join("\n"),
             display: None,
