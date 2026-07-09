@@ -6,8 +6,9 @@ Adversarial panel (4 reviewers, distinct mandates): all **APPROVE-WITH-FIXES, no
 BLOCKER**; the Failure reviewer confirmed **no path for a child to exceed its
 parent's effective policy**. All majors folded in (see Panel & review log —
 notably §2.6 reworked to parse-at-dispatch, and the `respond` conflict rule
-demoted to an advisory lint). Owner gate pending: **one escalation (E1: cut or
-keep the `Suffix` pattern variant)** + sign-off on the two folded reworks.
+demoted to an advisory lint). **OWNER GATE CLOSED 2026-07-09:** E1 resolved =
+`Suffix` CUT; both folded reworks (§2.6 parse-at-dispatch, rule 6 → advisory
+lint) signed off. **PLAN-READY** pending the light-tier consistency read.
 **Governing goal (owner, carried from Phase 2/3):** deepagents-style **modularity** —
 a custom sub-agent changes runtime behavior via configuration, not code. This slice
 adds one configured capability: a named sub-agent may declare a **permission floor**
@@ -34,8 +35,8 @@ nothing else. `middleware` and `skills` stay validated-inert (dropped, 3B-1 §9)
 
 **IN (built this cycle):**
 - Un-reserve `permissions` on `SubAgentSpec` as a typed two-list block (§2.2).
-- A flat tool-name pattern dialect — exact / `prefix*` / `*suffix` / bare `*`
-  (§2.3). Not `globset`, no path semantics.
+- A flat tool-name pattern dialect — exact / `prefix*` / bare `*` (§2.3).
+  Not `globset`, no path semantics. (Suffix patterns CUT at the gate, E1.)
 - `ToolPattern` + `ToolPermissions` + `SubAgentPolicy` in `agent-policy`
   (new module `subagent.rs`), where `SubAgentPolicy: PolicyEngine` computes
   `narrow(base.check(intent), rules.floor(&intent.tool))` (§2.4).
@@ -137,7 +138,7 @@ Semantics and validation (all violations are config errors naming the spec, in
 
 1. **Both lists match a tool → Deny wins** (most restrictive).
 2. Every pattern must parse under the §2.3 dialect (empty string, interior `*`,
-   multiple `*` → error).
+   leading `*` other than bare `"*"`, multiple `*` → error).
 3. Unknown keys in the block (e.g. `allow`) are rejected by
    `deny_unknown_fields` — widening is unrepresentable: no `allow` term can
    ever reach the floor. **Precise consequence (panel A-MAJOR):** the persisted
@@ -180,7 +181,6 @@ Semantics and validation (all violations are config errors naming the spec, in
 pub enum ToolPattern {
     Exact(String),   // "write_file"
     Prefix(String),  // "github__*"  → tools starting with "github__"
-    Suffix(String),  // "*_file"     → tools ending with "_file"
     Any,             // "*"
 }
 impl ToolPattern {
@@ -189,8 +189,11 @@ impl ToolPattern {
 }
 ```
 
-- Exactly zero or one `*`, and only at the first or last byte. `"a*b"`, `"*a*"`,
-  `""`, `"**"` → parse errors.
+- Exactly zero or one `*`, and only at the **last** byte (or a bare `"*"` =
+  `Any`). `"a*b"`, `"*a*"`, `"*_file"` (leading `*`), `""`, `"**"` → parse
+  errors. Suffix patterns were cut at the gate (E1): the only real suffix
+  family was `*_file`, which spans `read_file` plus two mutators — a floor
+  trap. Deferred behind the same future gate as command/path floors (§5).
 - Matching is case-sensitive byte comparison — tool names are already constrained
   to `[a-zA-Z0-9_-]` (MCP sanitizer, `agent-mcp/src/tool.rs`).
 - **MCP coverage:** live MCP names are `{server}__{tool}` (sanitized), so
@@ -207,17 +210,12 @@ impl ToolPattern {
   server-name variants, and the pre-existing `__`-boundary ambiguity — server
   `a__b`+tool `c` and server `a`+tool `b__c` both namespace to `a__b__c` under
   last-wins registration) is documented in §4 and `config.example.toml`.
-- **GATE DECISION E1 (escalated, not folded):** whether to **cut
-  `ToolPattern::Suffix`** from this slice. Two reviewers found it net-negative:
-  the only real suffix family is `*_file`, which spans `read_file` + two
-  mutators — a security author writing `deny=["*_file"]` to block mutations
-  also blocks reads. Prefix+exact+`Any` cover every documented use-case.
-  Recommendation: cut (defer behind the same future gate as command/path
-  floors, §5). If kept: add the `*_file`-spans-reads footgun note here and in
-  `config.example.toml`.
-- `Prefix("")`/`Suffix("")` cannot arise: `"*"` alone parses as `Any`, so every
-  `Prefix`/`Suffix` affix is non-empty by construction (no accidental
-  match-everything from a malformed affix).
+- **GATE DECISION E1 — RESOLVED (owner, 2026-07-09): `ToolPattern::Suffix`
+  CUT.** A leading-`*` pattern is a parse error in this slice; suffix support
+  is deferred behind the same future gate as command/path floors (§5).
+- `Prefix("")` cannot arise: `"*"` alone parses as `Any`, so every `Prefix`
+  affix is non-empty by construction (no accidental match-everything from a
+  malformed affix).
 
 ### 2.4 Policy types & narrowing semantics
 
@@ -426,6 +424,7 @@ if a real headless deployment needs fail-fast.
   scanner is global). A future slice could add command-pattern floors under the
   same monotone contract; nothing here precludes it.
 - Path-scoped floors (per-sub-agent workspace subsets) — same story.
+- Suffix (`*x`) patterns — cut at the gate (E1, §2.3); same future gate.
 - Parent-level / global permission profiles.
 - **deepagents parity, recorded divergence** (panel R-MINOR-3): deepagents'
   per-sub-agent permissions are path+operation glob keyed, offer
@@ -438,8 +437,9 @@ if a real headless deployment needs fail-fast.
 ## 6. Testing
 
 **Unit — `agent-policy` (pure, no loop):**
-- `ToolPattern::parse` accept/reject table (exact, prefix, suffix, bare `*`,
-  empty, interior `*`, double `*`).
+- `ToolPattern::parse` accept/reject table (exact, prefix, bare `*` accepted;
+  empty, interior `*`, leading `*` [suffix form — cut at gate E1], double `*`
+  rejected).
 - Match semantics per variant; case sensitivity.
 - `narrow` total order: all 9 (base × floor) combinations, including
   reason-preservation on base Deny and reason-content on floor Deny (agent name
@@ -538,17 +538,17 @@ MCP satisfy `intent.tool == name()`.
   documented; lint (b); conformance test extended over the assembled set incl.
   MCP; residual recorded in §4.
 
-**B. Escalated to the owner gate:**
+**B. Escalated to the owner gate (gate closed 2026-07-09):**
 - **E1 — cut or keep `ToolPattern::Suffix`** (S-MINOR + F-footgun convergence):
   only real suffix family is `*_file`, which spans `read_file` + two mutators;
   prefix+exact+`Any` cover every documented use-case. Panel + synthesis
-  recommendation: **CUT** (defer with command/path floors, §5). *(decision
-  pending)*
+  recommendation: CUT. **Owner decision: CUT** — leading-`*` is a parse error;
+  deferred with command/path floors (§5). Applied to §0/§2.2/§2.3/§5/§6.
 - **Gate sign-off on the two folded reworks** (they alter brainstorm-approved
   sections): §2.6 parse-at-dispatch (was fail-closed-at-assembly) and §2.2
   rule 6 hard-error → advisory lint (S-MINOR "drop rule 6" × F-MINOR-4 "keep +
   warn" resolved as: uniform non-fatal lint covering exact AND wildcard).
-  *(decision pending)*
+  **Owner decision: both signed off as folded.**
 
 **C. Minors — accepted as residual / folded:**
 - R-MINOR-3 deepagents parity divergence → recorded in §5 (folded).
