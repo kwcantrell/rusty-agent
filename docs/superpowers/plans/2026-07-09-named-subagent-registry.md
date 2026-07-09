@@ -21,6 +21,11 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-09-named-subagent-registry-design.md` (PLAN-READY, gate-approved trimmed scope).
 
+**Test-harness reference (USE THESE EXACT NAMES — verified at `cb6ddf0`; the earlier drafts used placeholder names that do not exist):**
+- `dispatch.rs` test module (`agent-core`): build deps with `exec_deps(model: ScriptedModel, max_turns: usize) -> DispatchDeps` and a ctx with `exec_ctx() -> ToolCtx`. Models/protocols are inline: `ScriptedModel::new(vec![ … ])` and `Arc::new(PassthroughProtocol)`, both imported via `use crate::testkit::{AlwaysApprove, PassthroughProtocol, Scripted, ScriptedModel};`. There is NO `test_deps`/`test_ctx`/`test_model`/`test_protocol` — wherever this plan's code blocks say those, substitute `exec_deps(ScriptedModel::new(vec![]), 1)` / `exec_ctx()` / `Arc::new(ScriptedModel::new(vec![…]))` / `Arc::new(PassthroughProtocol)`. **`exec_deps` is itself a `DispatchDeps` literal — Task B1 must add the new `subagents` field to it.**
+- `runtime_config.rs` test module: parse a partial config with `base().merge(serde_json::from_str::<PartialRuntimeConfig>(json).unwrap())` (see `runtime_config.rs:796-802`). `PartialRuntimeConfig` is private but the test module is in-file, so it is in scope. There is NO `from_partial_json`.
+- A capturing child model for asserting the child's system prompt exists near `dispatch.rs:1024` — reuse it (or a `ScriptedModel` that records its request) rather than inventing a new harness.
+
 ---
 
 ## Task 0: Branch
@@ -55,8 +60,9 @@ fn named_subagents_default_empty_and_roundtrip() {
     assert!(c.named_subagents.is_empty());
 
     let json = r#"{"named_subagents":[{"name":"reviewer","description":"reviews code","system_prompt":"You review Rust.","tools":["read_file","grep"]}]}"#;
-    let parsed: RuntimeConfig =
-        RuntimeConfig::from_partial_json(json).expect("parse");
+    let parsed = base().merge(
+        serde_json::from_str::<PartialRuntimeConfig>(json).unwrap(),
+    );
     assert_eq!(parsed.named_subagents.len(), 1);
     let s = &parsed.named_subagents[0];
     assert_eq!(s.name, "reviewer");
@@ -64,7 +70,7 @@ fn named_subagents_default_empty_and_roundtrip() {
     assert!(s.model.is_none() && s.tool_call_limit.is_none() && s.permissions.is_none());
 }
 ```
-NOTE: locate the actual helper the other tests use to parse a partial-JSON config (search the test module for how `subagent_fields_partial_file_overrides_only_those_fields` builds a config, ~L869-881, and mirror it — the constructor name may be `from_partial_json`, `load_from_str`, or similar; use whatever that test uses).
+(Uses the `base().merge(from_str::<PartialRuntimeConfig>(…))` pattern from `runtime_config.rs:796-802` — see the Test-harness reference.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -392,14 +398,14 @@ Add to the `#[cfg(test)] mod tests` in `dispatch.rs`:
 fn empty_registry_omits_subagent_type_from_schema() {
     // A DispatchAgentTool built with an empty registry has a schema byte-identical
     // to 3A (no `subagent_type` property).
-    let tool = DispatchAgentTool::new(test_deps()); // helper below
+    let tool = DispatchAgentTool::new(exec_deps(ScriptedModel::new(vec![]), 1));
     let schema = tool.schema();
     let props = schema.parameters.get("properties").unwrap();
     assert!(props.get("subagent_type").is_none(), "empty registry must not add subagent_type");
     assert!(props.get("prompt").is_some());
 }
 ```
-NOTE: `test_deps()` — reuse whatever the existing dispatch tests use to build a `DispatchDeps` (search the test module; there is already at least one such constructor since tests like `child_stack_is_exactly_curation_and_stuck_detection_never_memory_recall` build the tool). Add `subagents: Arc::new(SubAgentRegistry::default())` to that helper.
+NOTE: `exec_deps(model, max_turns)` is the real `DispatchDeps` constructor (see the Test-harness reference). Step 3/4 below adds the new `subagents` field to it. `ScriptedModel` is imported via `use crate::testkit::{…, ScriptedModel};` already present in the test module.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -462,6 +468,7 @@ Add the field to `DispatchDeps` (after `description_overrides` ~L262):
     /// exists and the tool schema is byte-identical to 3A.
     pub subagents: Arc<SubAgentRegistry>,
 ```
+The field MUST stay `Arc<SubAgentRegistry>` (not a by-value `SubAgentRegistry`) so `DispatchDeps` keeps its `#[derive(Clone)]` — `ResolvedSubAgent`/`SubAgentRegistry` are intentionally NOT `Clone`. The nested-dispatch clone (`dispatch.rs:464`) then shares the same immutable registry Arc with grandchildren (intended transitive semantics).
 
 - [ ] **Step 4: Fix every `DispatchDeps` construction site**
 
@@ -495,9 +502,11 @@ git commit -m "feat(core): ResolvedSubAgent + SubAgentRegistry threaded into Dis
 
 **Interfaces:**
 - Consumes: `cfg.named_subagents: Vec<SubAgentSpec>`, `child_base: Vec<Arc<dyn Tool>>`, `crate::build_routed_model`, `child_protocol` / `child_model` / `child_config` already computed in this block; `agent_core::{ResolvedSubAgent, SubAgentRegistry, SUBAGENT_PREAMBLE}`.
-- Produces: a populated `Arc<SubAgentRegistry>` in the `DispatchDeps.subagents` field; assembly-time tool-name resolution (a spec's `tools` must all exist in `child_base`).
+- Produces: a populated `Arc<SubAgentRegistry>` in the `DispatchDeps.subagents` field; `#[cfg(test)] BuiltLoop.subagent_registry`.
 
-- [ ] **Step 1: Write the failing tests**
+> **DESIGN NOTE (plan-review BLOCKER resolution):** `assemble_loop` stays **infallible** — do NOT add a `_checked`/`Result` variant. An earlier draft validated a spec's `tools` against the child snapshot here and returned `Err`, which would `.expect()`-panic the *lenient-boot* server daemon (`agent-server/src/runtime.rs:71-72` deliberately skips `validate()` so it always boots). It is unnecessary: a named spec's `tools` becomes the child `allow` allowlist, and the **existing execute-time allowlist check** (`dispatch.rs:410-425`) already rejects an unknown tool with a clean `ToolError::InvalidArgs` — symmetric with the ad-hoc `tools` arg today. So there is NO assembly-time tool validation; the unknown-tool case is pinned as a dispatch-time test in Task B4.
+
+- [ ] **Step 1: Write the failing test**
 
 Add to the `#[cfg(test)] mod tests` in `assemble.rs` (mirror the existing `parts(...)`/config helpers used by e.g. `child_base_snapshot_includes_memory_tools_when_enabled`):
 ```rust
@@ -519,53 +528,36 @@ fn named_subagent_resolves_into_dispatch_registry() {
     assert!(r.system_prompt.contains(agent_core::SUBAGENT_PREAMBLE));
     assert_eq!(r.tool_call_limit, Some(5));
 }
-
-#[test]
-fn named_subagent_unknown_tool_is_assembly_error() {
-    // A spec naming a tool absent from the child snapshot must be rejected.
-    // (Validated at assembly because it needs the parent tool set.)
-    let ws = tempdir();
-    let mut c = RuntimeConfig::default();
-    c.named_subagents = vec![agent_runtime_config::SubAgentSpec {
-        name: "x".into(), description: "d".into(), system_prompt: "p".into(),
-        tools: Some(vec!["no_such_tool".into()]),
-        model: None, tool_call_limit: None,
-        permissions: None, response_format: None, middleware: None, skills: None,
-    }];
-    let err = assemble_loop_checked(&c, parts(ws.path().into(), vec![]));
-    assert!(err.is_err(), "unknown tool ref must fail assembly");
-}
 ```
-NOTE ON TEST SHAPE: `assemble_loop` currently returns `BuiltLoop` (not a `Result`). This task adds a **fallible** resolution step. Two sub-decisions, pick to match the codebase:
-- Expose the registry on `BuiltLoop` behind `#[cfg(test)]` as `subagent_registry: Option<Arc<SubAgentRegistry>>` (mirrors the existing `#[cfg(test)] dispatch_base_names` / `subagent_model_routed` pattern at `assemble.rs:328-334`).
-- For the error path: add a `pub fn assemble_loop_checked(cfg, parts) -> Result<BuiltLoop, String>` that runs the tool-resolution validation and is called by `assemble_loop` (which `.expect()`s, preserving the existing infallible signature for production callers) — OR make the unknown-tool case a `panic!`/`expect` and assert via `#[should_panic]`. Prefer the `_checked` variant so callers can surface config errors; if the frontends already call `cfg.validate()` before `assemble_loop`, thread this validation into `validate` is NOT possible (needs the tool set), so `_checked` at assembly is the right home. Match whatever error-return convention `assemble_loop`'s callers can consume.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run test to verify it fails**
 
 Run: `cd agent && cargo test -p agent-runtime-config named_subagent_resolves`
-Expected: FAIL to compile (`subagent_registry` / `assemble_loop_checked` missing).
+Expected: FAIL to compile (`subagent_registry` field missing on `BuiltLoop`).
 
-- [ ] **Step 3: Build the registry in the dispatch block**
+- [ ] **Step 3a: Add the `#[cfg(test)]` registry field + mut binding (mirror `subagent_model_routed`)**
 
-Inside `if let Some(child_base) = child_base { … }`, AFTER `child_model`/`child_protocol`/`child_config` are computed and BEFORE `registry.register(Arc::new(agent_core::DispatchAgentTool::new(…)))`, insert:
+Add to the `BuiltLoop` struct (near `assemble.rs:60-79`, with the other `#[cfg(test)]` fields):
 ```rust
-        // Resolve config specs → dispatch-facing ResolvedSubAgent (spec §2.2/§2.4).
-        // Tool-name resolution happens here (needs the child snapshot).
-        let child_tool_names: std::collections::HashSet<&str> =
-            child_base.iter().map(|t| t.name()).collect();
+    #[cfg(test)]
+    pub subagent_registry: Option<std::sync::Arc<agent_core::SubAgentRegistry>>,
+```
+Before the `if let Some(child_base)` block (next to `#[cfg(test)] let mut subagent_model_routed` ~L332), add:
+```rust
+    #[cfg(test)]
+    let mut subagent_registry: Option<std::sync::Arc<agent_core::SubAgentRegistry>> = None;
+```
+And add `subagent_registry,` to the `BuiltLoop { ... }` struct literal at the bottom (~L449-464), alongside the other `#[cfg(test)]` fields (stays `None` when subagents are disabled).
+
+- [ ] **Step 3b: Build the registry in the dispatch block (infallible)**
+
+Inside the `if let Some(child_base) = child_base` block, AFTER `child_model`/`child_protocol`/`child_config` are computed and BEFORE `registry.register(Arc::new(agent_core::DispatchAgentTool::new(...)))`, insert:
+```rust
+        // Resolve config specs into dispatch-facing ResolvedSubAgent (spec 2.2/2.4).
+        // Infallible: unknown-tool refs surface at dispatch time (see design note).
         let mut resolved: std::collections::HashMap<String, agent_core::ResolvedSubAgent> =
             std::collections::HashMap::new();
         for spec in &cfg.named_subagents {
-            if let Some(tools) = &spec.tools {
-                for t in tools {
-                    if !child_tool_names.contains(t.as_str()) {
-                        return Err(format!(
-                            "named_subagents['{}']: unknown tool '{}'",
-                            spec.name, t
-                        ));
-                    }
-                }
-            }
             // Model: None → inherit the child default (child_model/child_protocol
             // + child_config knobs). Some → build a routed model on the SAME
             // endpoint (validation guarantees no backend/base_url override).
@@ -592,24 +584,27 @@ Inside `if let Some(child_base) = child_base { … }`, AFTER `child_model`/`chil
                 },
             );
         }
-        let subagent_registry = Arc::new(agent_core::SubAgentRegistry::from_map(resolved));
+        let subagents_reg = Arc::new(agent_core::SubAgentRegistry::from_map(resolved));
+        #[cfg(test)]
+        {
+            subagent_registry = Some(subagents_reg.clone());
+        }
 ```
-Then in the `DispatchDeps { … }` literal, replace the empty default from Task B1 with:
+Then in the `DispatchDeps { ... }` literal, replace the empty default from Task B1 with:
 ```rust
-                subagents: subagent_registry.clone(),
+                subagents: subagents_reg.clone(),
 ```
-NOTE: this makes the enclosing function fallible on the unknown-tool path — implement the `assemble_loop_checked` wrapper described in Task B2 Step 1 (or the codebase's chosen error convention). Expose `subagent_registry` on `BuiltLoop` under `#[cfg(test)]` for the assertion.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cd agent && cargo test -p agent-runtime-config named_subagent`
+Run: `cd agent && cargo test -p agent-runtime-config named_subagent_resolves`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add agent/crates/agent-runtime-config/src/assemble.rs
-git commit -m "feat(config): resolve named_subagents into dispatch SubAgentRegistry (per-spec model, tool-resolve) (3B-1 Wave B)"
+git commit -m "feat(config): resolve named_subagents into dispatch SubAgentRegistry (per-spec model) (3B-1 Wave B)"
 ```
 
 ### Task B3: `subagent_type` schema enum (fix M1) + arg parse + unknown-type error
@@ -623,7 +618,7 @@ git commit -m "feat(config): resolve named_subagents into dispatch SubAgentRegis
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to the dispatch test module. Build a tool whose deps carry a non-empty registry (add a `test_deps_with_registry(map)` helper mirroring `test_deps()` but setting `subagents`):
+Add to the dispatch test module. `one_agent_registry()` builds a one-entry registry using the real testkit types (`ScriptedModel`/`PassthroughProtocol` — see the Test-harness reference):
 ```rust
 fn one_agent_registry() -> Arc<SubAgentRegistry> {
     let mut m = std::collections::HashMap::new();
@@ -631,8 +626,8 @@ fn one_agent_registry() -> Arc<SubAgentRegistry> {
         description: "reviews code".into(),
         system_prompt: format!("You review.\n\n{}", SUBAGENT_PREAMBLE),
         tools: None,
-        model: test_model(),        // reuse the test model helper the file already has
-        protocol: test_protocol(),  // reuse the test protocol helper
+        model: Arc::new(ScriptedModel::new(vec![])),
+        protocol: Arc::new(PassthroughProtocol),
         model_limit: None, max_tokens: None, tool_call_limit: Some(3),
     });
     Arc::new(SubAgentRegistry::from_map(m))
@@ -640,7 +635,7 @@ fn one_agent_registry() -> Arc<SubAgentRegistry> {
 
 #[test]
 fn nonempty_registry_adds_subagent_type_enum_with_descriptions() {
-    let mut deps = test_deps();
+    let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
     deps.subagents = one_agent_registry();
     let tool = DispatchAgentTool::new(deps);
     let schema = tool.schema();
@@ -654,17 +649,17 @@ fn nonempty_registry_adds_subagent_type_enum_with_descriptions() {
 
 #[tokio::test]
 async fn unknown_subagent_type_is_invalid_args() {
-    let mut deps = test_deps();
+    let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
     deps.subagents = one_agent_registry();
     let tool = DispatchAgentTool::new(deps);
     let err = tool.execute(
         serde_json::json!({"prompt":"hi","subagent_type":"nope"}),
-        &test_ctx(),   // reuse the file's ToolCtx test helper
+        &exec_ctx(),
     ).await.unwrap_err();
     assert!(matches!(err, ToolError::InvalidArgs(_)));
 }
 ```
-NOTE: reuse existing test helpers (`test_deps`, a test `ModelClient`, a test `ToolCallProtocol`, a `ToolCtx` builder) — the dispatch test module already constructs children, so these exist under some names; find and reuse them rather than inventing new ones.
+(Uses the real `exec_deps`/`exec_ctx`/`ScriptedModel`/`PassthroughProtocol` helpers — see the Test-harness reference.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -775,6 +770,8 @@ git commit -m "feat(core): subagent_type enum discovery + unknown-type error (fi
 - Consumes: `resolved: Option<&ResolvedSubAgent>` (Task B3), `crate::ToolCallLimit`.
 - Produces: a named child whose construction uses the spec's prompt (+ preamble), tools, model/protocol/window, and (if set) a child `ToolCallLimit`; per-call `role`/`tools` are ignored for named types.
 
+> **BORROW-SAFETY RULE (architecture review):** `resolved` is a `&`-borrow into `self.deps.subagents`. Read every field you need out of `resolved` into an **owned local** (clone `system_prompt`/`tools`, `Arc::clone` `model`/`protocol`, copy the `Option<usize>`/`Option<u32>` knobs) **before** `AgentLoop::new`, and do NOT reference `resolved` anywhere after it. As written below this holds (last use of `resolved` is Step 6, before the child `.await` at ~L570), keeping the future `Send`; the rule prevents a later edit from reintroducing a hold-across-`await`.
+
 - [ ] **Step 1: Write the failing tests**
 
 Add to the dispatch test module (reuse the child-construction test scaffolding the file already has for asserting child prompt / stack / model — mirror `child_stack_is_exactly_curation_and_stuck_detection_never_memory_recall`):
@@ -788,19 +785,57 @@ async fn named_type_uses_spec_prompt_and_preamble_ignoring_role_tools() {
     let _ = tool.execute(serde_json::json!({
         "prompt":"do it","subagent_type":"reviewer",
         "role":"IGNORED ROLE","tools":["IGNORED"]
-    }), &test_ctx()).await;
+    }), &exec_ctx()).await;
     let sys = captured_system.lock().unwrap().clone().expect("child ran");
     assert!(sys.starts_with("You review."));
     assert!(sys.contains(SUBAGENT_PREAMBLE));
     assert!(!sys.contains("IGNORED ROLE"));
 }
+
+// Pin m-3 / architecture item (b): with a NON-EMPTY registry, selecting
+// general-purpose still yields the 3A child (parent prompt + role appended) —
+// the headline byte-identical invariant (spec §3 invariant 1) on the `None` arm.
+#[tokio::test]
+async fn general_purpose_under_nonempty_registry_is_unchanged() {
+    let (deps, captured_system) = deps_with_capturing_child(one_agent_registry());
+    let parent_prompt = deps.child_system_prompt.clone();
+    let tool = DispatchAgentTool::new(deps);
+    let _ = tool.execute(serde_json::json!({
+        "prompt":"do it","subagent_type":"general-purpose","role":"R"
+    }), &exec_ctx()).await;
+    let sys = captured_system.lock().unwrap().clone().expect("child ran");
+    assert!(sys.starts_with(&parent_prompt));   // parent-derived prompt, not a spec's
+    assert!(sys.contains("Role: R"));            // role honored on the general-purpose path
+}
+
+// Unknown-tool refs surface at DISPATCH time (Task B2 design note), not assembly.
+#[tokio::test]
+async fn named_type_unknown_tool_errors_at_dispatch() {
+    let mut m = std::collections::HashMap::new();
+    m.insert("bad".to_string(), ResolvedSubAgent {
+        description: "d".into(),
+        system_prompt: format!("p\n\n{}", SUBAGENT_PREAMBLE),
+        tools: Some(vec!["no_such_tool".into()]),   // not in the (empty) base snapshot
+        model: Arc::new(ScriptedModel::new(vec![])),
+        protocol: Arc::new(PassthroughProtocol),
+        model_limit: None, max_tokens: None, tool_call_limit: None,
+    });
+    let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
+    deps.subagents = Arc::new(SubAgentRegistry::from_map(m));
+    let tool = DispatchAgentTool::new(deps);
+    let err = tool.execute(
+        serde_json::json!({"prompt":"hi","subagent_type":"bad"}),
+        &exec_ctx(),
+    ).await.unwrap_err();
+    assert!(matches!(err, ToolError::InvalidArgs(_)));
+}
 ```
-NOTE: `deps_with_capturing_child` — if the file already has a `SchemaCapturingModel`/capturing child harness (it does, per `dispatch.rs:1024`), extend it to capture the child's system message; otherwise assert via a simpler observable (e.g. the child registry's tool set) that `role`/`tools` were ignored. Use the existing harness; do not build a parallel one.
+NOTE: `deps_with_capturing_child(registry) -> (DispatchDeps, Arc<Mutex<Option<String>>>)` — the file already has a capturing child harness near `dispatch.rs:1024`; extend it to record the child's system message and to set `subagents = registry`. Do NOT build a parallel harness. (`exec_deps` builds `base_tools: vec![]`, so the `no_such_tool` ref is genuinely absent — the existing execute-time allowlist check at `dispatch.rs:410-425` fires.)
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd agent && cargo test -p agent-core named_type_uses_spec_prompt`
-Expected: FAIL (named path not yet applied — child still gets parent prompt).
+Run: `cd agent && cargo test -p agent-core named_type_ && cargo test -p agent-core general_purpose_under`
+Expected: FAIL (named path not yet applied — child still gets parent prompt; the general-purpose pin fails only if the `None` arm regresses, which it must not).
 
 - [ ] **Step 3: Apply `resolved` — allowlist**
 
@@ -950,12 +985,19 @@ git commit -m "docs(config): document [[named_subagents]] example (3B-1)"
 ## Self-Review (run before handoff)
 
 **1. Spec coverage** (spec §§ → task):
-- §2.1 `SubAgentSpec` (core + reserved) → A1. §2.2 registry + `general-purpose` lockdown → A2 (reserved name) + B1/B2 (registry). §2.3 `subagent_type` enum (M1) + preamble (MINOR-5) + replace-semantics + merge-back → B3 + B4. §2.4 tools/model + endpoint lock (M3) → A2 (lock) + B2 (resolve) + B4 (apply). §2.5 E4 `tool_call_limit` + ceiling (M3) → A2 (ceiling) + B4 (apply). §2.6 system_prompt ceiling (M3) → A2. §2.7 config + validation + reserved rejection → A2 + B2 (tool-resolve). §3 invariants → B1 (empty=byte-identical), B4 (named path additive). §5 residuals: E4 → B4; Read⇒side-effects → carried to 3B-1c (no task, correct); eval `.with_todos` → A3. §6 tests → embedded per task.
-- Gap check: `general-purpose` byte-identical regression is asserted by keeping existing tests green (B1 Step 6, B4 Step 7) — no NEW dedicated test was added; **acceptable** because the existing suite already pins that path and B1/B4 are additive-only. If the reviewer wants an explicit pin, add a test asserting `test_deps()` (empty registry) child construction is unchanged.
+- §2.1 `SubAgentSpec` (core + reserved) → A1. §2.2 registry + `general-purpose` lockdown → A2 (reserved name) + B1/B2 (registry). §2.3 `subagent_type` enum (M1) + preamble (MINOR-5) + replace-semantics + merge-back → B3 + B4. §2.4 tools/model + endpoint lock (M3) → A2 (lock) + B2 (resolve) + B4 (apply); unknown-tool ref → dispatch-time check (B4 test). §2.5 E4 `tool_call_limit` + ceiling (M3) → A2 (ceiling) + B4 (apply). §2.6 system_prompt ceiling (M3) → A2. §2.7 config + validation + reserved rejection → A2. §3 invariants → B1 (empty=byte-identical) + B4 (`general_purpose_under_nonempty_registry_is_unchanged` pins the non-empty case). §5 residuals: E4 → B4; Read⇒side-effects → carried to 3B-1c (no task, correct); eval `.with_todos` → A3. §6 tests → embedded per task.
+- Gap check: the `general-purpose` byte-identical regression is now pinned BOTH ways — empty registry (`empty_registry_omits_subagent_type_from_schema`, B1) and non-empty-registry-but-general-purpose-selected (`general_purpose_under_nonempty_registry_is_unchanged`, B4). No gap.
 
-**2. Placeholder scan:** No "TBD"/"add error handling"/"similar to Task N". The two NOTE blocks (B2 error-return convention, test-helper reuse) describe **codebase-matching choices**, not deferred work — each gives the concrete options and the decision rule. Acceptable.
+**2. Placeholder scan:** No "TBD"/"add error handling"/"similar to Task N". The remaining NOTE blocks (test-helper reuse, capturing-child harness) point at named real helpers in the Test-harness reference — codebase-matching, not deferred work.
 
 **3. Type consistency:** `SubAgentSpec` fields (A1) match validation (A2), resolution (B2), and the reserved-rejection list. `ResolvedSubAgent`/`SubAgentRegistry` signatures (B1) match their uses in B2 (`from_map`), B3 (`is_empty`/`schema_hints`/`names`/`get`), B4 (`.tools`/`.system_prompt`/`.model`/`.protocol`/`.model_limit`/`.max_tokens`/`.tool_call_limit`). `subagents: Arc<SubAgentRegistry>` field name consistent across dispatch.rs + assemble.rs.
+
+## Plan review log
+
+### 2026-07-09 — Two plan reviewers (coverage/buildability + architecture)
+
+- **Coverage/buildability: APPROVE-WITH-FIXES.** **BLOCKER** — assembly-time tool validation would have made `assemble_loop` fallible and `.expect()`-panicked the lenient-boot server. **Resolved by REMOVING assembly-time tool validation** (Task B2 design note): a named spec's `tools` becomes the child `allow` allowlist, already validated at dispatch by the existing `dispatch.rs:410-425` check; pinned by `named_type_unknown_tool_errors_at_dispatch` (B4). **MAJOR** — plan test literals named non-existent helpers. **Fixed**: added the Test-harness reference and rewrote every literal to `exec_deps`/`exec_ctx`/`ScriptedModel`/`PassthroughProtocol` and `base().merge(from_str::<PartialRuntimeConfig>(…))`. **MAJOR** — `Arc`/`Clone` note added to B1. **MINOR** — `#[cfg(test)] subagent_registry` mut-binding pattern spelled out (B2 Step 3a). Verified-sound (no action): `build_routed_model`/`pick_protocol`/`child_protocol_name` signatures, `ToolCallLimit::with_cap` re-export, `SubAgentRegistry` re-export via `pub use dispatch::*`, `.with_todos` builder, all TDD fail-reasons.
+- **Architecture: SOUND-WITH-NOTES.** Confirmed the `resolved` borrow does NOT hold across the child `.await` (B4 clones fields out first) → **added the explicit BORROW-SAFETY RULE** to B4 so a later edit can't reintroduce it. Confirmed the dep-direction seam is the only correct one, the cloned-`child_config` reproduces assembly's knobs faithfully, and the `is_empty()` byte-identical keying matches the invariant's scope. **Item (b)** — added the `general_purpose_under_nonempty_registry_is_unchanged` pin (B4). Noted-residual (accepted): per-spec routed models are built eagerly at assembly even if never dispatched — precedented (the default child already does this) and negligible for a handful of specs; revisit only at dozens of rarely-used specs.
 
 ## Execution Handoff
 
