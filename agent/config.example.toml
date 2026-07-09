@@ -20,3 +20,15 @@ context_limit = 8192
 # # `required`, and `additionalProperties = false`. No nesting, no regex/pattern.
 # # The dispatch handoff's first line is then the JSON payload (or a marked fallback).
 # # response_format = { type = "object", additionalProperties = false, required = ["severity", "summary"], properties = { severity = { type = "string", enum = ["low", "high"] }, files = { type = "array", items = { type = "string" } }, summary = { type = "string" } } }
+# # Optional floor-only permissions (3B-1c): these can only TIGHTEN the runtime's
+# # base policy for this sub-agent and everything it dispatches — never loosen it.
+# # Patterns: exact tool name, trailing-* prefix ("github__*" covers one MCP
+# # server's tools — names are the SANITIZED "{server}__{tool}", case-sensitive),
+# # or bare "*" (every tool, INCLUDING built-ins like respond/context_compact —
+# # fail-closed for this child, so use with care). There is no allow list, by design.
+# # NOTE: a misspelled `permissions` key is silently ignored (the spec loads
+# # unfloored); an unknown key INSIDE the block (e.g. `allow`) fails the whole
+# # config file parse and the daemon falls back to flag defaults.
+# # [named_subagents.permissions]
+# # deny = ["execute_command", "github__*"]   # floored at Deny (with reason)
+# # ask  = ["write_file", "edit_file"]        # floored at Ask (approval prompt)
