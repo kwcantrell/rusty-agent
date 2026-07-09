@@ -7000,6 +7000,54 @@ mod tests {
         assert_eq!(events.last().unwrap(), "done");
     }
 
+    /// Spec §7 gap-fill (missing from the pre-Task-7 tree): an `EndRun` fired
+    /// from `after_tools` — AFTER the turn's real tool-call/tool-result pair
+    /// is already durably appended — must end the run cleanly with no
+    /// orphaned tool_calls message. Stack is `[a, b]`: `b` (reverse-order
+    /// first) EndRuns at `after_tools`, so `a`'s `after_tools` (and — in a
+    /// real assembled stack — StuckDetection's, the hook that would flush any
+    /// pending nudge) never fires this turn; the invariant under test is
+    /// `assert_no_orphans`'s guarantee holding across the short-circuit, not
+    /// any nudge content (this fixture's `counter_agent` replaces the whole
+    /// stack via `with_middleware`, so no StuckDetection instance is even
+    /// present here).
+    #[tokio::test]
+    async fn end_run_between_after_model_and_after_tools_leaves_no_orphans() {
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::Call(
+            "c1".into(),
+            "counter".into(),
+            r#"{"k":"a"}"#.into(),
+        )]));
+        let sink = Arc::new(CollectingSink::default());
+        let (agent, count) = counter_agent(model, sink.clone(), 5);
+        let (stack, log) = recording_pair(Some("after_tools"));
+        let agent = agent.with_middleware(stack);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![
+                "a:run_start",
+                "b:run_start",
+                "b:after_model",
+                "a:after_model",
+                "b:after_tools"
+            ],
+            "a:after_tools and everything past it must never fire"
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.last().unwrap(), "done");
+
+        use crate::ContextManager;
+        let built = ctx.build(100_000);
+        assert!(
+            crate::orphaned_tool_positions(&built).is_empty(),
+            "no orphaned tool_calls message after an after_tools EndRun: {built:?}"
+        );
+    }
+
     /// No node hook fires on the protocol-repair `continue` or a Length exit
     /// (spec §5.1 firing set). Reuses the malformed-call scripting that
     /// `protocol_repair_exhausted_emits_done` uses; assert after_model count.
@@ -7025,6 +7073,327 @@ mod tests {
             l.iter().filter(|e| e.ends_with(":after_model")).count(),
             2,
             "one turn × two middleware; repair turn must not fire after_model: {l:?}"
+        );
+    }
+
+    // --- Task 7: remaining parity pins --------------------------------------
+
+    /// A Write-tier tool (mirrors `WriteStub`'s Access::Write shape, but named
+    /// `counter` so `stuck_identical_calls_nudged_then_aborted`-style repeated
+    /// scripting drives BOTH the stuck-detection nudge and the post-tool
+    /// validator path in the same run — the plain `Counter` test tool is
+    /// Access::Read and would never trigger validators (task-7 brief note).
+    struct WriteCounter(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for WriteCounter {
+        fn name(&self) -> &str {
+            "counter"
+        }
+        fn description(&self) -> &str {
+            "records each execution (write-tier)"
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: "counter".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(&self, _args: &serde_json::Value) -> Result<agent_tools::ToolIntent, ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: "counter".into(),
+                access: agent_tools::Access::Write,
+                paths: vec![],
+                command: None,
+                summary: "count".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, ToolError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(agent_tools::ToolOutput {
+                content: "ok".into(),
+                display: None,
+            })
+        }
+    }
+
+    /// Spec §5.4 timeline: validator failure + pending nudge + maintain, in
+    /// today's exact durable order (tool results → validator msg → nudge).
+    /// Three identical Write-tier call turns trip the stuck-detection nudge
+    /// (3rd identical turn, spec §5.5) while `post_tool_validators =
+    /// ["false"]` fails validation on every one of them (a mutating Ok call);
+    /// a 4th, differing text turn ends the run cleanly.
+    #[tokio::test]
+    async fn nudged_turn_with_validator_failure_keeps_message_order() {
+        let ws = std::env::temp_dir();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(WriteCounter(count.clone())));
+        let one = || Scripted::Call("c1".into(), "counter".into(), r#"{"k":"a"}"#.into());
+        let model = Arc::new(ScriptedModel::new(vec![
+            one(),
+            one(),
+            one(),
+            Scripted::Text("done".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            Arc::new(reg),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                post_tool_validators: vec!["false".into()],
+                ..Default::default()
+            },
+        );
+        // Stuck-detection installed explicitly (mirrors counter_agent's own
+        // caution note): default AgentLoop::new carries no middleware.
+        let agent = agent.with_middleware(vec![Arc::new(crate::StuckDetectionMiddleware)]);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "all three identical Write-tier turns executed (no abort — only the nudge threshold)"
+        );
+
+        let built = ctx.build(100_000);
+        // Locate the 3rd turn's Tool-result message (the write's own result),
+        // and confirm the durable order right after it: Tool -> User(validation
+        // failure) -> User(nudge) -> (eventually) the next Assistant turn.
+        let tool_idx: Vec<usize> = built
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m.role, agent_model::Role::Tool))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            tool_idx.len(),
+            3,
+            "one tool-result message per Write-tier turn: {built:?}"
+        );
+        let last_tool_idx = *tool_idx.last().unwrap();
+        let validation_idx = last_tool_idx + 1;
+        let nudge_idx = last_tool_idx + 2;
+        assert!(
+            matches!(built[validation_idx].role, agent_model::Role::User)
+                && built[validation_idx]
+                    .content
+                    .contains("Post-edit validation reported problems"),
+            "validator failure must land immediately after the 3rd turn's tool result: {built:?}"
+        );
+        assert!(
+            matches!(built[nudge_idx].role, agent_model::Role::User)
+                && built[nudge_idx].content.contains("identical tool call"),
+            "the stuck-detection nudge must land immediately after the validator message: {built:?}"
+        );
+    }
+
+    /// Spec §5.1: no node hook fires on cancellation or budget exhaustion.
+    ///
+    /// (a) A precancelled token: `fire_run_start` runs BEFORE the turn-top
+    /// cancel check (loop_.rs `run_with_cancel`), so — observed, not the
+    /// brief's first guess of an empty log — both middleware's run_start DO
+    /// fire; the run then ends Done(Cancelled) with no further hooks.
+    /// (b) Budget exhaustion: the tools-disabled wrap-up completion is a bare
+    /// model call outside the node-hook dispatcher entirely, so it fires no
+    /// `final_reply` — only the one completed tool turn's hooks appear.
+    #[tokio::test]
+    async fn cancel_and_budget_paths_fire_no_hooks() {
+        // (a) precancelled token.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let ws = dir.path().to_path_buf();
+            let model = Arc::new(ScriptedModel::new(vec![Scripted::Text(
+                "should never run".into(),
+            )]));
+            let sink = Arc::new(CollectingSink::default());
+            let agent = AgentLoop::new(
+                model,
+                Arc::new(PassthroughProtocol),
+                registry(),
+                policy(ws.clone()),
+                Arc::new(AlwaysApprove),
+                sink.clone(),
+                LoopConfig {
+                    model_limit: 100_000,
+                    max_turns: 10,
+                    max_retries: 2,
+                    temperature: 0.0,
+                    max_tokens: None,
+                    workspace: ws,
+                    tool_timeout: std::time::Duration::from_secs(5),
+                    stream_idle_timeout: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                },
+            );
+            let (stack, log) = recording_pair(None);
+            let agent = agent.with_middleware(stack);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            let cancel = CancellationToken::new();
+            cancel.cancel(); // already cancelled before the run starts
+
+            agent
+                .run_with_cancel(&mut ctx, "go".into(), cancel)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                log.lock().unwrap().clone(),
+                vec!["a:run_start", "b:run_start"],
+                "run_start fires (it runs before the turn-top cancel check); \
+                 no other hook fires on a precancelled run"
+            );
+            let events = sink.events.lock().unwrap().clone();
+            assert_eq!(
+                events,
+                vec![
+                    "run_start:go:system_none=false".to_string(),
+                    "done".to_string()
+                ],
+                "no model call happened; events were: {events:?}"
+            );
+        }
+
+        // (b) budget exhaustion.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let ws = dir.path().to_path_buf();
+            std::fs::write(ws.join("f.txt"), "x").unwrap();
+            let model = Arc::new(ScriptedModel::new(vec![
+                Scripted::Call(
+                    "c1".into(),
+                    "read_file".into(),
+                    format!(r#"{{"path":"{}"}}"#, ws.join("f.txt").display()),
+                ),
+                Scripted::Text("wrap-up summary".into()),
+            ]));
+            let sink = Arc::new(CollectingSink::default());
+            let agent = AgentLoop::new(
+                model,
+                Arc::new(PassthroughProtocol),
+                registry(),
+                policy(ws.clone()),
+                Arc::new(AlwaysApprove),
+                sink.clone(),
+                LoopConfig {
+                    model_limit: 100_000,
+                    max_turns: 1,
+                    max_retries: 2,
+                    temperature: 0.0,
+                    max_tokens: None,
+                    workspace: ws,
+                    tool_timeout: std::time::Duration::from_secs(5),
+                    stream_idle_timeout: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                },
+            );
+            let (stack, log) = recording_pair(None);
+            let agent = agent.with_middleware(stack);
+            let mut ctx = WindowContext::new(Message::system("sys"));
+            agent.run(&mut ctx, "go".into()).await.unwrap();
+
+            // The one real (budget = 1) tool turn runs the full forward+reverse
+            // hook set; the tools-disabled wrap-up completion afterward is a bare
+            // model call the node-hook dispatcher never sees — no second
+            // after_model/after_tools/turn_end, and no final_reply (the run ends
+            // Done(BudgetExhausted), not the text-only exit path).
+            assert_eq!(
+                log.lock().unwrap().clone(),
+                vec![
+                    "a:run_start",
+                    "b:run_start",
+                    "b:after_model",
+                    "a:after_model",
+                    "b:after_tools",
+                    "a:after_tools",
+                    "b:turn_end",
+                    "a:turn_end",
+                ],
+                "budget exhaustion's wrap-up completion must fire no additional hooks"
+            );
+            let events = sink.events.lock().unwrap().clone();
+            assert!(
+                events.iter().any(|e| e == "token:wrap-up summary"),
+                "the wrap-up still streamed its text: {events:?}"
+            );
+            assert_eq!(events.last().map(String::as_str), Some("done"));
+        }
+    }
+
+    /// Spec §7: no maintain on either Length-stop exit. Mirrors
+    /// `truncated_tool_call_reports_max_tokens_not_bad_args`: a
+    /// `TruncatedCall` immediately yields `StopReason::Length`. OBSERVED (not
+    /// the brief's first guess of an empty log): `fire_run_start` runs before
+    /// the model is ever called, so both middleware's run_start DO fire; the
+    /// Length return then short-circuits everything after — no after_model,
+    /// no after_tools, no on_turn_end, and critically no after_final_reply
+    /// (the maintain hook), since the run never reaches the text-only exit
+    /// path either.
+    #[tokio::test]
+    async fn length_exit_fires_no_maintain_hooks() {
+        let ws = std::env::temp_dir();
+        let truncated = r##"{"path":"big.py","content":"#!/usr/bin/env python3\nprint('hi"##;
+        let model = Arc::new(ScriptedModel::new(vec![Scripted::TruncatedCall(
+            "write_file".into(),
+            truncated.into(),
+        )]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            policy(ws.clone()),
+            Arc::new(AlwaysApprove),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 2,
+                temperature: 0.0,
+                max_tokens: Some(2048),
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let (stack, log) = recording_pair(None);
+        let agent = agent.with_middleware(stack);
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent
+            .run(&mut ctx, "write a big file".into())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec!["a:run_start", "b:run_start"],
+            "run_start fires (it runs before the model is ever called); a Length-stop \
+             exit must fire no after_model/after_tools/turn_end/final_reply — in \
+             particular no maintain hook runs on this exit"
+        );
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("done"),
+            "the truncation abort must still terminate with Done; events were: {events:?}"
         );
     }
 }
