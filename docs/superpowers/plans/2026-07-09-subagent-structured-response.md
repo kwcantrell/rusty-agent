@@ -157,12 +157,11 @@ mod tests {
 }
 ```
 
-Add to `agent-core/src/lib.rs` (near the other `mod`/`pub use` lines):
+Add to `agent-core/src/lib.rs` (near the other `mod`/`pub use` lines). The crate re-exports submodules via `*` globs (e.g. `pub use dispatch::*;`, `pub use middleware::*;`), so a glob here auto-exports every `pub` item this module adds across A1/B1 (`validate_schema`, `validate_payload`, `ResponseHandle`, `MAX_RESPONSE_SCHEMA_PROPERTIES`, and later `RespondTool`, `RESPOND_TOOL_NAME`):
 
 ```rust
 mod response_format;
-pub use response_format::{validate_payload, validate_schema, ResponseHandle,
-    MAX_RESPONSE_SCHEMA_PROPERTIES};
+pub use response_format::*;
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -273,7 +272,12 @@ pub fn validate_payload(schema: &Value, payload: &Value) -> Result<(), String> {
         }
     }
     for (name, val) in p {
-        let sub = props[name].as_object().ok_or("schema property not an object")?;
+        // `.get()` not `props[name]` — panic-free even if a caller ever passes an
+        // unvalidated schema; the closed-object check above already guarantees the key.
+        let sub = props
+            .get(name)
+            .and_then(Value::as_object)
+            .ok_or("schema property not an object")?;
         check_value(name, sub, val)?;
     }
     Ok(())
@@ -349,13 +353,14 @@ git commit -m "feat(core): flat-object response_format schema validator (3B-1b A
 
 - [ ] **Step 1: Write the failing test**
 
-In `agent-runtime-config/src/assemble.rs` tests (near the existing `named_subagents`-resolving test that asserts `r.system_prompt.contains(agent_core::SUBAGENT_PREAMBLE)`), add:
+In `agent-runtime-config/src/assemble.rs` tests, mirror the existing `named_subagent_resolves_into_dispatch_registry` test (which builds a config with `cfg()`, assembles via `assemble_loop(&c, parts(ws.path().into(), vec![]))`, and reads `built.subagent_registry.expect(...).get("triage")`). Add:
 
 ```rust
 #[test]
 fn response_format_resolves_and_appends_prompt_clause() {
     use crate::runtime_config::SubAgentSpec;
-    let mut c = base_cfg(); // the helper the neighboring test uses; if it builds a RuntimeConfig differently, mirror it
+    let ws = tempfile::tempdir().unwrap();      // same tempdir idiom as the neighbor test
+    let mut c = cfg();                          // the neighbor test's config builder
     c.named_subagents = vec![SubAgentSpec {
         name: "triage".into(),
         description: "Triage failures".into(),
@@ -371,7 +376,8 @@ fn response_format_resolves_and_appends_prompt_clause() {
         middleware: None,
         skills: None,
     }];
-    let reg = resolve_registry(&c); // use the same resolution entry the neighboring test uses
+    let built = assemble_loop(&c, parts(ws.path().into(), vec![]));
+    let reg = built.subagent_registry.expect("registry built");
     let r = reg.get("triage").unwrap();
     assert_eq!(r.response_format.as_ref().unwrap()["type"], "object");
     assert!(r.system_prompt.contains(agent_core::RESPONSE_FORMAT_CLAUSE));
@@ -379,7 +385,7 @@ fn response_format_resolves_and_appends_prompt_clause() {
 }
 ```
 
-> Note: match `base_cfg()` / `resolve_registry(&c)` to whatever the adjacent `named_subagents` test in this file actually calls (it constructs a `RuntimeConfig`, runs assembly, and reads the resolved registry — reuse that exact scaffold; do not invent helpers).
+> `cfg()`, `parts(...)`, `assemble_loop`, and the `built.subagent_registry` field are exactly what `named_subagent_resolves_into_dispatch_registry` uses — copy that test's scaffold verbatim; do not invent helpers. (`subagent_registry` is `#[cfg(test)]`-populated on the assembled output.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -410,7 +416,7 @@ In the `ResolvedSubAgent` struct (same file), add the field after `tool_call_lim
     pub response_format: Option<serde_json::Value>,
 ```
 
-In `agent-core/src/lib.rs`, add `RESPONSE_FORMAT_CLAUSE` to the existing `pub use dispatch::{…}` re-export (wherever `SUBAGENT_PREAMBLE` is re-exported).
+No `lib.rs` change is needed for `RESPONSE_FORMAT_CLAUSE`: the crate re-exports dispatch items via `pub use dispatch::*;`, so the new `pub const` auto-exports at the crate root (same path `SUBAGENT_PREAMBLE` travels).
 
 - [ ] **Step 4: Resolve the field + append the clause at assembly**
 
@@ -479,56 +485,48 @@ git commit -m "feat(core): resolve response_format onto ResolvedSubAgent + promp
 
 - [ ] **Step 1: Write the failing tests**
 
-In `runtime_config.rs` tests (near the existing reserved-field-rejection test that sets `s.response_format = Some(json!({}))`), add:
+In `runtime_config.rs` tests, mirror the existing reserved-field test (which builds specs with `spec("name")` and configs with `cfg_with(vec![...])`, then calls `.validate()`). Add:
 
 ```rust
 #[test]
 fn accepts_valid_response_format_still_rejects_others() {
-    let mut c = base();
-    let mut s = sample_spec(); // the helper the neighboring test uses to build a valid SubAgentSpec
-    s.response_format = Some(serde_json::json!({
+    let good = serde_json::json!({
         "type": "object", "additionalProperties": false,
         "required": ["summary"],
         "properties": {"summary": {"type": "string"}}
-    }));
-    c.named_subagents = vec![s.clone()];
-    assert!(c.validate().is_ok(), "valid flat response_format must be accepted");
+    });
+    let mut s = spec("triage");
+    s.response_format = Some(good.clone());
+    assert!(cfg_with(vec![s]).validate().is_ok(), "valid flat response_format must be accepted");
 
     // ill-formed response_format (nested) → error naming the spec.
-    let mut s2 = s.clone();
+    let mut s2 = spec("triage");
     s2.response_format = Some(serde_json::json!({
         "type":"object","additionalProperties":false,
         "properties":{"inner":{"type":"object","additionalProperties":false,"properties":{}}}
     }));
-    c.named_subagents = vec![s2];
-    let e = c.validate().unwrap_err();
-    assert!(e.contains("response_format") && e.contains(&s.name));
+    let e = cfg_with(vec![s2]).validate().unwrap_err();
+    assert!(e.contains("response_format") && e.contains("triage"), "{e}");
 
     // permissions / middleware / skills still rejected.
-    for mut bad in [s.clone(), s.clone(), s.clone()].into_iter().enumerate().map(|(i, mut sp)| {
-        match i { 0 => sp.permissions = Some(serde_json::json!({})),
-                  1 => sp.middleware = Some(vec!["x".into()]),
-                  _ => sp.skills = Some(vec!["x".into()]) }
-        sp
-    }) {
-        bad.response_format = None;
-        c.named_subagents = vec![bad];
-        assert!(c.validate().is_err());
-    }
+    let mut sp = spec("triage"); sp.permissions = Some(serde_json::json!({}));
+    assert!(cfg_with(vec![sp]).validate().is_err());
+    let mut sm = spec("triage"); sm.middleware = Some(vec!["x".into()]);
+    assert!(cfg_with(vec![sm]).validate().is_err());
+    let mut sk = spec("triage"); sk.skills = Some(vec!["x".into()]);
+    assert!(cfg_with(vec![sk]).validate().is_err());
 }
 
 #[test]
 fn reserves_respond_tool_name() {
-    let mut c = base();
-    let mut s = sample_spec();
+    let mut s = spec("triage");
     s.tools = Some(vec!["respond".into()]);
-    c.named_subagents = vec![s];
-    let e = c.validate().unwrap_err();
-    assert!(e.contains("respond") && e.contains("reserved"));
+    let e = cfg_with(vec![s]).validate().unwrap_err();
+    assert!(e.contains("respond") && e.contains("reserved"), "{e}");
 }
 ```
 
-> Match `base()` / `sample_spec()` to the helpers the adjacent reserved-field test actually uses (that test builds a `SubAgentSpec` and calls `.validate()`); reuse them verbatim.
+> `spec("triage")` (returns a valid `SubAgentSpec`) and `cfg_with(vec![...])` (returns a `RuntimeConfig` with those `named_subagents`) are the real helpers the adjacent reserved-field test uses — reuse them verbatim; do not invent `base()`/`sample_spec()`.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -586,9 +584,9 @@ Replace with:
 Run: `cd agent && cargo test -p agent-runtime-config -- accepts_valid_response_format reserves_respond`
 Expected: PASS.
 
-- [ ] **Step 5: Confirm the old "reserved response_format" test is updated**
+- [ ] **Step 5: Update the pre-existing reserved-field test**
 
-The pre-existing test asserting a non-null `response_format` is rejected must be updated (it now describes the *other three* fields). Find it (it sets `s.response_format = Some(json!({}))` and expects `Err`) and change it to set `s.permissions` (or `middleware`/`skills`) instead, keeping the reject assertion. Run: `cd agent && cargo test -p agent-runtime-config named_subagents`
+The existing test `validate_rejects_reserved_fields_and_model_endpoint_override` sets `s.response_format = Some(serde_json::json!({}))` and expects `Err`. After A3's narrowing, `{}` still errors — but now via `validate_schema` (no `"type":"object"`), so leaving that line would make the test **pass for the wrong reason** and stop testing the reserved-field path. **Remove the `response_format = Some(json!({}))` line entirely** (the other-three coverage now lives in `accepts_valid_response_format_still_rejects_others`), keeping the rest of that test (permissions/middleware/skills/model-endpoint) intact. Run: `cd agent && cargo test -p agent-runtime-config validate_rejects_reserved`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -726,12 +724,7 @@ impl Tool for RespondTool {
 }
 ```
 
-Add to `agent-core/src/lib.rs` the re-export (extend the `response_format::{…}` list from A1):
-
-```rust
-pub use response_format::{validate_payload, validate_schema, RespondTool, ResponseHandle,
-    MAX_RESPONSE_SCHEMA_PROPERTIES, RESPOND_TOOL_NAME};
-```
+No `lib.rs` change is needed: A1 already added `pub use response_format::*;`, so the new `pub struct RespondTool` and `pub const RESPOND_TOOL_NAME` auto-export at the crate root (`agent_core::RespondTool`, `agent_core::RESPOND_TOOL_NAME`).
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -848,11 +841,7 @@ impl Middleware for ResponseCapture {
 }
 ```
 
-Re-export in `agent-core/src/lib.rs` next to the existing `ToolCallLimit` re-export from `middleware`:
-
-```rust
-pub use middleware::{/* …existing… */ ResponseCapture};
-```
+No `lib.rs` change is needed: the crate re-exports middleware via `pub use middleware::*;`, so the new `pub struct ResponseCapture` auto-exports at the crate root (same path `ToolCallLimit` travels — `dispatch.rs` reaches it as `crate::ResponseCapture`).
 
 - [ ] **Step 4: Wire the handle + tool into `dispatch.rs::execute()`**
 
@@ -874,6 +863,15 @@ In `execute()`, right after the per-child `todos` handle block (where `write_tod
         let response_schema: Option<serde_json::Value> =
             resolved.and_then(|r| r.response_format.clone());
         if let Some(schema) = response_schema.clone() {
+            // Resolved-registry collision guard (spec §2.2): no base/injected tool may
+            // already own the reserved name. Benign by construction today (register is
+            // last-wins, so `respond` would win anyway, and no host/context tool is
+            // named `respond`), but assert it so a future collision fails loudly in
+            // tests rather than silently shadowing a real tool.
+            debug_assert!(
+                reg.get(RESPOND_TOOL_NAME).is_none(),
+                "reserved tool name `{RESPOND_TOOL_NAME}` collides with an existing child tool",
+            );
             reg.register(Arc::new(RespondTool::new(schema, response_handle.clone())));
         }
 ```
@@ -914,7 +912,9 @@ Replace with:
 ```rust
         let content = if let Some(payload) = response_handle.lock().unwrap().take() {
             // §2.4 Some: single-line JSON payload (line 1), footer on later lines;
-            // the child's pre-`respond` prose (final_text) is SEVERED.
+            // the child's pre-`respond` prose (final_text) is SEVERED. budget_note is
+            // intentionally omitted: a captured payload means ResponseCapture ended the
+            // run with Stop, so s.stop is never BudgetExhausted on this branch.
             let body = serde_json::to_string(&payload).unwrap_or_else(|_| "null".into());
             format!("{body}\n\n{footer}")
         } else if response_schema.is_some() {
@@ -1012,6 +1012,10 @@ Append to `dispatch.rs` tests:
             .await.unwrap();
         assert!(out.content.contains("stop: Stop"), "capture must report Stop: {}", out.content);
         assert!(!out.content.contains("stop: Error"));
+        // Precedence winning must also sever the payload on the same turn, not just
+        // fix the stop-reason: line 1 is the JSON, not prose.
+        let v: serde_json::Value = serde_json::from_str(out.content.lines().next().unwrap()).unwrap();
+        assert_eq!(v["summary"], "done");
     }
 
     #[tokio::test]
@@ -1065,14 +1069,16 @@ In `config.example.toml`, under the existing `[[named_subagents]]` example, add 
 
 - [ ] **Step 2: Add the `#[ignore]` live soak**
 
-In `soak_live.rs`, add an `#[ignore]`d test that mirrors `soak_all_components_live`'s env-var + `assemble_loop` + approval/sink boilerplate (copy that scaffold), then swaps the config to a named sub-agent with a `response_format` and measures the valid-rate and per-trial turn count:
+This is **new harness work**, not copy-paste — it drives the real parent loop (via `agent.run_with_cancel`) to dispatch to a `response_format` sub-agent, and taps a sink to capture the resulting `dispatch_agent` tool-result. Mirror `soak_all_components_live` for the config + `assemble_loop`/`LoopParts` scaffold (the canonical example in this file), and mirror `SoakMonitor`'s `EventSink` impl for the exact `AgentEvent::ToolResult` variant fields.
+
+The **config + registration** (fully concrete — the `from_launch` call is copied verbatim from `soak_all_components_live`; `max_depth = 1` so the parent may dispatch):
 
 ```rust
-/// Live measurement (S1, spec §2.6): schema-valid rate + failure-tail cost of a
-/// response_format sub-agent on the default model. Ignored — run explicitly with
-/// AGENT_E2E_URL / AGENT_E2E_MODEL set.
+/// Live measurement (S1, spec §2.6): schema-valid rate + failure-tail turn cost of a
+/// response_format sub-agent on the default model. Ignored — run explicitly with a
+/// live server (AGENT_E2E_URL / AGENT_E2E_MODEL set).
 #[tokio::test]
-#[ignore]
+#[ignore = "live soak: requires AGENT_E2E_URL / AGENT_E2E_MODEL and a live server"]
 async fn response_format_valid_rate_live() {
     let url = std::env::var("AGENT_E2E_URL").expect("set AGENT_E2E_URL");
     let model_name = std::env::var("AGENT_E2E_MODEL").expect("set AGENT_E2E_MODEL");
@@ -1087,14 +1093,21 @@ async fn response_format_valid_rate_live() {
         }
     });
 
-    let mut cfg = RuntimeConfig::default();
-    // Point cfg at the live endpoint/model exactly as soak_all_components_live does
-    // (same fields it sets on RuntimeConfig for url/model). Then register the spec:
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().to_path_buf();
+    let mut cfg = RuntimeConfig::from_launch(
+        "openai".into(), url.clone(), model_name.clone(), "native".into(), 8000,
+    );
+    cfg.memory = false;
+    cfg.sandbox_mode = "off".into();
+    cfg.max_turns = 6;
+    cfg.max_depth = 1; // allow the parent to dispatch
     cfg.named_subagents = vec![agent_runtime_config::runtime_config::SubAgentSpec {
         name: "triager".into(),
-        description: "Classify a failure and summarize it.".into(),
-        system_prompt: "You triage software failures.".into(),
-        tools: Some(vec![]),
+        description: "Classify a software failure and summarize it.".into(),
+        system_prompt: "You triage software failures. Given a failure description, \
+            decide its severity and write a one-sentence summary.".into(),
+        tools: Some(vec![]),           // no other tools — just reason + respond
         model: None,
         tool_call_limit: None,
         permissions: None,
@@ -1103,34 +1116,59 @@ async fn response_format_valid_rate_live() {
         skills: None,
     }];
     cfg.validate().expect("config valid");
+```
+
+The **driver** (mirror the scaffold; the sink-tap is the one bit to write against `SoakMonitor`):
+
+```rust
+    // A capturing sink: records the content of every parent `dispatch_agent` tool
+    // result. Implement EventSink by mirroring SoakMonitor's impl in this file and
+    // matching on AgentEvent::ToolResult { name, .. } == "dispatch_agent" to stash
+    // its content string. (Copy SoakMonitor's variant field names verbatim — they
+    // are the source of truth for the AgentEvent shape.)
+    // struct DispatchCapture { last: Mutex<Option<String>> }  impl EventSink for DispatchCapture { … }
 
     let mut valid = 0usize;
     let mut total_turns = 0usize;
     for i in 0..trials {
-        // Build the loop via assemble_loop (copy the LoopParts/approval/sink scaffold
-        // from soak_all_components_live), then dispatch:
-        //   {"prompt": "Triage: build fails intermittently on CI", "subagent_type": "triager"}
-        // Capture the dispatch tool-result string `out`.
-        let out = drive_one_dispatch(&cfg, &url, &model_name).await; // helper you add mirroring the existing soak driver
+        let capture = Arc::new(DispatchCapture::default());
+        // assemble_loop with LoopParts copied from soak_all_components_live, but
+        // sink: capture.clone(); base_system_prompt instructs the parent to dispatch:
+        //   "For each task, call dispatch_agent with subagent_type=\"triager\" and the
+        //    failure text as prompt, then reply with its result."
+        let built = assemble_loop(&cfg, /* LoopParts { … sink: capture.clone(), … } */ unimplemented_loopparts());
+        let agent = built.loop_;
+        let artifacts = Arc::new(SessionArtifacts::new());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut ctx = CuratedContext::new(Message::system(built.system_prompt), artifacts, flag);
+        let task = "Triage this failure: the CI build fails intermittently, ~1 in 5 runs, \
+            on the integration test step, with no error in the logs.";
+        let _ = agent
+            .run_with_cancel(&mut ctx, task, tokio_util::sync::CancellationToken::new())
+            .await;
+
+        let out = capture.last.lock().unwrap().clone().unwrap_or_default();
         let line1 = out.lines().next().unwrap_or("");
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line1) {
             if agent_core::validate_payload(&schema, &v).is_ok() {
                 valid += 1;
             }
         }
-        // turns are in the footer "[sub-agent: N turns, …]"; parse N for the cost tail.
-        if let Some(n) = out.split("[sub-agent: ").nth(1).and_then(|s| s.split(" turns").next()).and_then(|s| s.trim().parse::<usize>().ok()) {
+        if let Some(n) = out.split("[sub-agent: ").nth(1)
+            .and_then(|s| s.split(" turns").next())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+        {
             total_turns += n;
         }
         eprintln!("trial {i}: {}", if line1.starts_with('{') { "structured" } else { "fallback" });
     }
-    eprintln!("response_format valid rate: {valid}/{trials}; avg turns: {}", total_turns as f64 / trials as f64);
-    // Floor guard (not a research target): most trials should be schema-valid.
+    eprintln!("response_format valid rate: {valid}/{trials}; avg sub-agent turns: {}",
+        total_turns as f64 / trials.max(1) as f64);
     assert!(valid * 2 >= trials, "valid rate below 50% floor: {valid}/{trials}");
 }
 ```
 
-> The `drive_one_dispatch` helper and the `RuntimeConfig` url/model fields must be filled by copying `soak_all_components_live`'s existing `assemble_loop(...)` call, `LoopParts`, approval channel, and sink setup verbatim — that test is the canonical scaffold in this file. Keep the test `#[ignore]` so `ci.sh` never runs it.
+> The two placeholders — `DispatchCapture` (an `EventSink` mirroring `SoakMonitor`) and the `LoopParts { … }` block — are filled by copying `soak_all_components_live`'s `EventSink` impl and its `assemble_loop(&cfg, LoopParts { … })` call verbatim, swapping `sink: capture.clone()` and the dispatch-instructing `base_system_prompt`. This is the "real work" the coverage review flagged; it is `#[ignore]`d, so `ci.sh` never runs it — Step 3 only compiles it.
 
 - [ ] **Step 3: Confirm it compiles (ignored, not run)**
 
@@ -1160,3 +1198,7 @@ git commit -m "docs(config)+test(config): response_format example + ignored live
 **Type consistency** — `ResponseHandle = Arc<Mutex<Option<Value>>>`, `validate_schema`/`validate_payload`, `RespondTool::new(schema, handle)`, `ResponseCapture::new(handle)`, `RESPOND_TOOL_NAME`, `RESPONSE_FORMAT_CLAUSE`, `ResolvedSubAgent.response_format` are named identically across A1→A2→A3→B1→B2→C.
 
 **Ordering note** — recommended task order **A1 → A2 → B1 → A3 → B2 → C** so `agent_core::RESPOND_TOOL_NAME` (B1) exists before A3 references it (A3 Step 3 gives the inline-literal fallback if reordered).
+
+**Reserved-name collision (spec §2.2, resolved-registry check).** Two layers: (1) config-time — a spec's `tools` may not list `respond` (Task A3). (2) dispatch-time — a `debug_assert!(reg.get(RESPOND_TOOL_NAME).is_none())` before registering `RespondTool` (Task B2 Step 4). This is benign by construction today (`register` is last-wins, so `respond` wins regardless, and no host/context/todos tool is named `respond`), so the invariant holds without a runtime error path; the `debug_assert` makes a *future* collision fail loudly in tests rather than silently shadowing a real tool. This satisfies §2.2's "checked against the resolved child registry" without adding a fallible assembly path.
+
+**Plan-review dispositions (2026-07-09, both reviewers APPROVE-WITH-FIXES, all folded in):** lib.rs re-exports are `*` globs, not lists (phrasing fixed across A1/A2/B1/B2); Task C soak rewritten with the real `from_launch` config + `run_with_cancel` driver + sink tap (was notional); test-helper names corrected to the real scaffolds (`cfg()`/`assemble_loop`/`built.subagent_registry`; `spec()`/`cfg_with`); A3 Step 5 now *removes* the stale `response_format = Some(json!({}))` line; `validate_payload` uses `.get().ok_or()` not `[]` indexing (panic-safety); `capture_wins` test also asserts the payload survives; budget-note omission on the `Some(payload)` branch is commented as provably safe. All three pinned decisions (reverse-iteration precedence, render sever-site + Copy-safe fallback, panic-free validator + last-wins registration) were verified correct against live control flow by the architecture reviewer.
