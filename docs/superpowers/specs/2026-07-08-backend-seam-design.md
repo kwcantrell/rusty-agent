@@ -880,3 +880,19 @@ decision):**
   and §8 dangling references all CLEAN; one stale E4 hedge in a §7 test
   description fixed, plus the `sub{n}:` → `sub{n}-` sanitization made
   explicit in §5.7.
+- 2026-07-08 — implementation notes (plan/build): (1) `SessionArtifacts`
+  fields shipped as `Arc<dyn Backend>` rather than concrete `Arc<MemBackend>`
+  — still the privileged unwrapped handles §5.3 requires, and it lets the E4
+  INCOMPLETE pin inject a failing history backend. (2) With `context_recall`
+  retired, `ContextCurationMiddleware` needs only the compact flag —
+  `new(flag)`, not §5.3's sketched `new(artifacts, flag, cap)`; the artifacts
+  handle is consumed by `CuratedContext` alone. (3) `build_registry` gained a
+  `max_read_bytes` parameter to thread the §5.4 read cap to `ReadFile`.
+  (4) `LoopConfig` was NOT extended with a `backend` field (§5.3 sketched
+  one): the default HostBackend is derived in `AgentLoop::new` from
+  `config.workspace` and overridden via `with_backend`, keeping the wave-1
+  config surface and its `Default` untouched. (5) host.rs's `FsError::NotUtf8`
+  message was reworded to "is not valid UTF-8" (Task 6): the spec's
+  parity-shim wording was unsatisfiable against the brief's own honest-error
+  test; ruled within J3's declared-change umbrella (edit_file-on-binary
+  wording changed, no consumer pinned the old text).

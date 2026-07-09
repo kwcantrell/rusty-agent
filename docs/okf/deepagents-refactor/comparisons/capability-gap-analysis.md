@@ -38,7 +38,7 @@ already right), **partial** (exists, wrong shape), **absent**,
 | Durable execution | Checkpointing: mid-run recovery, indefinite HITL pause, time travel | Session traces (JSONL), no checkpoint/resume | **absent** |
 | Per-model profiles | `HarnessProfile`: excluded tools, extra middleware, prompt suffix | Per-backend config knobs (claude-cli effort/session-reuse etc.), no profile abstraction | **partial** |
 | MCP | Via LangChain tool integration | First-class `agent-mcp` client crate | **match** |
-| Multimodal files | `read_file` returns images/video/audio/documents as content blocks | Not investigated in this research pass — file tools' non-text behavior unverified | **unassessed** |
+| Multimodal files | `read_file` returns images/video/audio/documents as content blocks | Text-only end-to-end (read_to_string; String content in ToolOutput/Message); assessed 2026-07-08 (Phase-2 spec J3) | **absent** (deliberately deferred) |
 
 ## The three structural gaps
 
