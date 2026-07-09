@@ -14,8 +14,9 @@ pub type ResponseHandle = Arc<Mutex<Option<Value>>>;
 pub const MAX_RESPONSE_SCHEMA_PROPERTIES: usize = 64;
 
 const SCALAR_TYPES: [&str; 5] = ["string", "number", "integer", "boolean", "null"];
-const BANNED_KEYS: [&str; 8] =
-    ["pattern", "$ref", "allOf", "anyOf", "oneOf", "not", "$defs", "format"];
+const BANNED_KEYS: [&str; 8] = [
+    "pattern", "$ref", "allOf", "anyOf", "oneOf", "not", "$defs", "format",
+];
 
 /// Config-time: is `schema` a well-formed FLAT-object response_format? (spec §2.5)
 pub fn validate_schema(schema: &Value) -> Result<(), String> {
@@ -77,7 +78,9 @@ fn validate_property(name: &str, sub: &Value) -> Result<(), String> {
                 return Err(format!("property `{name}`: array-of-object not allowed"));
             }
             if !matches!(it, Some(t) if SCALAR_TYPES.contains(&t)) {
-                return Err(format!("property `{name}`: array `items.type` must be scalar"));
+                return Err(format!(
+                    "property `{name}`: array `items.type` must be scalar"
+                ));
             }
             Ok(())
         }
@@ -95,7 +98,9 @@ pub fn validate_payload(schema: &Value, payload: &Value) -> Result<(), String> {
         .get("properties")
         .and_then(Value::as_object)
         .ok_or("schema has no properties")?;
-    let p = payload.as_object().ok_or("response must be a JSON object")?;
+    let p = payload
+        .as_object()
+        .ok_or("response must be a JSON object")?;
     if let Some(req) = sobj.get("required").and_then(Value::as_array) {
         for r in req {
             if let Some(rn) = r.as_str() {
@@ -190,7 +195,8 @@ mod tests {
     fn rejects_non_object_and_bad_top_level() {
         assert!(validate_schema(&json!([1, 2])).is_err());
         assert!(validate_schema(&json!({"type": "string"})).is_err());
-        assert!(validate_schema(&json!({"type": "object", "properties": {}})).is_err()); // no additionalProperties:false
+        assert!(validate_schema(&json!({"type": "object", "properties": {}})).is_err());
+        // no additionalProperties:false
     }
 
     #[test]
