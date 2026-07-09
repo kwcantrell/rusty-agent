@@ -1,7 +1,7 @@
 # Tauri v2 OKF bundle — design
 
 **Date:** 2026-07-09
-**Status:** Panel-reviewed, gate decisions E1–E3 recorded (§Panel log) — pending final owner spec review
+**Status:** Implemented on branch worktree-tauri-okf-bundle — spec approved 2026-07-09; panel + gate + consistency-read logged below
 **Branch:** `worktree-tauri-okf-bundle` (worktree forked from local `main` @ 5cabef5)
 
 ## Goal

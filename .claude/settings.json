@@ -18,6 +18,7 @@
       "Bash(python3 scripts/test_skills_lint.py)",
       "Bash(uv run scripts/okf_check.py *)",
       "Bash(uv run scripts/test_okf_check.py *)",
+      "Bash(uv run scripts/test_okf_check.py)",
       "Bash(git status)",
       "Bash(git log *)",
       "Bash(git diff *)",

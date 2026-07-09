@@ -190,6 +190,17 @@ class OkfCheckTest(unittest.TestCase):
         errs = okf_check.check_bundle(self.root)
         self.assertEqual(errs, [])
 
+    def test_unclosed_fence_fails_closed(self):
+        # An unterminated fence leaves its content unstripped, so a [n]-shaped
+        # literal inside it surfaces as a (spurious) marker error — fail-closed,
+        # never a silent pass.
+        valid_bundle(self.root)
+        write(self.root, "practices/unclosed.md",
+              "---\ntype: Practice\n---\nClaim [1].\n\n```js\nconst x = args[2];\n\n"
+              "# Citations\n1. [example](/sources/example.md)\n")
+        errs = okf_check.check_bundle(self.root)
+        self.assertTrue(any("unclosed.md" in e and "[2]" in e for e in errs))
+
 
 if __name__ == "__main__":
     unittest.main()
