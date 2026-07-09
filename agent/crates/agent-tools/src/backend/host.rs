@@ -70,7 +70,7 @@ impl Backend for HostBackend {
             .await
             .map_err(|e| FsError::NotFound(format!("{path}: {e}")))?;
         String::from_utf8(bytes)
-            .map_err(|_| FsError::NotUtf8(format!("{path}: stream did not contain valid UTF-8")))
+            .map_err(|_| FsError::NotUtf8(format!("{path}: is not valid UTF-8")))
     }
 
     async fn write(&self, path: &str, content: &str) -> Result<(), FsError> {

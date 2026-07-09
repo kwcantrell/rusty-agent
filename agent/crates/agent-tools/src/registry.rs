@@ -181,15 +181,20 @@ mod tests {
         use crate::fs::{EditFile, ListDirectory, ReadFile, WriteFile};
         use crate::{git::GitCommit, shell::ExecuteCommand, RenderArtifact};
         // Confusable prose mentions the sibling tool.
-        assert!(ReadFile
-            .when_not_to_call()
-            .unwrap()
-            .contains("read_skill_file"));
+        assert!((ReadFile {
+            max_bytes: 16 * 1024
+        })
+        .when_not_to_call()
+        .unwrap()
+        .contains("read_skill_file"));
         assert!(WriteFile.when_not_to_call().unwrap().contains("edit_file"));
         assert!(EditFile.when_not_to_call().unwrap().contains("write_file"));
         // Every required param on these tools now has a description.
         for s in [
-            ReadFile.schema(),
+            (ReadFile {
+                max_bytes: 16 * 1024,
+            })
+            .schema(),
             WriteFile.schema(),
             EditFile.schema(),
             ExecuteCommand.schema(),

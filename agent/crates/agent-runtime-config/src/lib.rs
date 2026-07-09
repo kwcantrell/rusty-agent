@@ -123,9 +123,11 @@ pub fn build_routed_model(
     )
 }
 
-pub fn build_registry(http_allow_hosts: &[String]) -> ToolRegistry {
+pub fn build_registry(http_allow_hosts: &[String], max_read_bytes: usize) -> ToolRegistry {
     let mut r = ToolRegistry::new();
-    r.register(Arc::new(ReadFile));
+    r.register(Arc::new(ReadFile {
+        max_bytes: max_read_bytes,
+    }));
     r.register(Arc::new(WriteFile));
     r.register(Arc::new(EditFile));
     r.register(Arc::new(ListDirectory));
@@ -459,7 +461,7 @@ mod tests {
 
     #[test]
     fn build_registry_includes_render() {
-        let r = build_registry(&[]);
+        let r = build_registry(&[], 16 * 1024);
         assert!(r.get("render").is_some(), "render tool must be registered");
     }
 
@@ -477,7 +479,7 @@ mod tests {
     }
     #[test]
     fn registry_has_all_core_tools() {
-        let r = build_registry(&[]);
+        let r = build_registry(&[], 16 * 1024);
         for name in [
             "read_file",
             "write_file",

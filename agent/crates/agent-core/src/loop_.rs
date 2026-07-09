@@ -1616,7 +1616,9 @@ mod tests {
 
     fn registry() -> Arc<ToolRegistry> {
         let mut r = ToolRegistry::new();
-        r.register(Arc::new(ReadFile));
+        r.register(Arc::new(ReadFile {
+            max_bytes: 16 * 1024,
+        }));
         Arc::new(r)
     }
 

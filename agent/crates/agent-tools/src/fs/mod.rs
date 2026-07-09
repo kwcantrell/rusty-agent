@@ -8,9 +8,10 @@ pub use write::{EditFile, WriteFile};
 use crate::backend::FsError;
 use crate::ToolError;
 
-/// FsError → ToolError in one place (spec §5.1). Wave-1 parity: NotUtf8 maps
-/// to NotFound (same message today's read_to_string path produced); Task 6
-/// flips it to the honest error alongside the paging contract.
+/// FsError → ToolError in one place (spec §5.1). `read_file` intercepts
+/// `NotUtf8` itself before reaching this mapping (Task 6: honest binary-file
+/// error alongside the paging contract) — the fallback arm below still maps
+/// it to `NotFound` for any other caller that hasn't made that switch yet.
 pub(crate) fn fs_err(e: FsError) -> ToolError {
     match e {
         FsError::NotFound(m) => ToolError::NotFound(m),

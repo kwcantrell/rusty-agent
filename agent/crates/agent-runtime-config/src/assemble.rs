@@ -160,7 +160,7 @@ fn fresh_claude_cli_client(
 /// The one place a RuntimeConfig + per-frontend `LoopParts` become an `AgentLoop`.
 /// Never panics: a `compose_system_prompt` failure falls back to the base prompt.
 pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
-    let mut registry = build_registry(&cfg.http_allow_hosts);
+    let mut registry = build_registry(&cfg.http_allow_hosts, cfg.max_tool_result_bytes);
     for t in &parts.mcp_tools {
         registry.register(t.clone());
     }
