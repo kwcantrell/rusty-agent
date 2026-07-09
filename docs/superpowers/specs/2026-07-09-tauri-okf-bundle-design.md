@@ -1,7 +1,7 @@
 # Tauri v2 OKF bundle — design
 
 **Date:** 2026-07-09
-**Status:** Panel-reviewed — pending owner gate (two escalated decisions, §Panel log)
+**Status:** Panel-reviewed, gate decisions E1–E3 recorded (§Panel log) — pending final owner spec review
 **Branch:** `worktree-tauri-okf-bundle` (worktree forked from local `main` @ 5cabef5)
 
 ## Goal
@@ -29,7 +29,7 @@ gets spec-input verification rigor now rather than retroactively.
 | Deep areas | Testing; security model; IPC & app architecture; distribution & updates; performance & footprint |
 | Mobile | Survey depth only (2–4 sources) |
 | Verification | Full two-shape: adversarial per-claim refuters + consistency/completeness pass, both logged |
-| Companion | Yes — shape escalated to gate (E1 in §Panel log): existing `.agents/skills/tauri/` skill collides |
+| Companion | Yes — standalone `tauri-okf` consume-guide skill (gate decision E1); the existing `tauri` builder skill is deprecation-bound and ignored |
 | Isolation | Dedicated worktree off local `main`; the primary checkout (another agent's live branch) is never touched |
 
 ## Deliverable 1 — checker upgrade (lands first)
@@ -131,25 +131,21 @@ Per-directory `index.md` files list every non-reserved node (checker-enforced).
   fetch window, and a staleness tripwire ("treat as stale after the next Tauri minor
   release or 2027-01, whichever comes first; re-verify per log.md discipline").
 
-## Deliverable 3 — companion skill (shape pending gate decision E1)
+## Deliverable 3 — companion skill: standalone `tauri-okf` (gate decision E1)
 
-A shipped skill **already exists** at `.agents/skills/tauri/` (builder skill: scaffold /
-develop / debug Tauri v2 desktop apps, with a `references/` tree and `.claude/skills`
-symlink). The companion deliverable must not silently overwrite or duplicate it. Two
-options, escalated to the owner gate:
-
-- **(a) Extend the existing `tauri` skill** — add a bundle-consumption section routing
-  to `docs/okf/tauri/` (index as entry point, citation-trust rule: bundle claims are
-  point-in-time; re-check live docs before acting on version-sensitive details), update
-  its description/trigger accordingly, and reconcile its "mobile out of scope" stance
-  with the bundle's survey-depth mobile coverage. One skill, one trigger surface.
-  **Recommended.**
-- **(b) Separate `tauri-okf` skill** — a standalone consume-guide modeled on
-  agent-sdlc's SKILL.md (+ new symlink). Keeps the builder skill untouched, at the cost
-  of two overlapping Tauri triggers agents must disambiguate.
-
-Either way: maintenance mechanics stay one short section pointing at
+A new consume-guide skill at `.agents/skills/tauri-okf/SKILL.md` (+ relative symlink
+`.claude/skills/tauri-okf`), modeled on agent-sdlc's SKILL.md: when to reach for the
+bundle, `index.md` as entry point, the citation-trust rule (bundle claims are
+point-in-time; re-check live docs before acting on version-sensitive details).
+Maintenance mechanics: one short section pointing at
 `.agents/skills/agent-sdlc/authoring.md`; no second authoring.md. `skills_lint` green.
+
+The existing `.agents/skills/tauri/` builder skill is **deprecation-bound (owner
+decision)**: this campaign does not touch it, and **none of its content or findings are
+folded into the bundle or the new skill** — the corpus stays docs + ecosystem only. The
+new skill's description is phrased to route knowledge-lookup queries (distinct from the
+old skill's build/debug trigger) so the two coexist without ambiguity until the owner
+deprecates the old one. Deprecating/removing it is out of scope here.
 
 ## Research & verification pipeline (Approach A — curation-first waves)
 
@@ -215,7 +211,7 @@ quoted content by content (house rule).
    that cite them** and directory indexes kept current per commit. Residual (accepted):
    mid-campaign commits may transiently fail the full checker between waves; the
    pre-push hook makes this moot since nothing is pushed mid-campaign.
-3. Companion skill work per gate decision E1.
+3. `tauri-okf` skill + symlink.
 4. Final: `bash scripts/ci.sh` green.
 
 Conventional commits throughout; no push without an explicit ask.
@@ -248,6 +244,8 @@ Conventional commits throughout; no push without an explicit ask.
 - No mobile deep-dive (Xcode/Gradle setup minutiae, store distribution).
 - No general-purpose third-party OKF validation beyond what the PyYAML upgrade naturally
   grants; house checks stay stricter than spec.
+- No content from the deprecation-bound `.agents/skills/tauri/` skill in the bundle or
+  the `tauri-okf` skill; deprecating/removing that skill is out of scope.
 
 ## Risks & residuals
 
@@ -301,13 +299,14 @@ does; its capability files are typed `Practice`) and the skill-collision claim (
 **Escalated to the owner gate:**
 
 - **E1 — companion-skill collision** with the shipped `.agents/skills/tauri/` builder
-  skill: extend it (recommended) vs separate `tauri-okf` skill. *(decision: pending)*
-- **E2 — allowlist owner checkpoint** adopted into the pipeline (owner eyeballs the
-  curated allowlist before Wave 1); owner may instead delegate curation. *(decision:
-  pending)*
+  skill: extend it (panel-recommended) vs separate `tauri-okf` skill. *(Owner decision
+  2026-07-09: **separate `tauri-okf`**; the existing skill is deprecation-bound —
+  ignore it entirely, fold none of its findings into the bundle or new skill.)*
+- **E2 — allowlist owner checkpoint** (owner eyeballs the curated allowlist before
+  Wave 1) vs delegated curation. *(Owner decision 2026-07-09: **checkpoint adopted**.)*
 - **E3 — pre-flight edits touch reviewed bundles** (mechanical frontmatter quoting in
-  agent-sdlc + deepagents-refactor, with log entries): flagged for owner awareness since
-  those artifacts already passed review. *(decision: pending)*
+  agent-sdlc + deepagents-refactor, with log entries). *(Owner decision 2026-07-09:
+  **approved**, syntax-only.)*
 
 **Minors accepted/fixed as noted:**
 
