@@ -290,6 +290,31 @@ pub fn clear_park(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("answer.json"));
 }
 
+/// Exclusive cross-process claim on resuming this checkpoint tree
+/// (refinement 11). O_EXCL create of <dir>/resume.lock: Ok(true) = claimed,
+/// Ok(false) = another process holds it, Err = I/O trouble (treat as not
+/// claimed). The success path's remove_dir_all reaps it; a FAILED resume
+/// must release_resume so a retry can claim.
+pub fn claim_resume(dir: &Path) -> std::io::Result<bool> {
+    std::fs::create_dir_all(dir)?; // dir exists whenever a park exists; cheap guard
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(dir.join("resume.lock")) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn release_resume(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join("resume.lock"));
+}
+
 /// Version-prefixed, domain-separated: `[2, approve]` differs in both length
 /// and first byte from the old `[approve] ‖ manifest_hex` message, so no
 /// cross-formula reinterpretation exists in either direction (a legacy
@@ -1158,5 +1183,28 @@ mod tests {
         assert!(!root.is_awaiting_ask());
         assert!(!child.is_awaiting_ask());
         assert!(!grand.is_awaiting_ask());
+    }
+
+    #[test]
+    fn claim_resume_is_exclusive_and_releasable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkpoint");
+
+        assert!(claim_resume(&root).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join("resume.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        assert!(!claim_resume(&root).unwrap());
+
+        release_resume(&root);
+        assert!(claim_resume(&root).unwrap());
     }
 }
