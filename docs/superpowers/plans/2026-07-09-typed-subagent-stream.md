@@ -38,6 +38,7 @@ Adding a variant to the derive-free `AgentEvent` compile-breaks four exhaustive 
 **Files:**
 - Modify: `agent/crates/agent-core/src/event.rs` (enum + variant)
 - Modify: `agent/crates/agent-core/src/testkit.rs` (`CollectingSink` label arm)
+- Modify: `agent/crates/agent-core/src/dispatch.rs` (test-mod `TapSpy` arm ONLY — compile-forced; production dispatch edits are A2/A3)
 - Modify: `agent/crates/agent-runtime-config/src/trace.rs` (`trace_event` → `Option`, two new `TraceEvent` variants, `write_record` skip)
 - Modify: `agent/crates/agent-server/src/wire.rs` (five `ServerEvent` variants + mapping arm)
 - Modify: `agent/crates/agent-cli/src/render.rs` (pure format helpers + `TerminalSink` arm)
@@ -154,6 +155,20 @@ And add the variant to `AgentEvent` (after `RunStart`):
 
 Add `SubagentEvent` to the existing `use` of crate event types in testkit.rs (it currently imports `AgentEvent`/`ContextEvent` — locate by content).
 
+ALSO in this step (plan-review Finding 1, BOTH reviewers): the test-local
+`TapSpy::record` match in `agent/crates/agent-core/src/dispatch.rs`'s
+`mod tests` is **exhaustive with no catch-all** (it ends with the combined
+`ToolStart | ToolResult | ServerUsage => "FORWARDED-KIND-MUST-NOT-BE-TAPPED"`
+arm) — without an arm here, `cargo test -p agent-core` fails to compile at
+Step 7. Add before that combined arm:
+
+```rust
+                AgentEvent::Subagent(_) => "subagent",
+```
+
+(The integration `tests/dispatch_tool.rs` sinks and the `loop_.rs` test sinks
+all have `_ =>` catch-alls and compile through A1 unchanged.)
+
 - [ ] **Step 3: `trace.rs` — record Start/End, skip deltas.** Three edits:
 
 (a) Two new `TraceEvent` variants (after `RunStart` in the enum):
@@ -208,15 +223,17 @@ the existing `AgentEvent::Done(r) => TraceEvent::Done { reason: … }` arm uses
                 } => TraceEvent::SubagentEnd {
                     id,
                     outcome: outcome.as_str(),
-                    stop: stop.as_ref().map(|r| /* same helper the Done arm uses — locate by content */ stop_reason(r)),
+                    stop: stop.as_ref().map(stop_reason_str),
                     detail: detail.as_deref(),
                     turns: *turns,
                     tool_calls: *tool_calls,
                     duration_ms: *duration_ms,
                 },
                 // (Bindings here are references — `trace_event` takes
-                // `&AgentEvent` — hence `as_deref`/`as_ref` above; write the
-                // stop mapping as `stop.as_ref().map(|r| <done-arm helper>(r))`.)
+                // `&AgentEvent` — hence `as_deref`/`as_ref` above.
+                // `stop_reason_str` is trace.rs's EXISTING StopReason →
+                // &'static str helper, the one the Done arm already calls —
+                // reuse it, do NOT add a second helper.)
                 // Typed deltas are UI telemetry; the raw ChildTraceTap records
                 // remain the single trace source of the child transcript
                 // (spec §2.6 exactly-once invariant).
@@ -778,7 +795,19 @@ Do NOT weaken any assertion to "contains"; keep exact lists.
 `FullSink` quads — no pseudo-asserts.)
 
 And in `agent/crates/agent-core/tests/dispatch_tool.rs` (integration — parent
-loop drives the dispatch tool; reuse its scripted-parent harness):
+loop drives the dispatch tool; reuse its scripted-parent harness). NOTE
+(plan-review Finding 3): this file's OWN `FullSink::emit` ends with
+`_ => return;` — it silently drops `Subagent` events, so the ordering test
+below has nothing to observe until you add an arm before that catch-all:
+
+```rust
+            AgentEvent::Subagent(agent_core::SubagentEvent::Start { id, .. }) => {
+                ("subagent_start".into(), id, String::new(), String::new())
+            }
+```
+
+(Only `Start` is needed for this test; other Subagent cases may keep falling
+to `_ => return` — existing tests in the file assert nothing about them.)
 
 ```rust
     #[tokio::test]
@@ -846,8 +875,8 @@ the match arms so forwards happen without holding it:
                         }));
                     }
                     AgentEvent::Usage { turn, .. } => {
-                        self.cap.lock().unwrap().turns =
-                            self.cap.lock().unwrap().turns.max(turn);
+                        let mut cap = self.cap.lock().unwrap();
+                        cap.turns = cap.turns.max(turn);
                     }
                     AgentEvent::Done(reason) => {
                         self.cap.lock().unwrap().stop = Some(reason);
@@ -875,10 +904,10 @@ the match arms so forwards happen without holding it:
             }
 ```
 
-CAREFUL with the `Usage` arm above — do NOT double-lock as written; keep the
-original single-lock form: `{ let mut cap = self.cap.lock().unwrap(); cap.turns = cap.turns.max(turn); }`.
 Preserve the original comments on the StreamRetry capture-trim (char-boundary,
-never pop) — move them with the code.
+never pop) — move them with the code. The single deprecation note on the
+`SubagentSink` type covers the whole `sub:`/`sub{n}:` mechanism (spec §3.1);
+per-arm notes at the rename sites are intentionally NOT added.
 
 Also update the `SubagentSink` doc comment: it currently says forwards "ONLY
 ToolStart/ToolResult … plus ServerUsage"; extend with the typed-delta
@@ -1015,9 +1044,8 @@ plus the ChildTraceTap, the production topology):
     }
 ```
 
-(If `SessionStats` lacks `PartialEq`/`Clone`, compare the individual
-`subagent_turns`/`subagent_tool_calls`/`turns`/`tool_calls` fields instead —
-do not add derives just for the test unless trivial.)
+(`SessionStats` already derives `Clone` + `PartialEq` — verified — so
+`assert_eq!(s, before)` compiles directly.)
 
 - [ ] **Step 5: Run:** `cargo test -p agent-core -p agent-runtime-config`
 Expected: PASS.
@@ -1249,7 +1277,8 @@ In the existing `done` case, before the `return`, finalize orphaned cards
 8. finalize-on-done: running card + `done` frame → `status:"done"`, `outcome:"unknown"`;
 9. `subagent_end` sets outcome/stop/detail/stats fields;
 10. no-typed-frames fallback: a `tool_start`/`tool_result` pair with no subagent frames yields an item with `subagent === undefined` (renders as today);
-11. depth-2: `tool_start(name:"sub:dispatch_agent", id:"sub3:c2", parent_id:"c9")` then `subagent_start(id:"sub3:c2")` attaches to that forwarded row.
+11. depth-2: `tool_start(name:"sub:dispatch_agent", id:"sub3:c2", parent_id:"c9")` then `subagent_start(id:"sub3:c2")` attaches to that forwarded row;
+12. out-of-contract ordering pin (plan-review Finding 4): `subagent_text` for "c1" (creates a placeholder card holding the text) followed by `subagent_start` for "c1" — assert the accumulated text is NOT silently lost (a second card item may open, but the first card's text must still be present in the items list).
 
 - [ ] **Step 7: Run:** `cd web && npm test`
 Expected: PASS (new file green, no existing test broken — `tsc` also clean via the test script; if the repo separates them run `npm run typecheck` too).
@@ -1396,6 +1425,29 @@ feasible), re-run `bash scripts/ci.sh`, then report the branch ready for
 whole-branch review + merge (do NOT merge or push in this task).
 
 ---
+
+## Plan review log
+
+- **2026-07-09 — 2 opus reviewers (coverage/buildability: APPROVE-WITH-FIXES;
+  adversarial architecture: SOUND-WITH-NOTES). All findings folded in:**
+  (MAJOR, both) `TapSpy` exhaustive match moved into A1 — the only exhaustive
+  TEST match, mis-bucketed to A3, would have broken A1's compile gate;
+  (MAJOR) integration `dispatch_tool.rs` FullSink `_ => return` drops
+  Subagent events — ordering test gets its own Start arm; (MINOR, both) the
+  Usage-arm code block double-locked (deadlock) — fixed inline, prose note
+  removed; trace stop helper named explicitly (`stop_reason_str`, reuse not
+  reinvent); dead `SessionStats`-derives fallback removed (derives verified
+  present); reducer test 12 pins the out-of-contract start-after-text
+  sequence; single type-level deprecation note declared intentional.
+  **Cleared by adversarial review at live source:** EndGuard exactly-once on
+  all paths incl. panic-unwind ordering vs `catch_unwind`; no early return
+  between guard arm and run; capture/forward atomicity (child tokens stream
+  from a single loop task — no concurrent `emit` per delegation); production
+  trace topology matches the A3 test (same `TraceWriter` behind `ObservedSink`
+  + `ChildTraceTap`, assemble.rs); reducer tool_result-vs-placeholder
+  correlation benign (binding a real tool_result to the placeholder finalizes
+  it — desirable); §3 invariant sweep clean. Spec §2.6 table corrected
+  (`CollectingSink`, + TapSpy row).
 
 ## Execution notes for the coordinator
 

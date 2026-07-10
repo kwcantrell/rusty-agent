@@ -273,7 +273,8 @@ sweep):
 | `agent-server/src/wire.rs` `server_event_from` | exhaustive — new arm (§2.3) |
 | `agent-cli/src/render.rs` `TerminalSink` | exhaustive — new arm (§2.5) |
 | `agent-runtime-config/src/trace.rs` `trace_event` + `TraceEvent` | exhaustive — new arm + on-disk shape (below) |
-| `agent-core/src/testkit.rs` `LabelSink` | exhaustive — new label arm |
+| `agent-core/src/testkit.rs` `CollectingSink` | exhaustive — new label arm |
+| `agent-core/src/dispatch.rs` test-mod `TapSpy` | exhaustive — new label arm (plan review) |
 | `agent-core/src/stats.rs` | has `_ => {}` — NO edit; `Subagent` events must not move any counter (the existing `subagent_turns`/`subagent_tool_calls` fold from `parent_id`-tagged rows stays the only source; test pins counters unmoved) |
 
 **Trace rule — no double-record.** The top-level sink is wrapped by
@@ -415,3 +416,7 @@ MAJOR-4 / Scope BLOCKER-1).
     justification is recorded on the `Reasoning` variant's doc note in §2.1
     (the pre-panel spec's blanket "no new exposure" claim was removed with
     the `prompt` field it annotated).
+- **2026-07-09 — plan written + 2-reviewer plan review (all findings folded;
+  log in the plan):** §2.6 table corrected here — the testkit sink is
+  `CollectingSink` (not `LabelSink`), and dispatch.rs's test-mod `TapSpy` is a
+  sixth compile-forced exhaustive match the sweep had missed.
