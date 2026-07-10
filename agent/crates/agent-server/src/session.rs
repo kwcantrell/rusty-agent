@@ -263,16 +263,26 @@ impl Session {
                 let Ok(resp) = rx.await else {
                     return;
                 };
-                // 4B-2 Task 2 threads feedback: Deny { feedback } is collapsed
-                // to a bool here and any feedback text is discarded.
-                let approve = matches!(
-                    resp,
-                    agent_policy::ApprovalResponse::Approve
-                        | agent_policy::ApprovalResponse::ApproveAlways
-                );
                 // Durable answer commit (header note 3). E2: ApproveAlways is
-                // committed as a plain one-shot approve.
-                if let Err(e) = checkpoint::write_answer(&ask_dir, &key, approve) {
+                // committed as a plain one-shot approve; a Deny's feedback
+                // text threads through so the resumed loop can render it.
+                let decision = match resp {
+                    agent_policy::ApprovalResponse::Approve
+                    | agent_policy::ApprovalResponse::ApproveAlways => checkpoint::ParkedAnswer {
+                        approve: true,
+                        feedback: None,
+                    },
+                    agent_policy::ApprovalResponse::Deny { feedback } => checkpoint::ParkedAnswer {
+                        approve: false,
+                        feedback,
+                    },
+                };
+                if let Err(e) = checkpoint::write_answer(
+                    &ask_dir,
+                    &key,
+                    decision.approve,
+                    decision.feedback.as_deref(),
+                ) {
                     sess.emit_error(format!("cannot commit answer: {e}"));
                     return;
                 }

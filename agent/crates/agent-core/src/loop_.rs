@@ -1302,8 +1302,8 @@ impl AgentLoop {
                     if let Some(ck) = self.checkpointer.as_ref() {
                         ck.clear_park();
                     }
-                    let approve = p.parked_decision.unwrap();
-                    if approve {
+                    let ans = p.parked_decision.clone().unwrap();
+                    if ans.approve {
                         // gate_preapproved emits ToolStart itself.
                         self.gate_preapproved(call, cancel)
                     } else {
@@ -1316,8 +1316,7 @@ impl AgentLoop {
                         GateOutcome::Rejected {
                             id: call.id,
                             name: call.name,
-                            // Task 2 threads the stored feedback in.
-                            content: denial_content(None),
+                            content: denial_content(ans.feedback.as_deref()),
                         }
                     }
                 }
@@ -1950,7 +1949,7 @@ pub struct ResumeTurn {
     pub parked_index: Option<usize>,
     /// Some(_) when a durable answer.json committed a decision (E2 note: an
     /// ApproveAlways answered pre-restart arrives as plain approve=true).
-    pub parked_decision: Option<bool>,
+    pub parked_decision: Option<crate::checkpoint::ParkedAnswer>,
     pub turn: u64,
     pub guardrails: crate::Guardrails,
     /// Goal text handed to fire_run_start (memory recall etc.); from the
@@ -1963,7 +1962,7 @@ struct PreDecided {
     records: Vec<crate::GateRecord>,
     parked_index: usize,
     /// Some(_) when answer.json committed a decision; None ⇒ re-ask live.
-    parked_decision: Option<bool>,
+    parked_decision: Option<crate::checkpoint::ParkedAnswer>,
     /// Dispatch-kind resume (owner decision P1): Ready records re-execute
     /// ONLY dispatch_agent calls; other siblings get a synthetic
     /// lost-result error so host side effects never replay.
@@ -9450,7 +9449,10 @@ mod tests {
             invalid: vec![],
             gate_records: vec![crate::GateRecord::Ready],
             parked_index: Some(1),
-            parked_decision: Some(true),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: true,
+                feedback: None,
+            }),
             turn: 3,
             guardrails: crate::Guardrails {
                 tool_calls: 5,
@@ -9507,7 +9509,10 @@ mod tests {
             invalid: vec![],
             gate_records: vec![crate::GateRecord::Ready],
             parked_index: Some(1),
-            parked_decision: Some(false),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: false,
+                feedback: None,
+            }),
             turn: 3,
             guardrails: crate::Guardrails {
                 tool_calls: 0,
@@ -9539,6 +9544,130 @@ mod tests {
             .find(|(i, _, _)| i == "c2")
             .cloned();
         assert!(c2.is_some());
+    }
+
+    /// Build the same resumed-batch rig as `resume_agent`, but wired to
+    /// `ToolResultSink` so the test can assert the exact spliced content
+    /// (`resume_agent`'s `IdSink` only records status labels).
+    fn resume_agent_with_result_sink(
+        ws: std::path::PathBuf,
+        approval: Arc<dyn ApprovalChannel>,
+    ) -> (AgentLoop, Arc<ToolResultSink>) {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        });
+        let sink = Arc::new(ToolResultSink::default());
+        let agent = AgentLoop::new(
+            Arc::new(ScriptedModel::new(vec![Scripted::Text(
+                "wrapped up".into(),
+            )])),
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            approval,
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        );
+        (agent, sink)
+    }
+
+    #[tokio::test]
+    async fn resumed_deny_renders_stored_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let approval = Arc::new(SpliceApproval {
+            resp: ApprovalResponse::Approve,
+            asks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            parked_at_ask: Arc::new(std::sync::Mutex::new(None)),
+            park_dir: None,
+        });
+        let (agent, sink) = resume_agent_with_result_sink(ws.clone(), approval);
+        let batch = echo_batch();
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![crate::GateRecord::Ready],
+            parked_index: Some(1),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: false,
+                feedback: Some("not that file".into()),
+            }),
+            turn: 3,
+            guardrails: crate::Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            goal_text: "the goal".into(),
+        };
+        agent
+            .resume_with_cancel(&mut ctx, resume, CancellationToken::new())
+            .await
+            .unwrap();
+        let results = sink.results.lock().unwrap();
+        let (status, content) = results
+            .iter()
+            .find(|(s, _)| *s == ToolStatus::Denied)
+            .expect("c2's denied result");
+        assert_eq!(*status, ToolStatus::Denied);
+        assert_eq!(content, &denial_content(Some("not that file")));
+    }
+
+    #[tokio::test]
+    async fn resumed_deny_without_feedback_matches_pre_4b2_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let approval = Arc::new(SpliceApproval {
+            resp: ApprovalResponse::Approve,
+            asks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            parked_at_ask: Arc::new(std::sync::Mutex::new(None)),
+            park_dir: None,
+        });
+        let (agent, sink) = resume_agent_with_result_sink(ws.clone(), approval);
+        let batch = echo_batch();
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![crate::GateRecord::Ready],
+            parked_index: Some(1),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: false,
+                feedback: None,
+            }),
+            turn: 3,
+            guardrails: crate::Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            goal_text: "the goal".into(),
+        };
+        agent
+            .resume_with_cancel(&mut ctx, resume, CancellationToken::new())
+            .await
+            .unwrap();
+        let results = sink.results.lock().unwrap();
+        let (status, content) = results
+            .iter()
+            .find(|(s, _)| *s == ToolStatus::Denied)
+            .expect("c2's denied result");
+        assert_eq!(*status, ToolStatus::Denied);
+        assert_eq!(content, &denial_content(None), "the 4B-1 string, unchanged");
     }
 
     #[tokio::test]
@@ -9626,7 +9755,10 @@ mod tests {
             invalid: vec![],
             gate_records: vec![crate::GateRecord::Ready],
             parked_index: Some(1),
-            parked_decision: Some(true),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: true,
+                feedback: None,
+            }),
             turn: 3,
             guardrails: crate::Guardrails {
                 tool_calls: (crate::TOOL_CALL_LIMIT - 1) as u64,

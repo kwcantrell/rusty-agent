@@ -1,6 +1,6 @@
 //! Attach-to-resume (spec §2.4): index parked runs from disk, re-emit their
 //! asks with re-derived displays, commit answers durably, resume the tree.
-use agent_core::checkpoint::{self, Checkpoint};
+use agent_core::checkpoint::{self, Checkpoint, ParkedAnswer};
 use agent_runtime_config::SessionDescriptor;
 use std::path::{Path, PathBuf};
 
@@ -90,8 +90,17 @@ fn walk(dir: &Path, key: &[u8; 32], s: &mut ParkedSession) {
 
 /// Durably commit an answer against one parked ask's checkpoint dir. The
 /// resumed loop consumes it via `checkpoint::take_answer` (verified, once).
-pub fn commit_answer(ask: &ParkedAsk, approve: bool, key: &[u8; 32]) -> std::io::Result<()> {
-    checkpoint::write_answer(&ask.dir, key, approve)
+pub fn commit_answer(
+    ask: &ParkedAsk,
+    decision: &ParkedAnswer,
+    key: &[u8; 32],
+) -> std::io::Result<()> {
+    checkpoint::write_answer(
+        &ask.dir,
+        key,
+        decision.approve,
+        decision.feedback.as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -278,9 +287,23 @@ mod tests {
         let ask = &parked[0].asks[0];
         assert!(!ask.answered, "no answer.json planted yet");
 
-        commit_answer(ask, true, &key()).unwrap();
+        commit_answer(
+            ask,
+            &ParkedAnswer {
+                approve: true,
+                feedback: None,
+            },
+            &key(),
+        )
+        .unwrap();
         // The resumed loop consumes it via take_answer — exactly once.
-        assert_eq!(checkpoint::take_answer(&ask.dir, &key()), Some(true));
+        assert_eq!(
+            checkpoint::take_answer(&ask.dir, &key()),
+            Some(ParkedAnswer {
+                approve: true,
+                feedback: None
+            })
+        );
         assert_eq!(
             checkpoint::take_answer(&ask.dir, &key()),
             None,

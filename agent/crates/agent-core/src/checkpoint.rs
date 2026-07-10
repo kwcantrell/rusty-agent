@@ -122,7 +122,17 @@ struct Manifest {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Answer {
     approve: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    feedback: Option<String>,
     mac: String,
+}
+
+/// A durably committed approval decision (spec §2.3 answer commit point).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParkedAnswer {
+    pub approve: bool,
+    /// Human feedback on a Deny — model-visible, therefore MAC-covered.
+    pub feedback: Option<String>,
 }
 
 fn create_dir_0700(dir: &Path) -> std::io::Result<()> {
@@ -280,20 +290,38 @@ pub fn clear_park(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("answer.json"));
 }
 
-fn answer_mac(key: &[u8; 32], approve: bool, manifest_hmac: &str) -> String {
-    let mut data = vec![approve as u8];
-    data.extend_from_slice(manifest_hmac.as_bytes());
-    hex(&hmac_sha256(key, &data))
+/// Version-prefixed, domain-separated: `[2, approve]` differs in both length
+/// and first byte from the old `[approve] ‖ manifest_hex` message, so no
+/// cross-formula reinterpretation exists in either direction (a legacy
+/// answer.json — no `feedback` field — never verifies under this formula).
+fn answer_mac(key: &[u8; 32], approve: bool, feedback: Option<&str>, manifest_mac: &str) -> String {
+    let mut msg = vec![2u8, approve as u8]; // 2 = answer-format version
+    match feedback {
+        Some(f) => {
+            msg.push(1);
+            msg.extend_from_slice(&(f.len() as u64).to_le_bytes());
+            msg.extend_from_slice(f.as_bytes());
+        }
+        None => msg.push(0),
+    }
+    msg.extend_from_slice(manifest_mac.as_bytes());
+    hex(&hmac_sha256(key, &msg))
 }
 
 /// Restart-path answer commit (header note 3): durable, MAC-bound to the
 /// exact park it answers. The resumed loop consumes it via `take_answer`.
-pub fn write_answer(dir: &Path, key: &[u8; 32], approve: bool) -> std::io::Result<()> {
+pub fn write_answer(
+    dir: &Path,
+    key: &[u8; 32],
+    approve: bool,
+    feedback: Option<&str>,
+) -> std::io::Result<()> {
     let m = verified_manifest(dir, key)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let a = Answer {
         approve,
-        mac: answer_mac(key, approve, &m.hmac),
+        feedback: feedback.map(str::to_string),
+        mac: answer_mac(key, approve, feedback, &m.hmac),
     };
     atomic_write_0600(
         &dir.join("answer.json"),
@@ -302,13 +330,21 @@ pub fn write_answer(dir: &Path, key: &[u8; 32], approve: bool) -> std::io::Resul
 }
 
 /// Verify + consume the answer. Any verification failure ⇒ None (the ask is
-/// re-prompted — fail closed, never fail open).
-pub fn take_answer(dir: &Path, key: &[u8; 32]) -> Option<bool> {
+/// re-prompted — fail closed, never fail open). Consumes (removes the file)
+/// BEFORE verifying, so a forged or corrupt answer never re-verifies.
+pub fn take_answer(dir: &Path, key: &[u8; 32]) -> Option<ParkedAnswer> {
     let bytes = std::fs::read(dir.join("answer.json")).ok()?;
     let _ = std::fs::remove_file(dir.join("answer.json"));
     let a: Answer = serde_json::from_slice(&bytes).ok()?;
     let m = verified_manifest(dir, key).ok()?;
-    mac_eq(&a.mac, &answer_mac(key, a.approve, &m.hmac)).then_some(a.approve)
+    mac_eq(
+        &a.mac,
+        &answer_mac(key, a.approve, a.feedback.as_deref(), &m.hmac),
+    )
+    .then_some(ParkedAnswer {
+        approve: a.approve,
+        feedback: a.feedback,
+    })
 }
 
 /// Path-component sanitizer for child checkpoint dirs (spec §2.3): keep
@@ -391,7 +427,7 @@ impl Checkpoint {
     /// injected separately by the caller (from a durable answer.json, or None
     /// to re-ask live). No verification here — the caller runs
     /// `verify_tally_floor` + manifest checks before building this.
-    pub fn resume_turn(&self, parked_decision: Option<bool>) -> crate::ResumeTurn {
+    pub fn resume_turn(&self, parked_decision: Option<ParkedAnswer>) -> crate::ResumeTurn {
         crate::ResumeTurn {
             assistant_text: self.parked.assistant_text.clone(),
             tool_calls: self.parked.tool_calls.clone(),
@@ -622,13 +658,13 @@ impl Checkpointer {
         self.waiting_asks.load(Ordering::SeqCst) > 0
     }
 
-    pub fn take_answer(&self) -> Option<bool> {
+    pub fn take_answer(&self) -> Option<ParkedAnswer> {
         take_answer(&self.dir, &self.key)
     }
 
     /// Consume a child's durable answer (dispatch resume rebinding): the
     /// answer.json committed against the child's park before restart.
-    pub fn load_child_answer(&self, call_id: &str) -> Option<bool> {
+    pub fn load_child_answer(&self, call_id: &str) -> Option<ParkedAnswer> {
         take_answer(
             &self.dir.join("children").join(sanitize_dir_key(call_id)),
             &self.key,
@@ -874,8 +910,14 @@ mod tests {
     fn answer_round_trips_consumes_and_rejects_forgery() {
         let dir = tempfile::tempdir().unwrap();
         write_checkpoint(dir.path(), &key(), &sample(), &arts()).unwrap();
-        write_answer(dir.path(), &key(), true).unwrap();
-        assert_eq!(take_answer(dir.path(), &key()), Some(true));
+        write_answer(dir.path(), &key(), true, None).unwrap();
+        assert_eq!(
+            take_answer(dir.path(), &key()),
+            Some(ParkedAnswer {
+                approve: true,
+                feedback: None
+            })
+        );
         assert_eq!(take_answer(dir.path(), &key()), None, "consumed");
         // forged (no key): hand-written approve must not verify
         std::fs::write(
@@ -884,6 +926,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(take_answer(dir.path(), &key()), None);
+    }
+
+    #[test]
+    fn answer_roundtrips_feedback_and_macs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write_checkpoint(dir.path(), &key(), &sample(), &arts()).unwrap();
+        write_answer(dir.path(), &key(), false, Some("wrong branch")).unwrap();
+        assert_eq!(
+            take_answer(dir.path(), &key()),
+            Some(ParkedAnswer {
+                approve: false,
+                feedback: Some("wrong branch".into())
+            })
+        );
+        assert_eq!(take_answer(dir.path(), &key()), None, "consumed");
+    }
+
+    #[test]
+    fn tampered_feedback_fails_mac_and_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        write_checkpoint(dir.path(), &key(), &sample(), &arts()).unwrap();
+        write_answer(dir.path(), &key(), false, Some("ok")).unwrap();
+        let p = dir.path().join("answer.json");
+        let body = std::fs::read_to_string(&p)
+            .unwrap()
+            .replace("ok", "run rm -rf /");
+        std::fs::write(&p, body).unwrap();
+        assert_eq!(take_answer(dir.path(), &key()), None, "MAC mismatch");
+        assert!(!p.exists(), "consumed even on failure (fail-closed)");
+    }
+
+    #[test]
+    fn legacy_answer_without_feedback_field_fails_new_mac_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_checkpoint(dir.path(), &key(), &sample(), &arts()).unwrap();
+        let m = verified_manifest(dir.path(), &key()).unwrap();
+        // Old formula: hmac(key, [approve as u8] ++ manifest_hmac_bytes).
+        let mut old_data = vec![true as u8];
+        old_data.extend_from_slice(m.hmac.as_bytes());
+        let old_mac = hex(&hmac_sha256(&key(), &old_data));
+        let body = serde_json::json!({"approve": true, "mac": old_mac});
+        std::fs::write(
+            dir.path().join("answer.json"),
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            take_answer(dir.path(), &key()),
+            None,
+            "old-format MAC never verifies under the new versioned formula"
+        );
     }
 
     #[tokio::test]

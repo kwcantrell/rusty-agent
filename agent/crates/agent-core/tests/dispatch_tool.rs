@@ -1853,7 +1853,7 @@ async fn dispatch_rebinds_a_parked_child_and_resumes_in_place() {
         &Default::default(),
     )
     .unwrap();
-    write_answer(&child_dir, &CKKEY, true).unwrap();
+    write_answer(&child_dir, &CKKEY, true, None).unwrap();
 
     // A recording approval proves NO prompt fires on resume.
     let approval = Arc::new(RecordingApproval {
