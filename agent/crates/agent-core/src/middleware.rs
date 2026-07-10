@@ -423,6 +423,130 @@ impl Middleware for ContextCurationMiddleware {
     }
 }
 
+/// Cap on raw index bytes the middleware will process per load (spec §2.4).
+/// NOTE (accepted residual, flag in review): Backend::read is whole-document,
+/// so RAM during the read equals file size — same exposure as the read_file
+/// tool; this cap bounds what enters processing/context. Dirty-flag cadence
+/// makes loads rare. A ranged-read backend method is future work.
+pub(crate) const MEMORY_INDEX_MAX_BYTES: usize = 256 * 1024;
+
+/// Rewrite a relative markdown link target to resolve under the memory mount.
+pub(crate) fn prefix_links(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find("](") {
+        let (head, tail) = rest.split_at(i + 2);
+        out.push_str(head);
+        if !(tail.starts_with('/')
+            || tail.starts_with("memories/")
+            || tail.starts_with("http://")
+            || tail.starts_with("https://"))
+        {
+            out.push_str("memories/project/");
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Non-empty index lines within the byte cap, link-prefixed, plus the exact
+/// count of non-empty lines dropped by the cap.
+pub(crate) fn index_lines(content: &str) -> (Vec<String>, usize) {
+    let mut kept = Vec::new();
+    let mut omitted = 0usize;
+    let mut used = 0usize;
+    for line in content.lines().filter(|l| !l.trim().is_empty()) {
+        // Cap on the PREFIXED length: prefix_links can grow a relative link
+        // target (e.g. `a.md` -> `memories/project/a.md`), so measuring the
+        // raw line would let the kept set exceed MEMORY_INDEX_MAX_BYTES.
+        let prefixed = prefix_links(line);
+        if used + prefixed.len() + 1 > MEMORY_INDEX_MAX_BYTES {
+            omitted += 1;
+            continue;
+        }
+        used += prefixed.len() + 1;
+        kept.push(prefixed);
+    }
+    (kept, omitted)
+}
+
+/// RunShared flag: a tool call wrote under the memory mount this turn.
+#[derive(Default)]
+struct MemoryDirty(bool);
+
+/// File-based memory (spec §2.4): loads memories/project/index.md into the
+/// pinned memory block at run start; dirty-flag refresh after any turn whose
+/// tools successfully wrote under the mount (gate E2). Contributes NO tools —
+/// editing is the ordinary file tools. Parent-only (child quarantine, §2.6).
+pub struct MemoryFilesMiddleware {
+    mem: Arc<dyn agent_tools::backend::Backend>,
+}
+
+impl MemoryFilesMiddleware {
+    pub fn new(mem: Arc<dyn agent_tools::backend::Backend>) -> Self {
+        Self { mem }
+    }
+    async fn load(&self, cx: &mut RunCx<'_>) {
+        // Missing dir/index ⇒ empty block; errors degrade, never abort (§4).
+        let lines = match self.mem.read("index.md").await {
+            Ok(content) => {
+                let (mut lines, omitted) = index_lines(&content);
+                if omitted > 0 {
+                    // Byte-cap omissions fold into the pointer via extra lines
+                    // the budget will also truncate; simplest honest signal:
+                    lines.push(format!(
+                        "[index byte-capped: {omitted} more lines — read memories/project/index.md]"
+                    ));
+                }
+                lines
+            }
+            Err(agent_tools::backend::FsError::NotFound(_)) => Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "memory index unreadable; loading empty");
+                Vec::new()
+            }
+        };
+        cx.ctx.set_recall(lines);
+    }
+}
+
+#[async_trait]
+impl Middleware for MemoryFilesMiddleware {
+    fn name(&self) -> &str {
+        "memory-files"
+    }
+    async fn on_run_start(&self, cx: &mut RunCx<'_>, _input: &str) -> Flow {
+        self.load(cx).await;
+        Flow::Continue
+    }
+    async fn wrap_tool_call(&self, call: ToolCall, next: ToolNext<'_>) -> crate::Executed {
+        let writes_memory = matches!(call.name.as_str(), "write_file" | "edit_file")
+            && call
+                .args
+                .get("path")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p.starts_with("memories/"));
+        // RunShared derives Clone (Arc<Mutex<..>> — cheap bump); clone BEFORE
+        // next.run(self) consumes `next`, set the flag AFTER on success.
+        let shared = next.shared().clone();
+        let out = next.run(call.args.clone()).await;
+        if writes_memory && matches!(out, crate::Executed::Ok(_)) {
+            shared.with::<MemoryDirty, _>(|d| d.0 = true);
+        }
+        out
+    }
+    async fn after_tools(&self, cx: &mut RunCx<'_>) -> Flow {
+        let dirty = cx
+            .shared()
+            .with::<MemoryDirty, _>(|d| std::mem::take(&mut d.0));
+        if dirty {
+            self.load(cx).await;
+        }
+        Flow::Continue
+    }
+}
+
 /// Repeated-identical-call detection (spec §5.5): nudge on the 3rd identical
 /// turn, abort on the 5th. Signature and message strings are byte-identical
 /// to the loop-resident original.
@@ -921,5 +1045,345 @@ mod tests {
                 Repair::ReAsk(_)
             ));
         }
+    }
+
+    // ---- MemoryFilesMiddleware (4A-1 A4 brief) ------------------------------
+
+    #[test]
+    fn prefix_links_rewrites_relative_targets_only() {
+        assert_eq!(
+            prefix_links("* [A](a.md) - h"),
+            "* [A](memories/project/a.md) - h"
+        );
+        assert_eq!(
+            prefix_links("* [A](memories/project/a.md) - h"),
+            "* [A](memories/project/a.md) - h"
+        );
+        assert_eq!(prefix_links("* [A](https://x) - h"), "* [A](https://x) - h");
+        assert_eq!(prefix_links("no link here"), "no link here");
+    }
+
+    #[test]
+    fn index_lines_caps_bytes_and_counts_omitted() {
+        let big: String = (0..10_000)
+            .map(|i| format!("* [m{i}](m{i}.md) - hook\n"))
+            .collect();
+        let (lines, omitted) = index_lines(&big);
+        assert!(lines.iter().map(|l| l.len() + 1).sum::<usize>() <= MEMORY_INDEX_MAX_BYTES);
+        assert!(omitted > 0);
+        let small = "* [a](a.md) - h\n";
+        let (lines, omitted) = index_lines(small);
+        assert_eq!((lines.len(), omitted), (1, 0));
+    }
+
+    use crate::context::MEMORY_HEADER;
+    use agent_tools::backend::{Backend, FsError, MemBackend};
+
+    /// A `RunCx` at run-start (`turn: None`), sharing the caller's
+    /// `ctx`/`state`/`shared` — mirrors `parse_fail_cx` above but for the
+    /// on_run_start / wrap_tool_call / after_tools hooks this middleware uses.
+    #[allow(clippy::too_many_arguments)]
+    fn mem_files_cx<'a>(
+        ctx: &'a mut dyn ContextManager,
+        state: &'a mut RunState,
+        shared: &'a RunShared,
+        cancel: &'a CancellationToken,
+        sink: &'a Arc<dyn EventSink>,
+        model: &'a Arc<dyn ModelClient>,
+        turn: Option<usize>,
+    ) -> RunCx<'a> {
+        RunCx {
+            ctx,
+            sink,
+            cancel,
+            state,
+            shared,
+            turn,
+            maint: MaintView {
+                maint_model: model,
+                maint_model_limit: 100_000,
+                effective_model_limit: 100_000,
+            },
+        }
+    }
+
+    /// Renders the pinned prompt from a `WindowContext` for assertions.
+    fn rendered(ctx: &crate::WindowContext) -> String {
+        ctx.build(100_000)
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+    }
+
+    #[tokio::test]
+    async fn memory_files_loads_index_at_run_start() {
+        let mem: Arc<dyn Backend> = Arc::new(MemBackend::new());
+        mem.write("index.md", "* [A](a.md) - hook a\n* [B](b.md) - hook b\n")
+            .await
+            .unwrap();
+        let m = MemoryFilesMiddleware::new(mem);
+
+        let mut ctx = crate::WindowContext::new(agent_model::Message::system("sys"));
+        let mut state = RunState::default();
+        let shared = RunShared::default();
+        let cancel = CancellationToken::new();
+        let sink: Arc<dyn EventSink> = Arc::new(crate::testkit::CollectingSink::default());
+        let model: Arc<dyn ModelClient> = Arc::new(crate::testkit::ScriptedModel::new(vec![]));
+
+        {
+            let mut cx = mem_files_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, None);
+            let flow = m.on_run_start(&mut cx, "go").await;
+            assert_eq!(flow, Flow::Continue);
+        }
+
+        let prompt = rendered(&ctx);
+        assert!(prompt.contains(MEMORY_HEADER));
+        assert!(prompt.contains("* [A](memories/project/a.md) - hook a"));
+        assert!(prompt.contains("* [B](memories/project/b.md) - hook b"));
+    }
+
+    #[tokio::test]
+    async fn memory_files_missing_index_renders_no_block() {
+        let mem: Arc<dyn Backend> = Arc::new(MemBackend::new());
+        let m = MemoryFilesMiddleware::new(mem);
+
+        let mut ctx = crate::WindowContext::new(agent_model::Message::system("sys"));
+        let mut state = RunState::default();
+        let shared = RunShared::default();
+        let cancel = CancellationToken::new();
+        let sink: Arc<dyn EventSink> = Arc::new(crate::testkit::CollectingSink::default());
+        let model: Arc<dyn ModelClient> = Arc::new(crate::testkit::ScriptedModel::new(vec![]));
+
+        {
+            let mut cx = mem_files_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, None);
+            m.on_run_start(&mut cx, "go").await;
+        }
+
+        let prompt = rendered(&ctx);
+        assert!(!prompt.contains(MEMORY_HEADER));
+    }
+
+    /// Minimal Write-tier tool that always succeeds — mirrors `WriteStub` in
+    /// loop_.rs (used there for validator tests); this file drives
+    /// `wrap_tool_call` directly (no loop), so it needs its own local copy.
+    struct AlwaysWrites;
+    #[async_trait]
+    impl agent_tools::Tool for AlwaysWrites {
+        fn name(&self) -> &str {
+            "write_file"
+        }
+        fn description(&self) -> &str {
+            "writes (test stub)"
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: "write_file".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn intent(
+            &self,
+            _args: &serde_json::Value,
+        ) -> Result<agent_tools::ToolIntent, agent_tools::ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: "write_file".into(),
+                access: agent_tools::Access::Write,
+                paths: vec![],
+                command: None,
+                summary: "write".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &agent_tools::ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, agent_tools::ToolError> {
+            Ok(agent_tools::ToolOutput {
+                content: "wrote".into(),
+                display: None,
+            })
+        }
+    }
+
+    fn test_tool_ctx() -> agent_tools::ToolCtx {
+        agent_tools::ToolCtx {
+            workspace: std::env::temp_dir(),
+            timeout: std::time::Duration::from_secs(5),
+            cancel: CancellationToken::new(),
+            sandbox: Arc::new(agent_tools::HostExecutor),
+            backend: Arc::new(agent_tools::backend::HostBackend::new(std::env::temp_dir())),
+            call_id: "test".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_files_dirty_flag_refreshes() {
+        let mem: Arc<dyn Backend> = Arc::new(MemBackend::new());
+        mem.write("index.md", "* [A](a.md) - hook a\n")
+            .await
+            .unwrap();
+        let m = MemoryFilesMiddleware::new(mem.clone());
+
+        let mut ctx = crate::WindowContext::new(agent_model::Message::system("sys"));
+        let mut state = RunState::default();
+        let shared = RunShared::default();
+        let cancel = CancellationToken::new();
+        let sink: Arc<dyn EventSink> = Arc::new(crate::testkit::CollectingSink::default());
+        let model: Arc<dyn ModelClient> = Arc::new(crate::testkit::ScriptedModel::new(vec![]));
+
+        // Run-start load: index has one entry.
+        {
+            let mut cx = mem_files_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, None);
+            m.on_run_start(&mut cx, "go").await;
+        }
+        assert!(rendered(&ctx).contains("hook a"));
+
+        // Turn 1: a scripted `write_file` call under `memories/` succeeds —
+        // drive `wrap_tool_call` directly (no mount exists yet; A5 wires it).
+        let tool: Arc<dyn agent_tools::Tool> = Arc::new(AlwaysWrites);
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "write_file".into(),
+            args: serde_json::json!({"path": "memories/project/index.md", "content": "..."}),
+        };
+        let tctx = test_tool_ctx();
+        let next = ToolNext {
+            tool: tool.clone(),
+            name: "write_file",
+            tctx: &tctx,
+            chain: &[],
+            call: &call,
+            shared: &shared,
+        };
+        let out = m.wrap_tool_call(call.clone(), next).await;
+        assert!(matches!(out, crate::Executed::Ok(_)));
+
+        // Simulate the write actually landing in the backend (A5's mount does
+        // this for real; here we drive the effect the dirty flag exists to
+        // pick up) before after_tools re-reads.
+        mem.write("index.md", "* [A](a.md) - hook a\n* [C](c.md) - hook c\n")
+            .await
+            .unwrap();
+
+        // after_tools sees the dirty flag set by wrap_tool_call and reloads.
+        {
+            let mut cx = mem_files_cx(
+                &mut ctx,
+                &mut state,
+                &shared,
+                &cancel,
+                &sink,
+                &model,
+                Some(0),
+            );
+            let flow = m.after_tools(&mut cx).await;
+            assert_eq!(flow, Flow::Continue);
+        }
+        let prompt = rendered(&ctx);
+        assert!(prompt.contains("hook a"));
+        assert!(
+            prompt.contains("hook c"),
+            "after_tools must reload the index once the dirty flag is set: {prompt}"
+        );
+    }
+
+    /// Counts `read` calls so the no-reread test can assert the run-start
+    /// load is the ONLY read when no memory write happens this turn.
+    #[derive(Default)]
+    struct CountingBackend {
+        inner: MemBackend,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Backend for CountingBackend {
+        async fn ls(&self, path: &str) -> Result<Vec<agent_tools::backend::Entry>, FsError> {
+            self.inner.ls(path).await
+        }
+        async fn read(&self, path: &str) -> Result<String, FsError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read(path).await
+        }
+        async fn write(&self, path: &str, content: &str) -> Result<(), FsError> {
+            self.inner.write(path, content).await
+        }
+        async fn glob(&self, pattern: &str) -> Result<Vec<String>, FsError> {
+            self.inner.glob(pattern).await
+        }
+        async fn grep(
+            &self,
+            pattern: &str,
+            path: Option<&str>,
+        ) -> Result<Vec<agent_tools::backend::GrepHit>, FsError> {
+            self.inner.grep(pattern, path).await
+        }
+        async fn delete(&self, path: &str) -> Result<(), FsError> {
+            self.inner.delete(path).await
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_files_clean_turn_does_not_reread() {
+        let counting = Arc::new(CountingBackend::default());
+        counting
+            .write("index.md", "* [A](a.md) - hook a\n")
+            .await
+            .unwrap();
+        let mem: Arc<dyn Backend> = counting.clone();
+        let m = MemoryFilesMiddleware::new(mem);
+
+        let mut ctx = crate::WindowContext::new(agent_model::Message::system("sys"));
+        let mut state = RunState::default();
+        let shared = RunShared::default();
+        let cancel = CancellationToken::new();
+        let sink: Arc<dyn EventSink> = Arc::new(crate::testkit::CollectingSink::default());
+        let model: Arc<dyn ModelClient> = Arc::new(crate::testkit::ScriptedModel::new(vec![]));
+
+        // Run-start load: 1 read.
+        {
+            let mut cx = mem_files_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, None);
+            m.on_run_start(&mut cx, "go").await;
+        }
+        assert_eq!(counting.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A turn with a non-memory tool call: wrap_tool_call sees no memory
+        // write, so no dirty flag; after_tools must not re-read.
+        let tool: Arc<dyn agent_tools::Tool> = Arc::new(AlwaysWrites);
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "some_other_tool".into(),
+            args: serde_json::json!({}),
+        };
+        let tctx = test_tool_ctx();
+        let next = ToolNext {
+            tool: tool.clone(),
+            name: "some_other_tool",
+            tctx: &tctx,
+            chain: &[],
+            call: &call,
+            shared: &shared,
+        };
+        let out = m.wrap_tool_call(call.clone(), next).await;
+        assert!(matches!(out, crate::Executed::Ok(_)));
+
+        {
+            let mut cx = mem_files_cx(
+                &mut ctx,
+                &mut state,
+                &shared,
+                &cancel,
+                &sink,
+                &model,
+                Some(0),
+            );
+            m.after_tools(&mut cx).await;
+        }
+        assert_eq!(
+            counting.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a clean turn (no memory write) must not trigger a reread"
+        );
     }
 }
