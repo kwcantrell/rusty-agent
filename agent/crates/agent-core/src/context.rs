@@ -240,6 +240,12 @@ pub trait ContextManager: Send + Sync {
     fn checkpoint_state(&self) -> Option<crate::CuratedContextState> {
         None
     }
+    /// Durable artifact stores to dump alongside a park checkpoint (spec §2.3).
+    /// Default None: implementations without durable stores (WindowContext,
+    /// test doubles) contribute an empty dump. Overridden by `CuratedContext`.
+    fn artifacts(&self) -> Option<Arc<crate::SessionArtifacts>> {
+        None
+    }
 }
 
 /// Sliding-window context: always keeps the system prompt; evicts oldest

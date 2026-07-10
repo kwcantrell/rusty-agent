@@ -1091,8 +1091,12 @@ impl AgentLoop {
         // Task 8; None in this task.
         pre: Option<PreDecided>,
     ) -> TurnFlow {
-        let _ = assistant_text;
         debug_assert!(pre.is_none());
+        // Park-support state (E1: pure memory unless an Ask actually parks;
+        // None checkpointer ⇒ every branch below is a no-op).
+        let batch_for_park: Option<Vec<ToolCall>> =
+            self.checkpointer.as_ref().map(|_| tool_calls.clone());
+        let mut records: Vec<crate::GateRecord> = Vec::new();
         // Phase 1 — gate every call sequentially (one approval prompt at a time).
         let mut order: Vec<String> = Vec::with_capacity(tool_calls.len() + invalid.len());
         let mut results: HashMap<String, (String, Resolved)> = HashMap::new();
@@ -1128,6 +1132,9 @@ impl AgentLoop {
         for call in tool_calls {
             match self.gate_tool(call, cancel).await {
                 GateOutcome::Rejected { id, name, content } => {
+                    records.push(crate::GateRecord::Rejected {
+                        content: content.clone(),
+                    });
                     order.push(id.clone());
                     results.insert(
                         id,
@@ -1142,6 +1149,7 @@ impl AgentLoop {
                     );
                 }
                 GateOutcome::Ready(rc) => {
+                    records.push(crate::GateRecord::Ready);
                     order.push(rc.id.clone());
                     ready.push(rc);
                 }
@@ -1153,6 +1161,47 @@ impl AgentLoop {
                         access,
                     } = *pa;
                     self.sink.emit(AgentEvent::Approval(req.clone()));
+                    // Park BEFORE blocking (spec §2.3). Write failure degrades
+                    // to live-only — log + event, never block the run.
+                    if let (Some(ck), Some(batch)) =
+                        (self.checkpointer.as_ref(), batch_for_park.as_ref())
+                    {
+                        if let Some(state) = ctx.checkpoint_state() {
+                            let idx = records.len();
+                            let chk = crate::Checkpoint {
+                                version: crate::CHECKPOINT_VERSION,
+                                session_id: ck.session_id().to_string(),
+                                subagent_path: ck.subagent_path().to_vec(),
+                                turn: turn as u64,
+                                context: state,
+                                guardrails: crate::Guardrails {
+                                    tool_calls: run_shared.with::<crate::ToolCallCount, _>(|c| c.0)
+                                        as u64,
+                                    model_calls: run_shared
+                                        .with::<crate::ModelCallCount, _>(|c| c.0)
+                                        as u64,
+                                },
+                                parked: crate::ParkedTurn {
+                                    assistant_text: assistant_text.clone(),
+                                    tool_calls: batch.clone(),
+                                    invalid: invalid.clone(),
+                                    gate_records: records.clone(),
+                                    parked_index: Some(idx),
+                                    origin: ck.origin().cloned(),
+                                },
+                            };
+                            let artifacts = ctx
+                                .artifacts()
+                                .unwrap_or_else(|| Arc::new(crate::SessionArtifacts::new()));
+                            if let Err(e) = ck.write_park(chk, &artifacts).await {
+                                tracing::warn!(target: "checkpoint", error = %e,
+                                    "park write failed; approval is live-only this ask");
+                                self.sink.emit(AgentEvent::Error(format!(
+                                    "checkpoint write failed (approval not durable): {e}"
+                                )));
+                            }
+                        }
+                    }
                     // P2 deadline disarm: while this durable Ask waits,
                     // every enclosing dispatch deadline is suspended.
                     // RAII — deny/cancel/drop all unwind the count.
@@ -1167,7 +1216,14 @@ impl AgentLoop {
                             ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
                         ),
                     };
+                    // Answer commit (spec §2.3): delete the park before
+                    // proceeding. Auto-deny (E5 knob) and cancel-deny commit
+                    // the same way.
+                    if let Some(ck) = self.checkpointer.as_ref() {
+                        ck.clear_park();
+                    }
                     if allowed {
+                        records.push(crate::GateRecord::Ready);
                         let rc = self.ready_call(tool, call, access, cancel);
                         order.push(rc.id.clone());
                         ready.push(rc);
@@ -1179,6 +1235,10 @@ impl AgentLoop {
                         } else {
                             "user declined"
                         };
+                        let content = format!("ERROR: {}", ToolError::Denied(reason.into()));
+                        records.push(crate::GateRecord::Rejected {
+                            content: content.clone(),
+                        });
                         order.push(call.id.clone());
                         results.insert(
                             call.id,
@@ -1186,12 +1246,37 @@ impl AgentLoop {
                                 call.name,
                                 Resolved::Err {
                                     status: ToolStatus::Denied,
-                                    content: format!("ERROR: {}", ToolError::Denied(reason.into())),
+                                    content,
                                     duration_ms: 0,
                                 },
                             ),
                         );
                     }
+                }
+            }
+        }
+
+        // Ancestor snapshot (spec §2.5, header note 4): memory-only; flushed
+        // to disk only if a descendant parks. Dispatch-bearing turns only.
+        if let Some(ck) = self.checkpointer.as_ref() {
+            if ready.iter().any(|rc| rc.name == "dispatch_agent") {
+                if let Some(state) = ctx.checkpoint_state() {
+                    ck.set_turn_snapshot(crate::PendingSnapshot {
+                        context: state,
+                        guardrails: crate::Guardrails {
+                            tool_calls: run_shared.with::<crate::ToolCallCount, _>(|c| c.0) as u64,
+                            model_calls: run_shared.with::<crate::ModelCallCount, _>(|c| c.0)
+                                as u64,
+                        },
+                        turn: turn as u64,
+                        assistant_text: assistant_text.clone(),
+                        tool_calls: batch_for_park.clone().unwrap_or_default(),
+                        invalid: invalid.clone(),
+                        gate_records: records.clone(),
+                        artifacts: ctx
+                            .artifacts()
+                            .unwrap_or_else(|| Arc::new(crate::SessionArtifacts::new())),
+                    });
                 }
             }
         }
@@ -1406,29 +1491,40 @@ impl AgentLoop {
             }
         }
 
-        // Node hook: after_tools (spec §5.1).
+        // Node hook: after_tools (spec §5.1). An EndRun here still falls
+        // through to the shared turn-end tail below (plan review finding 2):
+        // returning inline would leak a flushed dispatch-kind park.
         let flow = self
             .fire_after_tools(ctx, &mut *mw_state, cancel, turn, run_shared)
             .await;
-        if let crate::Flow::EndRun(reason) = flow {
+        let out = if let crate::Flow::EndRun(reason) = flow {
             self.sink.emit(AgentEvent::Done(reason));
-            return TurnFlow::End(Ok(()));
+            TurnFlow::End(Ok(()))
+        } else {
+            // Scheduled loop-bottom maintain now lives in
+            // ContextCurationMiddleware::on_turn_end (spec §5.5), fired below;
+            // it also sets the Maintained run-state marker that gates the
+            // text-only-exit maintain in after_final_reply.
+            //
+            // Node hook: on_turn_end (spec §5.1).
+            let flow = self
+                .fire_turn_end(ctx, &mut *mw_state, cancel, turn, run_shared)
+                .await;
+            if let crate::Flow::EndRun(reason) = flow {
+                self.sink.emit(AgentEvent::Done(reason));
+                TurnFlow::End(Ok(()))
+            } else {
+                TurnFlow::Continue
+            }
+        };
+        // Turn over either way: drop the memory snapshot; remove a dispatch-kind
+        // park if a child flushed it this turn (all children finished — Phase 2
+        // drained). Zero I/O unless a flush happened. Runs on EVERY exit of this
+        // shared tail, including the two EndRun exits above.
+        if let Some(ck) = self.checkpointer.as_ref() {
+            ck.end_turn();
         }
-
-        // Scheduled loop-bottom maintain now lives in
-        // ContextCurationMiddleware::on_turn_end (spec §5.5), fired below;
-        // it also sets the Maintained run-state marker that gates the
-        // text-only-exit maintain in after_final_reply.
-        //
-        // Node hook: on_turn_end (spec §5.1).
-        let flow = self
-            .fire_turn_end(ctx, &mut *mw_state, cancel, turn, run_shared)
-            .await;
-        if let crate::Flow::EndRun(reason) = flow {
-            self.sink.emit(AgentEvent::Done(reason));
-            return TurnFlow::End(Ok(()));
-        }
-        TurnFlow::Continue
+        out
     }
 
     /// Resolve, policy-check, and (if needed) get approval for one call — but do NOT
@@ -8342,6 +8438,442 @@ mod tests {
             events.last().map(String::as_str),
             Some("done"),
             "the truncation abort must still terminate with Done; events were: {events:?}"
+        );
+    }
+
+    // ---- Task 7: park-point checkpoint (write at Ask, delete on answer) ----
+
+    /// Approval channel that answers `resp` and records how many times it
+    /// was asked plus whether a park existed on disk WHILE it blocked.
+    struct ParkApproval {
+        resp: ApprovalResponse,
+        asks: Arc<std::sync::atomic::AtomicUsize>,
+        /// Some(bool) once asked: did a park exist at ask time?
+        parked_at_ask: Arc<std::sync::Mutex<Option<bool>>>,
+        park_dir: std::path::PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl ApprovalChannel for ParkApproval {
+        async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+            self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.parked_at_ask.lock().unwrap() = Some(crate::checkpoint::has_park(&self.park_dir));
+            self.resp
+        }
+    }
+
+    /// Build a one-execute_command-call agent with an empty-allowlist policy
+    /// (⇒ Ask) wired to `approval` and `ck`. Mirrors the
+    /// `approval_summary_includes_sandbox_posture` rig.
+    fn ask_agent(
+        ws: std::path::PathBuf,
+        approval: Arc<dyn ApprovalChannel>,
+        ck: Arc<crate::Checkpointer>,
+    ) -> (AgentLoop, Arc<CollectingSink>) {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        });
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "execute_command".into(),
+                r#"{"command":"echo hi"}"#.into(),
+            ),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            approval,
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        )
+        .with_checkpointer(ck);
+        (agent, sink)
+    }
+
+    fn curated(ws_note: &str) -> crate::CuratedContext {
+        let _ = ws_note;
+        crate::CuratedContext::new(
+            Message::system("s"),
+            Arc::new(crate::SessionArtifacts::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    #[tokio::test]
+    async fn ask_parks_before_blocking_and_answer_deletes_the_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked_at_ask = Arc::new(std::sync::Mutex::new(None));
+        let approval = Arc::new(ParkApproval {
+            resp: ApprovalResponse::Approve,
+            asks: asks.clone(),
+            parked_at_ask: parked_at_ask.clone(),
+            park_dir: ck_dir.clone(),
+        });
+        let (agent, _sink) = ask_agent(ws, approval, ck);
+        // MUST be CuratedContext: the park write is gated on
+        // ctx.checkpoint_state() being Some — WindowContext silently skips it.
+        let mut ctx = curated("ws");
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        // park existed WHILE the ask was pending (spec §2.3: write BEFORE block)…
+        assert_eq!(*parked_at_ask.lock().unwrap(), Some(true));
+        // …and the answer deleted it before the run proceeded (commit point).
+        assert!(!crate::checkpoint::has_park(&ck_dir));
+        assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn deny_also_deletes_the_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked_at_ask = Arc::new(std::sync::Mutex::new(None));
+        let approval = Arc::new(ParkApproval {
+            resp: ApprovalResponse::Deny,
+            asks: asks.clone(),
+            parked_at_ask: parked_at_ask.clone(),
+            park_dir: ck_dir.clone(),
+        });
+        let (agent, _sink) = ask_agent(ws, approval, ck);
+        let mut ctx = curated("ws");
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(
+            *parked_at_ask.lock().unwrap(),
+            Some(true),
+            "parked while blocked"
+        );
+        // Denial commits the answer the same way an approval does: park deleted.
+        assert!(!crate::checkpoint::has_park(&ck_dir));
+    }
+
+    #[tokio::test]
+    async fn non_ask_runs_write_zero_checkpoint_bytes() {
+        // E1: an allowlisted command auto-allows (Decision::Allow) so no Ask
+        // ever parks — the checkpoint dir must never be touched.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec!["echo".into()],
+            command_denylist: vec![],
+        });
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "execute_command".into(),
+                r#"{"command":"echo hi"}"#.into(),
+            ),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        )
+        .with_checkpointer(ck);
+        let mut ctx = curated("ws");
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert!(!ck_dir.exists(), "E1: no checkpoint I/O at all");
+    }
+
+    #[tokio::test]
+    async fn park_checkpoint_carries_context_records_and_parked_index() {
+        // Two calls in one turn: read_file (Allow) then execute_command (Ask).
+        // Approval channel loads the on-disk checkpoint WHILE blocked, then
+        // denies. Assertions run against the stashed checkpoint.
+        struct CapturingApproval {
+            ck_dir: std::path::PathBuf,
+            key: [u8; 32],
+            stash: Arc<std::sync::Mutex<Option<crate::Checkpoint>>>,
+        }
+        #[async_trait::async_trait]
+        impl ApprovalChannel for CapturingApproval {
+            async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+                *self.stash.lock().unwrap() =
+                    crate::checkpoint::load_checkpoint(&self.ck_dir, &self.key).unwrap();
+                ApprovalResponse::Deny
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        std::fs::write(ws.join("a.txt"), "FILEBODY").unwrap();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let stash = Arc::new(std::sync::Mutex::new(None));
+        let approval = Arc::new(CapturingApproval {
+            ck_dir: ck_dir.clone(),
+            key: [7u8; 32],
+            stash: stash.clone(),
+        });
+
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::fs::ReadFile {
+            max_bytes: 16 * 1024,
+        }));
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+        // read_file inside workspace -> Allow; execute_command empty allowlist -> Ask.
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        });
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                (
+                    "c1".into(),
+                    "read_file".into(),
+                    r#"{"path":"a.txt"}"#.into(),
+                ),
+                (
+                    "c2".into(),
+                    "execute_command".into(),
+                    r#"{"command":"echo hi"}"#.into(),
+                ),
+            ]),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            approval,
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        )
+        .with_checkpointer(ck);
+        let mut ctx = curated("ws");
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let parked = stash
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("checkpoint present on disk while the ask blocked");
+        assert_eq!(
+            parked.parked.parked_index,
+            Some(1),
+            "blocked at call index 1"
+        );
+        assert_eq!(
+            parked.parked.gate_records,
+            vec![crate::GateRecord::Ready],
+            "one Ready record precedes the parked call"
+        );
+        assert_eq!(parked.parked.tool_calls.len(), 2, "full batch persisted");
+        assert_eq!(parked.session_id, "s1");
+        // The assistant message with both calls was appended pre-gate.
+        let last = parked.context.history.last().expect("history non-empty");
+        assert_eq!(last.role, agent_model::Role::Assistant);
+        assert_eq!(
+            last.tool_calls.as_ref().map(|c| c.len()),
+            Some(2),
+            "the appended assistant message carries the full pre-gate batch"
+        );
+        // Guardrail tallies are captured (0 here — no counting middleware in
+        // this rig; the ModelCallLimit/ToolCallLimit units feed these).
+        assert_eq!(parked.guardrails.model_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_write_failure_degrades_to_live_only() {
+        // Point the checkpoint dir at a FILE so the write fails; the run must
+        // still complete normally (spec §2.3: never block the run on I/O).
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        // A regular file where the dir needs to be -> write_checkpoint's
+        // create_dir_all under it fails.
+        std::fs::write(&ck_dir, "x").unwrap();
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked_at_ask = Arc::new(std::sync::Mutex::new(None));
+        let approval = Arc::new(ParkApproval {
+            resp: ApprovalResponse::Approve,
+            asks: asks.clone(),
+            parked_at_ask: parked_at_ask.clone(),
+            park_dir: ck_dir.clone(),
+        });
+        let (agent, sink) = ask_agent(ws, approval, ck);
+        let mut ctx = curated("ws");
+        // No panic, no error return.
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        // The tool still ran and the run reached a normal terminal Done.
+        assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+    }
+
+    /// Plan review finding 2 / brief Step-4 note: a dispatch-kind ancestor
+    /// snapshot flushed to disk this turn MUST be cleared at turn end on
+    /// EVERY exit of `tool_phase`, including the on_turn_end EndRun exit —
+    /// otherwise a later scan misreads the stale park as a phantom session.
+    ///
+    /// This repo has no in-loop dispatch wiring yet, so we pin the leak-prone
+    /// PATH directly: a middleware sets a turn snapshot + flushes it (mimicking
+    /// a descendant park) and then EndRuns at on_turn_end. Assert no
+    /// dispatch-kind park survives.
+    #[tokio::test]
+    async fn end_turn_clears_flushed_park_on_end_run_exit() {
+        use crate::{Flow, RunCx};
+        struct FlushThenEnd {
+            ck: Arc<crate::Checkpointer>,
+        }
+        #[async_trait::async_trait]
+        impl crate::Middleware for FlushThenEnd {
+            fn name(&self) -> &str {
+                "flush-then-end"
+            }
+            async fn after_tools(&self, _cx: &mut RunCx<'_>) -> Flow {
+                // Simulate a dispatch-bearing turn whose descendant parked:
+                // set a pending snapshot and force it to disk this turn.
+                self.ck.set_turn_snapshot(crate::PendingSnapshot {
+                    context: crate::CuratedContext::new(
+                        Message::system("s"),
+                        Arc::new(crate::SessionArtifacts::new()),
+                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    )
+                    .checkpoint_state(),
+                    guardrails: crate::Guardrails::default(),
+                    turn: 0,
+                    assistant_text: String::new(),
+                    tool_calls: vec![],
+                    invalid: vec![],
+                    gate_records: vec![],
+                    artifacts: Arc::new(crate::SessionArtifacts::new()),
+                });
+                self.ck
+                    .write_park(
+                        crate::Checkpoint {
+                            version: crate::CHECKPOINT_VERSION,
+                            session_id: "s1".into(),
+                            subagent_path: vec![],
+                            turn: 0,
+                            context: crate::CuratedContext::new(
+                                Message::system("s"),
+                                Arc::new(crate::SessionArtifacts::new()),
+                                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            )
+                            .checkpoint_state(),
+                            guardrails: crate::Guardrails::default(),
+                            parked: crate::ParkedTurn {
+                                assistant_text: String::new(),
+                                tool_calls: vec![],
+                                invalid: vec![],
+                                gate_records: vec![],
+                                parked_index: None,
+                                origin: None,
+                            },
+                        },
+                        &crate::SessionArtifacts::new(),
+                    )
+                    .await
+                    .unwrap();
+                Flow::Continue
+            }
+            async fn on_turn_end(&self, _cx: &mut RunCx<'_>) -> Flow {
+                Flow::EndRun(StopReason::Error)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec!["echo".into()],
+            command_denylist: vec![],
+        });
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "execute_command".into(),
+                r#"{"command":"echo hi"}"#.into(),
+            ),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        )
+        .with_checkpointer(ck.clone())
+        .with_middleware(vec![Arc::new(FlushThenEnd { ck: ck.clone() })]);
+        let mut ctx = curated("ws");
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        // The run ended at on_turn_end (EndRun), yet the flushed dispatch-kind
+        // park must NOT survive — end_turn ran on that exit.
+        assert!(
+            !crate::checkpoint::has_park(&ck_dir),
+            "flushed dispatch-kind park leaked past an EndRun exit"
         );
     }
 }

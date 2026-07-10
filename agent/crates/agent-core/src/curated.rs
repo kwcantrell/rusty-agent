@@ -419,6 +419,10 @@ impl ContextManager for CuratedContext {
     fn checkpoint_state(&self) -> Option<crate::CuratedContextState> {
         Some(CuratedContext::checkpoint_state(self))
     }
+
+    fn artifacts(&self) -> Option<Arc<crate::SessionArtifacts>> {
+        Some(self.artifacts.clone())
+    }
 }
 
 /// Cap on the estimated size of a turn unit that qualifies as a durable
