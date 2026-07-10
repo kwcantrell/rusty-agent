@@ -100,7 +100,7 @@ impl RuntimeState {
         }
         let trace = agent_runtime_config::build_trace(&config, &session_id);
         let checkpointer = agent_runtime_config::sessions_root(&config).and_then(|root| {
-            let meta = agent_runtime_config::metadata_root()?;
+            let meta = agent_runtime_config::metadata_root_for(&config)?;
             match agent_runtime_config::load_or_create_secret(&meta) {
                 Ok(key) => Some(agent_core::Checkpointer::new(
                     agent_runtime_config::session_dir(&root, &session_id).join("checkpoint"),

@@ -143,7 +143,7 @@ impl Session {
             let Some(root) = agent_runtime_config::sessions_root(&cfg) else {
                 return;
             };
-            let Some(meta) = agent_runtime_config::metadata_root() else {
+            let Some(meta) = agent_runtime_config::metadata_root_for(&cfg) else {
                 return;
             };
             let Ok(key) = agent_runtime_config::load_or_create_secret(&meta) else {
