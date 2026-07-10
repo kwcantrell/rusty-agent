@@ -111,6 +111,46 @@ pub fn load_descriptor(dir: &Path) -> Option<SessionDescriptor> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// All readable descriptors under root (corrupt/missing skipped), newest
+/// first by session-id name order.
+pub fn scan_descriptors(root: &Path) -> Vec<SessionDescriptor> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.reverse(); // epoch-prefixed names ⇒ newest first
+    dirs.iter().filter_map(|d| load_descriptor(d)).collect()
+}
+
+/// Keep the newest `keep` session DIRS (name-sorted); never remove a dir
+/// containing checkpoint/parked.json (a parked run outlives retention).
+pub fn prune_session_dirs(root: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    if dirs.len() <= keep {
+        return;
+    }
+    let excess = dirs.len() - keep;
+    for d in dirs.into_iter().take(excess) {
+        if d.join("checkpoint").join("parked.json").exists() {
+            continue; // a parked run outlives retention (4B-1 resumes it)
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 fn create_dir_0700(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -274,5 +314,73 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn scan_returns_descriptors_newest_first_and_skips_corrupt() {
+        let root = tempfile::tempdir().unwrap();
+        for (id, ms) in [("100-aaaaaaaa", 1u64), ("200-bbbbbbbb", 2)] {
+            write_descriptor(
+                root.path(),
+                &SessionDescriptor {
+                    schema: DESCRIPTOR_SCHEMA,
+                    session_id: id.into(),
+                    workspace: PathBuf::from("/w"),
+                    created_ms: ms,
+                    config_path: None,
+                },
+            )
+            .unwrap();
+        }
+        // corrupt dir: descriptor unreadable — skipped, not fatal
+        let bad = session_dir(root.path(), "150-cccccccc");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("descriptor.json"), b"junk").unwrap();
+        // stray non-session file at root — ignored
+        std::fs::write(root.path().join("300-dddddddd.jsonl"), b"{}").unwrap();
+        let got = scan_descriptors(root.path());
+        let ids: Vec<&str> = got.iter().map(|d| d.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["200-bbbbbbbb", "100-aaaaaaaa"]);
+    }
+
+    #[test]
+    fn prune_keeps_newest_dirs_and_never_removes_parked() {
+        let root = tempfile::tempdir().unwrap();
+        for id in ["100-aaaaaaaa", "200-bbbbbbbb", "300-cccccccc"] {
+            write_descriptor(
+                root.path(),
+                &SessionDescriptor {
+                    schema: DESCRIPTOR_SCHEMA,
+                    session_id: id.into(),
+                    workspace: PathBuf::from("/w"),
+                    created_ms: 1,
+                    config_path: None,
+                },
+            )
+            .unwrap();
+        }
+        // oldest is parked → protected even though it would be pruned
+        let parked = session_dir(root.path(), "100-aaaaaaaa").join("checkpoint");
+        std::fs::create_dir_all(&parked).unwrap();
+        std::fs::write(parked.join("parked.json"), b"{}").unwrap();
+        // a trace .jsonl at root must be untouched by DIR pruning
+        std::fs::write(root.path().join("050-eeeeeeee.jsonl"), b"{}").unwrap();
+        prune_session_dirs(root.path(), 1);
+        assert!(
+            session_dir(root.path(), "100-aaaaaaaa").exists(),
+            "parked kept"
+        );
+        assert!(
+            !session_dir(root.path(), "200-bbbbbbbb").exists(),
+            "old pruned"
+        );
+        assert!(
+            session_dir(root.path(), "300-cccccccc").exists(),
+            "newest kept"
+        );
+        assert!(
+            root.path().join("050-eeeeeeee.jsonl").exists(),
+            "jsonl untouched"
+        );
     }
 }

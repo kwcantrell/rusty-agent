@@ -15,8 +15,8 @@ mod session_meta;
 // load_or_create_secret — re-export the full set (per brief) once all three
 // tasks have landed.
 pub use session_meta::{
-    load_descriptor, metadata_root, mint_session_id, session_dir, sessions_root, write_descriptor,
-    SessionDescriptor, DESCRIPTOR_SCHEMA,
+    load_descriptor, metadata_root, mint_session_id, prune_session_dirs, scan_descriptors,
+    session_dir, sessions_root, write_descriptor, SessionDescriptor, DESCRIPTOR_SCHEMA,
 };
 
 mod assemble;
