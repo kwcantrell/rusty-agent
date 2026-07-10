@@ -28,4 +28,20 @@ describe("ApprovalPrompt", () => {
     fireEvent.keyDown(screen.getByLabelText("prompt"), { key: "1" });
     expect(onDecide).not.toHaveBeenCalled();
   });
+  it("deny with feedback sends the object decision", () => {
+    const onDecide = vi.fn();
+    render(<ApprovalPrompt approval={approval} onDecide={onDecide} />);
+    fireEvent.change(screen.getByPlaceholderText(/optional feedback/i), {
+      target: { value: "use staging" },
+    });
+    fireEvent.click(screen.getByText(/^3\./).closest("button") ?? screen.getByText("No"));
+    expect(onDecide).toHaveBeenCalledWith({ deny: { feedback: "use staging" } });
+  });
+
+  it("deny with empty feedback sends the legacy string", () => {
+    const onDecide = vi.fn();
+    render(<ApprovalPrompt approval={approval} onDecide={onDecide} />);
+    fireEvent.keyDown(window, { key: "3" });
+    expect(onDecide).toHaveBeenCalledWith("deny");
+  });
 });

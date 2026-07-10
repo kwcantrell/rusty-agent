@@ -81,12 +81,23 @@ export type WireEvent =
   | { type: "subagent_end"; id: string; outcome: string; stop?: string; detail?: string;
       turns: number; tool_calls: number; duration_ms: number };
 
+export interface ParkedRun {
+  session_id: string;
+  workspace: string;
+  created_ms: number;
+  asks: number;
+  error?: string;
+}
+
 export type Inbound =
   | { v: number; session_id: string; kind: "event"; payload: WireEvent }
   | { v: number; session_id: string; id: string; kind: "approval_request"; summary: string; command?: string; display?: Display; origin?: ApprovalOrigin }
   | { v: number; session_id: string; kind: "presence"; online: boolean }
   | { v: number; session_id: string; kind: "settings_state"; settings: RuntimeSettings; workspace: string; api_key_set: boolean; hard_floor: string[]; discovered_skills: DiscoveredSkill[]; sandbox_degraded?: { mechanism: string; reason: string } | null }
-  | { v: number; session_id: string; kind: "settings_error"; message: string };
+  | { v: number; session_id: string; kind: "settings_error"; message: string }
+  | { v: number; session_id: string; kind: "parked_runs"; runs: ParkedRun[] }
+  | { v: number; session_id: string; kind: "approval_resolved"; id: string }
+  | { v: number; session_id: string; kind: "resumed"; resumed_session_id: string };
 
 export type Decision =
   | "approve"
@@ -112,7 +123,8 @@ export function parseInbound(raw: string): Inbound | null {
   const o = v as Record<string, unknown>;
   if (
     o.kind === "event" || o.kind === "approval_request" || o.kind === "presence" ||
-    o.kind === "settings_state" || o.kind === "settings_error"
+    o.kind === "settings_state" || o.kind === "settings_error" ||
+    o.kind === "parked_runs" || o.kind === "approval_resolved" || o.kind === "resumed"
   ) {
     return o as unknown as Inbound;
   }

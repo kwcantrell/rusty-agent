@@ -13,6 +13,7 @@ import type { RightTab } from "./storage";
 import { ContextExplorer } from "./explorer/ContextExplorer";
 import { RightPaneTabs } from "./components/RightPaneTabs";
 import { SandboxBanner } from "./components/SandboxBanner";
+import { ParkedBanner } from "./components/ParkedBanner";
 import { DesignPane } from "./components/design/DesignPane";
 import { ConfigPanel } from "./components/design/ConfigPanel";
 import { ArchitecturePane } from "./components/design/ArchitecturePane";
@@ -169,6 +170,9 @@ export default function App() {
       {state.sandboxDegraded && (
         <SandboxBanner info={state.sandboxDegraded}
           onDismiss={() => dispatch({ type: "dismiss_sandbox_banner" })} />
+      )}
+      {state.parkedRuns.length > 0 && (
+        <ParkedBanner runs={state.parkedRuns} onDismiss={() => dispatch({ type: "dismiss_parked_banner" })} />
       )}
       <div className="relative flex min-h-0 flex-1">
         <div className="min-w-0 flex-1" style={!narrow ? { flexBasis: "38%", maxWidth: "42%", borderRight: "1px solid var(--border)" } : undefined}>

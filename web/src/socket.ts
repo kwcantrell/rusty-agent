@@ -7,16 +7,30 @@ interface Handlers {
   onStatus: (s: ConnectionStatus) => void;
 }
 
-// A ServerEvent is the legacy WireEvent shape plus an `approval_request` case.
+// A ServerEvent is the legacy WireEvent shape plus the events lifted into
+// their own frame kinds (`approval_request`, `parked_runs`, `approval_resolved`,
+// `resumed`).
 type ServerEvent =
   | WireEvent
   | { type: "approval_request"; id: string; summary: string; command?: string; display?: unknown;
-      origin?: import("./wire").ApprovalOrigin };
+      origin?: import("./wire").ApprovalOrigin }
+  | { type: "parked_runs"; runs: import("./wire").ParkedRun[] }
+  | { type: "approval_resolved"; id: string }
+  | { type: "resumed"; session_id: string };
 
 function toInbound(ev: ServerEvent): Inbound {
   if (ev.type === "approval_request") {
     return { v: 1, session_id: "", id: ev.id, kind: "approval_request",
       summary: ev.summary, command: ev.command, display: ev.display as never, origin: ev.origin };
+  }
+  if (ev.type === "parked_runs") {
+    return { v: 1, session_id: "", kind: "parked_runs", runs: ev.runs };
+  }
+  if (ev.type === "approval_resolved") {
+    return { v: 1, session_id: "", kind: "approval_resolved", id: ev.id };
+  }
+  if (ev.type === "resumed") {
+    return { v: 1, session_id: "", kind: "resumed", resumed_session_id: ev.session_id };
   }
   return { v: 1, session_id: "", kind: "event", payload: ev };
 }
