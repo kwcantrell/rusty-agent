@@ -979,12 +979,15 @@ mod tests {
         let home_dir = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", home_dir.path());
-        let result = f();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         match prev {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
-        result
+        match result {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
     }
 
     #[test]
