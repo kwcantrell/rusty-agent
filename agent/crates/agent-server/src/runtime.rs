@@ -651,7 +651,11 @@ mod tests {
         use std::fs;
         let (rs, dir) = make();
         // Author a skill under the workspace default writable root.
-        let sdir = dir.path().join(".rusty-agent").join("skills").join("greeter");
+        let sdir = dir
+            .path()
+            .join(".rusty-agent")
+            .join("skills")
+            .join("greeter");
         fs::create_dir_all(&sdir).unwrap();
         fs::write(
             sdir.join("SKILL.md"),
@@ -738,7 +742,11 @@ mod tests {
         let (sink, approval) = parts();
         let dir = tempfile::tempdir().unwrap();
         // Put a skill in <workspace>/.rusty-agent/skills/greeter (the default writable root).
-        let sdir = dir.path().join(".rusty-agent").join("skills").join("greeter");
+        let sdir = dir
+            .path()
+            .join(".rusty-agent")
+            .join("skills")
+            .join("greeter");
         fs::create_dir_all(&sdir).unwrap();
         fs::write(
             sdir.join("SKILL.md"),

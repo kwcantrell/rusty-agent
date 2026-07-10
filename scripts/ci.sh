@@ -18,6 +18,13 @@ echo "==> skills lint"
 python3 scripts/test_skills_lint.py
 python3 scripts/skills_lint.py
 
+# Renamed metadata root: no runtime code may reference the old ~/.agent root.
+# NOTE: would also trip on a hypothetical `foo.agent` identifier — acceptable;
+# rename such an identifier or narrow this pattern if that ever happens.
+if grep -rn '\.agent\b' agent/crates src-tauri/src --include='*.rs' | grep -v '\.agents'; then
+  echo "ci: stale .agent literal (root renamed to .rusty-agent)" >&2; exit 1
+fi
+
 echo "==> cargo fmt --check"
 (cd agent && cargo fmt --all --check)
 
