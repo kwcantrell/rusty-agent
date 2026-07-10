@@ -69,7 +69,6 @@ impl Session {
                 runtime.artifacts(),
                 runtime.compact_flag(),
             )
-            .with_recall_budget(params.recall_token_budget)
             .with_offload_config(agent_core::OffloadConfig {
                 max_result_bytes: max_tool_result_bytes,
                 ..Default::default()
@@ -281,7 +280,6 @@ impl Session {
             self.runtime.artifacts(),
             self.runtime.compact_flag(),
         )
-        .with_recall_budget(self.recall_budget)
         .with_offload_config(agent_core::OffloadConfig {
             max_result_bytes: self.runtime.settings_state().settings.max_tool_result_bytes,
             ..Default::default()
