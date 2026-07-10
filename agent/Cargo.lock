@@ -119,6 +119,7 @@ dependencies = [
  "agent-skills",
  "agent-tools",
  "async-trait",
+ "futures",
  "serde",
  "serde_json",
  "sha2",

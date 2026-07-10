@@ -2056,7 +2056,7 @@ mod tests {
     }
 
     /// The normative claim (task-7 brief): children run `[context-curation,
-    /// stuck-detection]`, never `memory-recall`. Behavioral evidence over new
+    /// stuck-detection]`, never `memory-index`. Behavioral evidence over new
     /// `#[cfg(test)]` surface (per the brief's stated preference), reusing the
     /// `SchemaCapturingModel` shape from `description_overrides_reach_child_registry`:
     ///
@@ -2069,14 +2069,14 @@ mod tests {
     /// (b) stuck-detection is LIVE: three identical calls trip the spec §5.5
     ///     nudge inside the child's own turn loop (only reachable if
     ///     `StuckDetectionMiddleware` is actually in the child's stack).
-    /// (c) memory-recall is ABSENT: even with a memory tool visible, nothing
-    ///     injects a memory recall block into the child's own completion
+    /// (c) memory-index is ABSENT: even with a memory tool visible, nothing
+    ///     injects a memory index block into the child's own completion
     ///     requests (`MemoryFilesMiddleware::on_run_start` is the only source
     ///     of that block, and it is never constructed in
     ///     `DispatchAgentTool::execute`) — the strongest observable proxy for
-    ///     "never memory-recall" without a #[cfg(test)] stack accessor.
+    ///     "never memory-index" without a #[cfg(test)] stack accessor.
     #[tokio::test]
-    async fn child_stack_is_exactly_curation_and_stuck_detection_never_memory_recall() {
+    async fn child_stack_is_exactly_curation_and_stuck_detection_never_memory_index() {
         struct SchemaCapturingModel {
             inner: ScriptedModel,
             seen: std::sync::Mutex<Vec<(String, String)>>,
@@ -2160,12 +2160,12 @@ mod tests {
              history, proving StuckDetectionMiddleware ran inside the child: {last_request}"
         );
 
-        // (c) memory-recall is absent: no request ever carries a recall block,
-        // even though a memory tool was visible and callable.
+        // (c) memory-index is absent: no request ever carries a memory index
+        // block, even though a memory tool was visible and callable.
         for (i, text) in model.request_texts.lock().unwrap().iter().enumerate() {
             assert!(
                 !text.contains(crate::context::MEMORY_HEADER),
-                "request {i} must carry no memory-recall block — MemoryFilesMiddleware \
+                "request {i} must carry no memory-index block — MemoryFilesMiddleware \
                  is never installed on a dispatch child: {text}"
             );
         }
