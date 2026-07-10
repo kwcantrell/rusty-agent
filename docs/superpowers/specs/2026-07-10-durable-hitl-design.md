@@ -270,7 +270,7 @@ persist — the two guardrail tallies (read in-crate via `RunShared::with`;
 inside `CuratedContextState`). `StuckDetection` and `RepairMiddleware`
 reset on resume (their signal is the live streak). The `Middleware` trait
 is **unchanged** — the persistence set stays an auditable three-item list
-(serves §3.7). Memory index re-loads via the existing 4A dirty-flag path.
+(serves §3.8). Memory index re-loads via the existing 4A dirty-flag path.
 A child's captured `ResponseCapture` payload, if any, parks inside that
 child's own checkpoint.
 
@@ -373,7 +373,7 @@ index. From the parent's view the dispatch call is an in-flight tool call
 whose result arrives when the resumed child finishes. **Child deadlines:**
 a resumed child gets a **fresh** dispatch timeout (a park can outlast any
 deadline; the human attach+approve in the loop makes clock-reset abuse
-moot — recorded as the OQ3 resolution).
+moot — recorded in §7, child-deadline row).
 
 ### 2.6 Approval attribution (G4)
 
@@ -429,7 +429,7 @@ comment on skipped Approval events, config.example.json, the
 3. **Config is live truth, conversation is checkpointed truth.** Resume
    re-derives policy engine + 3B-1c floors from current config against the
    descriptor's workspace; a checkpoint can never widen policy, floors,
-   grants (E2), or tallies (monotonic clamp, §2.4.3).
+   grants (E2), or tallies (monotonic clamp, §2.4 restore step 3).
 4. **Approval display integrity:** what the human sees on resume is
    re-derived from the stored args via `tool.intent()` — never a trusted
    stored string.
@@ -481,7 +481,8 @@ comment on skipped Approval events, config.example.json, the
   replay-hazard design the gate declined this cycle).
 - **Declarative interrupt_on-style rules** (which tools ask, data not code).
 - **Server replay buffer** for late-joining clients (3B-2 deferral).
-- **claude-cli delta-resume/cache knob** for resumed sessions (§2.4.2).
+- **claude-cli delta-resume/cache knob** for resumed sessions (§2.4
+  rebuild step 2).
 - **Checkpoint retention/GC** beyond delete-on-completion, if parked trees
   ever accumulate in practice.
 - **Bundle gap-analysis row updates** after merge.
@@ -587,5 +588,9 @@ comment on skipped Approval events, config.example.json, the
   daemon-local secret is same-trust-domain (§0 OUT); grandchild live-drive
   coverage capped at depth 1 (E6a); parked runs hold their session slot
   until answered or auto-denied via the E5 knob (inherent to parking).
-- **2026-07-10 — owner gate:** E1–E6 CLOSED (recorded above). Light-tier
-  consistency read + owner spec review pending.
+- **2026-07-10 — owner gate:** E1–E6 CLOSED (recorded above).
+- **2026-07-10 — light-tier consistency read (sonnet):** CLEAN on all
+  substance (no stale E1/E2 language, dispositions match normative
+  sections, slice assignments consistent); 4 mechanical citation fixes
+  applied (§2.4 list-item pseudo-headings ×2, §3.7→§3.8 miscite, orphan
+  "OQ3" label). Owner spec review pending.
