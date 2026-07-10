@@ -390,8 +390,22 @@ impl Session {
                 root_chk.context.clone(),
             );
             let resume = root_chk.resume_turn(root_answer);
-            let mut failed = false;
-            match loop_.resume_with_cancel(&mut ctx, resume, cancel).await {
+            let mut retained = false;
+            match loop_
+                .resume_with_cancel(&mut ctx, resume, cancel.clone())
+                .await
+            {
+                Ok(()) if cancel.is_cancelled() => {
+                    // P1 (4B-2 branch review C-1): `turn_loop` returns Ok(())
+                    // on cancellation too, so Ok(()) alone does not mean the
+                    // tree completed. A cancel mid-resume (e.g. a re-park at
+                    // a NEW ask, or a `cancel` command arriving while
+                    // resuming) must retain the park exactly like the Err
+                    // arm below — never reap a park the run didn't actually
+                    // finish. Mirrors dispatch.rs's is_cancelled() check
+                    // BEFORE treating Ok as completed.
+                    retained = true;
+                }
                 Ok(()) => {
                     // Completed tree: delete-on-completion (spec §2.3; parked
                     // children were consumed en route).
@@ -403,11 +417,11 @@ impl Session {
                     // (plan review BLOCKER 1b — never destroy the checkpoint on a
                     // failed resume).
                     sess.emit_error(format!("session {sid}: resumed run failed: {e}"));
-                    failed = true;
+                    retained = true;
                 }
             }
             *sess.active.lock().unwrap() = None;
-            if failed {
+            if retained {
                 // In-life retry (4B-1 merge-gate deferral): the park was
                 // retained; releasing lock + guard lets the next attach
                 // re-prompt (refinement 11 makes the retry re-claim).
@@ -1548,6 +1562,19 @@ mod tests {
         sessions: &std::path::Path,
         prior_id: &str,
     ) -> (Arc<Session>, Arc<Captured>, [u8; 32]) {
+        plant_parked_session_with_command(ws, sessions, prior_id, "echo real").await
+    }
+
+    /// `plant_parked_session`, parameterized on the planted command — the
+    /// cancelled-resume test (C-1) needs a command with a real execution
+    /// window (`sleep N`) instead of an instant `echo`, so cancellation has
+    /// somewhere deterministic to land before the doomed model call.
+    async fn plant_parked_session_with_command(
+        ws: &std::path::Path,
+        sessions: &std::path::Path,
+        prior_id: &str,
+        command: &str,
+    ) -> (Arc<Session>, Arc<Captured>, [u8; 32]) {
         use agent_core::checkpoint::{Checkpoint, Checkpointer, Guardrails, ParkedTurn};
         use agent_policy::ApprovalOrigin;
 
@@ -1567,7 +1594,7 @@ mod tests {
         .unwrap();
         let prior_ck = agent_runtime_config::session_dir(sessions, prior_id).join("checkpoint");
         let ckr = Checkpointer::new(prior_ck.clone(), key, prior_id.into());
-        let planted_args = serde_json::json!({"command": "echo real"});
+        let planted_args = serde_json::json!({"command": command});
         let origin = ApprovalOrigin {
             delegation_id: "c9".into(),
             subagent_name: "explore".into(),
@@ -1743,6 +1770,86 @@ mod tests {
             None,
             "sanity: nothing left to resume once the answered ask's park is consumed"
         );
+
+        std::mem::forget(ws);
+        std::mem::forget(sessions);
+    }
+
+    /// C-1 (4B-2 branch review): a `cancel` command arriving mid-resume must
+    /// retain the root park instead of hitting `start_resume`'s success-reap
+    /// path — `resume_with_cancel` (via `turn_loop`) returns `Ok(())` on
+    /// cancellation exactly like completion, so `Ok(())` alone can't mean
+    /// "reap". Uses a `sleep 2` planted command (instead of the failed-resume
+    /// test's instant `echo real`) so cancellation has a real, deterministic
+    /// execution window to land in — well before the doomed model call at
+    /// `127.0.0.1:1` would otherwise race it via the network-refused path.
+    #[tokio::test]
+    async fn cancelled_mid_resume_retains_the_park_and_releases_the_guard() {
+        let ws = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let prior_id = "100-cccccccc";
+
+        let (sess, cap, _key) =
+            plant_parked_session_with_command(ws.path(), sessions.path(), prior_id, "sleep 2")
+                .await;
+        let root_dir =
+            agent_runtime_config::session_dir(sessions.path(), prior_id).join("checkpoint");
+
+        let ask_id = wait_for_ask_id(&cap, Duration::from_secs(5)).await;
+        sess.approve(&ask_id, Decision::Approve);
+
+        // Give start_resume's spawned task a moment to actually begin the
+        // `sleep 2` tool call (active slot populated) before tripping cancel,
+        // so we don't race the resume-lock claim/guard-insert at the very
+        // top of start_resume itself.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sess.active.lock().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resumed run never went active"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        sess.cancel();
+
+        // The resumed run must finish promptly (turn_loop's cancellation
+        // check, not the 2s sleep completing or the network call failing).
+        let cancel_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sess.active.lock().unwrap().is_some() {
+            assert!(
+                std::time::Instant::now() < cancel_deadline,
+                "cancelled resume never went idle"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            !cap.0.lock().unwrap().iter().any(|ev| {
+                matches!(ev, ServerEvent::Error { message } if message.contains("resumed run failed"))
+            }),
+            "a cancelled resume must not surface as a failure (proves the Ok(()) + \
+             is_cancelled() arm fired, not the Err arm)"
+        );
+        // This single-ask fixture's `parked.json` already self-cleared at
+        // answer-CONSUME time (inside tool_phase, before the sleep even
+        // starts — same property the failed-resume test above documents),
+        // so `has_park` can't be the signal here. What C-1 actually guards
+        // is the checkpoint TREE (root_dir + resume.lock) surviving instead
+        // of being `remove_dir_all`'d by the success-reap arm.
+        assert!(
+            root_dir.exists(),
+            "cancellation mid-resume must retain the checkpoint tree, not reap it \
+             via the success-reap remove_dir_all"
+        );
+        assert!(
+            !sess.resuming.lock().unwrap().contains(prior_id),
+            "cancelled resume must remove the session id from the `resuming` guard"
+        );
+        assert!(
+            agent_core::checkpoint::claim_resume(&root_dir).unwrap(),
+            "cancelled resume must release the cross-process lock so a retry can claim it"
+        );
+        agent_core::checkpoint::release_resume(&root_dir); // undo the probe claim above
 
         std::mem::forget(ws);
         std::mem::forget(sessions);

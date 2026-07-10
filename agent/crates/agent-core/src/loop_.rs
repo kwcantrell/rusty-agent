@@ -9024,6 +9024,113 @@ mod tests {
         );
     }
 
+    /// C-1 (4B-2 branch review, resume-driver variant of the test above): a
+    /// RESUMED run that re-parks at a NEW ask must also retain that park on
+    /// cancellation — `resume_with_cancel` (via `turn_loop`) returns `Ok(())`
+    /// on cancellation exactly like a fresh run does, so a caller (CLI
+    /// `run_sessions_reopen`, server `start_resume`) that reaps on any
+    /// `Ok(())` would wrongly delete a park the run deliberately kept. This
+    /// exercises the loop-level seam both drivers build on; also asserts the
+    /// resume lock is re-claimable afterward (proof `release_resume` ran,
+    /// mirroring what the fixed `start_resume`/`run_sessions_reopen` do).
+    #[tokio::test]
+    async fn cancelled_while_reparked_after_resume_retains_the_park_file() {
+        struct NeverApprove;
+        #[async_trait::async_trait]
+        impl ApprovalChannel for NeverApprove {
+            async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+                std::future::pending().await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+
+        // The RESUMED turn's pre-decided batch executes with no re-prompt;
+        // the model then requests a SECOND execute_command call, which the
+        // empty-allowlist policy sends to Ask — that's the new park.
+        let (agent, sink) = resume_agent(
+            ws.clone(),
+            Arc::new(NeverApprove),
+            Some(ck),
+            vec![Scripted::Call(
+                "c2".into(),
+                "execute_command".into(),
+                r#"{"command":"echo two"}"#.into(),
+            )],
+            vec![],
+        );
+        let batch = vec![ToolCall {
+            id: "c1".into(),
+            name: "execute_command".into(),
+            args: serde_json::json!({"command": "echo one"}),
+        }];
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![],
+            parked_index: Some(0),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: true,
+                feedback: None,
+            }),
+            turn: 3,
+            guardrails: crate::Guardrails {
+                tool_calls: 5,
+                model_calls: 4,
+            },
+            goal_text: "the goal".into(),
+        };
+
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        let run =
+            tokio::spawn(async move { agent.resume_with_cancel(&mut ctx, resume, cancel).await });
+
+        // Poll for the NEW park to land (c1 replays without re-prompting;
+        // c2 is the fresh Ask that writes it) rather than assume timing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::checkpoint::has_park(&ck_dir) {
+            if std::time::Instant::now() > deadline {
+                panic!("re-park never landed before cancel");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        c2.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run must finish promptly after cancel, not wedge on the prompt")
+            .expect("run task must not panic");
+        assert!(
+            result.is_ok(),
+            "resume_with_cancel must return Ok(()) on cancellation, same as a fresh run: {result:?}"
+        );
+
+        assert_eq!(
+            sink.status_of("c1").as_deref(),
+            Some("ok"),
+            "the pre-decided call executes without re-prompting before the cancel lands"
+        );
+        assert!(
+            crate::checkpoint::has_park(&ck_dir),
+            "cancellation mid-resume must not consume or clear the re-parked ask"
+        );
+
+        // Proof a caller's release_resume actually unblocks a retry: claim,
+        // then release, mirroring what the fixed start_resume/reopen do on
+        // this arm.
+        assert!(
+            crate::checkpoint::claim_resume(&ck_dir).unwrap(),
+            "the resume lock must be re-claimable after cancellation retains the park"
+        );
+        crate::checkpoint::release_resume(&ck_dir);
+    }
+
     #[tokio::test]
     async fn non_ask_runs_write_zero_checkpoint_bytes() {
         // E1: an allowlisted command auto-allows (Decision::Allow) so no Ask
