@@ -28,6 +28,17 @@ Non-trivial work follows the superpowers SDLC — **don't jump straight to code*
 implement.** Small, obvious fixes can skip ahead, but design-bearing changes get a
 spec first.
 
+**Normative doc edits are design-bearing.** Text that *prescribes* future
+behavior — skill guidance, conventions, decision records — is never a "small,
+obvious fix" regardless of diff size: before landing it gets at least a light
+adversarial pass (two skeptical reviewers with distinct mandates, e.g.
+facts/assumptions + scope/wrong-prescription). Purely factual corrections
+verified against live source may still skip ahead. Either way, **say the
+skip-ahead classification out loud before editing** so the owner can veto it.
+(Origin: 2026-07-09 — a "small" skill update carried two normative
+prescriptions and two factual errors past fact-checking; a retroactive panel
+caught all four.)
+
 ### Adversarial review of the spec
 
 Before `spec → plan`, run an **adversarial panel on the spec** — the earliest,
