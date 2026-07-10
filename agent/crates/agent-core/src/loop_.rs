@@ -210,6 +210,17 @@ impl AgentLoop {
         self.tools.schemas()
     }
 
+    /// Re-derive a tool's intent from stored args (resume display path —
+    /// spec §3.4: what the human sees is never a trusted stored string).
+    /// `None` when the named tool is not registered under the current config.
+    pub fn derive_intent(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Option<agent_tools::ToolIntent> {
+        self.tools.get(name)?.intent(args).ok()
+    }
+
     /// Route context compaction to a (typically cheaper) dedicated model
     /// (spec 2026-07-02 sub-spec #3, G4). None = the session model.
     pub fn with_compaction_model(mut self, model: Arc<dyn ModelClient>) -> Self {
