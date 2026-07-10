@@ -57,6 +57,9 @@ impl IpcApprovalChannel {
     pub fn resolve(&self, id: &str, decision: ApprovalResponse) {
         self.pending_frames.lock().unwrap().remove(id);
         self.external_groups.lock().unwrap().remove(id);
+        if let Some(out) = self.slot.lock().unwrap().clone() {
+            out.send(ServerEvent::ApprovalResolved { id: id.to_string() });
+        }
         if let Some(tx) = self.pending.lock().unwrap().remove(id) {
             let _ = tx.send(decision);
         }
@@ -118,13 +121,20 @@ impl IpcApprovalChannel {
                 .map(|(id, _)| id.clone())
                 .collect()
         };
-        let mut pending = self.pending.lock().unwrap();
-        let mut frames = self.pending_frames.lock().unwrap();
-        let mut groups = self.external_groups.lock().unwrap();
-        for id in ids {
-            pending.remove(&id); // dropping the sender resolves waiters' rx with Err
-            frames.remove(&id);
-            groups.remove(&id);
+        {
+            let mut pending = self.pending.lock().unwrap();
+            let mut frames = self.pending_frames.lock().unwrap();
+            let mut groups = self.external_groups.lock().unwrap();
+            for id in &ids {
+                pending.remove(id); // dropping the sender resolves waiters' rx with Err
+                frames.remove(id);
+                groups.remove(id);
+            }
+        }
+        if let Some(out) = self.slot.lock().unwrap().clone() {
+            for id in ids {
+                out.send(ServerEvent::ApprovalResolved { id });
+            }
         }
     }
 }
@@ -170,9 +180,11 @@ impl ApprovalChannel for IpcApprovalChannel {
         match self.timeout {
             Some(t) => match tokio::time::timeout(t, orx).await {
                 Ok(Ok(resp)) => resp,
-                _ => ApprovalResponse::Deny,
+                _ => ApprovalResponse::Deny { feedback: None },
             },
-            None => orx.await.unwrap_or(ApprovalResponse::Deny),
+            None => orx
+                .await
+                .unwrap_or(ApprovalResponse::Deny { feedback: None }),
         }
     }
 }
@@ -277,7 +289,7 @@ mod tests {
         let h = tokio::spawn(async move { ch2.request(req()).await });
         wait_for_ask(&cap).await;
         tokio::time::advance(Duration::from_secs(3)).await;
-        assert_eq!(h.await.unwrap(), ApprovalResponse::Deny);
+        assert_eq!(h.await.unwrap(), ApprovalResponse::Deny { feedback: None });
         // The pending map is drained on timeout (PendingGuard on drop).
         assert!(ch.pending.lock().unwrap().is_empty());
         assert!(ch.pending_frames.lock().unwrap().is_empty());
@@ -390,6 +402,104 @@ mod tests {
         ch.reemit_pending(&(cap2.clone() as Arc<dyn EventOut>));
         assert_eq!(cap2.ask_count(), 0, "aborted ask must not re-emit");
         ch.resolve(&id, ApprovalResponse::Approve); // must not panic; no-op
+    }
+
+    #[tokio::test]
+    async fn resolve_emits_approval_resolved_to_the_attached_surface() {
+        let cap = Arc::new(Captured::default());
+        let ch = Arc::new(IpcApprovalChannel::new(slot_with(cap.clone()), None));
+        let ch2 = ch.clone();
+        let h = tokio::spawn(async move { ch2.request(req()).await });
+        let id = wait_for_ask(&cap).await;
+        ch.resolve(&id, ApprovalResponse::Approve);
+        assert_eq!(h.await.unwrap(), ApprovalResponse::Approve);
+        let last = cap.0.lock().unwrap().last().cloned();
+        assert!(
+            matches!(&last, Some(ServerEvent::ApprovalResolved { id: rid }) if rid == &id),
+            "last captured frame must be ApprovalResolved for the resolved id, got {last:?}"
+        );
+
+        // Emitted after the maps clear: a reemit_pending after resolve sends nothing.
+        let cap2 = Arc::new(Captured::default());
+        ch.reemit_pending(&(cap2.clone() as Arc<dyn EventOut>));
+        assert_eq!(cap2.ask_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn retract_external_sweeps_and_emits_resolved_per_id() {
+        let cap = Arc::new(Captured::default());
+        let ch = Arc::new(IpcApprovalChannel::new(slot_with(cap.clone()), None));
+        let group = "200-bbbbbbbb";
+        let (id1, _rx1) = ch.register_external(
+            group,
+            ExternalAsk {
+                summary: "one".into(),
+                command: None,
+                display: None,
+                origin: None,
+            },
+        );
+        let (id2, _rx2) = ch.register_external(
+            group,
+            ExternalAsk {
+                summary: "two".into(),
+                command: None,
+                display: None,
+                origin: None,
+            },
+        );
+
+        ch.retract_external_for(group);
+
+        let resolved: Vec<String> = cap
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|ev| match ev {
+                ServerEvent::ApprovalResolved { id } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved.len(), 2, "one ApprovalResolved per retracted id");
+        assert!(resolved.contains(&id1));
+        assert!(resolved.contains(&id2));
+
+        assert!(ch.pending.lock().unwrap().is_empty());
+        assert!(ch.pending_frames.lock().unwrap().is_empty());
+        assert!(ch.external_groups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_surface_first_answer_wins_and_second_attach_sees_retraction() {
+        let cap_a = Arc::new(Captured::default());
+        let ch = Arc::new(IpcApprovalChannel::new(slot_with(cap_a.clone()), None));
+        let ch2 = ch.clone();
+        let h = tokio::spawn(async move { ch2.request(req()).await });
+        let id = wait_for_ask(&cap_a).await;
+
+        ch.resolve(&id, ApprovalResponse::Approve);
+        assert_eq!(h.await.unwrap(), ApprovalResponse::Approve);
+
+        let cap_b = Arc::new(Captured::default());
+        ch.reemit_pending(&(cap_b.clone() as Arc<dyn EventOut>));
+        assert_eq!(
+            cap_b.ask_count(),
+            0,
+            "second attach must see no live prompt for an already-resolved ask"
+        );
+        assert!(
+            cap_b.last_ask_id().is_none(),
+            "B's history must contain no live prompt"
+        );
+
+        // The resolve-time ApprovalResolved went to the then-attached surface (A).
+        assert!(cap_a
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|ev| matches!(ev, ServerEvent::ApprovalResolved { id: rid } if rid == &id)));
     }
 
     /// Poll a spawned task to completion-check: returns true if it is STILL

@@ -1,6 +1,6 @@
 //! Attach-to-resume (spec §2.4): index parked runs from disk, re-emit their
 //! asks with re-derived displays, commit answers durably, resume the tree.
-use agent_core::checkpoint::{self, Checkpoint};
+use agent_core::checkpoint::{self, Checkpoint, ParkedAnswer};
 use agent_runtime_config::SessionDescriptor;
 use std::path::{Path, PathBuf};
 
@@ -36,21 +36,34 @@ pub fn scan_parked(root: &Path, key: &[u8; 32], own_session_id: &str) -> Vec<Par
         if d.session_id == own_session_id {
             continue; // live session: pending_frames covers its asks
         }
-        let ck_dir = agent_runtime_config::session_dir(root, &d.session_id).join("checkpoint");
-        if !checkpoint::has_park(&ck_dir) {
-            continue;
+        if let Some(s) = scan_parked_session(root, key, d) {
+            out.push(s);
         }
-        let mut s = ParkedSession {
-            descriptor: d,
-            root_dir: ck_dir.clone(),
-            root: None,
-            asks: Vec::new(),
-            errors: Vec::new(),
-        };
-        walk(&ck_dir, key, &mut s);
-        out.push(s);
     }
     out
+}
+
+/// Scan a single session's checkpoint tree for a park (CLI `sessions reopen`,
+/// Task 10 — the per-descriptor body `scan_parked` loops over). `None` ⇔ no
+/// park under this session's checkpoint dir.
+pub fn scan_parked_session(
+    root: &Path,
+    key: &[u8; 32],
+    descriptor: SessionDescriptor,
+) -> Option<ParkedSession> {
+    let ck_dir = agent_runtime_config::session_dir(root, &descriptor.session_id).join("checkpoint");
+    if !checkpoint::has_park(&ck_dir) {
+        return None;
+    }
+    let mut s = ParkedSession {
+        descriptor,
+        root_dir: ck_dir.clone(),
+        root: None,
+        asks: Vec::new(),
+        errors: Vec::new(),
+    };
+    walk(&ck_dir, key, &mut s);
+    Some(s)
 }
 
 /// Recursively load + verify one checkpoint level, then descend into
@@ -90,8 +103,17 @@ fn walk(dir: &Path, key: &[u8; 32], s: &mut ParkedSession) {
 
 /// Durably commit an answer against one parked ask's checkpoint dir. The
 /// resumed loop consumes it via `checkpoint::take_answer` (verified, once).
-pub fn commit_answer(ask: &ParkedAsk, approve: bool, key: &[u8; 32]) -> std::io::Result<()> {
-    checkpoint::write_answer(&ask.dir, key, approve)
+pub fn commit_answer(
+    ask: &ParkedAsk,
+    decision: &ParkedAnswer,
+    key: &[u8; 32],
+) -> std::io::Result<()> {
+    checkpoint::write_answer(
+        &ask.dir,
+        key,
+        decision.approve,
+        decision.feedback.as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -235,6 +257,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_parked_session_finds_the_single_session_tree() {
+        let root = tempfile::tempdir().unwrap();
+        descriptor(root.path(), "200-bbbbbbbb");
+        let other_ck =
+            agent_runtime_config::session_dir(root.path(), "200-bbbbbbbb").join("checkpoint");
+        plant_child_gate(&other_ck, "call_1").await;
+
+        let descs = agent_runtime_config::scan_descriptors(root.path());
+        let d = descs
+            .into_iter()
+            .find(|d| d.session_id == "200-bbbbbbbb")
+            .unwrap();
+        let parked = scan_parked_session(root.path(), &key(), d).expect("park present");
+        assert_eq!(parked.descriptor.session_id, "200-bbbbbbbb");
+        assert!(parked.root.is_some());
+        assert_eq!(parked.asks.len(), 1);
+        assert!(parked.errors.is_empty());
+
+        descriptor(root.path(), "300-cccccccc");
+        let descs = agent_runtime_config::scan_descriptors(root.path());
+        let empty = descs
+            .into_iter()
+            .find(|d| d.session_id == "300-cccccccc")
+            .unwrap();
+        assert!(
+            scan_parked_session(root.path(), &key(), empty).is_none(),
+            "no checkpoint dir => None"
+        );
+    }
+
+    #[tokio::test]
     async fn corrupt_level_reports_error_and_never_resumes() {
         let root = tempfile::tempdir().unwrap();
         descriptor(root.path(), "200-bbbbbbbb");
@@ -278,9 +331,23 @@ mod tests {
         let ask = &parked[0].asks[0];
         assert!(!ask.answered, "no answer.json planted yet");
 
-        commit_answer(ask, true, &key()).unwrap();
+        commit_answer(
+            ask,
+            &ParkedAnswer {
+                approve: true,
+                feedback: None,
+            },
+            &key(),
+        )
+        .unwrap();
         // The resumed loop consumes it via take_answer — exactly once.
-        assert_eq!(checkpoint::take_answer(&ask.dir, &key()), Some(true));
+        assert_eq!(
+            checkpoint::take_answer(&ask.dir, &key()),
+            Some(ParkedAnswer {
+                approve: true,
+                feedback: None
+            })
+        );
         assert_eq!(
             checkpoint::take_answer(&ask.dir, &key()),
             None,

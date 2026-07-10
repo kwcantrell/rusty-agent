@@ -1302,8 +1302,8 @@ impl AgentLoop {
                     if let Some(ck) = self.checkpointer.as_ref() {
                         ck.clear_park();
                     }
-                    let approve = p.parked_decision.unwrap();
-                    if approve {
+                    let ans = p.parked_decision.clone().unwrap();
+                    if ans.approve {
                         // gate_preapproved emits ToolStart itself.
                         self.gate_preapproved(call, cancel)
                     } else {
@@ -1316,10 +1316,7 @@ impl AgentLoop {
                         GateOutcome::Rejected {
                             id: call.id,
                             name: call.name,
-                            content: format!(
-                                "ERROR: {}",
-                                ToolError::Denied("user declined".into())
-                            ),
+                            content: denial_content(ans.feedback.as_deref()),
                         }
                     }
                 }
@@ -1406,18 +1403,30 @@ impl AgentLoop {
                     // Race the approval wait against cancellation: Ctrl-C during a
                     // pending prompt must end the run promptly rather than wedge until
                     // the prompt is answered. Cancel-during-prompt counts as a deny.
-                    let allowed = tokio::select! {
-                        _ = cancel.cancelled() => false,
-                        resp = self.approval.request(req) => matches!(
-                            resp,
-                            ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
-                        ),
+                    let (resp, answered) = tokio::select! {
+                        _ = cancel.cancelled() => (ApprovalResponse::Deny { feedback: None }, false),
+                        resp = self.approval.request(req) => (resp, true),
                     };
-                    // Answer commit (spec §2.3): delete the park before
-                    // proceeding. Auto-deny (E5 knob) and cancel-deny commit
-                    // the same way.
+                    let allowed = matches!(
+                        resp,
+                        ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
+                    );
+                    // Answer commit (spec §2.3): delete the park only on a REAL
+                    // channel answer — approve / deny / E5 auto-deny (an
+                    // auto-deny IS an answer, delivered via the channel itself).
+                    // Cancellation must RETAIN the park (P1, ratified): it is the
+                    // CLI Ctrl-C / frontend-disconnect story (spec §2.7), and the
+                    // run must stay resumable via `agent sessions reopen`.
                     if let Some(ck) = self.checkpointer.as_ref() {
-                        ck.clear_park();
+                        if answered {
+                            ck.clear_park();
+                        } else {
+                            // Retain the file, but still reset the flushed flag
+                            // so the shared turn-end tail's cleanup (end_turn)
+                            // doesn't mistake our own retained gate-kind write
+                            // for a descendant's dispatch-kind flush and delete it.
+                            ck.retain_park();
+                        }
                     }
                     if allowed {
                         records.push(crate::GateRecord::Ready);
@@ -1427,12 +1436,15 @@ impl AgentLoop {
                     } else {
                         // Distinguish a cancel-driven denial (the run is ending) from
                         // an explicit user "no" so the tool result reads correctly.
-                        let reason = if cancel.is_cancelled() {
-                            "run cancelled"
+                        let content = if cancel.is_cancelled() {
+                            format!("ERROR: {}", ToolError::Denied("run cancelled".into()))
                         } else {
-                            "user declined"
+                            let feedback = match &resp {
+                                ApprovalResponse::Deny { feedback } => feedback.as_deref(),
+                                _ => None,
+                            };
+                            denial_content(feedback)
                         };
-                        let content = format!("ERROR: {}", ToolError::Denied(reason.into()));
                         records.push(crate::GateRecord::Rejected {
                             content: content.clone(),
                         });
@@ -1897,6 +1909,19 @@ struct ReadyCall {
     access: agent_tools::Access,
 }
 
+/// The ONE renderer for human-decline tool results (live NeedsApproval arm,
+/// resume splice, dispatch rebind all call it). Cancel-driven denial keeps
+/// its own "run cancelled" message — this covers explicit human declines only.
+pub(crate) fn denial_content(feedback: Option<&str>) -> String {
+    match feedback {
+        Some(f) => format!(
+            "ERROR: {}",
+            ToolError::Denied(format!("user declined — {f}"))
+        ),
+        None => format!("ERROR: {}", ToolError::Denied("user declined".into())),
+    }
+}
+
 /// Outcome of gating a single call before execution.
 enum GateOutcome {
     Ready(ReadyCall),
@@ -1935,7 +1960,7 @@ pub struct ResumeTurn {
     pub parked_index: Option<usize>,
     /// Some(_) when a durable answer.json committed a decision (E2 note: an
     /// ApproveAlways answered pre-restart arrives as plain approve=true).
-    pub parked_decision: Option<bool>,
+    pub parked_decision: Option<crate::checkpoint::ParkedAnswer>,
     pub turn: u64,
     pub guardrails: crate::Guardrails,
     /// Goal text handed to fire_run_start (memory recall etc.); from the
@@ -1948,7 +1973,7 @@ struct PreDecided {
     records: Vec<crate::GateRecord>,
     parked_index: usize,
     /// Some(_) when answer.json committed a decision; None ⇒ re-ask live.
-    parked_decision: Option<bool>,
+    parked_decision: Option<crate::checkpoint::ParkedAnswer>,
     /// Dispatch-kind resume (owner decision P1): Ready records re-execute
     /// ONLY dispatch_agent calls; other siblings get a synthetic
     /// lost-result error so host side effects never replay.
@@ -3590,6 +3615,127 @@ mod tests {
         assert_eq!(events.last().unwrap(), "done");
     }
 
+    #[test]
+    fn denial_content_no_feedback_is_byte_identical_to_today() {
+        // Pins the pre-4B-2 literal exactly (ToolError::Denied display is
+        // "denied: {0}"):
+        assert_eq!(denial_content(None), "ERROR: denied: user declined");
+    }
+
+    #[test]
+    fn denial_content_with_feedback_appends_the_text() {
+        assert_eq!(
+            denial_content(Some("use the staging DB instead")),
+            "ERROR: denied: user declined — use the staging DB instead"
+        );
+    }
+
+    /// Approval channel returning one scripted `ApprovalResponse`, wired to
+    /// the AskAll policy so every tool call hits the live NeedsApproval arm.
+    struct ScriptedApproval(ApprovalResponse);
+    #[async_trait::async_trait]
+    impl ApprovalChannel for ScriptedApproval {
+        async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+            self.0.clone()
+        }
+    }
+
+    /// Captures the full `ToolResult` (status + content) the string-label
+    /// `CollectingSink` can't — needed to assert the exact denial text.
+    #[derive(Default)]
+    struct ToolResultSink {
+        results: Mutex<Vec<(ToolStatus, String)>>,
+    }
+    impl EventSink for ToolResultSink {
+        fn emit(&self, event: AgentEvent) {
+            if let AgentEvent::ToolResult { status, output, .. } = event {
+                self.results.lock().unwrap().push((status, output.content));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_deny_with_feedback_reaches_the_tool_result() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
+            Scripted::Text("Understood.".into()),
+        ]));
+        let sink = Arc::new(ToolResultSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            Arc::new(AskAll),
+            Arc::new(ScriptedApproval(ApprovalResponse::Deny {
+                feedback: Some("wrong host".into()),
+            })),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let results = sink.results.lock().unwrap();
+        let (status, content) = results.first().expect("the gated call gets a result");
+        assert_eq!(*status, ToolStatus::Denied);
+        assert_eq!(content, &denial_content(Some("wrong host")));
+    }
+
+    #[tokio::test]
+    async fn live_deny_without_feedback_matches_pre_4b2_content() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
+            Scripted::Text("Understood.".into()),
+        ]));
+        let sink = Arc::new(ToolResultSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            Arc::new(AskAll),
+            Arc::new(ScriptedApproval(ApprovalResponse::Deny { feedback: None })),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let results = sink.results.lock().unwrap();
+        let (status, content) = results.first().expect("the gated call gets a result");
+        assert_eq!(*status, ToolStatus::Denied);
+        assert_eq!(content, "ERROR: denied: user declined");
+    }
+
     /// Ctrl-C during a pending approval prompt must end the run promptly as
     /// Cancelled — not wedge until the prompt is answered (audit Component 4).
     #[tokio::test(start_paused = true)]
@@ -4352,7 +4498,7 @@ mod tests {
         impl ApprovalChannel for RecordingApproval {
             async fn request(&self, req: ApprovalRequest) -> ApprovalResponse {
                 *self.captured.lock().unwrap() = Some(req.intent.summary.clone());
-                ApprovalResponse::Deny
+                ApprovalResponse::Deny { feedback: None }
             }
         }
 
@@ -4452,7 +4598,7 @@ mod tests {
         impl ApprovalChannel for RecordingApproval {
             async fn request(&self, req: ApprovalRequest) -> ApprovalResponse {
                 *self.captured.lock().unwrap() = Some(req.intent.summary.clone());
-                ApprovalResponse::Deny
+                ApprovalResponse::Deny { feedback: None }
             }
         }
 
@@ -8716,7 +8862,7 @@ mod tests {
         async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
             self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.parked_at_ask.lock().unwrap() = Some(crate::checkpoint::has_park(&self.park_dir));
-            self.resp
+            self.resp.clone()
         }
     }
 
@@ -8810,7 +8956,7 @@ mod tests {
         let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let parked_at_ask = Arc::new(std::sync::Mutex::new(None));
         let approval = Arc::new(ParkApproval {
-            resp: ApprovalResponse::Deny,
+            resp: ApprovalResponse::Deny { feedback: None },
             asks: asks.clone(),
             parked_at_ask: parked_at_ask.clone(),
             park_dir: ck_dir.clone(),
@@ -8825,6 +8971,263 @@ mod tests {
         );
         // Denial commits the answer the same way an approval does: park deleted.
         assert!(!crate::checkpoint::has_park(&ck_dir));
+    }
+
+    /// P1 (ratified owner decision, refinement 4b): cancellation must RETAIN
+    /// a parked ask — only a REAL channel answer (approve / deny / E5
+    /// auto-deny) clears it. Cancel-while-parked is the CLI Ctrl-C /
+    /// frontend-disconnect story (spec §2.7): the operator should be able to
+    /// reopen and answer later, not lose the park.
+    #[tokio::test]
+    async fn cancelled_while_parked_retains_the_park_file() {
+        struct NeverApprove;
+        #[async_trait::async_trait]
+        impl ApprovalChannel for NeverApprove {
+            async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+                std::future::pending().await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let (agent, _sink) = ask_agent(ws, Arc::new(NeverApprove), ck);
+
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        let run = tokio::spawn(async move {
+            let mut ctx = curated("ws");
+            agent.run_with_cancel(&mut ctx, "go".into(), cancel).await
+        });
+
+        // Poll for the park file to land (the loop writes it before blocking
+        // on the never-answering prompt) rather than assume timing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::checkpoint::has_park(&ck_dir) {
+            if std::time::Instant::now() > deadline {
+                panic!("park file never appeared before cancel");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        c2.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run must finish promptly after cancel, not wedge on the prompt")
+            .expect("run task must not panic")
+            .expect("run returns Ok");
+
+        assert!(
+            crate::checkpoint::has_park(&ck_dir),
+            "cancellation must not consume or clear a parked ask"
+        );
+    }
+
+    /// C-1 (4B-2 branch review, resume-driver variant of the test above): a
+    /// RESUMED run that re-parks at a NEW ask must also retain that park on
+    /// cancellation — `resume_with_cancel` (via `turn_loop`) returns `Ok(())`
+    /// on cancellation exactly like a fresh run does, so a caller (CLI
+    /// `run_sessions_reopen`, server `start_resume`) that reaps on any
+    /// `Ok(())` would wrongly delete a park the run deliberately kept. This
+    /// exercises the loop-level seam both drivers build on; also asserts the
+    /// resume lock is re-claimable afterward (proof `release_resume` ran,
+    /// mirroring what the fixed `start_resume`/`run_sessions_reopen` do).
+    #[tokio::test]
+    async fn cancelled_while_reparked_after_resume_retains_the_park_file() {
+        struct NeverApprove;
+        #[async_trait::async_trait]
+        impl ApprovalChannel for NeverApprove {
+            async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+                std::future::pending().await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+
+        // The RESUMED turn's pre-decided batch executes with no re-prompt;
+        // the model then requests a SECOND execute_command call, which the
+        // empty-allowlist policy sends to Ask — that's the new park.
+        let (agent, sink) = resume_agent(
+            ws.clone(),
+            Arc::new(NeverApprove),
+            Some(ck),
+            vec![Scripted::Call(
+                "c2".into(),
+                "execute_command".into(),
+                r#"{"command":"echo two"}"#.into(),
+            )],
+            vec![],
+        );
+        let batch = vec![ToolCall {
+            id: "c1".into(),
+            name: "execute_command".into(),
+            args: serde_json::json!({"command": "echo one"}),
+        }];
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![],
+            parked_index: Some(0),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: true,
+                feedback: None,
+            }),
+            turn: 3,
+            guardrails: crate::Guardrails {
+                tool_calls: 5,
+                model_calls: 4,
+            },
+            goal_text: "the goal".into(),
+        };
+
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        let run =
+            tokio::spawn(async move { agent.resume_with_cancel(&mut ctx, resume, cancel).await });
+
+        // Poll for the NEW park to land (c1 replays without re-prompting;
+        // c2 is the fresh Ask that writes it) rather than assume timing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::checkpoint::has_park(&ck_dir) {
+            if std::time::Instant::now() > deadline {
+                panic!("re-park never landed before cancel");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        c2.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run must finish promptly after cancel, not wedge on the prompt")
+            .expect("run task must not panic");
+        assert!(
+            result.is_ok(),
+            "resume_with_cancel must return Ok(()) on cancellation, same as a fresh run: {result:?}"
+        );
+
+        assert_eq!(
+            sink.status_of("c1").as_deref(),
+            Some("ok"),
+            "the pre-decided call executes without re-prompting before the cancel lands"
+        );
+        assert!(
+            crate::checkpoint::has_park(&ck_dir),
+            "cancellation mid-resume must not consume or clear the re-parked ask"
+        );
+
+        // Proof a caller's release_resume actually unblocks a retry: claim,
+        // then release, mirroring what the fixed start_resume/reopen do on
+        // this arm.
+        assert!(
+            crate::checkpoint::claim_resume(&ck_dir).unwrap(),
+            "the resume lock must be re-claimable after cancellation retains the park"
+        );
+        crate::checkpoint::release_resume(&ck_dir);
+    }
+
+    /// Live-drive regression (task-11b / 4B-2): deny-then-repark must not
+    /// produce a checkpoint that fails its own tally floor on the very next
+    /// load. Sequence: resume replays a committed DENY for the parked call
+    /// (the `parked_decision.approve == false` arm, `loop_.rs` ~1294-1321,
+    /// which appends a `Role::Tool` denial to history WITHOUT bumping
+    /// `ToolCallCount`) → the model retries with a brand-new call → the
+    /// empty-allowlist policy sends it to Ask again → THAT re-park must
+    /// still load and `verify_tally_floor` cleanly, proving
+    /// `Checkpointer::write_park`'s clamp covers the gate-kind park path
+    /// end to end (not just the checkpoint.rs unit level).
+    #[tokio::test]
+    async fn denied_then_reparked_checkpoint_passes_verify_tally_floor() {
+        struct NeverApprove;
+        #[async_trait::async_trait]
+        impl ApprovalChannel for NeverApprove {
+            async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+                std::future::pending().await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+
+        // The RESUMED turn's single pending call ("c1") is committed as a
+        // DENY. The model then retries with a fresh call ("c3") that the
+        // empty-allowlist policy sends to a live Ask, which never answers —
+        // that Ask is the new park under test.
+        let (agent, _sink) = resume_agent(
+            ws.clone(),
+            Arc::new(NeverApprove),
+            Some(ck),
+            vec![Scripted::Call(
+                "c3".into(),
+                "execute_command".into(),
+                r#"{"command":"echo retry"}"#.into(),
+            )],
+            vec![],
+        );
+        let batch = vec![ToolCall {
+            id: "c1".into(),
+            name: "execute_command".into(),
+            args: serde_json::json!({"command": "echo one"}),
+        }];
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![],
+            parked_index: Some(0),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: false,
+                feedback: Some("use something else instead".into()),
+            }),
+            turn: 3,
+            guardrails: crate::Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            goal_text: "the goal".into(),
+        };
+
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        let run =
+            tokio::spawn(async move { agent.resume_with_cancel(&mut ctx, resume, cancel).await });
+
+        // Poll for the NEW park (c3's Ask) to land.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::checkpoint::has_park(&ck_dir) {
+            if std::time::Instant::now() > deadline {
+                panic!("re-park never landed before cancel");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        c2.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run must finish promptly after cancel, not wedge on the prompt")
+            .expect("run task must not panic");
+        assert!(
+            result.is_ok(),
+            "resume_with_cancel returns Ok(()) on cancel: {result:?}"
+        );
+
+        // The bug: this new park's history now carries c1's denial (a
+        // Role::Tool message) with ToolCallCount never bumped for it, so a
+        // naive tally would read 0 against an implied floor of 1. The write
+        // clamp must keep the persisted checkpoint self-consistent.
+        let loaded = crate::checkpoint::load_checkpoint(&ck_dir, &[7u8; 32])
+            .unwrap()
+            .expect("re-park must be on disk");
+        crate::checkpoint::verify_tally_floor(&loaded)
+            .expect("clamped tally must satisfy its own history-implied floor");
     }
 
     #[tokio::test]
@@ -8890,7 +9293,7 @@ mod tests {
             async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
                 *self.stash.lock().unwrap() =
                     crate::checkpoint::load_checkpoint(&self.ck_dir, &self.key).unwrap();
-                ApprovalResponse::Deny
+                ApprovalResponse::Deny { feedback: None }
             }
         }
 
@@ -9197,7 +9600,7 @@ mod tests {
             if let Some(d) = &self.park_dir {
                 *self.parked_at_ask.lock().unwrap() = Some(crate::checkpoint::has_park(d));
             }
-            self.resp
+            self.resp.clone()
         }
     }
 
@@ -9314,7 +9717,10 @@ mod tests {
             invalid: vec![],
             gate_records: vec![crate::GateRecord::Ready],
             parked_index: Some(1),
-            parked_decision: Some(true),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: true,
+                feedback: None,
+            }),
             turn: 3,
             guardrails: crate::Guardrails {
                 tool_calls: 5,
@@ -9371,7 +9777,10 @@ mod tests {
             invalid: vec![],
             gate_records: vec![crate::GateRecord::Ready],
             parked_index: Some(1),
-            parked_decision: Some(false),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: false,
+                feedback: None,
+            }),
             turn: 3,
             guardrails: crate::Guardrails {
                 tool_calls: 0,
@@ -9403,6 +9812,130 @@ mod tests {
             .find(|(i, _, _)| i == "c2")
             .cloned();
         assert!(c2.is_some());
+    }
+
+    /// Build the same resumed-batch rig as `resume_agent`, but wired to
+    /// `ToolResultSink` so the test can assert the exact spliced content
+    /// (`resume_agent`'s `IdSink` only records status labels).
+    fn resume_agent_with_result_sink(
+        ws: std::path::PathBuf,
+        approval: Arc<dyn ApprovalChannel>,
+    ) -> (AgentLoop, Arc<ToolResultSink>) {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        });
+        let sink = Arc::new(ToolResultSink::default());
+        let agent = AgentLoop::new(
+            Arc::new(ScriptedModel::new(vec![Scripted::Text(
+                "wrapped up".into(),
+            )])),
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            approval,
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        );
+        (agent, sink)
+    }
+
+    #[tokio::test]
+    async fn resumed_deny_renders_stored_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let approval = Arc::new(SpliceApproval {
+            resp: ApprovalResponse::Approve,
+            asks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            parked_at_ask: Arc::new(std::sync::Mutex::new(None)),
+            park_dir: None,
+        });
+        let (agent, sink) = resume_agent_with_result_sink(ws.clone(), approval);
+        let batch = echo_batch();
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![crate::GateRecord::Ready],
+            parked_index: Some(1),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: false,
+                feedback: Some("not that file".into()),
+            }),
+            turn: 3,
+            guardrails: crate::Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            goal_text: "the goal".into(),
+        };
+        agent
+            .resume_with_cancel(&mut ctx, resume, CancellationToken::new())
+            .await
+            .unwrap();
+        let results = sink.results.lock().unwrap();
+        let (status, content) = results
+            .iter()
+            .find(|(s, _)| *s == ToolStatus::Denied)
+            .expect("c2's denied result");
+        assert_eq!(*status, ToolStatus::Denied);
+        assert_eq!(content, &denial_content(Some("not that file")));
+    }
+
+    #[tokio::test]
+    async fn resumed_deny_without_feedback_matches_pre_4b2_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let approval = Arc::new(SpliceApproval {
+            resp: ApprovalResponse::Approve,
+            asks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            parked_at_ask: Arc::new(std::sync::Mutex::new(None)),
+            park_dir: None,
+        });
+        let (agent, sink) = resume_agent_with_result_sink(ws.clone(), approval);
+        let batch = echo_batch();
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![crate::GateRecord::Ready],
+            parked_index: Some(1),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: false,
+                feedback: None,
+            }),
+            turn: 3,
+            guardrails: crate::Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            goal_text: "the goal".into(),
+        };
+        agent
+            .resume_with_cancel(&mut ctx, resume, CancellationToken::new())
+            .await
+            .unwrap();
+        let results = sink.results.lock().unwrap();
+        let (status, content) = results
+            .iter()
+            .find(|(s, _)| *s == ToolStatus::Denied)
+            .expect("c2's denied result");
+        assert_eq!(*status, ToolStatus::Denied);
+        assert_eq!(content, &denial_content(None), "the 4B-1 string, unchanged");
     }
 
     #[tokio::test]
@@ -9490,7 +10023,10 @@ mod tests {
             invalid: vec![],
             gate_records: vec![crate::GateRecord::Ready],
             parked_index: Some(1),
-            parked_decision: Some(true),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: true,
+                feedback: None,
+            }),
             turn: 3,
             guardrails: crate::Guardrails {
                 tool_calls: (crate::TOOL_CALL_LIMIT - 1) as u64,

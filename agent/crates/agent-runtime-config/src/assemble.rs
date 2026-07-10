@@ -49,7 +49,8 @@ pub struct LoopParts {
     pub api_key: Option<String>,
     pub claude_binary: String,
     /// Park-point checkpointing (4B-1). None ⇒ no checkpoint I/O ever (E1);
-    /// the CLI passes None in 4B-1 (its reopen surface is 4B-2).
+    /// the CLI now passes Some for live runs and its `sessions reopen` driver
+    /// alike (4B-2), so checkpoint I/O is active on both front-ends.
     pub checkpoint: Option<Arc<agent_core::Checkpointer>>,
 }
 

@@ -32,11 +32,11 @@ pub struct ApprovalRequest {
     pub origin: Option<ApprovalOrigin>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ApprovalResponse {
     Approve,
     ApproveAlways,
-    Deny,
+    Deny { feedback: Option<String> },
 }
 
 #[async_trait]
@@ -371,7 +371,7 @@ mod tests {
         impl ApprovalChannel for Capture {
             async fn request(&self, req: ApprovalRequest) -> ApprovalResponse {
                 *self.0.lock().unwrap() = Some(req);
-                ApprovalResponse::Deny
+                ApprovalResponse::Deny { feedback: None }
             }
         }
         let cap = Arc::new(Capture(Mutex::new(None)));

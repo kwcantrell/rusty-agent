@@ -2586,7 +2586,7 @@ mod tests {
             _r: agent_policy::ApprovalRequest,
         ) -> agent_policy::ApprovalResponse {
             self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.resp
+            self.resp.clone()
         }
     }
 
@@ -2759,7 +2759,10 @@ mod tests {
     async fn ask_floor_routes_through_approval_channel() {
         for (resp, should_run) in [
             (agent_policy::ApprovalResponse::Approve, true),
-            (agent_policy::ApprovalResponse::Deny, false),
+            (
+                agent_policy::ApprovalResponse::Deny { feedback: None },
+                false,
+            ),
         ] {
             let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let probe = Arc::new(ProbeTool {

@@ -1,0 +1,22 @@
+#!/usr/bin/expect -f
+# reopen_drive.exp — park a CLI run at an approval, then die (Task 11 / 4B-2
+# live drive). Requires $DRIVE_HOME and $DRIVE_WS to be set in the
+# environment (isolated tmp dirs — never point this at a real ~/.rusty-agent).
+#
+# NOTE: this host's environment lacked the `expect`/`tclsh` package and had
+# no passwordless sudo to install it, so Task 11 was actually driven with an
+# equivalent pexpect (Python) script — see
+# .superpowers/sdd/task-11-report.md for the real transcripts/evidence. This
+# .exp file is kept as the canonical, directly-runnable driver per the task
+# brief for hosts that do have `expect` installed; it mirrors the pexpect
+# script step-for-step and was reviewed (not executed) against the observed
+# CLI behavior (prompt glyph is the unicode "›", not ">").
+set timeout 120
+set env(HOME) $::env(DRIVE_HOME)
+spawn ./target/release/agent --workspace $::env(DRIVE_WS) --base-url http://localhost:8080
+expect "›"
+send "run the command: touch /tmp/4b2-drive-marker\r"
+expect -re {Allow:.*\[y\]es}
+# Ask is on screen => the park is already written. Kill without answering:
+exec kill -INT [exp_pid]
+expect eof

@@ -63,6 +63,12 @@ describe("ipc transport", () => {
     expect(invoke).toHaveBeenCalledWith("approve", { id: "c0", decision: "approve" });
   });
 
+  it("routes a deny-with-feedback approval_response to the approve command", () => {
+    const sock = connect({ onFrame: () => {}, onStatus: () => {} });
+    sock.send({ kind: "approval_response", id: "c0", decision: { deny: { feedback: "why" } } });
+    expect(invoke).toHaveBeenCalledWith("approve", { id: "c0", decision: { deny: { feedback: "why" } } });
+  });
+
   it("dispatches settings_get result as a settings_state frame", async () => {
     invoke.mockReset();
     invoke.mockImplementation((cmd: string) => {

@@ -128,6 +128,31 @@ pub enum ServerEvent {
         tool_calls: u64,
         duration_ms: u64,
     },
+    /// Attach-time snapshot of PRIOR sessions parked on approvals (4B-2).
+    ParkedRuns {
+        runs: Vec<ParkedRunDto>,
+    },
+    /// An approval was answered/retracted somewhere else — drop the prompt.
+    ApprovalResolved {
+        id: String,
+    },
+    /// A parked session's resume has started; its banner row should drop.
+    Resumed {
+        session_id: String,
+    },
+}
+
+/// One PRIOR session parked on an approval, surfaced in the `ParkedRuns`
+/// attach-time snapshot (4B-2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParkedRunDto {
+    pub session_id: String,
+    pub workspace: String,
+    pub created_ms: u64,
+    /// Unanswered asks awaiting a human (0 with error set ⇒ unresumable).
+    pub asks: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Wire form of `agent_policy::ApprovalOrigin` — sub-agent attribution carried
@@ -271,12 +296,64 @@ pub fn redact_base_url(url: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     Approve,
     ApproveAlways,
-    Deny,
+    Deny { feedback: Option<String> },
+}
+
+// Hand-written serde: bare "deny" must stay valid on the wire in both
+// directions, and `Deny { feedback: None }` must serialize back to it —
+// only a feedback-carrying deny uses the `{"deny":{"feedback":"…"}}` form.
+impl Serialize for Decision {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Decision::Approve => s.serialize_str("approve"),
+            Decision::ApproveAlways => s.serialize_str("approve_always"),
+            Decision::Deny { feedback: None } => s.serialize_str("deny"),
+            Decision::Deny { feedback: Some(f) } => {
+                use serde::ser::SerializeMap;
+                #[derive(Serialize)]
+                struct Fb<'a> {
+                    feedback: &'a str,
+                }
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_entry("deny", &Fb { feedback: f })?;
+                m.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Decision {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Tag(String),
+            Obj { deny: DenyBody },
+        }
+        #[derive(Deserialize)]
+        struct DenyBody {
+            #[serde(default)]
+            feedback: Option<String>,
+        }
+        match Wire::deserialize(d)? {
+            Wire::Tag(t) => match t.as_str() {
+                "approve" => Ok(Decision::Approve),
+                "approve_always" => Ok(Decision::ApproveAlways),
+                "deny" => Ok(Decision::Deny { feedback: None }),
+                other => Err(serde::de::Error::unknown_variant(
+                    other,
+                    &["approve", "approve_always", "deny"],
+                )),
+            },
+            Wire::Obj { deny } => Ok(Decision::Deny {
+                feedback: deny.feedback,
+            }),
+        }
+    }
 }
 
 impl From<Decision> for ApprovalResponse {
@@ -284,7 +361,7 @@ impl From<Decision> for ApprovalResponse {
         match d {
             Decision::Approve => ApprovalResponse::Approve,
             Decision::ApproveAlways => ApprovalResponse::ApproveAlways,
-            Decision::Deny => ApprovalResponse::Deny,
+            Decision::Deny { feedback } => ApprovalResponse::Deny { feedback },
         }
     }
 }
@@ -872,6 +949,56 @@ mod tests {
         assert_eq!(
             ApprovalResponse::from(Decision::ApproveAlways),
             ApprovalResponse::ApproveAlways
+        );
+    }
+
+    #[test]
+    fn decision_serde_accepts_legacy_bare_deny_and_new_object_form() {
+        let d: Decision = serde_json::from_str("\"deny\"").unwrap();
+        assert_eq!(d, Decision::Deny { feedback: None });
+        let d: Decision = serde_json::from_str(r#"{"deny":{"feedback":"use staging"}}"#).unwrap();
+        assert_eq!(
+            d,
+            Decision::Deny {
+                feedback: Some("use staging".into())
+            }
+        );
+        let d: Decision = serde_json::from_str(r#"{"deny":{}}"#).unwrap();
+        assert_eq!(d, Decision::Deny { feedback: None });
+        let d: Decision = serde_json::from_str("\"approve_always\"").unwrap();
+        assert_eq!(d, Decision::ApproveAlways);
+    }
+
+    #[test]
+    fn decision_serialize_is_byte_identical_when_no_feedback() {
+        assert_eq!(
+            serde_json::to_string(&Decision::Approve).unwrap(),
+            "\"approve\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Decision::Deny { feedback: None }).unwrap(),
+            "\"deny\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Decision::Deny {
+                feedback: Some("x".into())
+            })
+            .unwrap(),
+            r#"{"deny":{"feedback":"x"}}"#
+        );
+    }
+
+    #[test]
+    fn deny_feedback_crosses_into_approval_response() {
+        let r: ApprovalResponse = Decision::Deny {
+            feedback: Some("nope".into()),
+        }
+        .into();
+        assert_eq!(
+            r,
+            ApprovalResponse::Deny {
+                feedback: Some("nope".into())
+            }
         );
     }
 

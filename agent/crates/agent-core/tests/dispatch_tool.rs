@@ -503,7 +503,7 @@ struct RecordingApproval {
 impl agent_policy::ApprovalChannel for RecordingApproval {
     async fn request(&self, req: agent_policy::ApprovalRequest) -> agent_policy::ApprovalResponse {
         self.seen.lock().unwrap().push(req.intent.summary.clone());
-        self.reply
+        self.reply.clone()
     }
 }
 
@@ -546,7 +546,7 @@ async fn child_ask_routes_to_the_shared_approval_channel_and_deny_sticks() {
     let sink = Arc::new(FullSink::default());
     let approval = Arc::new(RecordingApproval {
         seen: Mutex::new(vec![]),
-        reply: agent_policy::ApprovalResponse::Deny,
+        reply: agent_policy::ApprovalResponse::Deny { feedback: None },
     });
     let mut d = deps(
         ScriptedModel::new(vec![
@@ -1666,7 +1666,7 @@ impl agent_policy::ApprovalChannel for CapturingApproval {
         if let Some(d) = self.delay {
             tokio::time::sleep(d).await;
         }
-        self.reply
+        self.reply.clone()
     }
 }
 
@@ -1737,7 +1737,7 @@ async fn child_ask_carries_origin_and_parks_under_children_dir() {
         park_seen: Mutex::new(vec![]),
         child_dir: child_dir.clone(),
         parent_dir: ckdir.clone(),
-        reply: agent_policy::ApprovalResponse::Deny,
+        reply: agent_policy::ApprovalResponse::Deny { feedback: None },
         delay: None,
     });
     let sink = Arc::new(FullSink::default());
@@ -1795,7 +1795,7 @@ async fn parent_ask_has_no_origin() {
         park_seen: Mutex::new(vec![]),
         child_dir: ws.clone(),
         parent_dir: ws.clone(),
-        reply: agent_policy::ApprovalResponse::Deny,
+        reply: agent_policy::ApprovalResponse::Deny { feedback: None },
         delay: None,
     });
     let mut reg = ToolRegistry::new();
@@ -1853,12 +1853,12 @@ async fn dispatch_rebinds_a_parked_child_and_resumes_in_place() {
         &Default::default(),
     )
     .unwrap();
-    write_answer(&child_dir, &CKKEY, true).unwrap();
+    write_answer(&child_dir, &CKKEY, true, None).unwrap();
 
     // A recording approval proves NO prompt fires on resume.
     let approval = Arc::new(RecordingApproval {
         seen: Mutex::new(vec![]),
-        reply: agent_policy::ApprovalResponse::Deny,
+        reply: agent_policy::ApprovalResponse::Deny { feedback: None },
     });
     let sink = Arc::new(FullSink::default());
     let mut d = deps(

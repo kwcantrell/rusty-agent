@@ -188,7 +188,7 @@ struct DenyAll;
 #[async_trait::async_trait]
 impl ApprovalChannel for DenyAll {
     async fn request(&self, _r: ApprovalRequest) -> ApprovalResponse {
-        ApprovalResponse::Deny
+        ApprovalResponse::Deny { feedback: None }
     }
 }
 

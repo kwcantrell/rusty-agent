@@ -146,6 +146,11 @@ Split per E4 into three plan slices sharing this spec.
 - CLI: session listing (parked marked), reopen-with-re-prompt,
   timeout parks-and-exits (E5).
 
+*Ratification note (2026-07-10, Task 12 sweep): the 4B-1 merge-gate
+deferrals — including refinement 5a, per-descriptor trace attribution for
+resumed runs — landed in 4B-2 (Task 6); pending owner sign-off at the
+4B-2 whole-branch merge gate.*
+
 **OUT (named, §5 where deferred):** edit/respond decisions; ApproveAlways
 grant store (E2); time travel / checkpoint history; mid-tool-execution
 checkpointing; **any crash recovery for non-parked runs** (E1); declarative

@@ -178,6 +178,7 @@ impl RuntimeState {
     /// artifacts/todos/flag, shared sink/approval/stats/mcp tools.
     pub fn build_resume_loop(
         &self,
+        resumed_session_id: &str,
         workspace: &Path,
         checkpoint: Arc<agent_core::Checkpointer>,
         artifacts: &Arc<SessionArtifacts>,
@@ -185,6 +186,9 @@ impl RuntimeState {
         compact_flag: &Arc<AtomicBool>,
     ) -> BuiltLoop {
         let cfg = self.config.lock().unwrap().clone();
+        // Trace attribution (4B-1 merge-gate deferral): a resumed session's
+        // events append to ITS OWN jsonl, not the resuming daemon's.
+        let trace = agent_runtime_config::build_trace(&cfg, resumed_session_id);
         build_loop(
             &cfg,
             &self.sink,
@@ -198,7 +202,7 @@ impl RuntimeState {
             compact_flag,
             todos,
             &self.stats,
-            &self.trace,
+            &trace,
             &Some(checkpoint),
         )
     }
@@ -1005,7 +1009,7 @@ mod tests {
         let artifacts = Arc::new(SessionArtifacts::new());
         let todos: agent_core::TodoHandle = Arc::new(Mutex::new(Vec::new()));
         let flag = Arc::new(AtomicBool::new(false));
-        let built = rs.build_resume_loop(other_ws.path(), ck, &artifacts, &todos, &flag);
+        let built = rs.build_resume_loop("old-1", other_ws.path(), ck, &artifacts, &todos, &flag);
         // system prompt composed from CURRENT config (live truth):
         assert_eq!(built.system_prompt, rs.current_system_prompt());
     }

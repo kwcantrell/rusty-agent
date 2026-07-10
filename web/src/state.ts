@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import type { ApprovalOrigin, Display, Inbound, RuntimeSettings, SessionStats } from "./wire";
+import type { ApprovalOrigin, Display, Inbound, ParkedRun, RuntimeSettings, SessionStats } from "./wire";
 import { displayDesignId } from "./designStore";
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
@@ -76,6 +76,7 @@ export interface ConversationState {
   settingsError: string | null;
   sandboxDegraded: { mechanism: string; reason: string } | null;
   stats: SessionStats | null;
+  parkedRuns: ParkedRun[];
 }
 
 export type Action =
@@ -84,11 +85,12 @@ export type Action =
   | { type: "user_send"; text: string }
   | { type: "approval_sent" }
   | { type: "status"; status: ConnectionStatus }
-  | { type: "dismiss_sandbox_banner" };
+  | { type: "dismiss_sandbox_banner" }
+  | { type: "dismiss_parked_banner" };
 
 export function initialState(userMsgs: string[]): ConversationState {
   return { items: [], pendingApproval: null, usage: null, serverUsage: null, online: false, status: "connecting", userMsgs, turnIndex: 0, inTurn: false,
-    settings: null, settingsMeta: null, settingsError: null, sandboxDegraded: null, stats: null };
+    settings: null, settingsMeta: null, settingsError: null, sandboxDegraded: null, stats: null, parkedRuns: [] };
 }
 
 /** One-line human summary of a context-management event, keyed by kind. */
@@ -203,6 +205,8 @@ export function reduce(state: ConversationState, action: Action): ConversationSt
       };
     case "dismiss_sandbox_banner":
       return { ...state, sandboxDegraded: null };
+    case "dismiss_parked_banner":
+      return { ...state, parkedRuns: [] };
     case "frame":
       return reduceFrame(state, action.frame);
   }
@@ -233,6 +237,29 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
     return { ...state, items, pendingApproval: {
       id: frame.id, summary: frame.summary, command: frame.command,
       display: frame.display, origin: frame.origin } };
+  }
+  if (frame.kind === "parked_runs") {
+    return { ...state, parkedRuns: frame.runs };
+  }
+  if (frame.kind === "approval_resolved") {
+    // id-guarded: a retraction for an overwritten OLD id must not clear a
+    // newer prompt (arch review finding 8 verified this guard sufficient).
+    if (state.pendingApproval?.id !== frame.id) return state;
+    return {
+      ...state,
+      pendingApproval: null,
+      items: state.items.map((it) =>
+        isToolItem(it) && it.subagent?.waitingApproval
+          ? { ...it, subagent: { ...it.subagent, waitingApproval: false } }
+          : it,
+      ),
+    };
+  }
+  if (frame.kind === "resumed") {
+    return {
+      ...state,
+      parkedRuns: state.parkedRuns.filter((r) => r.session_id !== frame.resumed_session_id),
+    };
   }
   // frame.kind === "event"
   const p = frame.payload;
