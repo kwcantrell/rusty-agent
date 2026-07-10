@@ -35,4 +35,8 @@ AGENT_E2E_URL=… AGENT_E2E_MODEL=… cargo test -p agent-core --test e2e_sglang
 - Session traces land in `~/.rusty-agent/sessions/<id>.jsonl` (disable with `"trace": false`
   in the runtime config). Each session also writes
   `~/.rusty-agent/sessions/<id>/descriptor.json` — its durable identity
-  (workspace + config provenance), written even when tracing is off.
+  (workspace + config provenance), written even when tracing is off. A
+  session with an unanswered approval also writes
+  `~/.rusty-agent/sessions/<id>/checkpoint/` — an HMAC'd `parked.json`
+  (keyed by `~/.rusty-agent/secret`) that lets the run survive frontend
+  disconnect and daemon restart; it's deleted once the approval is answered.
