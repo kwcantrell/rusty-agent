@@ -9131,6 +9131,105 @@ mod tests {
         crate::checkpoint::release_resume(&ck_dir);
     }
 
+    /// Live-drive regression (task-11b / 4B-2): deny-then-repark must not
+    /// produce a checkpoint that fails its own tally floor on the very next
+    /// load. Sequence: resume replays a committed DENY for the parked call
+    /// (the `parked_decision.approve == false` arm, `loop_.rs` ~1294-1321,
+    /// which appends a `Role::Tool` denial to history WITHOUT bumping
+    /// `ToolCallCount`) → the model retries with a brand-new call → the
+    /// empty-allowlist policy sends it to Ask again → THAT re-park must
+    /// still load and `verify_tally_floor` cleanly, proving
+    /// `Checkpointer::write_park`'s clamp covers the gate-kind park path
+    /// end to end (not just the checkpoint.rs unit level).
+    #[tokio::test]
+    async fn denied_then_reparked_checkpoint_passes_verify_tally_floor() {
+        struct NeverApprove;
+        #[async_trait::async_trait]
+        impl ApprovalChannel for NeverApprove {
+            async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+                std::future::pending().await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+
+        // The RESUMED turn's single pending call ("c1") is committed as a
+        // DENY. The model then retries with a fresh call ("c3") that the
+        // empty-allowlist policy sends to a live Ask, which never answers —
+        // that Ask is the new park under test.
+        let (agent, _sink) = resume_agent(
+            ws.clone(),
+            Arc::new(NeverApprove),
+            Some(ck),
+            vec![Scripted::Call(
+                "c3".into(),
+                "execute_command".into(),
+                r#"{"command":"echo retry"}"#.into(),
+            )],
+            vec![],
+        );
+        let batch = vec![ToolCall {
+            id: "c1".into(),
+            name: "execute_command".into(),
+            args: serde_json::json!({"command": "echo one"}),
+        }];
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![],
+            parked_index: Some(0),
+            parked_decision: Some(crate::checkpoint::ParkedAnswer {
+                approve: false,
+                feedback: Some("use something else instead".into()),
+            }),
+            turn: 3,
+            guardrails: crate::Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            goal_text: "the goal".into(),
+        };
+
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        let run =
+            tokio::spawn(async move { agent.resume_with_cancel(&mut ctx, resume, cancel).await });
+
+        // Poll for the NEW park (c3's Ask) to land.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::checkpoint::has_park(&ck_dir) {
+            if std::time::Instant::now() > deadline {
+                panic!("re-park never landed before cancel");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        c2.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run must finish promptly after cancel, not wedge on the prompt")
+            .expect("run task must not panic");
+        assert!(
+            result.is_ok(),
+            "resume_with_cancel returns Ok(()) on cancel: {result:?}"
+        );
+
+        // The bug: this new park's history now carries c1's denial (a
+        // Role::Tool message) with ToolCallCount never bumped for it, so a
+        // naive tally would read 0 against an implied floor of 1. The write
+        // clamp must keep the persisted checkpoint self-consistent.
+        let loaded = crate::checkpoint::load_checkpoint(&ck_dir, &[7u8; 32])
+            .unwrap()
+            .expect("re-park must be on disk");
+        crate::checkpoint::verify_tally_floor(&loaded)
+            .expect("clamped tally must satisfy its own history-implied floor");
+    }
+
     #[tokio::test]
     async fn non_ask_runs_write_zero_checkpoint_bytes() {
         // E1: an allowlisted command auto-allows (Decision::Allow) so no Ask

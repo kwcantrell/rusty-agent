@@ -472,22 +472,36 @@ impl Checkpoint {
     }
 }
 
-/// Monotonic tally clamp (spec §2.4 step 3): the restored tally may never be
-/// below what the checkpointed history implies. Implied floor = executed tool
-/// results after the last user message (this run's earlier turns). Rejected /
-/// invalid results in history also count `Role::Tool`, but never over-floor —
-/// they were still gate outcomes this run; an over-strict floor errs toward
-/// refuse, which is the fail-safe direction.
-pub fn verify_tally_floor(chk: &Checkpoint) -> Result<(), CheckpointError> {
-    let last_user = chk
-        .context
+/// Implied tool-tally floor: count of `Role::Tool` history messages after
+/// the last `Role::User` message (this run's earlier turns). This counts
+/// EVERY `Role::Tool` entry — executed results AND gate denials alike, since
+/// both a live gate-deny (spec §2.3) and a committed-answer replay-deny
+/// (resume path) append a `Role::Tool` rejection message without ever
+/// reaching `ToolCallLimit::wrap_tool_call` (the sole `ToolCallCount`
+/// increment site). Park writers clamp the persisted tally up to this floor
+/// (see `Checkpointer::write_park` / `flush_snapshot`) so denials never
+/// desync `guardrails.tool_calls` from what the history implies.
+pub(crate) fn implied_tool_floor(state: &crate::CuratedContextState) -> u64 {
+    let last_user = state
         .history
         .iter()
         .rposition(|m| m.role == agent_model::Role::User);
-    let implied = chk.context.history[last_user.map_or(0, |i| i + 1)..]
+    state.history[last_user.map_or(0, |i| i + 1)..]
         .iter()
         .filter(|m| m.role == agent_model::Role::Tool)
-        .count() as u64;
+        .count() as u64
+}
+
+/// Monotonic tally clamp (spec §2.4 step 3): the restored tally may never be
+/// below what the checkpointed history implies (`implied_tool_floor`). This
+/// is the E6b anti-tamper guard — a forged-DOWN tally must still refuse, so
+/// this function only ever REFUSES, never repairs. The write-side clamp
+/// (`Checkpointer::write_park` / `flush_snapshot`) is what keeps legitimate
+/// denial-then-repark checkpoints at or above this floor in the first place;
+/// this is the read-side check that a checkpoint wasn't tampered with after
+/// the fact.
+pub fn verify_tally_floor(chk: &Checkpoint) -> Result<(), CheckpointError> {
+    let implied = implied_tool_floor(&chk.context);
     if chk.guardrails.tool_calls < implied {
         return Err(CheckpointError::Corrupt(format!(
             "tool tally {} below history-implied floor {implied}",
@@ -611,9 +625,20 @@ impl Checkpointer {
     // resuming into a child checkpoint that never got written.
     pub async fn write_park(
         &self,
-        chk: Checkpoint,
+        mut chk: Checkpoint,
         artifacts: &crate::SessionArtifacts,
     ) -> std::io::Result<()> {
+        // Clamp UP to the history-implied floor (never down — budget only
+        // shrinks toward the floor, never refills; spec §3.8 direction).
+        // `ToolCallCount` undercounts gate-denied-without-dispatch calls
+        // (both live-deny and committed-answer-replay-deny skip
+        // `wrap_tool_call`), so the tally can legitimately trail the floor
+        // at write time; this restores the invariant `verify_tally_floor`
+        // checks on read.
+        chk.guardrails.tool_calls = chk
+            .guardrails
+            .tool_calls
+            .max(implied_tool_floor(&chk.context));
         let dump = dump_artifacts(artifacts).await;
         write_checkpoint(&self.dir, &self.key, &chk, &dump)?;
         self.flushed.store(true, Ordering::SeqCst);
@@ -634,13 +659,20 @@ impl Checkpointer {
         }
         let snap = self.turn_snapshot.lock().unwrap().take();
         let Some(snap) = snap else { return };
+        // Same clamp as `write_park` (see its comment) — this is the OTHER
+        // production writer of a `Checkpoint`, so it needs its own copy.
+        let floor = implied_tool_floor(&snap.context);
+        let guardrails = crate::Guardrails {
+            tool_calls: snap.guardrails.tool_calls.max(floor),
+            ..snap.guardrails
+        };
         let chk = Checkpoint {
             version: CHECKPOINT_VERSION,
             session_id: self.session_id.clone(),
             subagent_path: self.subagent_path.clone(),
             turn: snap.turn,
             context: snap.context,
-            guardrails: snap.guardrails,
+            guardrails,
             parked: ParkedTurn {
                 assistant_text: snap.assistant_text,
                 tool_calls: snap.tool_calls,
@@ -863,6 +895,69 @@ mod tests {
         chk.guardrails.tool_calls = 0;
         assert!(matches!(
             verify_tally_floor(&chk),
+            Err(CheckpointError::Corrupt(_))
+        ));
+    }
+
+    /// Reproduces the live-drive bug (task-11b): a deny (live gate-deny or
+    /// committed-answer replay) appends a `Role::Tool` denial to history
+    /// without bumping `ToolCallCount`, so a checkpoint built with the
+    /// desynced tally at park time would fail `verify_tally_floor` on the
+    /// very next load. `Checkpointer::write_park` must clamp the tally UP to
+    /// the implied floor at write time so the round-tripped checkpoint
+    /// always verifies.
+    #[tokio::test]
+    async fn write_park_clamps_tally_to_history_implied_floor_after_a_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let ck = Checkpointer::new(dir.path().join("checkpoint"), key(), "s1".into());
+        let mut chk = sample();
+        // [user, assistant(tool_calls), tool(denial)] — one denial in
+        // history, but the tally was never bumped for it (0).
+        chk.context.history = vec![
+            agent_model::Message::user("hi"),
+            agent_model::Message::assistant("go", None),
+            agent_model::Message::tool("c1", "execute_command", "ERROR: denied: user declined"),
+        ];
+        chk.guardrails.tool_calls = 0;
+        ck.write_park(chk, &crate::SessionArtifacts::new())
+            .await
+            .unwrap();
+
+        let loaded = load_checkpoint(ck.dir(), &key()).unwrap().unwrap();
+        assert_eq!(
+            loaded.guardrails.tool_calls, 1,
+            "write_park clamps the persisted tally up to the implied floor"
+        );
+        assert!(
+            verify_tally_floor(&loaded).is_ok(),
+            "clamped checkpoint must round-trip and verify"
+        );
+    }
+
+    /// The clamp lives at the WRITER, not the verifier: a checkpoint that
+    /// reaches disk with a tally below the floor by some OTHER path (bypass
+    /// the clamp, simulating tamper or a future writer that forgets it) must
+    /// still be refused on load. This is the E6b anti-tamper guarantee —
+    /// `verify_tally_floor` never repairs, only refuses.
+    #[test]
+    fn verify_tally_floor_still_refuses_a_hand_forged_below_floor_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut chk = sample();
+        chk.context.history = vec![
+            agent_model::Message::user("hi"),
+            agent_model::Message::assistant("go", None),
+            agent_model::Message::tool("c1", "execute_command", "ERROR: denied"),
+        ];
+        chk.guardrails.tool_calls = 0; // forged/under-counted, bypassing write_park's clamp
+        write_checkpoint(dir.path(), &key(), &chk, &arts()).unwrap();
+
+        let loaded = load_checkpoint(dir.path(), &key()).unwrap().unwrap();
+        assert_eq!(
+            loaded.guardrails.tool_calls, 0,
+            "write_checkpoint itself does not clamp"
+        );
+        assert!(matches!(
+            verify_tally_floor(&loaded),
             Err(CheckpointError::Corrupt(_))
         ));
     }
