@@ -613,6 +613,47 @@ mod tests {
     }
 
     #[test]
+    fn child_token_lands_in_the_jsonl_exactly_once() {
+        // Production topology: SubagentSink over an ObservedSink whose `trace`
+        // is the SAME TraceWriter behind the ChildTraceTap (spec §2.6/§3.4).
+        struct NullSink;
+        impl EventSink for NullSink {
+            fn emit(&self, _: AgentEvent) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = TraceWriter::create(dir.path(), 1024 * 1024).unwrap();
+        let observed = Arc::new(ObservedSink {
+            inner: Arc::new(NullSink),
+            stats: Arc::new(RwLock::new(SessionStats::default())),
+            trace: Some(writer.clone()),
+        });
+        let sink = agent_core::SubagentSink::new(
+            observed,
+            1,
+            "d1".into(),
+            Some(Arc::new(ChildTraceTap(writer.clone()))),
+        );
+        sink.emit(agent_core::AgentEvent::Token("UNIQ_TOKEN_PAYLOAD".into()));
+        // Flush via the pattern the existing tests use (record a Done).
+        writer.record(&AgentEvent::Done(agent_model::StopReason::Stop));
+        let path = dir.path().join(format!("{}.jsonl", writer.session_id()));
+        let contents = std::fs::read_to_string(path).unwrap();
+        let hits = contents.matches("UNIQ_TOKEN_PAYLOAD").count();
+        assert_eq!(
+            hits, 1,
+            "child token must be traced exactly once (raw tap), got {hits}:\n{contents}"
+        );
+        // And the one hit is the raw child record (has "sub":1), not a typed frame:
+        let line = contents
+            .lines()
+            .find(|l| l.contains("UNIQ_TOKEN_PAYLOAD"))
+            .unwrap();
+        assert!(line.contains(r#""sub":1"#), "{line}");
+        assert!(!line.contains("subagent_text"), "{line}");
+    }
+
+    #[test]
     fn run_start_record_carries_input_and_system() {
         let dir = tempfile::tempdir().unwrap();
         let t = TraceWriter::create(dir.path(), 64).unwrap();

@@ -213,4 +213,25 @@ mod tests {
         assert_eq!(s.tool_calls, 2, "totals stay totals");
         assert_eq!(s.subagent_tool_calls, 1, "subset counter");
     }
+
+    #[test]
+    fn subagent_events_move_no_counters() {
+        use crate::{SubagentEvent, SubagentOutcome};
+        let mut s = SessionStats::default();
+        let before = s.clone();
+        s.fold(&AgentEvent::Subagent(SubagentEvent::Text {
+            id: "d1".into(),
+            text: "x".into(),
+        }));
+        s.fold(&AgentEvent::Subagent(SubagentEvent::End {
+            id: "d1".into(),
+            outcome: SubagentOutcome::Completed,
+            stop: None,
+            detail: None,
+            turns: 9,
+            tool_calls: 9,
+            duration_ms: 9,
+        }));
+        assert_eq!(s, before, "Subagent events must not double-count stats");
+    }
 }

@@ -122,9 +122,16 @@ pub trait SubagentTrace: Send + Sync {
 /// forwards ONLY ToolStart/ToolResult (ids `sub{n}:{id}`, names `sub:{name}`)
 /// plus ServerUsage (real cost) to the parent sink — all existing wire frames,
 /// so no wire/web/CLI changes (spec D9). Forwards carry the dispatching call's
-/// id as `parent_id` (lineage). Child Token/Done/Error/Context stay off the
-/// parent's streamed transcript, but tee to the optional child-trace tap so a
+/// id as `parent_id` (lineage). Child Token/Reasoning/StreamRetry additionally
+/// forward as TYPED `AgentEvent::Subagent` deltas (spec §2.2), stamped with
+/// the same dispatching call's id; Done/Error/Context stay off the parent's
+/// streamed transcript entirely, but every non-forwarded event (including the
+/// ones that now also forward) tees to the optional child-trace tap so a
 /// failed child turn is replayable (spec E4).
+///
+/// DEPRECATED (3B-2): the `sub:{name}`/`sub{n}:{id}` renaming is superseded by
+/// the typed `AgentEvent::Subagent` stream for new consumers; it is kept for
+/// wire byte-compat and will be removed in a future phase.
 pub struct SubagentSink {
     parent: Arc<dyn EventSink>,
     n: u64,
@@ -222,22 +229,45 @@ impl EventSink for SubagentSink {
                     parent_id: Some(self.parent_call_id.clone()),
                 });
             }
-            // Everything else stays off the frontends (spec D9/E9) but goes to
-            // the child-trace tap so a failed child turn is replayable (E4).
+            // Everything else stays off the frontends' RAW stream (spec D9/E9)
+            // but goes to the child-trace tap so a failed child turn is
+            // replayable (E4). 3B-2: Token/Reasoning/StreamRetry additionally
+            // forward as TYPED Subagent deltas (spec §2.2) — capture and tap
+            // are unchanged.
             other => {
                 if let Some(t) = &self.child_trace {
                     t.record(self.n, &self.parent_call_id, &other);
                 }
-                let mut cap = self.cap.lock().unwrap();
                 match other {
                     AgentEvent::Token(t) => {
-                        cap.segments
-                            .last_mut()
-                            .expect("segments never empty")
-                            .push_str(&t);
+                        {
+                            let mut cap = self.cap.lock().unwrap();
+                            cap.segments
+                                .last_mut()
+                                .expect("segments never empty")
+                                .push_str(&t);
+                        }
+                        self.parent.emit(AgentEvent::Subagent(SubagentEvent::Text {
+                            id: self.parent_call_id.clone(),
+                            text: t,
+                        }));
                     }
-                    AgentEvent::Usage { turn, .. } => cap.turns = cap.turns.max(turn),
-                    AgentEvent::Done(reason) => cap.stop = Some(reason),
+                    // Net-new arm: reasoning is not captured (never was) — it
+                    // only forwards (spec §2.2; gate G5 on the egress).
+                    AgentEvent::Reasoning(t) => {
+                        self.parent
+                            .emit(AgentEvent::Subagent(SubagentEvent::Reasoning {
+                                id: self.parent_call_id.clone(),
+                                text: t,
+                            }));
+                    }
+                    AgentEvent::Usage { turn, .. } => {
+                        let mut cap = self.cap.lock().unwrap();
+                        cap.turns = cap.turns.max(turn);
+                    }
+                    AgentEvent::Done(reason) => {
+                        self.cap.lock().unwrap().stop = Some(reason);
+                    }
                     // A child stream died mid-answer and retries: retract the
                     // abandoned trailing text from the current segment so the
                     // captured result the parent model reads holds only the
@@ -247,11 +277,20 @@ impl EventSink for SubagentSink {
                     // pop, or the ToolResult-boundary segment invariant breaks.
                     AgentEvent::StreamRetry {
                         discarded_text_chars,
-                        ..
+                        discarded_reasoning_chars,
                     } => {
-                        let seg = cap.segments.last_mut().expect("segments never empty");
-                        let keep = seg.chars().count().saturating_sub(discarded_text_chars);
-                        *seg = seg.chars().take(keep).collect();
+                        {
+                            let mut cap = self.cap.lock().unwrap();
+                            let seg = cap.segments.last_mut().expect("segments never empty");
+                            let keep = seg.chars().count().saturating_sub(discarded_text_chars);
+                            *seg = seg.chars().take(keep).collect();
+                        }
+                        self.parent
+                            .emit(AgentEvent::Subagent(SubagentEvent::StreamRetry {
+                                id: self.parent_call_id.clone(),
+                                discarded_text_chars,
+                                discarded_reasoning_chars,
+                            }));
                     }
                     _ => {}
                 }
@@ -1081,11 +1120,24 @@ mod tests {
         sink.emit(AgentEvent::Done(StopReason::Stop));
 
         let got = parent.events.lock().unwrap().clone();
-        // ONLY ToolStart/ToolResult (rewritten) + ServerUsage forwarded, each
-        // stamped with the dispatching call's id ("d1") as parent_id.
+        // ToolStart/ToolResult (rewritten) + ServerUsage forward as before;
+        // Token/Reasoning ALSO now forward as typed Subagent deltas (3B-2),
+        // each stamped with the dispatching call's id ("d1") as parent_id.
         assert_eq!(
             got,
             vec![
+                (
+                    "subagent_text".to_string(),
+                    "d1".to_string(),
+                    "hi".to_string(),
+                    String::new(),
+                ),
+                (
+                    "subagent_reasoning".to_string(),
+                    "d1".to_string(),
+                    "r".to_string(),
+                    String::new(),
+                ),
                 (
                     "tool_start".to_string(),
                     "sub7:c1".to_string(),
@@ -1134,10 +1186,21 @@ mod tests {
         sink.emit(AgentEvent::Error("boom".into()));
         sink.emit(AgentEvent::Done(StopReason::Stop));
 
-        // Forwards stamped with the dispatch call id (even though the child emitted None):
+        // Forwards stamped with the dispatch call id (even though the child emitted None).
+        // The Token also now forwards as a typed subagent_text quad (3B-2) —
+        // inserted at its real position, first in emission order.
         let got = parent.events.lock().unwrap().clone();
         assert_eq!(
             got[0],
+            (
+                "subagent_text".to_string(),
+                "d1".to_string(),
+                "hi".to_string(),
+                String::new(),
+            )
+        );
+        assert_eq!(
+            got[1],
             (
                 "tool_start".to_string(),
                 "sub7:c1".to_string(),
@@ -1145,10 +1208,11 @@ mod tests {
                 "d1".to_string()
             )
         );
-        assert_eq!(got[1].3, "d1");
-        assert_eq!(got[2].3, "d1"); // server_usage
+        assert_eq!(got[2].3, "d1");
+        assert_eq!(got[3].3, "d1"); // server_usage
                                     // Tap saw exactly the non-forwarded kinds, attributed to ordinal 7 and
-                                    // stamped with the dispatch call id "d1" (the zero-tool-call join key):
+                                    // stamped with the dispatch call id "d1" (the zero-tool-call join key);
+                                    // UNCHANGED — token/error/done still tapped even though token also forwards.
         assert_eq!(
             tap.seen.lock().unwrap().clone(),
             vec![
@@ -1157,6 +1221,67 @@ mod tests {
                 (7, "d1".to_string(), "done"),
             ]
         );
+    }
+
+    #[test]
+    fn one_token_emission_forwards_typed_and_captures() {
+        let parent = Arc::new(FullSink::default());
+        let sink = SubagentSink::new(parent.clone(), 3, "d9".into(), None);
+        sink.emit(AgentEvent::Token("hello".into()));
+        // Forwarded typed, stamped with the delegation id:
+        assert_eq!(
+            parent.events.lock().unwrap()[0],
+            (
+                "subagent_text".to_string(),
+                "d9".to_string(),
+                "hello".to_string(),
+                String::new()
+            )
+        );
+        // AND captured (single emission feeds both — spec §5 dual-role pin):
+        assert_eq!(sink.summary().final_text, "hello");
+    }
+
+    #[test]
+    fn reasoning_forwards_but_is_never_captured() {
+        let parent = Arc::new(FullSink::default());
+        let sink = SubagentSink::new(parent.clone(), 3, "d9".into(), None);
+        sink.emit(AgentEvent::Reasoning("thinking".into()));
+        assert_eq!(parent.events.lock().unwrap()[0].0, "subagent_reasoning");
+        assert_eq!(sink.summary().final_text, "");
+    }
+
+    #[test]
+    fn stream_retry_forwards_typed_and_trims_capture() {
+        let parent = Arc::new(FullSink::default());
+        let sink = SubagentSink::new(parent.clone(), 3, "d9".into(), None);
+        sink.emit(AgentEvent::Token("abcdef".into()));
+        sink.emit(AgentEvent::StreamRetry {
+            discarded_text_chars: 3,
+            discarded_reasoning_chars: 0,
+        });
+        assert_eq!(sink.summary().final_text, "abc"); // capture trimmed
+        let got = parent.events.lock().unwrap().clone();
+        assert_eq!(got[1].0, "subagent_stream_retry"); // AND forwarded
+        assert_eq!(got[1].1, "d9");
+    }
+
+    #[test]
+    fn subagent_events_never_arrive_at_a_subagent_sink_but_fall_to_tap_if_they_did() {
+        // Absence pin (spec §2.2): feed a Subagent event straight in; it must
+        // not be re-forwarded as a tool row or captured — it falls to the
+        // catch-all (tap-only).
+        let parent = Arc::new(FullSink::default());
+        let tap = Arc::new(TapSpy::default());
+        let sink = SubagentSink::new(parent.clone(), 3, "d9".into(), Some(tap.clone()));
+        sink.emit(AgentEvent::Subagent(SubagentEvent::Text {
+            id: "x".into(),
+            text: "t".into(),
+        }));
+        assert_eq!(sink.summary().final_text, "");
+        // It forwards nothing itself; only the tap records it.
+        assert!(parent.events.lock().unwrap().is_empty());
+        assert_eq!(tap.seen.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -2546,6 +2671,14 @@ mod tests {
                     "general-purpose".to_string(),
                     String::new(),
                 ),
+                // 3B-2: the child's final-text Token now forwards as a typed
+                // subagent_text delta (in addition to feeding the tool result).
+                (
+                    "subagent_text".to_string(),
+                    "d1".to_string(),
+                    "gp done".to_string(),
+                    String::new(),
+                ),
                 (
                     "server_usage".to_string(),
                     "0".to_string(),
@@ -2588,6 +2721,14 @@ mod tests {
                     "subagent_start".to_string(),
                     "d1".to_string(),
                     "reviewer".to_string(),
+                    String::new(),
+                ),
+                // 3B-2: the empty default-scripted Token still forwards typed
+                // (empty text) — the forwarding is on the emission, not its content.
+                (
+                    "subagent_text".to_string(),
+                    "d1".to_string(),
+                    String::new(),
                     String::new(),
                 ),
                 (
