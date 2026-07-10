@@ -1251,8 +1251,13 @@ impl AgentLoop {
                         parent_id: None,
                     });
                     order.push(call.id.clone());
+                    // Build the message ONCE so the gate record and the tool
+                    // result never diverge (branch review I4).
+                    let lost_result_msg = "ERROR: result lost across daemon restart — \
+                                          re-run this call if it is still needed"
+                        .to_string();
                     records.push(crate::GateRecord::Rejected {
-                        content: "ERROR: result lost across daemon restart".into(),
+                        content: lost_result_msg.clone(),
                     });
                     results.insert(
                         call.id,
@@ -1260,9 +1265,7 @@ impl AgentLoop {
                             call.name,
                             Resolved::Err {
                                 status: ToolStatus::Error,
-                                content: "ERROR: result lost across daemon restart — \
-                                          re-run this call if it is still needed"
-                                    .into(),
+                                content: lost_result_msg,
                                 duration_ms: 0,
                             },
                         ),

@@ -195,6 +195,18 @@ impl Session {
             &flag,
         );
         let sid = parked.descriptor.session_id.clone();
+        if self.resuming.lock().unwrap().contains(&sid) {
+            // Already driving (or already attempted and failed) this tree this
+            // daemon lifetime — branch review I1b: registering externals here
+            // would show the user a prompt whose answer can never reach a
+            // resume, since `start_resume`'s sticky guard would just bounce it.
+            tracing::debug!(
+                target: "session",
+                sid = %sid,
+                "skipping parked re-emit: session already in resuming set"
+            );
+            return;
+        }
         for ask in parked.asks {
             if ask.answered {
                 // Crash-after-commit window: resume directly, no re-prompt.
@@ -284,7 +296,14 @@ impl Session {
         root_dir: PathBuf,
     ) {
         if !self.resuming.lock().unwrap().insert(sid.to_string()) {
-            return; // first answer already driving this tree
+            // First answer already driving this tree (or a prior resume attempt
+            // already failed and left the sticky guard set — branch review I1a):
+            // surface it instead of bouncing silently, since a caller retrying
+            // after a failed resume would otherwise see nothing happen.
+            self.emit_error(format!(
+                "session {sid}: resume already in progress or attempted; restart the daemon to retry a failed resume"
+            ));
+            return;
         }
         {
             let mut active = self.active.lock().unwrap();
@@ -329,11 +348,10 @@ impl Session {
                     // frontend; the PARK IS RETAINED so a later attach can retry
                     // (plan review BLOCKER 1b — never destroy the checkpoint on a
                     // failed resume).
-                    sess.emit_error(format!("resumed run failed: {e}"));
+                    sess.emit_error(format!("session {sid}: resumed run failed: {e}"));
                 }
             }
             *sess.active.lock().unwrap() = None;
-            let _ = &sid; // retained for tracing/debugging symmetry
         });
     }
 
@@ -744,6 +762,120 @@ mod tests {
         );
 
         std::mem::forget(ws); // keep temp dirs alive for the process
+        std::mem::forget(sessions);
+    }
+
+    /// If a session id is already in the `resuming` set (a resume for its tree is
+    /// in flight or already attempted and failed this daemon lifetime), attach
+    /// must NOT re-register its parked ask as a fresh external prompt — branch
+    /// review I1b: any answer to that prompt could never reach a resume, since
+    /// `start_resume`'s sticky guard would just bounce it, silently stranding the
+    /// user's decision. Mirrors `attach_reemits_parked_ask_with_rederived_display`'s
+    /// rig but pre-seeds `resuming` with the prior session id before attaching.
+    #[tokio::test]
+    async fn attach_skips_reemit_for_already_resuming_session() {
+        use agent_core::checkpoint::{Checkpoint, Checkpointer, Guardrails, ParkedTurn};
+        use agent_policy::ApprovalOrigin;
+
+        let ws = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+
+        let meta = agent_runtime_config::metadata_root().expect("HOME set");
+        let key = agent_runtime_config::load_or_create_secret(&meta).expect("secret");
+
+        let prior_id = "100-bbbbbbbb";
+        agent_runtime_config::write_descriptor(
+            sessions.path(),
+            &agent_runtime_config::SessionDescriptor {
+                schema: agent_runtime_config::DESCRIPTOR_SCHEMA,
+                session_id: prior_id.into(),
+                workspace: ws.path().to_path_buf(),
+                created_ms: 1,
+                config_path: None,
+            },
+        )
+        .unwrap();
+        let prior_ck =
+            agent_runtime_config::session_dir(sessions.path(), prior_id).join("checkpoint");
+        let ckr = Checkpointer::new(prior_ck.clone(), key, prior_id.into());
+        let planted_args = serde_json::json!({"command": "echo real"});
+        let origin = ApprovalOrigin {
+            delegation_id: "c9".into(),
+            subagent_name: "explore".into(),
+            depth: 1,
+        };
+        let chk = Checkpoint {
+            version: agent_core::checkpoint::CHECKPOINT_VERSION,
+            session_id: prior_id.into(),
+            subagent_path: vec![],
+            turn: 0,
+            context: agent_core::CuratedContextState {
+                goal: None,
+                history: vec![Message::user("hi")],
+                compaction_summary: None,
+                folded_facts: vec![],
+                folded_sections: vec![],
+                seq: 0,
+                history_has_spans: false,
+                history_incomplete: false,
+                artifact_prefix: String::new(),
+                todos: vec![],
+            },
+            guardrails: Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            parked: ParkedTurn {
+                assistant_text: "running".into(),
+                tool_calls: vec![agent_tools::ToolCall {
+                    id: "c9".into(),
+                    name: "execute_command".into(),
+                    args: planted_args.clone(),
+                }],
+                invalid: vec![],
+                gate_records: vec![],
+                parked_index: Some(0),
+                origin: Some(origin.clone()),
+            },
+        };
+        ckr.write_park(chk, &agent_core::SessionArtifacts::new())
+            .await
+            .unwrap();
+
+        let mut params = crate::setup::local_params(
+            ws.path().to_path_buf(),
+            ws.path().join("rt.json"),
+            "http://localhost:8080".into(),
+            "m".into(),
+        );
+        params.config.trace_dir = Some(sessions.path().to_string_lossy().into_owned());
+        let sess = Session::from_params(params);
+
+        // Simulate an in-flight/failed-and-stuck resume for the prior tree
+        // BEFORE attaching, exactly the state `start_resume`'s sticky guard
+        // leaves behind (branch review I1a).
+        sess.resuming.lock().unwrap().insert(prior_id.to_string());
+
+        let cap = Arc::new(Captured::default());
+        sess.set_event_out(cap.clone());
+
+        // Give the reemit task a bounded window to (incorrectly) emit, then
+        // assert it never did. There is no positive event to await here — the
+        // absence IS the assertion — so we sleep past where the sibling test
+        // reliably observes its ApprovalRequest and check nothing landed.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let saw_request = cap
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|ev| matches!(ev, ServerEvent::ApprovalRequest { .. }));
+        assert!(
+            !saw_request,
+            "attach re-emitted an ApprovalRequest for a session already in `resuming`"
+        );
+
+        std::mem::forget(ws);
         std::mem::forget(sessions);
     }
 

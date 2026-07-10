@@ -543,6 +543,11 @@ impl Checkpointer {
 
     /// Gate-kind park write (spec §2.3): dumps artifacts, writes checkpoint,
     /// then flushes every ancestor's pending snapshot (dispatch-kind).
+    // Child-park-then-ancestor-flush ordering (branch review I3): a crash between
+    // the two leaves an orphaned child park with no flushed ancestor above it —
+    // the startup scan skips rootless sessions, so that run is simply lost (per
+    // D1: fails safe). Flushing ancestors first would risk the opposite failure —
+    // resuming into a child checkpoint that never got written.
     pub async fn write_park(
         &self,
         chk: Checkpoint,
