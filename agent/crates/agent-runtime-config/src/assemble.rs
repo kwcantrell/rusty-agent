@@ -758,7 +758,7 @@ mod tests {
     fn memory_off_pinned_assembly_byte_identical() {
         // cfg.memory=false: nothing on the pinned-assembly path changed. The
         // golden is the pre-change rendering of the same inputs (system+goal
-        // only — no recall block exists when empty today, so this is stable).
+        // only — no memory index block exists when empty today, so this is stable).
         let dir = tempfile::tempdir().unwrap();
         let mut c = cfg();
         c.memory = false;
@@ -767,7 +767,11 @@ mod tests {
             built.system_prompt.clone(),
         ));
         let rendered = agent_core::ContextManager::build(&ctx, 100_000);
-        assert_eq!(rendered.len(), 1, "no recall block when memory is off");
+        assert_eq!(
+            rendered.len(),
+            1,
+            "no memory index block when memory is off"
+        );
         assert_eq!(rendered[0].content, built.system_prompt);
     }
 

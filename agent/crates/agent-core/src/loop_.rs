@@ -5265,7 +5265,7 @@ mod tests {
             self.history.push(m);
         }
         fn set_system(&mut self, _: Message) {}
-        fn set_recall(&mut self, _: Vec<String>) {}
+        fn set_memory_index(&mut self, _: Vec<String>) {}
         fn set_goal(&mut self, _: String) {}
         fn build(&self, _limit: usize) -> Vec<Message> {
             if self.compaction_requests > 0 {
@@ -5300,7 +5300,7 @@ mod tests {
             self.history.push(m);
         }
         fn set_system(&mut self, _: Message) {}
-        fn set_recall(&mut self, _: Vec<String>) {}
+        fn set_memory_index(&mut self, _: Vec<String>) {}
         fn set_goal(&mut self, _: String) {}
         fn build(&self, limit: usize) -> Vec<Message> {
             if limit != usize::MAX {

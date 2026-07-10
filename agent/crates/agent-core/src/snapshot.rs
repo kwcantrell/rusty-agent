@@ -26,7 +26,7 @@ pub(crate) fn preview(s: &str, n: usize) -> String {
 
 /// Build a snapshot from already-separated context blocks. Pure so it is unit
 /// testable without a full CuratedContext.
-// One positional param per pinned context block plus the recall cap — a flat
+// One positional param per pinned context block plus the memory index cap — a flat
 // fan-in of already-separated pieces, not state worth bundling into a struct.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_snapshot(
@@ -36,8 +36,8 @@ pub(crate) fn build_snapshot(
     goal: Option<&Message>,
     ledger: Option<&Message>,
     ledger_items: &[String],
-    recall: &[String],
-    recall_budget: usize,
+    memory_index: &[String],
+    memory_index_budget: usize,
     compaction_summary: Option<&Message>,
     history: &[Message],
     todos: &[crate::TodoItem],
@@ -73,14 +73,17 @@ pub(crate) fn build_snapshot(
         });
     }
 
-    // The context injects only the capped `memory_block(recall, budget)` — a
+    // The context injects only the capped `memory_block(memory_index, budget)` — a
     // greedy whole-entry prefix under the token cap — so the snapshot sizes
     // the memory segment from that SAME block, never the raw line sum, or the
     // dashboard over-reports memory pressure. `kept` is recovered by counting
     // how many non-empty input lines survived as a prefix of the rendered
     // entries (raw, one per line, after the fixed header+framing preamble).
-    if let Some(block) = memory_block(recall, recall_budget) {
-        let entries: Vec<&String> = recall.iter().filter(|l| !l.trim().is_empty()).collect();
+    if let Some(block) = memory_block(memory_index, memory_index_budget) {
+        let entries: Vec<&String> = memory_index
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
         let kept = entries
             .iter()
             .take_while(|l| block.content.contains(l.as_str()))
@@ -231,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_block_becomes_memory_segment_with_previews() {
+    fn memory_index_block_becomes_memory_segment_with_previews() {
         let snap = build_snapshot(
             1,
             1000,
@@ -259,7 +262,7 @@ mod tests {
 
     #[test]
     fn memory_segment_uses_capped_memory_block_not_raw_sum() {
-        // Many long recall lines vastly exceed a tiny budget. The context only
+        // Many long memory index lines vastly exceed a tiny budget. The context only
         // injects the capped `memory_block` (a short whole-entry prefix), so the
         // snapshot's memory segment must be sized from that block — est ≤ the
         // block's own estimate — never the raw sum of all lines.

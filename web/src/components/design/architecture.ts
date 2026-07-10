@@ -13,7 +13,7 @@ export interface ArchitectureSnapshot {
   policy: { allowlist: string[]; denylist: string[]; hard_floor: string[]; http_allow_hosts: string[] };
   sandbox: { mode: string; mechanism: string; image: string | null; network: boolean; degraded: string | null };
   context: { context_limit: number; max_tool_result_bytes: number; memory_enabled: boolean;
-    recall_budget: number; compaction_model: string | null };
+    memory_index_budget: number; compaction_model: string | null };
   loop: { max_turns: number; max_parallel_tools: number; subagents_enabled: boolean;
     subagent_max_depth: number; subagent_model: string | null; stream_idle_timeout_secs: number };
   prompt: { est_tokens: number; override_active: boolean; override_chars: number | null };

@@ -466,7 +466,7 @@ impl MemoryFilesMiddleware {
                 Vec::new()
             }
         };
-        cx.ctx.set_recall(lines);
+        cx.ctx.set_memory_index(lines);
     }
 }
 

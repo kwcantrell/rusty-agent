@@ -151,7 +151,7 @@ pub(crate) fn orphaned_tool_positions(messages: &[Message]) -> Vec<usize> {
 }
 
 /// Default cap on the auto-loaded memory index block, in estimated tokens
-/// (spec §2.4; replaces the 512-token recall budget).
+/// (spec §2.4; replaces the 512-token memory index budget).
 pub const DEFAULT_MEMORY_INDEX_BUDGET: usize = 1024;
 
 pub(crate) const MEMORY_HEADER: &str =
@@ -162,7 +162,7 @@ explicit request.";
 
 /// Greedy whole-entry prefix of the index under `budget` tokens, always ≥1
 /// entry when any exist (soft cap), plus an honesty pointer when truncated
-/// (spec §2.4.4 — NET-NEW vs the silent recall_block it replaces). Shared by
+/// (spec §2.4.4 — NET-NEW vs the silent memory_index block it replaces). Shared by
 /// `WindowContext` and `CuratedContext`.
 pub(crate) fn memory_block(lines: &[String], budget: usize) -> Option<Message> {
     let entries: Vec<&String> = lines.iter().filter(|l| !l.trim().is_empty()).collect();
@@ -214,9 +214,9 @@ pub trait ContextManager: Send + Sync {
     fn append(&mut self, msg: Message);
     fn build(&self, model_limit: usize) -> Vec<Message>;
     fn set_system(&mut self, system: Message);
-    /// Replace the auto-retrieved recall lines surfaced this turn. Default no-op
-    /// so non-memory implementations are unaffected.
-    fn set_recall(&mut self, _items: Vec<String>) {}
+    /// Replace the auto-retrieved memory index lines surfaced this turn. Default
+    /// no-op so non-memory implementations are unaffected.
+    fn set_memory_index(&mut self, _items: Vec<String>) {}
     /// Record the original goal for re-grounding. Default no-op; set-once impls.
     fn set_goal(&mut self, _goal: String) {}
     /// The current system message, when the implementation holds one. Read by
@@ -237,14 +237,14 @@ pub trait ContextManager: Send + Sync {
 }
 
 /// Sliding-window context: always keeps the system prompt; evicts oldest
-/// history turns until the estimate fits `model_limit`. An optional recall block
-/// (auto-retrieved memories) sits right after the system prompt, capped at
-/// `recall_budget` tokens so it can never starve history.
+/// history turns until the estimate fits `model_limit`. An optional memory index
+/// block (auto-retrieved memories) sits right after the system prompt, capped at
+/// `memory_index_budget` tokens so it can never starve history.
 pub struct WindowContext {
     system: Message,
     history: Vec<Message>,
-    recall: Vec<String>,
-    recall_budget: usize,
+    memory_index: Vec<String>,
+    memory_index_budget: usize,
 }
 
 impl WindowContext {
@@ -252,22 +252,22 @@ impl WindowContext {
         Self {
             system,
             history: Vec::new(),
-            recall: Vec::new(),
-            recall_budget: DEFAULT_MEMORY_INDEX_BUDGET,
+            memory_index: Vec::new(),
+            memory_index_budget: DEFAULT_MEMORY_INDEX_BUDGET,
         }
     }
 
-    /// Override the recall-block token cap (default `DEFAULT_MEMORY_INDEX_BUDGET`).
-    pub fn with_recall_budget(mut self, budget: usize) -> Self {
-        self.recall_budget = budget;
+    /// Override the memory-index-block token cap (default `DEFAULT_MEMORY_INDEX_BUDGET`).
+    pub fn with_memory_index_budget(mut self, budget: usize) -> Self {
+        self.memory_index_budget = budget;
         self
     }
 
     /// Build the memory index block message, greedily keeping whole entries
-    /// under `recall_budget`. Always includes at least the first entry if any
+    /// under `memory_index_budget`. Always includes at least the first entry if any
     /// are present (soft cap).
-    fn recall_message(&self) -> Option<Message> {
-        memory_block(&self.recall, self.recall_budget)
+    fn memory_index_message(&self) -> Option<Message> {
+        memory_block(&self.memory_index, self.memory_index_budget)
     }
 }
 
@@ -280,8 +280,8 @@ impl ContextManager for WindowContext {
         self.system = system;
     }
 
-    fn set_recall(&mut self, items: Vec<String>) {
-        self.recall = items;
+    fn set_memory_index(&mut self, items: Vec<String>) {
+        self.memory_index = items;
     }
 
     fn system(&self) -> Option<&Message> {
@@ -290,17 +290,17 @@ impl ContextManager for WindowContext {
 
     fn build(&self, model_limit: usize) -> Vec<Message> {
         let sys_tokens = message_tokens(&self.system);
-        let recall_msg = self.recall_message();
-        let recall_tokens = recall_msg.as_ref().map(message_tokens).unwrap_or(0);
+        let memory_index_msg = self.memory_index_message();
+        let memory_index_tokens = memory_index_msg.as_ref().map(message_tokens).unwrap_or(0);
         let budget = model_limit
             .saturating_sub(sys_tokens)
-            .saturating_sub(recall_tokens);
+            .saturating_sub(memory_index_tokens);
         // Walk history newest-first in turn units, keep whole units while they
         // fit — never split a tool_calls parent from its Role::Tool results.
         let start = evict_start(&self.history, budget);
         let mut out = Vec::with_capacity(self.history.len() - start + 2);
         out.push(self.system.clone());
-        if let Some(m) = recall_msg {
+        if let Some(m) = memory_index_msg {
             out.push(m);
         }
         out.extend(self.history[start..].iter().cloned());
@@ -424,48 +424,48 @@ mod tests {
     }
 
     #[test]
-    fn set_recall_injects_block_after_system_before_history() {
+    fn set_memory_index_injects_block_after_system_before_history() {
         let mut ctx = WindowContext::new(Message::system("SYS"));
         ctx.append(Message::user("hello"));
-        ctx.set_recall(vec!["user likes rust".into(), "project uses tokio".into()]);
+        ctx.set_memory_index(vec!["user likes rust".into(), "project uses tokio".into()]);
         let built = ctx.build(100_000);
         assert!(matches!(built[0].role, Role::System)); // system first
         assert_eq!(
             built[1].content,
             format!("{MEMORY_HEADER}\n{MEMORY_TRUST_FRAMING}\nuser likes rust\nproject uses tokio")
         );
-        assert!(matches!(built[1].role, Role::System)); // recall block is system-role
-        assert_eq!(built.last().unwrap().content, "hello"); // history after recall
+        assert!(matches!(built[1].role, Role::System)); // memory index block is system-role
+        assert_eq!(built.last().unwrap().content, "hello"); // history after memory index
     }
 
     #[test]
-    fn empty_recall_injects_no_block() {
+    fn empty_memory_index_injects_no_block() {
         let mut ctx = WindowContext::new(Message::system("SYS"));
         ctx.append(Message::user("hello"));
-        ctx.set_recall(vec![]);
+        ctx.set_memory_index(vec![]);
         let built = ctx.build(100_000);
         assert_eq!(built.len(), 2); // system + history only
     }
 
     #[test]
-    fn set_recall_replaces_previous_lines() {
+    fn set_memory_index_replaces_previous_lines() {
         let mut ctx = WindowContext::new(Message::system("SYS"));
-        ctx.set_recall(vec!["old".into()]);
-        ctx.set_recall(vec!["new".into()]);
+        ctx.set_memory_index(vec!["old".into()]);
+        ctx.set_memory_index(vec!["new".into()]);
         let built = ctx.build(100_000);
         assert!(built[1].content.contains("new"));
         assert!(!built[1].content.contains("old"));
     }
 
     #[test]
-    fn recall_block_is_capped_by_budget() {
+    fn memory_index_block_is_capped_by_budget() {
         // 30 long lines vastly exceed a 64-token budget; the block must stay under it
         // (plus the soft floor of one line) — never inject all 30.
-        let mut ctx = WindowContext::new(Message::system("SYS")).with_recall_budget(64);
+        let mut ctx = WindowContext::new(Message::system("SYS")).with_memory_index_budget(64);
         let lines: Vec<String> = (0..30)
             .map(|i| format!("memory fact number {i} with a fair amount of padding text"))
             .collect();
-        ctx.set_recall(lines);
+        ctx.set_memory_index(lines);
         let built = ctx.build(100_000);
         let block = &built[1].content;
         // Far fewer than 30 lines survived.
@@ -474,17 +474,17 @@ mod tests {
     }
 
     #[test]
-    fn history_is_evicted_before_recall_and_system() {
+    fn history_is_evicted_before_memory_index_and_system() {
         let mut ctx = WindowContext::new(Message::system("SYS"));
         for i in 0..50 {
             ctx.append(Message::user(format!(
                 "message number {i} with some padding text"
             )));
         }
-        ctx.set_recall(vec!["pinned memory".into()]);
+        ctx.set_memory_index(vec!["pinned memory".into()]);
         let built = ctx.build(40); // tiny limit forces history eviction
         assert!(matches!(built[0].role, Role::System));
-        assert!(built[1].content.contains("pinned memory")); // recall survives
+        assert!(built[1].content.contains("pinned memory")); // memory index survives
         assert!(built.len() < 51); // history evicted
     }
 

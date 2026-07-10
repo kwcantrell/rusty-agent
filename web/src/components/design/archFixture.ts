@@ -13,7 +13,7 @@ export const archFixture: ArchitectureSnapshot = {
   sandbox: { mode: "auto", mechanism: "docker", image: "agent-sandbox-dev:latest",
     network: false, degraded: null },
   context: { context_limit: 262144, max_tool_result_bytes: 65536, memory_enabled: true,
-    recall_budget: 512, compaction_model: null },
+    memory_index_budget: 512, compaction_model: null },
   loop: { max_turns: 40, max_parallel_tools: 4, subagents_enabled: true,
     subagent_max_depth: 1, subagent_model: null, stream_idle_timeout_secs: 300 },
   prompt: { est_tokens: 97, override_active: false, override_chars: null },

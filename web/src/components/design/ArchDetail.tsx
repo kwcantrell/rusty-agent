@@ -86,7 +86,7 @@ export function ArchDetail({ snapshot, block }: { snapshot: ArchitectureSnapshot
         <dl>
           <Row k="Context limit" v={`${s.context.context_limit.toLocaleString()} tokens`} />
           <Row k="Max tool result" v={`${s.context.max_tool_result_bytes.toLocaleString()} bytes`} />
-          <Row k="Memory" v={s.context.memory_enabled ? `on (recall budget ${s.context.recall_budget})` : "off"} />
+          <Row k="Memory" v={s.context.memory_enabled ? `on (memory index budget ${s.context.memory_index_budget})` : "off"} />
           <Row k="Compaction model" v={s.context.compaction_model ?? "— (primary model)"} />
         </dl>
       )}

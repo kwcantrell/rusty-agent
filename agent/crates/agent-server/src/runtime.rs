@@ -229,7 +229,7 @@ impl RuntimeState {
     // Accepted cfg-vs-loop generation tear: config is read under a separate lock from
     // the loop/prompt, so a concurrent apply() can produce old-cfg + new-loop values in
     // one snapshot — read-only, self-heals on refresh (same accepted pattern as settings_state()).
-    pub fn architecture(&self, recall_budget: usize) -> ArchitectureSnapshot {
+    pub fn architecture(&self, memory_index_budget: usize) -> ArchitectureSnapshot {
         const CONTEXT_TOOLS: [&str; 1] = ["context_compact"];
         const SKILL_TOOLS: [&str; 4] = [
             "list_skills",
@@ -307,7 +307,7 @@ impl RuntimeState {
                 context_limit: cfg.context_limit,
                 max_tool_result_bytes: cfg.max_tool_result_bytes,
                 memory_enabled: cfg.memory,
-                recall_budget,
+                memory_index_budget,
                 compaction_model: cfg.compaction_model.as_ref().and_then(|m| m.model.clone()),
             },
             loop_info: LoopInfo {
@@ -525,10 +525,10 @@ mod tests {
     }
 
     #[test]
-    fn architecture_reflects_sandbox_and_recall_budget() {
+    fn architecture_reflects_sandbox_and_memory_index_budget() {
         let (rs, _dir) = make();
         let snap = rs.architecture(1234);
-        assert_eq!(snap.context.recall_budget, 1234);
+        assert_eq!(snap.context.memory_index_budget, 1234);
         assert!(!snap.sandbox.mechanism.is_empty());
         // Verify sandbox mode is a lowercase string matching one of the valid modes
         assert!(

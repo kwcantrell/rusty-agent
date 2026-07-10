@@ -268,7 +268,7 @@ async fn soak_all_components_live() {
         flag,
     )
     .with_todos(todos.clone())
-    .with_recall_budget(256);
+    .with_memory_index_budget(256);
 
     let mut rng = SystemTime::now()
         .duration_since(UNIX_EPOCH)

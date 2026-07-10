@@ -36,7 +36,7 @@ pub struct Session {
     slot: EventSlot,
     approval: Arc<IpcApprovalChannel>,
     active: Arc<Mutex<Option<CancellationToken>>>,
-    recall_budget: usize,
+    memory_index_budget: usize,
     /// The live workspace for this session. `set_workspace` updates only this copy
     /// (so memory scope + skills follow the current workspace); it intentionally does
     /// NOT touch `RuntimeState`'s own workspace, which the run loop owns. Do not "sync"
@@ -80,7 +80,7 @@ impl Session {
             slot,
             approval,
             active: Arc::new(Mutex::new(None)),
-            recall_budget: agent_core::DEFAULT_MEMORY_INDEX_BUDGET,
+            memory_index_budget: agent_core::DEFAULT_MEMORY_INDEX_BUDGET,
             workspace: Mutex::new(params.workspace),
         })
     }
@@ -145,7 +145,7 @@ impl Session {
 
     /// Read-only architecture self-portrait (the `architecture_get` command).
     pub fn architecture(&self) -> ArchitectureSnapshot {
-        self.runtime.architecture(self.recall_budget)
+        self.runtime.architecture(self.memory_index_budget)
     }
 
     /// Snapshot of the cumulative per-session counters (the `session_stats` query).
