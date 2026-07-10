@@ -257,6 +257,7 @@ async fn soak_all_components_live() {
             trace: None,
             api_key: None,
             claude_binary: "claude".into(),
+            checkpoint: None,
         },
     );
     let agent = built.loop_;
@@ -535,6 +536,7 @@ async fn response_format_valid_rate_live() {
                 trace: None,
                 api_key: None,
                 claude_binary: "claude".into(),
+                checkpoint: None,
             },
         );
         let agent = built.loop_;

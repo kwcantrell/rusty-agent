@@ -48,6 +48,9 @@ pub struct LoopParts {
     /// model stays caller-built; both values are frontend-held today.
     pub api_key: Option<String>,
     pub claude_binary: String,
+    /// Park-point checkpointing (4B-1). None ⇒ no checkpoint I/O ever (E1);
+    /// the CLI passes None in 4B-1 (its reopen surface is 4B-2).
+    pub checkpoint: Option<Arc<agent_core::Checkpointer>>,
 }
 
 /// Result of assembling a loop: the loop itself, the composed system prompt, and
@@ -470,8 +473,7 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 description_overrides: cfg.tool_description_overrides.clone(),
                 subagents: subagents_reg.clone(),
                 memories: Some(memories.clone()),
-                // Task 11 wires the parent loop's checkpointer here.
-                checkpoint: None,
+                checkpoint: parts.checkpoint.clone(),
             },
         )));
     }
@@ -494,6 +496,10 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
     );
     let agent = match &compaction_model {
         Some(m) => agent.with_compaction_model(m.clone()),
+        None => agent,
+    };
+    let agent = match &parts.checkpoint {
+        Some(ck) => agent.with_checkpointer(ck.clone()),
         None => agent,
     };
     #[cfg(test)]
@@ -598,6 +604,7 @@ mod tests {
             trace: None,
             api_key: None,
             claude_binary: "claude".into(),
+            checkpoint: None,
         }
     }
 

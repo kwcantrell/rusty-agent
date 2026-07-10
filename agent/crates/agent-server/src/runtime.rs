@@ -47,6 +47,10 @@ pub struct RuntimeState {
     /// TraceWriter, recorded in sessions/<id>/descriptor.json. The
     /// descriptor — not the trace — is what a restarted daemon indexes.
     session_id: String,
+    /// The session's root park-point checkpointer (4B-1). Built once with
+    /// the durable id + daemon-local secret; None when HOME/secret is
+    /// unavailable (checkpointing degrades to live-only approvals).
+    checkpointer: Option<Arc<agent_core::Checkpointer>>,
     /// On-disk config content as of our last read/write. `apply` refuses to
     /// clobber a file some other process (CLI, editor) changed since.
     persisted_file: Mutex<Option<String>>,
@@ -95,6 +99,21 @@ impl RuntimeState {
             agent_runtime_config::prune_session_dirs(&root, 50);
         }
         let trace = agent_runtime_config::build_trace(&config, &session_id);
+        let checkpointer = agent_runtime_config::sessions_root(&config).and_then(|root| {
+            let meta = agent_runtime_config::metadata_root()?;
+            match agent_runtime_config::load_or_create_secret(&meta) {
+                Ok(key) => Some(agent_core::Checkpointer::new(
+                    agent_runtime_config::session_dir(&root, &session_id).join("checkpoint"),
+                    key,
+                    session_id.clone(),
+                )),
+                Err(e) => {
+                    tracing::warn!(target: "session", error = %e,
+                        "no daemon secret; approvals will not be durable");
+                    None
+                }
+            }
+        });
         let persisted_file = Mutex::new(std::fs::read_to_string(&config_path).ok());
         let built = build_loop(
             &config,
@@ -110,6 +129,7 @@ impl RuntimeState {
             &todos,
             &stats,
             &trace,
+            &checkpointer,
         );
         // Startup is lenient: an unknown persisted preset is already warned + dropped
         // inside build_loop, so the daemon always boots.
@@ -131,6 +151,7 @@ impl RuntimeState {
             stats,
             trace,
             session_id,
+            checkpointer,
             persisted_file,
         }
     }
@@ -144,6 +165,42 @@ impl RuntimeState {
     /// a restarted daemon re-learns it from descriptor.json, not from us.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// The session's root checkpointer (None when identity/secret
+    /// unavailable). Shared by build_loop and the resume coordinator.
+    pub fn checkpointer(&self) -> Option<Arc<agent_core::Checkpointer>> {
+        self.checkpointer.clone()
+    }
+
+    /// Assemble a loop bound to ANOTHER session's workspace + checkpointer
+    /// (attach-to-resume, spec §2.4 step 2): current config, fresh
+    /// artifacts/todos/flag, shared sink/approval/stats/mcp tools.
+    pub fn build_resume_loop(
+        &self,
+        workspace: &Path,
+        checkpoint: Arc<agent_core::Checkpointer>,
+        artifacts: &Arc<SessionArtifacts>,
+        todos: &agent_core::TodoHandle,
+        compact_flag: &Arc<AtomicBool>,
+    ) -> BuiltLoop {
+        let cfg = self.config.lock().unwrap().clone();
+        build_loop(
+            &cfg,
+            &self.sink,
+            &self.approval,
+            workspace,
+            &self.api_key,
+            &self.claude_binary,
+            &self.mcp_tools,
+            &self.base_system_prompt,
+            artifacts,
+            compact_flag,
+            todos,
+            &self.stats,
+            &self.trace,
+            &Some(checkpoint),
+        )
     }
 
     /// Rewrite descriptor.json with a new workspace (workspace switch).
@@ -220,6 +277,7 @@ impl RuntimeState {
             &self.todos,
             &self.stats,
             &self.trace,
+            &self.checkpointer,
         );
         if !built.unknown_presets.is_empty() {
             // Strict on the wire: a typo'd / missing active skill is a hard error.
@@ -395,6 +453,7 @@ fn build_loop(
     todos: &agent_core::TodoHandle,
     stats: &Arc<std::sync::RwLock<agent_core::SessionStats>>,
     trace: &Option<Arc<agent_runtime_config::TraceWriter>>,
+    checkpoint: &Option<Arc<agent_core::Checkpointer>>,
 ) -> BuiltLoop {
     let model = build_model(
         &cfg.backend,
@@ -422,6 +481,7 @@ fn build_loop(
             trace: trace.clone(),
             api_key: api_key.clone(),
             claude_binary: claude_binary.to_string(),
+            checkpoint: checkpoint.clone(),
         },
     )
 }
@@ -883,6 +943,7 @@ mod tests {
             &todos,
             &Arc::default(),
             &None,
+            &None,
         );
         // If we get here without panic/error the strategy was constructed OK.
         let _loop = result.loop_; // just confirm it's built
@@ -907,6 +968,57 @@ mod tests {
         let next = rs.settings_state().settings;
         rs.apply(next.clone()).unwrap();
         rs.apply(next).unwrap();
+    }
+
+    /// Scopes `$HOME` to a tempdir for the duration of the closure, then
+    /// restores it — `RuntimeState::new` sources the daemon secret via
+    /// `load_or_create_secret(metadata_root())`, i.e. the REAL `$HOME`; tests
+    /// that reach that path must never write `~/.rusty-agent/secret` for
+    /// real. Paired with `#[serial]` on every caller (env vars are process-global).
+    fn with_scoped_home<T>(f: impl FnOnce() -> T) -> T {
+        let home_dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", home_dir.path());
+        let result = f();
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        result
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn runtime_owns_a_checkpointer_rooted_in_the_session_dir() {
+        with_scoped_home(|| {
+            let (rs, _ws, sessions) = make_with_trace_dir();
+            let ck = rs.checkpointer().expect("checkpointer built");
+            let expect = agent_runtime_config::session_dir(sessions.path(), rs.session_id())
+                .join("checkpoint");
+            assert_eq!(ck.dir(), expect.as_path());
+            // E1: construction creates NOTHING on disk
+            assert!(!expect.exists());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_resume_loop_binds_descriptor_workspace_and_checkpointer() {
+        with_scoped_home(|| {
+            let (rs, _ws, sessions) = make_with_trace_dir();
+            let other_ws = tempfile::tempdir().unwrap();
+            let ck = agent_core::Checkpointer::new(
+                sessions.path().join("old-1").join("checkpoint"),
+                [1u8; 32],
+                "old-1".into(),
+            );
+            let artifacts = Arc::new(SessionArtifacts::new());
+            let todos: agent_core::TodoHandle = Arc::new(Mutex::new(Vec::new()));
+            let flag = Arc::new(AtomicBool::new(false));
+            let built = rs.build_resume_loop(other_ws.path(), ck, &artifacts, &todos, &flag);
+            // system prompt composed from CURRENT config (live truth):
+            assert_eq!(built.system_prompt, rs.current_system_prompt());
+        });
     }
 
     #[test]
@@ -938,6 +1050,7 @@ mod tests {
             &flag,
             &todos,
             &Arc::default(),
+            &None,
             &None,
         );
         let _loop = result.loop_;
