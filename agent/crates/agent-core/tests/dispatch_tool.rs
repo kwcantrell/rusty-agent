@@ -1,13 +1,17 @@
 //! Integration tests for DispatchAgentTool (spec D1-D13 core behaviors).
 use agent_core::testkit::{AlwaysApprove, PassthroughProtocol, Scripted, ScriptedModel};
 use agent_core::{
-    AgentEvent, DispatchAgentTool, DispatchDeps, EventSink, LoopConfig, SessionArtifacts,
-    SubAgentRegistry, SUBAGENT_PREAMBLE,
+    AgentEvent, AgentLoop, CuratedContext, DispatchAgentTool, DispatchDeps, EventSink, LoopConfig,
+    SessionArtifacts, SubAgentRegistry, SUBAGENT_PREAMBLE,
 };
+use agent_model::Message;
 use agent_policy::{Decision, PolicyEngine, RulePolicy};
 use agent_tools::backend::{Backend, CompositeBackend, HostBackend, ReadOnlyToTools};
-use agent_tools::{Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolSchema};
+use agent_tools::{
+    Access, Tool, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolRegistry, ToolSchema,
+};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -60,6 +64,9 @@ impl EventSink for FullSink {
                 String::new(),
                 parent_id.unwrap_or_default(),
             ),
+            AgentEvent::Subagent(agent_core::SubagentEvent::Start { id, .. }) => {
+                ("subagent_start".into(), id, String::new(), String::new())
+            }
             _ => return,
         };
         self.events.lock().unwrap().push(t);
@@ -1547,5 +1554,76 @@ async fn child_reads_its_own_artifacts_and_shares_workspace() {
     assert!(
         read.contains("WORKSPACE_SHARED=yes"),
         "child must read the shared workspace file: {read}"
+    );
+}
+
+/// Task A2 / spec §5 ordering pin: the PARENT loop's own `ToolStart` for the
+/// `dispatch_agent` call (emitted by the loop itself, before the tool runs)
+/// must precede the typed `Subagent(Start)` (emitted inside `execute()`,
+/// after dispatch validation) — and both carry the identical on-wire id, so a
+/// frontend can join the typed stream to the already-rendered tool row.
+#[tokio::test]
+async fn subagent_start_id_matches_an_already_emitted_tool_start() {
+    let sink = Arc::new(FullSink::default());
+    let ws = workspace();
+    let child = ScriptedModel::new(vec![Scripted::Text("child done".into())]);
+    let d = deps(child, sink.clone(), vec![]);
+
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(DispatchAgentTool::new(d)));
+
+    let parent_model = ScriptedModel::new(vec![
+        Scripted::Call(
+            "call1".into(),
+            "dispatch_agent".into(),
+            r#"{"prompt":"go"}"#.into(),
+        ),
+        Scripted::Text("parent done".into()),
+    ]);
+    let config = LoopConfig {
+        model_limit: 16384,
+        max_turns: 3,
+        max_retries: 1,
+        tool_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(3600),
+        workspace: ws.clone(),
+        ..LoopConfig::default()
+    };
+    let agent = AgentLoop::new(
+        Arc::new(parent_model),
+        Arc::new(PassthroughProtocol),
+        Arc::new(reg),
+        Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        }),
+        Arc::new(AlwaysApprove),
+        sink.clone(),
+        config,
+    );
+    let mut ctx = CuratedContext::new(
+        Message::system("s"),
+        Arc::new(SessionArtifacts::new()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    agent.run(&mut ctx, "go".into()).await.unwrap();
+
+    let events = sink.events.lock().unwrap().clone();
+    let tool_start_index = events
+        .iter()
+        .position(|(k, _, n, _)| k == "tool_start" && n == "dispatch_agent")
+        .expect("parent loop must emit ToolStart for the dispatch_agent call");
+    let start_index = events
+        .iter()
+        .position(|(k, _, _, _)| k == "subagent_start")
+        .expect("execute() must emit Subagent(Start)");
+    assert!(
+        tool_start_index < start_index,
+        "ToolStart must be observed before Subagent(Start): {events:?}"
+    );
+    assert_eq!(
+        events[tool_start_index].1, events[start_index].1,
+        "ToolStart and Subagent(Start) must carry the identical on-wire id: {events:?}"
     );
 }

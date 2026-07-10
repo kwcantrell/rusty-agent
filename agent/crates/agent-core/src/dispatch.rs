@@ -2,8 +2,8 @@
 use crate::{
     AgentEvent, AgentLoop, ContextCurationMiddleware, CuratedContext, EventSink, LoopConfig,
     Middleware, OffloadConfig, RepairMiddleware, RespondTool, ResponseCapture, ResponseHandle,
-    SessionArtifacts, StuckDetectionMiddleware, TodoHandle, ToolCallLimit, WriteTodosTool,
-    RESPOND_TOOL_NAME,
+    SessionArtifacts, StuckDetectionMiddleware, SubagentEvent, SubagentOutcome, TodoHandle,
+    ToolCallLimit, WriteTodosTool, RESPOND_TOOL_NAME,
 };
 use agent_model::{Message, ModelClient, StopReason, ToolCallProtocol};
 use agent_policy::{
@@ -256,6 +256,62 @@ impl EventSink for SubagentSink {
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+/// RAII guarantee of exactly one `SubagentEvent::End` per `Start` (spec §2.2).
+/// The four ordinary exit paths call `finish` with a precise outcome; if the
+/// dispatch future panics inside the child run (caught upstream by
+/// execute_isolated's catch_unwind) or is dropped by the loop's backstop
+/// timeout, `Drop` emits a Failed End so a frontend card can never spin
+/// forever. Stats come from the sink's CaptureSummary — the same source the
+/// tool-result footer uses (spec §3.6).
+struct EndGuard {
+    sink: Arc<SubagentSink>,
+    out: Arc<dyn EventSink>,
+    id: String,
+    started: std::time::Instant,
+    armed: bool,
+}
+
+impl EndGuard {
+    fn new(sink: Arc<SubagentSink>, out: Arc<dyn EventSink>, id: String) -> Self {
+        Self {
+            sink,
+            out,
+            id,
+            started: std::time::Instant::now(),
+            armed: true,
+        }
+    }
+
+    fn emit(&self, outcome: SubagentOutcome, detail: Option<String>) {
+        let s = self.sink.summary();
+        self.out.emit(AgentEvent::Subagent(SubagentEvent::End {
+            id: self.id.clone(),
+            outcome,
+            stop: s.stop,
+            detail,
+            turns: s.turns,
+            tool_calls: s.tool_calls,
+            duration_ms: self.started.elapsed().as_millis() as u64,
+        }));
+    }
+
+    fn finish(mut self, outcome: SubagentOutcome, detail: Option<String>) {
+        self.armed = false;
+        self.emit(outcome, detail);
+    }
+}
+
+impl Drop for EndGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.emit(
+                SubagentOutcome::Failed,
+                Some("dispatch aborted (panic or executor drop)".into()),
+            );
         }
     }
 }
@@ -683,13 +739,30 @@ impl Tool for DispatchAgentTool {
 
         // Visible parent id: at top level this is the raw call id; nested, the
         // prefix makes it the child row's on-wire id (spec G8 attribution).
+        // Also the 3B-2 delegation id: Start/End and forwarded deltas all
+        // carry this exact string.
         let parent_id = format!("{}{}", self.deps.id_prefix, ctx.call_id);
         let sink = Arc::new(SubagentSink::new(
             self.deps.sink.clone(),
             n,
-            parent_id,
+            parent_id.clone(),
             self.deps.child_trace.clone(),
         ));
+        // Typed lifecycle (spec §2.2): Start fires only after every validation
+        // Err-return above (verified: none between next_dispatch_n() and the
+        // run), and after the loop's own ToolStart for this call.
+        self.deps
+            .sink
+            .emit(AgentEvent::Subagent(SubagentEvent::Start {
+                id: parent_id.clone(),
+                subagent_type: subagent_type.clone(),
+                role: if resolved.is_some() {
+                    None
+                } else {
+                    role.clone()
+                },
+            }));
+        let guard = EndGuard::new(sink.clone(), self.deps.sink.clone(), parent_id);
         // Named type may route its own model/protocol/window; general-purpose
         // uses the parent-configured child defaults (byte-identical to 3A).
         let (child_model, child_protocol, child_loop_config) = match resolved {
@@ -772,27 +845,25 @@ impl Tool for DispatchAgentTool {
         match tokio::time::timeout(ctx.timeout, run).await {
             Err(_elapsed) => {
                 child_cancel.cancel();
-                return Ok(failure_output(
-                    &sink,
-                    format!("sub-agent timed out after {}s", ctx.timeout.as_secs()),
-                    "timeout",
-                ));
+                let what = format!("sub-agent timed out after {}s", ctx.timeout.as_secs());
+                guard.finish(SubagentOutcome::Timeout, Some(what.clone()));
+                return Ok(failure_output(&sink, what, "timeout"));
             }
             Ok(Err(e)) => {
-                return Ok(failure_output(
-                    &sink,
-                    format!("sub-agent failed: {e}"),
-                    "failed",
-                ));
+                let what = format!("sub-agent failed: {e}");
+                guard.finish(SubagentOutcome::Failed, Some(what.clone()));
+                return Ok(failure_output(&sink, what, "failed"));
             }
             Ok(Ok(())) => {}
         }
         if ctx.cancel.is_cancelled() {
+            guard.finish(SubagentOutcome::Cancelled, None);
             return Err(ToolError::Failed {
                 message: "sub-agent cancelled".into(),
                 stderr: None,
             });
         }
+        guard.finish(SubagentOutcome::Completed, None);
 
         let s = sink.summary();
         let stop = s.stop.unwrap_or(StopReason::Stop);
@@ -888,6 +959,37 @@ mod tests {
                     String::new(),
                     parent_id.unwrap_or_default(),
                 ),
+                AgentEvent::Subagent(se) => {
+                    use crate::SubagentEvent as SE;
+                    match se {
+                        SE::Start {
+                            id, subagent_type, ..
+                        } => ("subagent_start".into(), id, subagent_type, String::new()),
+                        SE::Text { id, text } => ("subagent_text".into(), id, text, String::new()),
+                        SE::Reasoning { id, text } => {
+                            ("subagent_reasoning".into(), id, text, String::new())
+                        }
+                        SE::StreamRetry { id, .. } => (
+                            "subagent_stream_retry".into(),
+                            id,
+                            String::new(),
+                            String::new(),
+                        ),
+                        SE::End {
+                            id,
+                            outcome,
+                            detail,
+                            ..
+                        } => (
+                            "subagent_end".into(),
+                            id,
+                            outcome.as_str().into(),
+                            // 4th slot = detail so the timeout/fatal/panic
+                            // tests can assert it (Failed/Timeout non-empty).
+                            detail.unwrap_or_default(),
+                        ),
+                    }
+                }
                 // Anything else reaching the parent is a forwarding-table bug —
                 // record it so the exact-equality assertion below catches the leak.
                 _ => (
@@ -2412,5 +2514,337 @@ mod tests {
             "grandchild must inherit the child's floor — delegation must not escape it"
         );
         assert!(out.content.contains("child done"));
+    }
+
+    // --- Task A2: typed Start/End lifecycle ---------------------------------
+
+    #[tokio::test]
+    async fn start_carries_registry_name_and_gp_role_and_end_completed() {
+        // general-purpose with role: Start{subagent_type:"general-purpose", role:Some}.
+        let parent = Arc::new(FullSink::default());
+        let mut deps = exec_deps(
+            ScriptedModel::new(vec![Scripted::Text("gp done".into())]),
+            1,
+        );
+        deps.sink = parent.clone();
+        let tool = DispatchAgentTool::new(deps);
+        let out = tool
+            .execute(
+                serde_json::json!({"prompt": "go", "role": "reviewer"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("gp done"));
+        let got = parent.events.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "subagent_start".to_string(),
+                    "d1".to_string(),
+                    "general-purpose".to_string(),
+                    String::new(),
+                ),
+                (
+                    "server_usage".to_string(),
+                    "0".to_string(),
+                    String::new(),
+                    "d1".to_string(),
+                ),
+                (
+                    "subagent_end".to_string(),
+                    "d1".to_string(),
+                    "completed".to_string(),
+                    String::new(),
+                ),
+            ]
+        );
+
+        // named type: Start{subagent_type:"reviewer", role:None} even though a
+        // role arg is passed (named types ignore role). Ends Completed too.
+        let parent2 = Arc::new(FullSink::default());
+        let mut deps2 = exec_deps(ScriptedModel::new(vec![]), 1);
+        deps2.sink = parent2.clone();
+        deps2.subagents = one_agent_registry();
+        let tool2 = DispatchAgentTool::new(deps2);
+        let out2 = tool2
+            .execute(
+                serde_json::json!({
+                    "prompt": "go",
+                    "subagent_type": "reviewer",
+                    "role": "ignored"
+                }),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(out2.content.contains("stop:"));
+        let got2 = parent2.events.lock().unwrap().clone();
+        assert_eq!(
+            got2,
+            vec![
+                (
+                    "subagent_start".to_string(),
+                    "d1".to_string(),
+                    "reviewer".to_string(),
+                    String::new(),
+                ),
+                (
+                    "server_usage".to_string(),
+                    "0".to_string(),
+                    String::new(),
+                    "d1".to_string(),
+                ),
+                (
+                    "subagent_end".to_string(),
+                    "d1".to_string(),
+                    "completed".to_string(),
+                    String::new(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_dispatch_emits_no_start() {
+        let parent = Arc::new(FullSink::default());
+        let mut deps = exec_deps(ScriptedModel::new(vec![]), 1);
+        deps.sink = parent.clone();
+        let tool = DispatchAgentTool::new(deps);
+        let err = tool
+            .execute(
+                serde_json::json!({"prompt": "hi", "subagent_type": "nope"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+        let got = parent.events.lock().unwrap().clone();
+        assert!(
+            got.is_empty(),
+            "a rejected dispatch must emit zero Subagent events: {got:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn end_on_timeout_fatal_and_cancel_paths() {
+        // (a) timeout: ctx.timeout tiny + a child model that never resolves
+        // (Scripted::HangOpen — mirrors dispatch_tool.rs's wall-clock-timeout test).
+        {
+            let parent = Arc::new(FullSink::default());
+            let mut deps = exec_deps(ScriptedModel::new(vec![Scripted::HangOpen]), 1);
+            deps.sink = parent.clone();
+            let tool = DispatchAgentTool::new(deps);
+            let mut ctx = exec_ctx();
+            ctx.timeout = Duration::from_millis(1);
+            let out = tool
+                .execute(serde_json::json!({"prompt": "p"}), &ctx)
+                .await
+                .unwrap();
+            assert!(
+                out.content.starts_with("[sub-agent timed out"),
+                "{}",
+                out.content
+            );
+            let got = parent.events.lock().unwrap().clone();
+            let ends: Vec<_> = got.iter().filter(|q| q.0 == "subagent_end").collect();
+            assert_eq!(ends.len(), 1, "{got:?}");
+            assert_eq!(ends[0].2, "timeout");
+            assert!(!ends[0].3.is_empty(), "detail must be non-empty: {got:?}");
+        }
+
+        // (b) fatal: a child model that returns a transport error → End "failed",
+        // and the detail-bearing tool result still matches failure_output.
+        {
+            let parent = Arc::new(FullSink::default());
+            // exec_deps wires max_retries: 1, so the child gets one retry after
+            // the first transport error before the turn is fatal — script BOTH
+            // attempts as errors so the run is unrecoverable.
+            let mut deps = exec_deps(
+                ScriptedModel::new(vec![Scripted::Error, Scripted::Error]),
+                1,
+            );
+            deps.sink = parent.clone();
+            let tool = DispatchAgentTool::new(deps);
+            let out = tool
+                .execute(serde_json::json!({"prompt": "p"}), &exec_ctx())
+                .await
+                .unwrap();
+            assert!(
+                out.content.starts_with("[sub-agent failed"),
+                "{}",
+                out.content
+            );
+            let got = parent.events.lock().unwrap().clone();
+            let ends: Vec<_> = got.iter().filter(|q| q.0 == "subagent_end").collect();
+            assert_eq!(ends.len(), 1, "{got:?}");
+            assert_eq!(ends[0].2, "failed");
+            assert!(!ends[0].3.is_empty(), "detail must be non-empty: {got:?}");
+        }
+
+        // (c) cancel: cancel ctx.cancel before the run → End "cancelled".
+        {
+            let parent = Arc::new(FullSink::default());
+            let mut deps = exec_deps(ScriptedModel::new(vec![Scripted::Text("never".into())]), 1);
+            deps.sink = parent.clone();
+            let tool = DispatchAgentTool::new(deps);
+            let ctx = exec_ctx();
+            ctx.cancel.cancel();
+            let err = tool
+                .execute(serde_json::json!({"prompt": "p"}), &ctx)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ToolError::Failed { ref message, .. } if message.contains("cancelled"))
+            );
+            let got = parent.events.lock().unwrap().clone();
+            let ends: Vec<_> = got.iter().filter(|q| q.0 == "subagent_end").collect();
+            assert_eq!(ends.len(), 1, "{got:?}");
+            assert_eq!(ends[0].2, "cancelled");
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_child_still_yields_exactly_one_failed_end() {
+        use futures::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        struct PanicModel;
+        #[async_trait::async_trait]
+        impl agent_model::ModelClient for PanicModel {
+            async fn stream(
+                &self,
+                _req: agent_model::CompletionRequest,
+            ) -> Result<
+                futures::stream::BoxStream<
+                    'static,
+                    Result<agent_model::Chunk, agent_model::ModelError>,
+                >,
+                agent_model::ModelError,
+            > {
+                panic!("SENTINEL_TEST_PANIC_A2");
+            }
+        }
+
+        // Silence the sentinel panic's default hook output (mirrors loop_.rs's
+        // execute_isolated tests) without disturbing other tests' panic output.
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            let default = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let is_sentinel = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| *s == "SENTINEL_TEST_PANIC_A2")
+                    .unwrap_or(false);
+                if !is_sentinel {
+                    default(info);
+                }
+            }));
+        });
+
+        let parent = Arc::new(FullSink::default());
+        let ws = std::env::temp_dir();
+        let mut deps = DispatchDeps {
+            model: Arc::new(PanicModel),
+            protocol: Arc::new(PassthroughProtocol),
+            policy: Arc::new(agent_policy::RulePolicy {
+                workspace: ws.clone(),
+                command_allowlist: vec![],
+                command_denylist: vec![],
+            }),
+            approval: Arc::new(AlwaysApprove),
+            sink: parent.clone(),
+            child_trace: None,
+            base_tools: vec![],
+            child_system_prompt: "SYS".into(),
+            loop_config: LoopConfig {
+                model_limit: 16384,
+                max_turns: 1,
+                max_retries: 1,
+                tool_timeout: Duration::from_secs(5),
+                stream_idle_timeout: Duration::from_secs(3600),
+                workspace: ws.clone(),
+                ..LoopConfig::default()
+            },
+            max_result_bytes: 16 * 1024,
+            subagent_timeout: Duration::from_secs(600),
+            compaction_model: None,
+            depth: 1,
+            max_depth: 1,
+            id_prefix: String::new(),
+            description_overrides: Default::default(),
+            subagents: Arc::new(SubAgentRegistry::default()),
+        };
+        deps.sink = parent.clone();
+        let tool = DispatchAgentTool::new(deps);
+
+        let ctx = exec_ctx();
+        let fut =
+            AssertUnwindSafe(tool.execute(serde_json::json!({"prompt": "p"}), &ctx)).catch_unwind();
+        let result = fut.await;
+        assert!(result.is_err(), "the child panic must unwind execute()");
+
+        let got = parent.events.lock().unwrap().clone();
+        let ends: Vec<_> = got.iter().filter(|q| q.0 == "subagent_end").collect();
+        assert_eq!(
+            ends.len(),
+            1,
+            "exactly one End must be emitted by the EndGuard Drop: {got:?}"
+        );
+        assert_eq!(ends[0].2, "failed");
+        assert_eq!(ends[0].3, "dispatch aborted (panic or executor drop)");
+    }
+
+    #[tokio::test]
+    async fn nested_dispatch_start_id_is_fully_qualified() {
+        // Grandchild answers directly; child dispatches it via dispatch_agent.
+        let grandchild = ScriptedModel::new(vec![Scripted::Text("grandchild done".into())]);
+        let child = ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "dispatch_agent".into(),
+                r#"{"prompt":"delegate"}"#.into(),
+            ),
+            Scripted::Text("child done".into()),
+        ]);
+        let m = resolved_with(None, child, None);
+        let mut deps = exec_deps(grandchild, 4);
+        deps.max_depth = 2; // allow one nested dispatch level
+        deps.subagents = Arc::new(SubAgentRegistry::from_map(m));
+        let parent = Arc::new(FullSink::default());
+        deps.sink = parent.clone();
+        let tool = DispatchAgentTool::new(deps);
+        let out = tool
+            .execute(
+                serde_json::json!({"prompt":"go","subagent_type":"triage"}),
+                &exec_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("child done"));
+
+        let got = parent.events.lock().unwrap().clone();
+        // The forwarded sub:dispatch_agent tool_start row carries the child's
+        // on-wire id ("sub{n}:c1"); the grandchild's own subagent_start id must
+        // be exactly that same string (spec G8 attribution).
+        let forwarded_id = got
+            .iter()
+            .find(|q| q.0 == "tool_start" && q.2 == "sub:dispatch_agent")
+            .map(|q| q.1.clone())
+            .expect("dispatch_agent tool_start must be forwarded to the parent");
+        assert!(
+            forwarded_id.starts_with("sub") && forwarded_id.contains(':'),
+            "{forwarded_id}"
+        );
+        let grandchild_start_id = got
+            .iter()
+            .filter(|q| q.0 == "subagent_start" && q.2 == "general-purpose")
+            .map(|q| q.1.clone())
+            .next()
+            .expect("grandchild subagent_start must reach the top-level parent");
+        assert_eq!(grandchild_start_id, forwarded_id);
     }
 }
