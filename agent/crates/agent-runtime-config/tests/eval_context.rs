@@ -5,11 +5,7 @@
 //!   AGENT_E2E_URL=http://localhost:8080 AGENT_E2E_MODEL=qwen3.6-35b-a3b \
 //!   TASK_JSON=task.json CONFIG_JSON=cfg.json HIDDEN_TESTS_DIR=hidden_tests \
 //!   cargo test -p agent-runtime-config --test eval_context -- --ignored --nocapture
-use agent_core::{AgentEvent, CuratedContext, EventSink, Retriever, SessionArtifacts};
-use agent_memory::{
-    build_tools_with, project_scope, Embedder, FastEmbedEmbedder, MemoryConfig, MemoryRetriever,
-    MemoryScope, MemoryStore, SqliteStore, StubEmbedder,
-};
+use agent_core::{AgentEvent, CuratedContext, EventSink, SessionArtifacts};
 use agent_model::{Message, OpenAiCompatClient};
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse};
 use agent_runtime_config::eval::{CandidateConfig, RunResult, TaskSpec, TrajectoryStep};
@@ -197,7 +193,6 @@ async fn eval_context_run() {
         std::fs::write(dest, &sf.contents).unwrap();
     }
 
-    let mem_db = ws.join("memory.db");
     let meter = Arc::new(TokenMeter::default());
     // Shared across sessions (like `meter`) so denials accumulate for the whole run and
     // stay in scope at RunResult construction below.
@@ -229,49 +224,6 @@ async fn eval_context_run() {
             cfg.skills_dirs = vec![d];
         }
 
-        // Memory: shared SqliteStore so facts persist across sessions. Default embedder
-        // is the deterministic StubEmbedder (exact-match only, no network). Set
-        // EVAL_REAL_EMBEDDINGS=1 (+ optional FASTEMBED_CACHE=<dir>) to use the real
-        // BGE-Small model — required for any task that tests *semantic* recall, since the
-        // stub scores distinct text near-orthogonal regardless of meaning.
-        let (mem_tools, retriever) = if cfg.memory {
-            let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open(&mem_db).unwrap());
-            let embedder: Arc<dyn Embedder> = if std::env::var("EVAL_REAL_EMBEDDINGS").is_ok() {
-                let mut ecfg = MemoryConfig::default();
-                ecfg.model_cache_dir = std::env::var("FASTEMBED_CACHE")
-                    .ok()
-                    .map(std::path::PathBuf::from);
-                Arc::new(FastEmbedEmbedder::new(&ecfg).expect("load BGE-Small embedder"))
-            } else {
-                Arc::new(StubEmbedder::d384())
-            };
-            let mut mcfg = MemoryConfig::default();
-            mcfg.default_k = cc.default_k;
-            mcfg.relevance_threshold = cc.relevance_threshold;
-            mcfg.dedup_threshold = cc.dedup_threshold;
-            mcfg.forget_threshold = cc.forget_threshold;
-            mcfg.max_recall_chars = cc.max_recall_chars;
-            mcfg.recall_token_budget = cc.recall_token_budget;
-            mcfg.auto_recall = cc.auto_recall;
-            let mcfg = Arc::new(mcfg);
-            let scope = project_scope(&ws);
-            let tools =
-                build_tools_with(embedder.clone(), store.clone(), mcfg.clone(), scope.clone());
-            let key = match &scope {
-                MemoryScope::Project(k) => k.clone(),
-                MemoryScope::Global => String::new(),
-            };
-            let r: Arc<dyn Retriever> = Arc::new(MemoryRetriever {
-                embedder,
-                store,
-                cfg: mcfg,
-                project_key: key,
-            });
-            (tools, Some(r))
-        } else {
-            (vec![], None)
-        };
-
         let artifacts = Arc::new(SessionArtifacts::new());
         let flag = Arc::new(AtomicBool::new(false));
         let todos = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -287,8 +239,6 @@ async fn eval_context_run() {
                 approval: approval.clone(),
                 workspace: ws.clone(),
                 mcp_tools: vec![],
-                memory_tools: mem_tools,
-                memory_retriever: retriever,
                 stream_idle_timeout: Duration::from_secs(120),
                 base_system_prompt: cc.resolved_system_prompt(EVAL_DEFAULT_PROMPT).to_string(),
                 artifacts: artifacts.clone(),
@@ -308,7 +258,7 @@ async fn eval_context_run() {
             flag,
         )
         .with_todos(todos.clone())
-        .with_recall_budget(cc.recall_budget)
+        .with_memory_index_budget(cc.recall_budget)
         .with_offload_config(cc.offload_config())
         .with_high_water_pct(cc.high_water_pct);
 

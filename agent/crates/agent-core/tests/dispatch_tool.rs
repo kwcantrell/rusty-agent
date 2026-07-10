@@ -181,6 +181,7 @@ fn deps(model: ScriptedModel, sink: Arc<dyn EventSink>, base: Vec<Arc<dyn Tool>>
         id_prefix: String::new(),
         description_overrides: Default::default(),
         subagents: Arc::new(SubAgentRegistry::default()),
+        memories: None,
     }
 }
 

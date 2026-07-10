@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import type { ContextSnapshot } from "./types";
 import { getContext } from "./api";
 import { computeBreakdown } from "./breakdown";
-import { MemorySection } from "./MemorySection";
 import { SkillSection } from "./SkillSection";
 
 const COLORS: Record<string, string> = {
@@ -12,11 +11,10 @@ const COLORS: Record<string, string> = {
 };
 
 export function ContextExplorer(
-  { realTotal, refreshKey, skills, lastQuery }: {
+  { realTotal, refreshKey, skills }: {
     realTotal: number | null;
     refreshKey: number;
     skills: { name: string; description: string }[];
-    lastQuery: string | null;
   },
 ) {
   const [snap, setSnap] = useState<ContextSnapshot | null>(null);
@@ -83,10 +81,6 @@ export function ContextExplorer(
       </div>
 
       <div className="mt-3 border-t" style={{ borderColor: "var(--border)" }}>
-        <MemorySection
-          recalled={snap.segments.find((x) => x.category === "memory")?.items ?? []}
-          lastQuery={lastQuery}
-        />
         <SkillSection skills={skills} />
       </div>
     </div>

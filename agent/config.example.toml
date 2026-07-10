@@ -1,10 +1,22 @@
 # Example invocation reference (flags shown; this file is documentation only).
+# The real runtime config on disk is JSON, parsed field-by-field (serde_json,
+# `PartialRuntimeConfig` merge) — this TOML file never round-trips the loader.
+# It exists purely as an illustrative reference for the available fields;
+# translate keys/values into your actual JSON config by hand.
 # agent --base-url http://localhost:30000 --model my-model --protocol native --workspace .
 base_url = "http://localhost:30000"
 model = "default"
 protocol = "native"   # or "prompted"
 workspace = "."
 context_limit = 8192
+
+# File-based memory (Phase 4A). `memory` gates the memory-index load +
+# prompt discipline only — the `memories/project/` mount (read-write to
+# tools) stays mounted either way, so files are always reachable by path.
+memory = true            # default true; false disables load + discipline (mount still on)
+# memories_dir = "/custom/path"   # override the memory store root;
+                                   # default: ~/.rusty-agent/memories
+                                   # (real consumer: test isolation)
 
 # Named sub-agents (Phase 3B-1). Each becomes a `subagent_type` the model can
 # pick via dispatch_agent. Only name/description/system_prompt are required.

@@ -180,7 +180,7 @@ export function SettingsForm({ settings, meta, error, disabled, onSave }: {
         <label className="flex items-center gap-2 text-sm">
           <input id="memory" type="checkbox" checked={form.memory}
             onChange={(e) => set("memory", e.target.checked)} />
-          Long-term memory (remember/recall across sessions)
+          Long-term memory — project memory files (memories/project/)
         </label>
       </section>
 

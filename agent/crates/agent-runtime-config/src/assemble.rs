@@ -1,8 +1,10 @@
 //! The single place a `RuntimeConfig` + per-frontend pieces become an `AgentLoop`.
 //! Used by both the CLI (`agent-cli`) and the server (`agent-server`) so loop
 //! assembly cannot diverge between front-ends.
-use crate::{build_registry, build_skills, pick_protocol, ModelRef, RuntimeConfig};
-use agent_core::{AgentLoop, EventSink, LoopConfig, Retriever};
+use crate::{
+    build_memories_backend, build_registry, build_skills, pick_protocol, ModelRef, RuntimeConfig,
+};
+use agent_core::{AgentLoop, EventSink, LoopConfig};
 use agent_model::ModelClient;
 use agent_policy::{ApprovalChannel, RulePolicy};
 use agent_skills::compose_system_prompt;
@@ -20,8 +22,6 @@ pub struct LoopParts {
     pub approval: Arc<dyn ApprovalChannel>,
     pub workspace: PathBuf,
     pub mcp_tools: Vec<Arc<dyn Tool>>,
-    pub memory_tools: Vec<Arc<dyn Tool>>,
-    pub memory_retriever: Option<Arc<dyn Retriever>>,
     pub stream_idle_timeout: Duration,
     pub base_system_prompt: String,
     /// Artifact stores the curator writes offloaded content into. The caller
@@ -81,6 +81,11 @@ pub struct BuiltLoop {
     /// None when subagents are disabled (mirrors `dispatch_base_names`).
     #[cfg(test)]
     pub subagent_registry: Option<std::sync::Arc<agent_core::SubAgentRegistry>>,
+    /// Names of the installed middleware stack, in order — lets tests assert
+    /// presence/absence of a stack slot (e.g. "memory-files") without a
+    /// production accessor on `AgentLoop`.
+    #[cfg(test)]
+    pub middleware_names: Vec<String>,
 }
 
 /// Resolve the tool-call protocol name for a routed child loop (spec G5).
@@ -168,6 +173,9 @@ fn fresh_claude_cli_client(
 /// The one place a RuntimeConfig + per-frontend `LoopParts` become an `AgentLoop`.
 /// Never panics: a `compose_system_prompt` failure falls back to the base prompt.
 pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
+    // Project-scope memory store: the mount is unconditional (spec §2.6/§2.7);
+    // cfg.memory gates only the middleware + prompt below.
+    let memories = build_memories_backend(cfg, &parts.workspace);
     let mut registry = build_registry(&cfg.http_allow_hosts, cfg.max_tool_result_bytes);
     for t in &parts.mcp_tools {
         registry.register(t.clone());
@@ -187,9 +195,8 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         parts.todos.clone(),
     )));
     if cfg.memory {
-        stack.push(Arc::new(agent_core::MemoryRecallMiddleware::new(
-            parts.memory_tools.clone(),
-            parts.memory_retriever.clone(),
+        stack.push(Arc::new(agent_core::MemoryFilesMiddleware::new(
+            memories.clone(),
         )));
     }
     // Scheduled context curation (spec §5.5): loop-bottom + text-exit maintain,
@@ -251,7 +258,7 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         .system_prompt_override
         .as_deref()
         .unwrap_or(&parts.base_system_prompt);
-    let system_prompt = match compose_system_prompt(base, &skill_registry, &presets) {
+    let system_prompt = match compose_system_prompt(base, &skill_registry, &presets, cfg.memory) {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "compose_system_prompt failed unexpectedly; using base prompt");
@@ -462,6 +469,7 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 id_prefix: String::new(),
                 description_overrides: cfg.tool_description_overrides.clone(),
                 subagents: subagents_reg.clone(),
+                memories: Some(memories.clone()),
             },
         )));
     }
@@ -486,13 +494,18 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         Some(m) => agent.with_compaction_model(m.clone()),
         None => agent,
     };
+    #[cfg(test)]
+    let middleware_names: Vec<String> = stack.iter().map(|m| m.name().to_string()).collect();
     let agent = agent.with_middleware(stack);
 
     // The guarded composite tools see: two read-only artifact mounts over the
     // caller's SessionArtifacts, backed by a HostBackend at the workspace root
     // (spec §5.2/§5.6). Curation writes go through the UNWRAPPED handles.
     use agent_tools::backend::{Backend, CompositeBackend, HostBackend, ReadOnlyToTools};
-    for name in ["large_tool_results", "conversation_history"] {
+    // Known coarseness, accepted at plan review: only memories/project/* is
+    // actually shadowed by the mount, so a workspace memories/ dir without a
+    // project/ subdir over-warns — directionally safe.
+    for name in ["large_tool_results", "conversation_history", "memories"] {
         if parts.workspace.join(name).exists() {
             tracing::warn!(
                 dir = name,
@@ -509,6 +522,10 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
             (
                 "conversation_history/".into(),
                 Arc::new(ReadOnlyToTools(parts.artifacts.history.clone())) as Arc<dyn Backend>,
+            ),
+            (
+                "memories/project/".into(),
+                memories.clone() as Arc<dyn Backend>,
             ),
         ],
         Arc::new(HostBackend::new(parts.workspace.clone())),
@@ -533,6 +550,8 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         child_loop_knobs,
         #[cfg(test)]
         subagent_registry,
+        #[cfg(test)]
+        middleware_names,
     }
 }
 
@@ -555,49 +574,8 @@ mod tests {
         }
     }
 
-    fn fake_mem(name: &'static str) -> Arc<dyn Tool> {
-        use agent_tools::{Access, ToolCtx, ToolError, ToolIntent, ToolOutput, ToolSchema};
-        struct M(&'static str);
-        #[async_trait::async_trait]
-        impl Tool for M {
-            fn name(&self) -> &str {
-                self.0
-            }
-            fn description(&self) -> &str {
-                "fake"
-            }
-            fn schema(&self) -> ToolSchema {
-                ToolSchema {
-                    name: self.0.into(),
-                    description: "fake".into(),
-                    parameters: serde_json::json!({"type":"object"}),
-                }
-            }
-            fn intent(&self, _a: &serde_json::Value) -> Result<ToolIntent, ToolError> {
-                Ok(ToolIntent {
-                    tool: self.0.into(),
-                    access: Access::Read,
-                    paths: vec![],
-                    command: None,
-                    summary: "x".into(),
-                })
-            }
-            async fn execute(
-                &self,
-                _a: serde_json::Value,
-                _c: &ToolCtx,
-            ) -> Result<ToolOutput, ToolError> {
-                Ok(ToolOutput {
-                    content: "ok".into(),
-                    display: None,
-                })
-            }
-        }
-        Arc::new(M(name))
-    }
-
     // A never-connected client is fine: assemble_loop only constructs the loop.
-    fn parts(workspace: PathBuf, mem: Vec<Arc<dyn Tool>>) -> LoopParts {
+    fn parts(workspace: PathBuf) -> LoopParts {
         LoopParts {
             model: Arc::new(OpenAiCompatClient::new(
                 "http://127.0.0.1:0".into(),
@@ -608,8 +586,6 @@ mod tests {
             approval: Arc::new(NoApproval),
             workspace,
             mcp_tools: vec![],
-            memory_tools: mem,
-            memory_retriever: None,
             stream_idle_timeout: Duration::from_secs(99),
             base_system_prompt: "BASE".into(),
             artifacts: Arc::new(agent_core::SessionArtifacts::new()),
@@ -668,7 +644,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Unset: child inherits the primary knobs.
         let mut c = cfg();
-        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
         let (ml, mt) = built.child_loop_knobs.expect("subagents on by default");
         assert_eq!(ml, c.context_limit);
         assert_eq!(mt, Some(c.max_tokens));
@@ -678,7 +654,7 @@ mod tests {
             max_tokens: Some(256),
             ..Default::default()
         });
-        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
         assert_eq!(built.child_loop_knobs, Some((2048, Some(256))));
     }
 
@@ -705,7 +681,7 @@ mod tests {
         // unit level: LoopParts carries the caller-owned handles, and an
         // ObservedSink built over them folds stats AND forwards to the inner sink.
         let dir = tempfile::tempdir().unwrap();
-        let p = parts(dir.path().to_path_buf(), vec![]);
+        let p = parts(dir.path().to_path_buf());
         let stats = p.stats.clone();
         let inner = Arc::new(agent_core::testkit::CollectingSink::default());
         let sink = crate::trace::ObservedSink {
@@ -724,24 +700,79 @@ mod tests {
     fn assemble_wires_child_trace_only_when_tracing_is_on() {
         // No trace → assembles fine (child_trace None path).
         let dir = tempfile::tempdir().unwrap();
-        let _ = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        let _ = assemble_loop(&cfg(), parts(dir.path().to_path_buf()));
         // With a trace writer → also assembles fine (tap constructed).
-        let mut p = parts(dir.path().to_path_buf(), vec![]);
+        let mut p = parts(dir.path().to_path_buf());
         let tdir = tempfile::tempdir().unwrap();
         p.trace = Some(crate::trace::TraceWriter::create(tdir.path(), 1024 * 1024).unwrap());
         let _ = assemble_loop(&cfg(), p);
     }
 
     #[test]
-    fn registers_memory_tools_when_enabled() {
+    fn memory_middleware_present_iff_cfg_memory() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = cfg();
         c.memory = true;
-        let built = assemble_loop(
-            &c,
-            parts(dir.path().to_path_buf(), vec![fake_mem("remember")]),
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
+        assert!(
+            built.middleware_names.iter().any(|n| n == "memory-files"),
+            "{:?}",
+            built.middleware_names
         );
-        assert!(built.registered_names.iter().any(|n| n == "remember"));
+
+        c.memory = false;
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
+        assert!(
+            !built.middleware_names.iter().any(|n| n == "memory-files"),
+            "{:?}",
+            built.middleware_names
+        );
+    }
+
+    /// Permanent guard (4A-1 B2): the retired vector-memory tools must never
+    /// reappear in either the parent registry or the child dispatch-base
+    /// snapshot, even with `cfg.memory = true` (the file-based replacement
+    /// ships no tools of its own — it only renders `index.md` into the
+    /// pinned memory block).
+    #[test]
+    fn memory_tools_absent_from_registry_and_child_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.memory = true;
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
+        let base = built.dispatch_base_names.expect("subagents on by default");
+        for n in ["remember", "recall", "forget"] {
+            assert!(
+                !built.registered_names.iter().any(|x| x == n),
+                "{n} must not be registered: {:?}",
+                built.registered_names
+            );
+            assert!(
+                !base.iter().any(|x| x == n),
+                "{n} must not be in the child dispatch base: {base:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_off_pinned_assembly_byte_identical() {
+        // cfg.memory=false: nothing on the pinned-assembly path changed. The
+        // golden is the pre-change rendering of the same inputs (system+goal
+        // only — no memory index block exists when empty today, so this is stable).
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.memory = false;
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
+        let ctx = agent_core::WindowContext::new(agent_model::Message::system(
+            built.system_prompt.clone(),
+        ));
+        let rendered = agent_core::ContextManager::build(&ctx, 100_000);
+        assert_eq!(
+            rendered.len(),
+            1,
+            "no memory index block when memory is off"
+        );
+        assert_eq!(rendered[0].content, built.system_prompt);
     }
 
     #[test]
@@ -749,7 +780,7 @@ mod tests {
         // Phase 2 (spec G5): context_compact is the only context tool; offload
         // recovery goes through the ordinary file tools (read_file / grep).
         let dir = tempfile::tempdir().unwrap();
-        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf()));
         assert!(built
             .registered_names
             .iter()
@@ -760,7 +791,7 @@ mod tests {
     #[test]
     fn registers_write_todos_child_visible() {
         let dir = tempfile::tempdir().unwrap();
-        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf()));
         assert!(built.registered_names.iter().any(|n| n == "write_todos"));
         // child-visible: it is in the child base snapshot (registered before it).
         let base = built.dispatch_base_names.expect("subagents on by default");
@@ -768,23 +799,11 @@ mod tests {
     }
 
     #[test]
-    fn skips_memory_tools_when_disabled() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut c = cfg();
-        c.memory = false;
-        let built = assemble_loop(
-            &c,
-            parts(dir.path().to_path_buf(), vec![fake_mem("remember")]),
-        );
-        assert!(!built.registered_names.iter().any(|n| n == "remember"));
-    }
-
-    #[test]
     fn unknown_active_skill_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = cfg();
         c.active_skills = vec!["definitely-not-a-real-skill".into()];
-        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
         assert!(built
             .unknown_presets
             .iter()
@@ -852,7 +871,7 @@ mod tests {
     #[test]
     fn routed_models_default_to_the_primary() {
         let dir = tempfile::tempdir().unwrap();
-        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf()));
         assert_eq!(built.subagent_model_routed, Some(false));
         assert!(!built.compaction_model_routed);
     }
@@ -869,7 +888,7 @@ mod tests {
             model: Some("tiny".into()),
             ..Default::default()
         });
-        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
         assert_eq!(built.subagent_model_routed, Some(true));
         assert!(built.compaction_model_routed);
     }
@@ -883,7 +902,7 @@ mod tests {
             model: Some("mini".into()),
             ..Default::default()
         });
-        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
         assert_eq!(built.subagent_model_routed, Some(true));
         assert!(!built.compaction_model_routed);
     }
@@ -897,7 +916,7 @@ mod tests {
             model: Some("tiny".into()),
             ..Default::default()
         });
-        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
         assert_eq!(built.subagent_model_routed, Some(false));
         assert!(built.compaction_model_routed);
     }
@@ -940,7 +959,7 @@ mod tests {
         let mut c = cfg();
         c.backend = "claude-cli".into();
         c.protocol = "prompted".into();
-        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
         // subagent_model_routed = Some(true) ↔ child client is a distinct Arc
         assert_eq!(built.subagent_model_routed, Some(true));
         // compaction client is also a distinct (fresh) instance
@@ -952,7 +971,7 @@ mod tests {
         // For the openai backend, the stateless client is safe to share; the
         // clone behavior must remain unchanged so we don't churn a working path.
         let dir = tempfile::tempdir().unwrap();
-        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf()));
         // cfg() uses backend "openai" — child should share the parent Arc
         assert_eq!(built.subagent_model_routed, Some(false));
         assert!(!built.compaction_model_routed);
@@ -964,14 +983,14 @@ mod tests {
         let mut c = cfg();
         c.subagent_max_depth = 0;
         // Assembles fine; the clamp is a read-site rule (no panic, tool registered).
-        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
         assert!(built.registered_names.iter().any(|n| n == "dispatch_agent"));
     }
 
     #[test]
     fn registers_dispatch_agent_by_default() {
         let dir = tempfile::tempdir().unwrap();
-        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf()));
         assert!(built.registered_names.iter().any(|n| n == "dispatch_agent"));
     }
 
@@ -980,31 +999,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut c = cfg();
         c.subagents = false;
-        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
         assert!(!built.registered_names.iter().any(|n| n == "dispatch_agent"));
         assert!(built.dispatch_base_names.is_none());
     }
 
     #[test]
-    fn child_base_snapshot_includes_memory_tools_when_enabled() {
-        // Inclusion half of the snapshot invariant: the snapshot is taken AFTER
-        // memory tools register (and before context tools + dispatch), so an
-        // enabled memory tool is child-visible.
+    fn child_base_snapshot_unaffected_by_memory_files_middleware() {
+        // MemoryFilesMiddleware is parent-only (spec §2.6 child quarantine) and
+        // contributes no tools, so enabling memory must not change the child
+        // base snapshot's tool set.
         let dir = tempfile::tempdir().unwrap();
         let mut c = cfg();
+        c.memory = false;
+        let off = assemble_loop(&c, parts(dir.path().to_path_buf()));
+        let base_off = off.dispatch_base_names.expect("subagents on by default");
+
         c.memory = true;
-        let built = assemble_loop(
-            &c,
-            parts(dir.path().to_path_buf(), vec![fake_mem("remember")]),
-        );
-        let base = built.dispatch_base_names.expect("subagents on by default");
-        assert!(base.iter().any(|n| n == "remember"), "{base:?}");
+        let on = assemble_loop(&c, parts(dir.path().to_path_buf()));
+        let base_on = on.dispatch_base_names.expect("subagents on by default");
+
+        // Registry iteration order is not stable across builds; compare as sets.
+        let set_off: std::collections::HashSet<_> = base_off.iter().collect();
+        let set_on: std::collections::HashSet<_> = base_on.iter().collect();
+        assert_eq!(set_off, set_on, "memory=true must not change child tools");
     }
 
     #[test]
     fn child_base_snapshot_excludes_context_tools_and_dispatch_itself() {
         let dir = tempfile::tempdir().unwrap();
-        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf()));
         let base = built.dispatch_base_names.expect("subagents on by default");
         assert!(!base.iter().any(|n| n == "dispatch_agent"), "{base:?}");
         assert!(!base.iter().any(|n| n == "context_compact"), "{base:?}");
@@ -1015,9 +1039,8 @@ mod tests {
     #[test]
     fn every_required_param_is_described_in_the_assembled_registry() {
         let dir = tempfile::tempdir().unwrap();
-        // Default config (memory off): base + context + skill tools are real; the
-        // runtime-injected `recall` is intentionally absent (enforced in agent-memory).
-        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        // Default config (memory off): base + context + skill tools are real.
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf()));
         for s in &built.schemas {
             let missing = agent_tools::required_params_missing_description(s);
             assert!(
@@ -1033,7 +1056,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut c = cfg();
         c.system_prompt_override = Some("OVERRIDE PROMPT".into());
-        let built = assemble_loop(&c, parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
         assert!(built.system_prompt.starts_with("OVERRIDE PROMPT"));
         assert!(!built.system_prompt.contains("BASE"));
     }
@@ -1042,7 +1065,7 @@ mod tests {
     fn confusable_tools_carry_disambiguation_in_the_assembled_registry() {
         use std::collections::HashSet;
         let dir = tempfile::tempdir().unwrap();
-        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf(), vec![]));
+        let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf()));
         let present: HashSet<&str> = built.schemas.iter().map(|s| s.name.as_str()).collect();
 
         // Every confusable tool that IS assembled here must carry the folded marker.
@@ -1057,10 +1080,10 @@ mod tests {
             }
         }
 
-        // Coverage ratchet: the ONLY confusable tool absent from this assembly is
-        // `recall` (runtime-injected, enforced in agent-memory). If a future
-        // confusable tool becomes invisible here without separate coverage, this
-        // fails and forces a decision.
+        // Coverage ratchet: every confusable tool must be present in this
+        // assembly (memory=false doesn't hide any of them post-vector-fork).
+        // If a future confusable tool becomes invisible here without separate
+        // coverage, this fails and forces a decision.
         let absent: HashSet<&str> = agent_tools::CONFUSABLE_TOOLS
             .iter()
             .copied()
@@ -1068,7 +1091,7 @@ mod tests {
             .collect();
         assert_eq!(
             absent,
-            HashSet::from(["recall"]),
+            HashSet::new(),
             "unexpected confusable tools missing from the assembled registry: {absent:?}"
         );
     }
@@ -1089,7 +1112,7 @@ mod tests {
             middleware: None,
             skills: None,
         }];
-        let built = assemble_loop(&c, parts(ws.path().into(), vec![]));
+        let built = assemble_loop(&c, parts(ws.path().into()));
         let reg = built
             .subagent_registry
             .expect("registry present when subagents on");
@@ -1119,7 +1142,7 @@ mod tests {
             middleware: None,
             skills: None,
         }];
-        let built = assemble_loop(&c, parts(ws.path().into(), vec![]));
+        let built = assemble_loop(&c, parts(ws.path().into()));
         let reg = built.subagent_registry.expect("registry built");
         let r = reg.get("triage").unwrap();
         assert_eq!(r.response_format.as_ref().unwrap()["type"], "object");
@@ -1173,7 +1196,7 @@ mod tests {
                 skills: None,
             },
         ];
-        let built = assemble_loop(&c, parts(ws.path().into(), vec![]));
+        let built = assemble_loop(&c, parts(ws.path().into()));
         let reg = built
             .subagent_registry
             .expect("registry present when subagents on");
@@ -1197,7 +1220,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut c = cfg();
         c.sandbox_mode = "enforce".into();
-        let mut p = parts(dir.path().to_path_buf(), vec![]);
+        let mut p = parts(dir.path().to_path_buf());
         p.sandbox = Arc::new(agent_tools::HostExecutor);
         let built = assemble_loop(&c, p);
         assert_eq!(built.loop_.sandbox_descriptor().mechanism, "host");

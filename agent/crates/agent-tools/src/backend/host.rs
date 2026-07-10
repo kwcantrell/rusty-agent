@@ -80,7 +80,31 @@ impl Backend for HostBackend {
                 .await
                 .map_err(|e| FsError::Io(e.to_string()))?;
         }
-        tokio::fs::write(&full, content)
+        // Atomic replace: same-dir temp + rename, so readers see old or new
+        // complete content, never a truncated file (spec §2.4 atomic writes).
+        // The temp name APPENDS to (not replaces) the full original file
+        // name, so distinct targets sharing a stem (notes.md vs notes.txt)
+        // never collide on the same temp path — each embeds its own full
+        // name. Concurrent writes to the *same* path still race on rename
+        // order; readers see old-or-new complete content only (accepted
+        // residual, not a torn read).
+        let mut tmp_name = full
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        tmp_name.push(format!(
+            ".tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let tmp = full.with_file_name(tmp_name);
+        tokio::fs::write(&tmp, content)
+            .await
+            .map_err(|e| FsError::Io(e.to_string()))?;
+        tokio::fs::rename(&tmp, &full)
             .await
             .map_err(|e| FsError::Io(e.to_string()))
     }
@@ -193,5 +217,52 @@ mod tests {
         let hits = b.grep("needle", None).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "real.txt");
+    }
+
+    #[tokio::test]
+    async fn write_is_atomic_no_torn_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let be = std::sync::Arc::new(HostBackend::new(tmp.path().to_path_buf()));
+        be.write("f.txt", &"A".repeat(1 << 20)).await.unwrap();
+        let w = {
+            let be = be.clone();
+            tokio::spawn(async move {
+                for _ in 0..50 {
+                    be.write("f.txt", &"B".repeat(1 << 20)).await.unwrap();
+                }
+            })
+        };
+        for _ in 0..200 {
+            let s = be.read("f.txt").await.unwrap();
+            // Old or new complete content only — never empty/partial.
+            assert!(s.len() == 1 << 20, "torn read: len {}", s.len());
+        }
+        w.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_stem_writes_do_not_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let be = std::sync::Arc::new(HostBackend::new(tmp.path().to_path_buf()));
+        let a = {
+            let be = be.clone();
+            tokio::spawn(async move {
+                for _ in 0..50 {
+                    be.write("notes.md", &"M".repeat(64 * 1024)).await.unwrap();
+                }
+            })
+        };
+        let b = {
+            let be = be.clone();
+            tokio::spawn(async move {
+                for _ in 0..50 {
+                    be.write("notes.txt", &"T".repeat(64 * 1024)).await.unwrap();
+                }
+            })
+        };
+        a.await.unwrap();
+        b.await.unwrap();
+        assert_eq!(be.read("notes.md").await.unwrap(), "M".repeat(64 * 1024));
+        assert_eq!(be.read("notes.txt").await.unwrap(), "T".repeat(64 * 1024));
     }
 }

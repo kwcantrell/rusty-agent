@@ -8,7 +8,7 @@ describe("ArchDetail", () => {
     render(<ArchDetail snapshot={fixture} block="tools" />);
     expect(screen.getByText("render")).toBeInTheDocument();
     expect(screen.getByText("Render an artifact")).toBeInTheDocument();
-    expect(screen.getByText("memory")).toBeInTheDocument(); // kind chip for `remember`
+    expect(screen.getByText("skills")).toBeInTheDocument(); // kind chip for `use_skill`
   });
 
   it("policy block marks hard-floor entries", () => {

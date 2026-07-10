@@ -131,13 +131,6 @@ export default function App() {
   const projectLabel = `session ${sessionId.slice(0, 8)}`;
   const model = state.settings?.model;
 
-  // Derive the most recent user message for recall scoring in MemorySection.
-  let lastQuery: string | null = null;
-  for (let i = state.items.length - 1; i >= 0; i--) {
-    const it = state.items[i];
-    if (it.kind === "user") { lastQuery = it.text; break; }
-  }
-
   const rightPane = (
     <div className="flex h-full flex-col">
       <RightPaneTabs rightTab={rightTab} setRightTab={setRightTab} />
@@ -146,7 +139,7 @@ export default function App() {
           ? <WorkspacePane artifacts={artifacts} activeKey={activeArtifactKey} onSelect={setActiveArtifactKey} />
           : rightTab === "context"
             ? <ContextExplorer realTotal={state.serverUsage?.promptTokens ?? null} refreshKey={state.turnIndex}
-                skills={state.settingsMeta?.discoveredSkills ?? []} lastQuery={lastQuery} />
+                skills={state.settingsMeta?.discoveredSkills ?? []} />
             : rightTab === "architecture"
               ? <ArchitecturePane />
               : rightTab === "config"

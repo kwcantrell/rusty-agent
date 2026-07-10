@@ -61,7 +61,7 @@ describe("SettingsPanel sampling inputs", () => {
     const onSave = vi.fn();
     render(<SettingsPanel settings={base} meta={null} error={null} disabled={false}
       onSave={onSave} onClose={() => {}} />);
-    fireEvent.click(screen.getByLabelText("Long-term memory (remember/recall across sessions)"));
+    fireEvent.click(screen.getByLabelText("Long-term memory — project memory files (memories/project/)"));
     fireEvent.click(screen.getByText("Save"));
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ memory: false }));
   });

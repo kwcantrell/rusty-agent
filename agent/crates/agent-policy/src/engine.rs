@@ -153,6 +153,50 @@ mod tests {
             Decision::Ask
         ));
     }
+
+    // --- Task A5: memories/project/ mount policy pins (spec §2.6) ------------
+    // No engine.rs code change: `memories/project/...` resolves as an ordinary
+    // workspace-relative path, so the existing Read-Allow/Write-Ask gates
+    // already yield these decisions. These tests only pin them.
+
+    #[test]
+    fn memory_mount_read_auto_allows() {
+        assert!(matches!(
+            policy().check(&intent(
+                Access::Read,
+                vec!["memories/project/index.md"],
+                None
+            )),
+            Decision::Allow
+        ));
+    }
+    #[test]
+    fn memory_mount_write_asks() {
+        assert!(matches!(
+            policy().check(&intent(
+                Access::Write,
+                vec!["memories/project/index.md"],
+                None
+            )),
+            Decision::Ask
+        ));
+    }
+    #[test]
+    fn memory_absolute_form_asks() {
+        // Auto-allow depends on the workspace-relative rendering — a leading
+        // slash must NOT be silently allowed (regression guard: every rendered
+        // memory path in headers/pointers/discipline is slash-less on purpose;
+        // reintroducing a leading slash would cause per-read approval fatigue).
+        assert!(matches!(
+            policy().check(&intent(
+                Access::Read,
+                vec!["/memories/project/index.md"],
+                None
+            )),
+            Decision::Ask
+        ));
+    }
+
     #[test]
     fn allowlisted_command_allowed() {
         assert!(matches!(

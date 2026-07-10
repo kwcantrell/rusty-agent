@@ -77,8 +77,6 @@ fn assemble_test(
             approval,
             workspace,
             mcp_tools: vec![],
-            memory_tools: vec![],
-            memory_retriever: None,
             stream_idle_timeout: Duration::from_secs(10),
             base_system_prompt: "You are a test agent.".into(),
             artifacts: Arc::new(agent_core::SessionArtifacts::new()),

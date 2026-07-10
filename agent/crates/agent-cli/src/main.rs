@@ -4,9 +4,9 @@ mod render;
 use agent_core::CuratedContext;
 use agent_model::Message;
 use agent_runtime_config::{
-    assemble_loop, backend_name_is_valid, build_memory_full, build_model, build_sandbox,
-    claude_cli_opts, default_allowlist, default_denylist, LoopParts, RuntimeConfig,
-    BASE_SYSTEM_PROMPT, DEFAULT_SANDBOX_IMAGE,
+    assemble_loop, backend_name_is_valid, build_model, build_sandbox, claude_cli_opts,
+    default_allowlist, default_denylist, LoopParts, RuntimeConfig, BASE_SYSTEM_PROMPT,
+    DEFAULT_SANDBOX_IMAGE,
 };
 use approval::TerminalApproval;
 use clap::Parser;
@@ -165,15 +165,9 @@ struct Cli {
     #[arg(long = "sandbox-extra-ro")]
     sandbox_extra_ro: Vec<String>,
     // ── Memory flags ───────────────────────────────────────────────────────
-    /// Enable long-term memory (remember/recall/forget tools).
+    /// Enable project memory (the memories/project/ mount + pinned index block).
     #[arg(long, default_value_t = false)]
     memory: bool,
-    /// Override the memory DB path (default ~/.rusty-agent/memory.db).
-    #[arg(long)]
-    memory_db: Option<std::path::PathBuf>,
-    /// Override the embedding-model cache dir.
-    #[arg(long)]
-    memory_model_dir: Option<std::path::PathBuf>,
     // ── claude-cli backend knobs ───────────────────────────────────────────
     /// Enable or disable session reuse across claude-cli calls (delta resume).
     /// Omit to use the runtime-config default (on). Pass `false` to force
@@ -250,14 +244,6 @@ async fn main() {
         None => None,
     };
 
-    // Long-term memory: construct once (loads the embedding model); pass tools + retriever in.
-    let memory = build_memory_full(
-        cli.memory,
-        cli.memory_db.clone(),
-        cli.memory_model_dir.clone(),
-        &workspace,
-    );
-
     let artifacts = Arc::new(agent_core::SessionArtifacts::new());
     let compact_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let todos: agent_core::TodoHandle = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -277,8 +263,6 @@ async fn main() {
             approval: Arc::new(TerminalApproval::default()),
             workspace: workspace.clone(),
             mcp_tools,
-            memory_tools: memory.tools.clone(),
-            memory_retriever: memory.retriever.clone(),
             stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
             base_system_prompt: BASE_SYSTEM_PROMPT.to_string(),
             artifacts: artifacts.clone(),
@@ -305,7 +289,6 @@ async fn main() {
         artifacts,
         compact_flag,
     )
-    .with_recall_budget(memory.recall_token_budget)
     .with_offload_config(agent_core::OffloadConfig {
         max_result_bytes: rt.max_tool_result_bytes,
         ..Default::default()

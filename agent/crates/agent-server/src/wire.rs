@@ -222,7 +222,7 @@ pub struct ContextInfo {
     pub context_limit: usize,
     pub max_tool_result_bytes: usize,
     pub memory_enabled: bool,
-    pub recall_budget: usize,
+    pub memory_index_budget: usize,
     pub compaction_model: Option<String>,
 }
 
@@ -507,7 +507,7 @@ mod tests {
                 context_limit: 32768,
                 max_tool_result_bytes: 1,
                 memory_enabled: false,
-                recall_budget: 0,
+                memory_index_budget: 0,
                 compaction_model: None,
             },
             loop_info: LoopInfo {

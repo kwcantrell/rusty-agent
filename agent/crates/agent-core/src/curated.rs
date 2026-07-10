@@ -1,8 +1,8 @@
 use crate::compactor::{compaction_is_worthwhile, run_compaction, run_extraction};
 use crate::context::{
-    estimate_tokens, message_tokens, orphaned_tool_positions, plan_retention, recall_block,
+    estimate_tokens, memory_block, message_tokens, orphaned_tool_positions, plan_retention,
     snap_split_to_unit_boundary, turn_unit_ranges, ContextManager, MaintCtx, MaintReport,
-    DEFAULT_RECALL_TOKEN_BUDGET,
+    DEFAULT_MEMORY_INDEX_BUDGET,
 };
 use crate::event::{AgentEvent, ContextEvent};
 use crate::offload_policy::{
@@ -16,15 +16,16 @@ use std::sync::Arc;
 /// Default fraction of `model_limit` at which `maintain` triggers a compaction pass.
 pub const DEFAULT_HIGH_WATER_PCT: f32 = 0.85;
 
-/// A curating context manager. Pins `system → re-grounding → recall → compaction
-/// summary → windowed recent history`, offloads stale/large tool results into a
-/// side table each turn, and compacts the old span when over the high-water mark.
+/// A curating context manager. Pins `system → re-grounding → memory index →
+/// compaction summary → windowed recent history`, offloads stale/large tool
+/// results into a side table each turn, and compacts the old span when over
+/// the high-water mark.
 pub struct CuratedContext {
     system: Message,
     goal: Option<Message>,
     history: Vec<Message>,
-    recall: Vec<String>,
-    recall_budget: usize,
+    memory_index: Vec<String>,
+    memory_index_budget: usize,
     pub(crate) compaction_summary: Option<Message>,
     /// Extracted fact lines from folded (evicted) user units — rendered as a
     /// pinned ledger block. Append-only; never re-summarized (no generation
@@ -62,8 +63,8 @@ impl CuratedContext {
             system,
             goal: None,
             history: Vec::new(),
-            recall: Vec::new(),
-            recall_budget: DEFAULT_RECALL_TOKEN_BUDGET,
+            memory_index: Vec::new(),
+            memory_index_budget: DEFAULT_MEMORY_INDEX_BUDGET,
             compaction_summary: None,
             folded_facts: Vec::new(),
             artifacts,
@@ -80,8 +81,8 @@ impl CuratedContext {
         }
     }
 
-    pub fn with_recall_budget(mut self, budget: usize) -> Self {
-        self.recall_budget = budget;
+    pub fn with_memory_index_budget(mut self, budget: usize) -> Self {
+        self.memory_index_budget = budget;
         self
     }
 
@@ -134,7 +135,7 @@ impl CuratedContext {
             (None, false) => out.push(Message::system(self.folded_block_body())),
             (None, true) => {}
         }
-        if let Some(r) = recall_block(&self.recall, self.recall_budget) {
+        if let Some(r) = memory_block(&self.memory_index, self.memory_index_budget) {
             out.push(r);
         }
         if let Some(c) = &self.compaction_summary {
@@ -144,7 +145,7 @@ impl CuratedContext {
             }
             out.push(msg);
         }
-        // The todos plan is the LAST pinned block — after goal/ledger → recall →
+        // The todos plan is the LAST pinned block — after goal/ledger → memory index →
         // summary+pointer (existing order byte-identical), nearest the windowed
         // conversation (spec §5.4/E3). Empty list → nothing.
         if let Some(t) = crate::render_todos_block(&self.todos.lock().unwrap()) {
@@ -198,7 +199,7 @@ impl CuratedContext {
         if !self.folded_facts.is_empty() {
             t += message_tokens(&self.folded_block());
         }
-        if let Some(r) = recall_block(&self.recall, self.recall_budget) {
+        if let Some(r) = memory_block(&self.memory_index, self.memory_index_budget) {
             t += message_tokens(&r);
         }
         if let Some(c) = &self.compaction_summary {
@@ -244,8 +245,8 @@ impl CuratedContext {
             self.goal.as_ref(),
             ledger.as_ref(),
             &self.folded_facts,
-            &self.recall,
-            self.recall_budget,
+            &self.memory_index,
+            self.memory_index_budget,
             self.compaction_summary.as_ref(),
             &self.history,
             &todos,
@@ -263,8 +264,8 @@ impl ContextManager for CuratedContext {
         self.system = system;
     }
 
-    fn set_recall(&mut self, items: Vec<String>) {
-        self.recall = items;
+    fn set_memory_index(&mut self, items: Vec<String>) {
+        self.memory_index = items;
     }
 
     fn system(&self) -> Option<&Message> {
@@ -368,7 +369,7 @@ const PLACEHOLDER_UNIT_MAX_TOKENS: usize = 160;
 const FOLDED_FACTS_MAX_TOKENS: usize = 512;
 
 /// Token cap for the pinned goal block (audit 7.1). Same scale as
-/// `DEFAULT_RECALL_TOKEN_BUDGET` and `FOLDED_FACTS_MAX_TOKENS` — every pinned
+/// `DEFAULT_MEMORY_INDEX_BUDGET` and `FOLDED_FACTS_MAX_TOKENS` — every pinned
 /// block is budgeted. The full input stays in history; only the pin truncates.
 const GOAL_MAX_TOKENS: usize = 512;
 const GOAL_TRUNCATION_MARKER: &str =
@@ -815,16 +816,16 @@ mod tests {
     }
 
     #[test]
-    fn build_assembly_order_system_goal_recall_then_history() {
+    fn build_assembly_order_system_goal_memory_index_then_history() {
         let mut c = ctx();
         c.set_goal("ship the feature".into());
-        c.set_recall(vec!["user likes rust".into()]);
+        c.set_memory_index(vec!["user likes rust".into()]);
         c.append(Message::user("hello"));
         let built = c.build(100_000);
         assert!(matches!(built[0].role, Role::System));
         assert_eq!(built[0].content, "SYS");
         assert_eq!(built[1].content, "Original goal: ship the feature");
-        assert!(built[2].content.starts_with("Relevant memories"));
+        assert!(built[2].content.starts_with(crate::context::MEMORY_HEADER));
         assert_eq!(built.last().unwrap().content, "hello");
     }
 
@@ -899,7 +900,7 @@ mod tests {
         let mut c = ctx();
         c.append(Message::user("hi"));
         let built = c.build(100_000);
-        assert_eq!(built.len(), 2); // system + history (no goal/recall set)
+        assert_eq!(built.len(), 2); // system + history (no goal/memory index set)
     }
 
     #[tokio::test]
@@ -1510,13 +1511,13 @@ mod tests {
     }
 
     #[test]
-    fn curated_snapshot_reports_system_recall_and_messages() {
+    fn curated_snapshot_reports_system_memory_index_and_messages() {
         let mut c = CuratedContext::new(
             Message::system("SYS"),
             Arc::new(crate::SessionArtifacts::new()),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        c.set_recall(vec!["user likes rust".into()]);
+        c.set_memory_index(vec!["user likes rust".into()]);
         c.append(Message::user("hello"));
         let snap = c.snapshot(10_000, 7);
         assert_eq!(snap.turn, 7);
@@ -2115,7 +2116,7 @@ mod tests {
 
     #[test]
     fn todos_render_as_the_last_pinned_block_after_existing_order() {
-        // The existing pinned order (system → goal/ledger → recall → summary+pointer)
+        // The existing pinned order (system → goal/ledger → memory index → summary+pointer)
         // stays byte-identical; todos is APPENDED after it (spec §5.4/E3).
         let handle: Arc<std::sync::Mutex<Vec<crate::TodoItem>>> =
             Arc::new(std::sync::Mutex::new(vec![crate::TodoItem {
@@ -2124,7 +2125,7 @@ mod tests {
             }]));
         let mut with = ctx().with_todos(handle.clone());
         with.set_goal("ship it".into());
-        with.set_recall(vec!["a memory".into()]);
+        with.set_memory_index(vec!["a memory".into()]);
         with.compaction_summary = Some(Message::system("Summary: earlier"));
         with.append(Message::user("hello"));
         let built = with.build(100_000);
@@ -2132,7 +2133,7 @@ mod tests {
         // Same prefix as without todos:
         let mut without = ctx();
         without.set_goal("ship it".into());
-        without.set_recall(vec!["a memory".into()]);
+        without.set_memory_index(vec!["a memory".into()]);
         without.compaction_summary = Some(Message::system("Summary: earlier"));
         without.append(Message::user("hello"));
         let base = without.build(100_000);
@@ -2147,11 +2148,11 @@ mod tests {
             })
             .expect("todos block present");
         assert!(todo_msg.content.contains("[in_progress] do the thing"));
-        // Existing pinned order preserved: system/goal/recall/summary identical.
+        // Existing pinned order preserved: system/goal/memory index/summary identical.
         assert_eq!(built[0].content, base[0].content); // system
         assert_eq!(built[1].content, base[1].content); // goal
-        assert!(built[2].content.starts_with("Relevant memories")); // recall
-                                                                    // history tail unchanged
+        assert!(built[2].content.starts_with(crate::context::MEMORY_HEADER)); // memory index
+                                                                              // history tail unchanged
         assert_eq!(built.last().unwrap().content, "hello");
     }
 

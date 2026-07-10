@@ -2866,164 +2866,6 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), Some(1));
     }
 
-    struct FakeRetriever(Vec<String>);
-    #[async_trait::async_trait]
-    impl crate::Retriever for FakeRetriever {
-        async fn retrieve(&self, _q: &str) -> Vec<String> {
-            self.0.clone()
-        }
-    }
-
-    #[tokio::test]
-    async fn auto_retrieval_injects_recall_block_into_context() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path().to_path_buf();
-        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("ok".into())]));
-        let sink = Arc::new(CollectingSink::default());
-        let agent = AgentLoop::new(
-            model,
-            Arc::new(PassthroughProtocol),
-            registry(),
-            policy(ws.clone()),
-            Arc::new(AlwaysApprove),
-            sink.clone(),
-            LoopConfig {
-                model_limit: 100_000,
-                max_turns: 10,
-                max_retries: 2,
-                temperature: 0.0,
-                max_tokens: None,
-                workspace: ws,
-                tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60),
-                ..Default::default()
-            },
-        );
-        let agent = agent.with_middleware(vec![Arc::new(crate::MemoryRecallMiddleware::new(
-            vec![],
-            Some(Arc::new(FakeRetriever(vec![
-                "user prefers rust 2021".into()
-            ]))),
-        ))]);
-        let mut ctx = WindowContext::new(Message::system("sys"));
-        agent.run(&mut ctx, "hello".into()).await.unwrap();
-
-        let built = ctx.build(100_000);
-        assert!(built.iter().any(
-            |m| m.content.contains("Relevant memories from past sessions:")
-                && m.content.contains("user prefers rust 2021")
-        ));
-    }
-
-    #[tokio::test]
-    async fn empty_retrieval_injects_no_block_and_turn_completes() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path().to_path_buf();
-        let model = Arc::new(ScriptedModel::new(vec![Scripted::Text("ok".into())]));
-        let sink = Arc::new(CollectingSink::default());
-        let agent = AgentLoop::new(
-            model,
-            Arc::new(PassthroughProtocol),
-            registry(),
-            policy(ws.clone()),
-            Arc::new(AlwaysApprove),
-            sink.clone(),
-            LoopConfig {
-                model_limit: 100_000,
-                max_turns: 10,
-                max_retries: 2,
-                temperature: 0.0,
-                max_tokens: None,
-                workspace: ws,
-                tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60),
-                ..Default::default()
-            },
-        );
-        let agent = agent.with_middleware(vec![Arc::new(crate::MemoryRecallMiddleware::new(
-            vec![],
-            Some(Arc::new(FakeRetriever(vec![]))),
-        ))]);
-        let mut ctx = WindowContext::new(Message::system("sys"));
-        agent.run(&mut ctx, "hello".into()).await.unwrap();
-
-        let built = ctx.build(100_000);
-        assert!(!built
-            .iter()
-            .any(|m| m.content.contains("Relevant memories")));
-        assert!(sink.events.lock().unwrap().last().unwrap() == "done");
-    }
-
-    /// A run that retrieves nothing must CLEAR the previous run's recall block —
-    /// contexts persist across runs (spec §2, audit Spine B #4).
-    #[tokio::test]
-    async fn empty_retrieval_clears_stale_recall() {
-        // Retriever stub: first call returns ["fact A"], every later call [].
-        struct TogglingRetriever(std::sync::atomic::AtomicUsize);
-        #[async_trait::async_trait]
-        impl crate::Retriever for TogglingRetriever {
-            async fn retrieve(&self, _q: &str) -> Vec<String> {
-                if self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-                    vec!["fact A".into()]
-                } else {
-                    vec![]
-                }
-            }
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path().to_path_buf();
-        let model = Arc::new(ScriptedModel::new(vec![
-            Scripted::Text("ok".into()),
-            Scripted::Text("ok".into()),
-        ]));
-        let sink = Arc::new(CollectingSink::default());
-        let agent = AgentLoop::new(
-            model,
-            Arc::new(PassthroughProtocol),
-            registry(),
-            policy(ws.clone()),
-            Arc::new(AlwaysApprove),
-            sink.clone(),
-            LoopConfig {
-                model_limit: 100_000,
-                max_turns: 10,
-                max_retries: 2,
-                temperature: 0.0,
-                max_tokens: None,
-                workspace: ws,
-                tool_timeout: std::time::Duration::from_secs(5),
-                stream_idle_timeout: std::time::Duration::from_secs(60),
-                ..Default::default()
-            },
-        );
-        let agent = agent.with_middleware(vec![Arc::new(crate::MemoryRecallMiddleware::new(
-            vec![],
-            Some(Arc::new(TogglingRetriever(
-                std::sync::atomic::AtomicUsize::new(0),
-            ))),
-        ))]);
-
-        // Shared real context across two runs (persists like a REPL/server session).
-        let mut ctx = WindowContext::new(Message::system("sys"));
-
-        agent.run(&mut ctx, "hello".into()).await.unwrap();
-        assert!(
-            ctx.build(100_000)
-                .iter()
-                .any(|m| m.content.contains("fact A")),
-            "run 1 (non-empty retrieval) should inject the recall block"
-        );
-
-        agent.run(&mut ctx, "again".into()).await.unwrap();
-        assert!(
-            !ctx.build(100_000)
-                .iter()
-                .any(|m| m.content.contains("fact A")),
-            "run 2 (empty retrieval) must clear the stale recall block"
-        );
-    }
-
     #[tokio::test]
     async fn runs_tool_then_finishes() {
         let dir = tempfile::tempdir().unwrap();
@@ -5423,7 +5265,7 @@ mod tests {
             self.history.push(m);
         }
         fn set_system(&mut self, _: Message) {}
-        fn set_recall(&mut self, _: Vec<String>) {}
+        fn set_memory_index(&mut self, _: Vec<String>) {}
         fn set_goal(&mut self, _: String) {}
         fn build(&self, _limit: usize) -> Vec<Message> {
             if self.compaction_requests > 0 {
@@ -5458,7 +5300,7 @@ mod tests {
             self.history.push(m);
         }
         fn set_system(&mut self, _: Message) {}
-        fn set_recall(&mut self, _: Vec<String>) {}
+        fn set_memory_index(&mut self, _: Vec<String>) {}
         fn set_goal(&mut self, _: String) {}
         fn build(&self, limit: usize) -> Vec<Message> {
             if limit != usize::MAX {
