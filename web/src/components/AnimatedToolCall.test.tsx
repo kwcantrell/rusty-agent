@@ -1,7 +1,7 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { AnimatedToolCall } from "./AnimatedToolCall";
-import type { AnimatedItem } from "../state";
+import type { AnimatedItem, SubagentCard } from "../state";
 
 type ToolItem = Extract<AnimatedItem, { kind: "tool" }>;
 
@@ -15,6 +15,19 @@ const toolItem = (over: Partial<ToolItem>): ToolItem => ({
   ts: 0,
   streaming: false,
   progress: 1,
+  ...over,
+});
+
+const subagentCard = (over: Partial<SubagentCard>): SubagentCard => ({
+  subagentType: "researcher",
+  status: "running",
+  text: "",
+  reasoning: "",
+  textElided: 0,
+  reasoningElided: 0,
+  promptTokens: 0,
+  completionTokens: 0,
+  costUsd: 0,
   ...over,
 });
 
@@ -54,5 +67,60 @@ describe("AnimatedToolCall", () => {
     render(<AnimatedToolCall item={toolItem({})} artifactKey="art-1" onSelect={onSelect} />);
     fireEvent.click(screen.getByText("view →"));
     expect(onSelect).toHaveBeenCalledWith("art-1");
+  });
+  it("renders a running subagent card with badge, status, and live transcript", () => {
+    render(
+      <AnimatedToolCall
+        item={toolItem({
+          status: "running",
+          subagent: subagentCard({
+            subagentType: "researcher",
+            status: "running",
+            text: "partial answer",
+            reasoning: "",
+            textElided: 0,
+          }),
+        })}
+      />
+    );
+    expect(screen.getByTestId("subagent-card")).toBeInTheDocument();
+    expect(screen.getByText("agent[researcher]")).toBeInTheDocument();
+    expect(screen.getByText("running")).toBeInTheDocument();
+    expect(screen.getByTestId("subagent-transcript")).toHaveTextContent("partial answer");
+  });
+  it("renders outcome footer with detail, stats, and elision marker when done", () => {
+    render(
+      <AnimatedToolCall
+        item={toolItem({
+          status: "done",
+          subagent: subagentCard({
+            status: "done",
+            outcome: "timeout",
+            detail: "sub-agent timed out after 5s",
+            stop: "stop",
+            turns: 2,
+            toolCalls: 3,
+            durationMs: 5000,
+            textElided: 42,
+            promptTokens: 100,
+            completionTokens: 20,
+            costUsd: 0.0123,
+          }),
+        })}
+      />
+    );
+    // outcome word shows in the status pill, not the footer text
+    expect(screen.getByText("timeout")).toBeInTheDocument();
+    expect(screen.getByText(/sub-agent timed out after 5s/)).toBeInTheDocument();
+    expect(screen.getByText(/2 turns/)).toBeInTheDocument();
+    expect(screen.getByText(/3 tools/)).toBeInTheDocument();
+    expect(screen.getByText(/5\.0s/)).toBeInTheDocument();
+    expect(screen.getByText(/120 tok/)).toBeInTheDocument();
+    expect(screen.getByText(/\$0\.0123/)).toBeInTheDocument();
+    expect(screen.getByTestId("subagent-transcript")).toHaveTextContent("…(42 chars elided)");
+  });
+  it("renders no card block when item.subagent is undefined", () => {
+    render(<AnimatedToolCall item={toolItem({ subagent: undefined })} />);
+    expect(screen.queryByTestId("subagent-card")).not.toBeInTheDocument();
   });
 });

@@ -4,15 +4,50 @@ import { displayDesignId } from "./designStore";
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
 
+/** Live per-delegation card state (spec 3B-2 §2.4). Attached to the
+ *  dispatch_agent tool item whose id equals the delegation id. */
+export interface SubagentCard {
+  subagentType: string;
+  role?: string;
+  status: "running" | "done";
+  text: string;
+  reasoning: string;
+  /** Code points head-trimmed off text/reasoning by the transcript cap. */
+  textElided: number;
+  reasoningElided: number;
+  outcome?: string;
+  stop?: string;
+  detail?: string;
+  /** Accumulated from child server_usage frames (parent_id === delegation id). */
+  promptTokens: number;
+  completionTokens: number;
+  costUsd: number;
+  turns?: number;
+  toolCalls?: number;
+  durationMs?: number;
+}
+
 export type Item =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string; done?: string }
   | { kind: "reasoning"; text: string }
   | { kind: "tool"; name: string; args: unknown; status: "running" | "done";
-      id?: string; parentId?: string;
-      content?: string; display?: Display; resultStatus?: string; durationMs?: number }
+      id?: string; parentId?: string; subagent?: SubagentCard;
+      content?: string; display?: Display; resultStatus?: string; durationMs?: number;
+      /** Set only by `placeholderCardItem`: this row was materialized from a
+       *  subagent frame, not a real `tool_start` — no `tool_result` will ever
+       *  arrive for it, so its outer `status` must be flipped explicitly
+       *  wherever its card finalizes (finding 2, 3B-2 review). */
+      placeholder?: true }
   | { kind: "context"; text: string }
   | { kind: "error"; message: string };
+
+/** The tool-item shape of `Item`, narrowed for card helpers. */
+type ToolItem = Extract<Item, { kind: "tool" }>;
+
+function isToolItem(it: Item): it is ToolItem {
+  return it.kind === "tool";
+}
 
 export interface PendingApproval {
   id: string;
@@ -88,6 +123,52 @@ function trimTrailing(items: Item[], kind: "assistant" | "reasoning", chars: num
   }
 }
 
+/** Per-card transcript budget, in code points (spec §2.4: a runaway child
+ *  must not grow a single React string unboundedly; append is a full copy). */
+export const SUBAGENT_TRANSCRIPT_CAP = 30000;
+
+function freshCard(subagentType: string, role?: string): SubagentCard {
+  return { subagentType, role, status: "running", text: "", reasoning: "",
+    textElided: 0, reasoningElided: 0, promptTokens: 0, completionTokens: 0, costUsd: 0 };
+}
+
+/** Append with head-trim: keep the newest CAP code points, count what fell off. */
+function appendCapped(cur: string, elided: number, delta: string): { s: string; elided: number } {
+  const cps = Array.from(cur + delta);
+  if (cps.length <= SUBAGENT_TRANSCRIPT_CAP) return { s: cur + delta, elided };
+  const overflow = cps.length - SUBAGENT_TRANSCRIPT_CAP;
+  return { s: cps.slice(overflow).join(""), elided: elided + overflow };
+}
+
+/** Trim `chars` code points off a card transcript tail (child stream retry). */
+function trimTail(s: string, chars: number): string {
+  if (chars <= 0) return s;
+  const cps = Array.from(s);
+  return cps.slice(0, Math.max(0, cps.length - chars)).join("");
+}
+
+/** Find the newest tool item with this delegation id whose card can still
+ *  receive frames (running card, or bare running dispatch row). Returns -1
+ *  when only done cards (or nothing) match — caller creates a new item
+ *  (placeholder rule, spec §2.4 / gate G3). */
+function findLiveCardIndex(items: Item[], id: string): number {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (isToolItem(it) && it.id === id &&
+        (it.subagent ? it.subagent.status === "running" : it.status === "running")) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/** Placeholder item for frames that matched nothing (mid-run reload, or a
+ *  reused call id whose old card is done). */
+function placeholderCardItem(id: string, card: SubagentCard): Item {
+  return { kind: "tool", name: "dispatch_agent", args: {}, status: "running", id,
+    subagent: card, placeholder: true };
+}
+
 /** Emit the stored user message that heads the current turn, if not already emitted. */
 function startTurn(s: ConversationState): ConversationState {
   if (s.inTurn) return s;
@@ -142,11 +223,24 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
       return { ...s, usage: { promptTokens: p.prompt_tokens, contextLimit: p.context_limit, turn: p.turn, maxTurns: p.max_turns } };
     // The breakdown only needs the prompt total, so we intentionally keep only
     // promptTokens here and drop completion_tokens. Revisit if a chart needs it.
-    case "server_usage":
+    case "server_usage": {
       // A sub-agent's usage frame must not flicker the parent turn readout;
+      // it instead accumulates into its delegation card (spec 3B-2 §2.4) —
       // its tokens still land in session_stats (spec E5/E6c).
-      if (p.parent_id) return s;
+      if (p.parent_id) {
+        const items = [...s.items];
+        const i = findLiveCardIndex(items, p.parent_id);
+        if (i < 0) return s;
+        const it = items[i] as ToolItem;
+        if (!it.subagent) return s;
+        items[i] = { ...it, subagent: { ...it.subagent,
+          promptTokens: it.subagent.promptTokens + p.prompt_tokens,
+          completionTokens: it.subagent.completionTokens + p.completion_tokens,
+          costUsd: it.subagent.costUsd + (p.cost_usd ?? 0) } };
+        return { ...s, items };
+      }
       return { ...s, serverUsage: { promptTokens: p.prompt_tokens, turn: p.turn } };
+    }
     case "token": {
       const items = [...s.items];
       const last = items[items.length - 1];
@@ -203,11 +297,92 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
     }
     case "error":
       return { ...s, inTurn: false, items: [...s.items, { kind: "error", message: p.message }] };
+    case "subagent_start": {
+      const items = [...s.items];
+      const i = findLiveCardIndex(items, p.id);
+      const it = i >= 0 ? items[i] : undefined;
+      if (it && isToolItem(it) && !it.subagent) {
+        items[i] = { ...it, subagent: freshCard(p.subagent_type, p.role) };
+      } else {
+        // Reused call id landing on a live card, or no match at all → new card.
+        items.push(placeholderCardItem(p.id, freshCard(p.subagent_type, p.role)));
+      }
+      return { ...s, items };
+    }
+    case "subagent_text":
+    case "subagent_reasoning": {
+      const items = [...s.items];
+      let i = findLiveCardIndex(items, p.id);
+      let it = i >= 0 ? items[i] : undefined;
+      if (!it || !isToolItem(it) || !it.subagent) {
+        // Placeholder rule: a frame with no live card materializes one so a
+        // mid-run reload doesn't silently drop the delegation (gate G3).
+        items.push(placeholderCardItem(p.id, freshCard("sub-agent")));
+        i = items.length - 1;
+        it = items[i] as ToolItem;
+      }
+      const card = { ...(it as ToolItem).subagent! };
+      if (p.type === "subagent_text") {
+        const r = appendCapped(card.text, card.textElided, p.text);
+        card.text = r.s; card.textElided = r.elided;
+      } else {
+        const r = appendCapped(card.reasoning, card.reasoningElided, p.text);
+        card.reasoning = r.s; card.reasoningElided = r.elided;
+      }
+      items[i] = { ...(it as ToolItem), subagent: card };
+      return { ...s, items };
+    }
+    case "subagent_stream_retry": {
+      const items = [...s.items];
+      const i = findLiveCardIndex(items, p.id);
+      if (i < 0) return s;
+      const it = items[i] as ToolItem;
+      if (!it.subagent) return s;
+      items[i] = { ...it, subagent: { ...it.subagent,
+        text: trimTail(it.subagent.text, p.discarded_text_chars),
+        reasoning: trimTail(it.subagent.reasoning, p.discarded_reasoning_chars) } };
+      return { ...s, items };
+    }
+    case "subagent_end": {
+      const items = [...s.items];
+      let i = findLiveCardIndex(items, p.id);
+      let it = i >= 0 ? items[i] : undefined;
+      if (!it || !isToolItem(it) || !it.subagent) {
+        items.push(placeholderCardItem(p.id, freshCard("sub-agent")));
+        i = items.length - 1;
+        it = items[i];
+      }
+      const ti = it as ToolItem;
+      items[i] = { ...ti, subagent: { ...ti.subagent!, status: "done",
+        outcome: p.outcome, stop: p.stop, detail: p.detail,
+        turns: p.turns, toolCalls: p.tool_calls, durationMs: p.duration_ms },
+        // Placeholder rows never get a real tool_result (spec §2.4 / gate G3),
+        // so the outer status would otherwise pulse "running" forever
+        // (finding 2, 3B-2 review). A REAL dispatch row awaiting its
+        // tool_result must keep outer status "running" — that correlation
+        // matches on it — so only flip placeholders.
+        ...(ti.placeholder ? { status: "done" as const } : {}) };
+      return { ...s, items };
+    }
     case "done": {
       const items = [...s.items];
       const last = items[items.length - 1];
       if (last && last.kind === "assistant" && last.done === undefined) {
         items[items.length - 1] = { ...last, done: p.reason };
+      }
+      // Safety net: a card still running at run end lost its End somewhere —
+      // finalize as "unknown" so nothing spins forever (spec §2.4). Only
+      // placeholder rows get their OUTER status flipped here too — a real
+      // dispatch row awaiting its tool_result must keep outer status
+      // "running" since tool_result correlation matches on it (finding 2,
+      // 3B-2 review); a placeholder never gets a real tool_result, so its
+      // outer status would otherwise pulse "running" forever.
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (it.kind === "tool" && it.subagent?.status === "running") {
+          items[i] = { ...it, subagent: { ...it.subagent, status: "done", outcome: "unknown" },
+            ...(it.placeholder ? { status: "done" as const } : {}) };
+        }
       }
       // Close the turn: next event starts a new one and re-emits the next user message.
       return { ...s, items, turnIndex: s.turnIndex + 1, inTurn: false };

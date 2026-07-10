@@ -66,7 +66,14 @@ export type WireEvent =
   | { type: "error"; message: string }
   | { type: "done"; reason: string }
   | { type: "sandbox_degraded"; mechanism: string; reason: string }
-  | { type: "stream_retry"; discarded_text_chars: number; discarded_reasoning_chars: number };
+  | { type: "stream_retry"; discarded_text_chars: number; discarded_reasoning_chars: number }
+  | { type: "subagent_start"; id: string; subagent_type: string; role?: string }
+  | { type: "subagent_text"; id: string; text: string }
+  | { type: "subagent_reasoning"; id: string; text: string }
+  | { type: "subagent_stream_retry"; id: string;
+      discarded_text_chars: number; discarded_reasoning_chars: number }
+  | { type: "subagent_end"; id: string; outcome: string; stop?: string; detail?: string;
+      turns: number; tool_calls: number; duration_ms: number };
 
 export type Inbound =
   | { v: number; session_id: string; kind: "event"; payload: WireEvent }

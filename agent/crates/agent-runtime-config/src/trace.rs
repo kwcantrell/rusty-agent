@@ -94,12 +94,15 @@ impl TraceWriter {
         if inner.w.is_none() {
             return;
         }
+        let Some(ev) = trace_event(event) else {
+            return;
+        };
         let rec = TraceRecord {
             seq: inner.seq,
             ts_ms: epoch_ms(),
             sub,
             parent_id,
-            event: trace_event(event),
+            event: ev,
         };
         let line = match serde_json::to_string(&rec) {
             Ok(l) => l,
@@ -273,10 +276,27 @@ enum TraceEvent<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         system: Option<&'a str>,
     },
+    SubagentStart {
+        id: &'a str,
+        subagent_type: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role: Option<&'a str>,
+    },
+    SubagentEnd {
+        id: &'a str,
+        outcome: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<&'a str>,
+        turns: usize,
+        tool_calls: u64,
+        duration_ms: u64,
+    },
 }
 
-fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
-    match e {
+fn trace_event(e: &AgentEvent) -> Option<TraceEvent<'_>> {
+    Some(match e {
         AgentEvent::Token(t) => TraceEvent::Token { text: t },
         AgentEvent::Reasoning(t) => TraceEvent::Reasoning { text: t },
         AgentEvent::Usage {
@@ -387,7 +407,47 @@ fn trace_event(e: &AgentEvent) -> TraceEvent<'_> {
             input,
             system: system.as_deref(),
         },
-    }
+        AgentEvent::Subagent(se) => {
+            use agent_core::SubagentEvent as SE;
+            match se {
+                SE::Start {
+                    id,
+                    subagent_type,
+                    role,
+                } => TraceEvent::SubagentStart {
+                    id,
+                    subagent_type,
+                    role: role.as_deref(),
+                },
+                SE::End {
+                    id,
+                    outcome,
+                    stop,
+                    detail,
+                    turns,
+                    tool_calls,
+                    duration_ms,
+                } => TraceEvent::SubagentEnd {
+                    id,
+                    outcome: outcome.as_str(),
+                    stop: stop.as_ref().map(stop_reason_str),
+                    detail: detail.as_deref(),
+                    turns: *turns,
+                    tool_calls: *tool_calls,
+                    duration_ms: *duration_ms,
+                },
+                // (Bindings here are references — `trace_event` takes
+                // `&AgentEvent` — hence `as_deref`/`as_ref` above.
+                // `stop_reason_str` is trace.rs's EXISTING StopReason →
+                // &'static str helper, the one the Done arm already calls —
+                // reuse it, do NOT add a second helper.)
+                // Typed deltas are UI telemetry; the raw ChildTraceTap records
+                // remain the single trace source of the child transcript
+                // (spec §2.6 exactly-once invariant).
+                SE::Text { .. } | SE::Reasoning { .. } | SE::StreamRetry { .. } => return None,
+            }
+        }
+    })
 }
 
 fn stop_reason_str(r: &StopReason) -> &'static str {
@@ -504,6 +564,93 @@ mod tests {
         assert!(lines[2].contains(r#""parent_id":"d1""#), "{}", lines[2]);
         // seq stays monotonic across both write paths:
         assert!(lines[2].contains(r#""seq":1"#), "{}", lines[2]);
+    }
+
+    #[test]
+    fn subagent_lifecycle_traced_and_deltas_skipped() {
+        use agent_core::{SubagentEvent, SubagentOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let writer = TraceWriter::create(dir.path(), 1024 * 1024).unwrap();
+        writer.record(&AgentEvent::Subagent(SubagentEvent::Start {
+            id: "c1".into(),
+            subagent_type: "researcher".into(),
+            role: None,
+        }));
+        writer.record(&AgentEvent::Subagent(SubagentEvent::Text {
+            id: "c1".into(),
+            text: "delta".into(),
+        }));
+        writer.record(&AgentEvent::Subagent(SubagentEvent::Reasoning {
+            id: "c1".into(),
+            text: "rdelta".into(),
+        }));
+        writer.record(&AgentEvent::Subagent(SubagentEvent::StreamRetry {
+            id: "c1".into(),
+            discarded_text_chars: 1,
+            discarded_reasoning_chars: 0,
+        }));
+        writer.record(&AgentEvent::Subagent(SubagentEvent::End {
+            id: "c1".into(),
+            outcome: SubagentOutcome::Completed,
+            stop: None,
+            detail: None,
+            turns: 1,
+            tool_calls: 0,
+            duration_ms: 5,
+        }));
+        writer.record(&AgentEvent::Done(agent_model::StopReason::Stop)); // flushes the BufWriter
+        let path = dir.path().join(format!("{}.jsonl", writer.session_id()));
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert!(contents.contains(r#""type":"subagent_start""#));
+        assert!(contents.contains(r#""type":"subagent_end""#));
+        assert!(
+            !contents.contains("subagent_text"),
+            "deltas must be skipped"
+        );
+        assert!(!contents.contains("subagent_reasoning"));
+        assert!(!contents.contains("subagent_stream_retry"));
+        assert!(!contents.contains("delta"), "delta payloads must not land");
+    }
+
+    #[test]
+    fn child_token_lands_in_the_jsonl_exactly_once() {
+        // Production topology: SubagentSink over an ObservedSink whose `trace`
+        // is the SAME TraceWriter behind the ChildTraceTap (spec §2.6/§3.4).
+        struct NullSink;
+        impl EventSink for NullSink {
+            fn emit(&self, _: AgentEvent) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = TraceWriter::create(dir.path(), 1024 * 1024).unwrap();
+        let observed = Arc::new(ObservedSink {
+            inner: Arc::new(NullSink),
+            stats: Arc::new(RwLock::new(SessionStats::default())),
+            trace: Some(writer.clone()),
+        });
+        let sink = agent_core::SubagentSink::new(
+            observed,
+            1,
+            "d1".into(),
+            Some(Arc::new(ChildTraceTap(writer.clone()))),
+        );
+        sink.emit(agent_core::AgentEvent::Token("UNIQ_TOKEN_PAYLOAD".into()));
+        // Flush via the pattern the existing tests use (record a Done).
+        writer.record(&AgentEvent::Done(agent_model::StopReason::Stop));
+        let path = dir.path().join(format!("{}.jsonl", writer.session_id()));
+        let contents = std::fs::read_to_string(path).unwrap();
+        let hits = contents.matches("UNIQ_TOKEN_PAYLOAD").count();
+        assert_eq!(
+            hits, 1,
+            "child token must be traced exactly once (raw tap), got {hits}:\n{contents}"
+        );
+        // And the one hit is the raw child record (has "sub":1), not a typed frame:
+        let line = contents
+            .lines()
+            .find(|l| l.contains("UNIQ_TOKEN_PAYLOAD"))
+            .unwrap();
+        assert!(line.contains(r#""sub":1"#), "{line}");
+        assert!(!line.contains("subagent_text"), "{line}");
     }
 
     #[test]

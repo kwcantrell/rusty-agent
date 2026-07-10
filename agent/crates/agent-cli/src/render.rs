@@ -1,4 +1,5 @@
 use agent_core::{AgentEvent, EventSink, ToolStatus};
+use agent_model::StopReason;
 use agent_tools::Display;
 use similar::{ChangeTag, TextDiff};
 use std::io::Write;
@@ -101,6 +102,49 @@ fn format_tool_result(
     }
 }
 
+/// Mirrors `wire.rs::stop_reason_str` — six variants, snake_case wire words
+/// (a `{:?}.to_lowercase()` shortcut is WRONG: BudgetExhausted != budget_exhausted).
+fn stop_str(r: &StopReason) -> &'static str {
+    match r {
+        StopReason::Stop => "stop",
+        StopReason::ToolCalls => "tool_calls",
+        StopReason::Length => "length",
+        StopReason::BudgetExhausted => "budget_exhausted",
+        StopReason::Cancelled => "cancelled",
+        StopReason::Error => "error",
+    }
+}
+
+/// The Subagent Start display line (pure for testability).
+fn format_subagent_start(subagent_type: &str, role: Option<&str>) -> String {
+    let role_note = role.map(|r| format!(" — {r}")).unwrap_or_default();
+    format!("  ↳ \x1b[36magent[{subagent_type}]\x1b[0m started{role_note}")
+}
+
+/// The Subagent End display line (pure for testability).
+fn format_subagent_end(
+    outcome: agent_core::SubagentOutcome,
+    stop: Option<&str>,
+    detail: Option<&str>,
+    turns: usize,
+    tool_calls: u64,
+    duration_ms: u64,
+) -> String {
+    use agent_core::SubagentOutcome as O;
+    let word = match outcome {
+        O::Completed => "done",
+        O::Timeout => "timed out",
+        O::Failed => "failed",
+        O::Cancelled => "cancelled",
+    };
+    let stop_note = stop.map(|s| format!("{s}, ")).unwrap_or_default();
+    let detail_note = detail.map(|d| format!(" — {d}")).unwrap_or_default();
+    let secs = duration_ms as f64 / 1000.0;
+    format!(
+        "  ↳ agent {word} — {stop_note}{turns} turns, {tool_calls} tools, {secs:.1}s{detail_note}"
+    )
+}
+
 /// Renders agent events to stdout/stderr. Buffers streamed tokens inline.
 #[allow(dead_code)]
 pub struct TerminalSink {
@@ -191,6 +235,47 @@ impl EventSink for TerminalSink {
             AgentEvent::Done(_) => {
                 let _ = writeln!(out);
             }
+            AgentEvent::Subagent(se) => {
+                use agent_core::SubagentEvent as SE;
+                match se {
+                    SE::Start {
+                        subagent_type,
+                        role,
+                        ..
+                    } => {
+                        let _ = writeln!(
+                            out,
+                            "\n{}",
+                            format_subagent_start(&subagent_type, role.as_deref())
+                        );
+                    }
+                    SE::End {
+                        outcome,
+                        stop,
+                        detail,
+                        turns,
+                        tool_calls,
+                        duration_ms,
+                        ..
+                    } => {
+                        let _ = writeln!(
+                            out,
+                            "{}",
+                            format_subagent_end(
+                                outcome,
+                                stop.map(|r| stop_str(&r)),
+                                detail.as_deref(),
+                                turns,
+                                tool_calls,
+                                duration_ms
+                            )
+                        );
+                    }
+                    // Live child prose is terminal noise (spec §2.5, owner
+                    // decision) — lifecycle lines only.
+                    SE::Text { .. } | SE::Reasoning { .. } | SE::StreamRetry { .. } => {}
+                }
+            }
         }
     }
 }
@@ -264,6 +349,35 @@ mod tests {
         assert!(!top.contains('↳'));
         assert!(child.starts_with("  ↳"), "{child:?}");
         assert!(child.contains("sub:read_file"));
+    }
+
+    #[test]
+    fn subagent_lifecycle_lines() {
+        assert!(format_subagent_start("researcher", None).contains("agent[researcher]"));
+        assert!(format_subagent_start("general-purpose", Some("be brief")).contains("— be brief"));
+        let end = format_subagent_end(
+            agent_core::SubagentOutcome::Timeout,
+            None,
+            Some("sub-agent timed out after 5s"),
+            2,
+            3,
+            5000,
+        );
+        assert!(end.contains("timed out"), "{end}");
+        assert!(end.contains("2 turns, 3 tools, 5.0s"), "{end}");
+        assert!(end.contains("— sub-agent timed out after 5s"), "{end}");
+        let done = format_subagent_end(
+            agent_core::SubagentOutcome::Completed,
+            Some("stop"),
+            None,
+            4,
+            7,
+            12300,
+        );
+        assert!(
+            done.contains("done — stop, 4 turns, 7 tools, 12.3s"),
+            "{done}"
+        );
     }
 
     #[test]

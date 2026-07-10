@@ -96,6 +96,36 @@ pub enum ServerEvent {
     SessionStats {
         stats: agent_core::SessionStats,
     },
+    SubagentStart {
+        id: String,
+        subagent_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+    },
+    SubagentText {
+        id: String,
+        text: String,
+    },
+    SubagentReasoning {
+        id: String,
+        text: String,
+    },
+    SubagentStreamRetry {
+        id: String,
+        discarded_text_chars: usize,
+        discarded_reasoning_chars: usize,
+    },
+    SubagentEnd {
+        id: String,
+        outcome: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        turns: usize,
+        tool_calls: u64,
+        duration_ms: u64,
+    },
 }
 
 /// Settings snapshot returned by the `settings_get` command (was `WireBody::SettingsState`).
@@ -377,6 +407,48 @@ pub fn server_event_from(event: AgentEvent) -> Option<ServerEvent> {
             discarded_text_chars,
             discarded_reasoning_chars,
         },
+        AgentEvent::Subagent(se) => {
+            use agent_core::SubagentEvent as SE;
+            match se {
+                SE::Start {
+                    id,
+                    subagent_type,
+                    role,
+                } => ServerEvent::SubagentStart {
+                    id,
+                    subagent_type,
+                    role,
+                },
+                SE::Text { id, text } => ServerEvent::SubagentText { id, text },
+                SE::Reasoning { id, text } => ServerEvent::SubagentReasoning { id, text },
+                SE::StreamRetry {
+                    id,
+                    discarded_text_chars,
+                    discarded_reasoning_chars,
+                } => ServerEvent::SubagentStreamRetry {
+                    id,
+                    discarded_text_chars,
+                    discarded_reasoning_chars,
+                },
+                SE::End {
+                    id,
+                    outcome,
+                    stop,
+                    detail,
+                    turns,
+                    tool_calls,
+                    duration_ms,
+                } => ServerEvent::SubagentEnd {
+                    id,
+                    outcome: outcome.as_str().into(),
+                    stop: stop.map(|r| stop_reason_str(&r).to_string()),
+                    detail,
+                    turns,
+                    tool_calls,
+                    duration_ms,
+                },
+            }
+        }
     })
 }
 
@@ -516,6 +588,68 @@ mod tests {
         let ev = server_event_from(AgentEvent::Token("hi".into())).unwrap();
         let j = serde_json::to_string(&ev).unwrap();
         assert_eq!(j, r#"{"type":"token","text":"hi"}"#);
+    }
+
+    #[test]
+    fn subagent_frames_serialize_with_type_tags_and_omit_none_optionals() {
+        use agent_core::{SubagentEvent, SubagentOutcome};
+        let start = server_event_from(AgentEvent::Subagent(SubagentEvent::Start {
+            id: "c7".into(),
+            subagent_type: "general-purpose".into(),
+            role: None,
+        }))
+        .unwrap();
+        let j = serde_json::to_string(&start).unwrap();
+        assert!(j.contains(r#""type":"subagent_start""#), "{j}");
+        assert!(j.contains(r#""id":"c7""#), "{j}");
+        assert!(!j.contains("role"), "None role must be omitted: {j}");
+
+        let end = server_event_from(AgentEvent::Subagent(SubagentEvent::End {
+            id: "c7".into(),
+            outcome: SubagentOutcome::Timeout,
+            stop: None,
+            detail: Some("sub-agent timed out after 5s".into()),
+            turns: 2,
+            tool_calls: 3,
+            duration_ms: 5000,
+        }))
+        .unwrap();
+        let j = serde_json::to_string(&end).unwrap();
+        assert!(j.contains(r#""type":"subagent_end""#), "{j}");
+        assert!(j.contains(r#""outcome":"timeout""#), "{j}");
+        assert!(!j.contains(r#""stop""#), "None stop must be omitted: {j}");
+        assert!(
+            j.contains(r#""detail":"sub-agent timed out after 5s""#),
+            "{j}"
+        );
+        assert!(
+            j.contains(r#""turns":2"#) && j.contains(r#""tool_calls":3"#),
+            "{j}"
+        );
+
+        let text = server_event_from(AgentEvent::Subagent(SubagentEvent::Text {
+            id: "c7".into(),
+            text: "hi".into(),
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&text).unwrap(),
+            r#"{"type":"subagent_text","id":"c7","text":"hi"}"#
+        );
+
+        let stop_end = server_event_from(AgentEvent::Subagent(SubagentEvent::End {
+            id: "c7".into(),
+            outcome: SubagentOutcome::Completed,
+            stop: Some(StopReason::BudgetExhausted),
+            detail: None,
+            turns: 4,
+            tool_calls: 0,
+            duration_ms: 10,
+        }))
+        .unwrap();
+        let j = serde_json::to_string(&stop_end).unwrap();
+        assert!(j.contains(r#""stop":"budget_exhausted""#), "{j}");
+        assert!(!j.contains("detail"), "{j}");
     }
 
     #[test]

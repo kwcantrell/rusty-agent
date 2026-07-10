@@ -56,6 +56,74 @@ impl ToolStatus {
     }
 }
 
+/// Typed per-delegation sub-agent stream (spec 2026-07-09 3B-2). Every case
+/// carries the delegation id = the dispatching call's on-wire id — the exact
+/// string forwarded child rows carry as `parent_id` — so frontends join the
+/// typed stream to the existing `dispatch_agent` tool row, at any depth.
+#[derive(Debug, Clone)]
+pub enum SubagentEvent {
+    /// One dispatch began. Emitted after all dispatch validation (a rejected
+    /// dispatch never emits Start) and after the loop's ToolStart for the
+    /// dispatch_agent call, so frontends always see the host row first.
+    Start {
+        id: String,
+        /// Registry name, or "general-purpose" for the ad-hoc path.
+        subagent_type: String,
+        /// Per-call role arg (general-purpose only; None for named types).
+        role: Option<String>,
+    },
+    /// Child assistant text delta.
+    Text { id: String, text: String },
+    /// Child reasoning delta. NOTE: a genuinely NEW egress path — child
+    /// reasoning was trace-file-only before 3B-2. Streaming it to the local
+    /// UI was gate-approved (spec G5): same trust boundary as the parent's
+    /// own reasoning stream.
+    Reasoning { id: String, text: String },
+    /// Child mid-stream retry retracted in-flight deltas: frontends trim the
+    /// tail of THIS delegation's transcript (mirrors top-level StreamRetry).
+    StreamRetry {
+        id: String,
+        discarded_text_chars: usize,
+        discarded_reasoning_chars: usize,
+    },
+    /// The delegation finished, on any path (drop-guard guaranteed: exactly
+    /// one End per Start).
+    End {
+        id: String,
+        outcome: SubagentOutcome,
+        /// The child's own stop reason from the capture; None when the child
+        /// never emitted Done (e.g. timeout before its first turn completed).
+        stop: Option<StopReason>,
+        /// Human-readable failure/timeout detail; None on Completed.
+        detail: Option<String>,
+        turns: usize,
+        tool_calls: u64,
+        duration_ms: u64,
+    },
+}
+
+/// How a delegation terminated. Deliberately NOT derivable from `stop` +
+/// tool-result status (Timeout and Failed both surface non-ok; Cancelled
+/// returns Err) — dispatch's execute() is the only place that knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentOutcome {
+    Completed,
+    Timeout,
+    Failed,
+    Cancelled,
+}
+
+impl SubagentOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Timeout => "timeout",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 pub enum AgentEvent {
     Token(String),
     Reasoning(String),
@@ -125,6 +193,9 @@ pub enum AgentEvent {
         input: String,
         system: Option<String>,
     },
+    /// Typed per-delegation sub-agent stream (3B-2). Emitted ONLY by
+    /// dispatch.rs (execute() lifecycle + SubagentSink delta forwarding).
+    Subagent(SubagentEvent),
 }
 
 pub trait EventSink: Send + Sync {
