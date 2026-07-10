@@ -2747,7 +2747,7 @@ mod tests {
 
         let parent = Arc::new(FullSink::default());
         let ws = std::env::temp_dir();
-        let mut deps = DispatchDeps {
+        let deps = DispatchDeps {
             model: Arc::new(PanicModel),
             protocol: Arc::new(PassthroughProtocol),
             policy: Arc::new(agent_policy::RulePolicy {
@@ -2778,7 +2778,6 @@ mod tests {
             description_overrides: Default::default(),
             subagents: Arc::new(SubAgentRegistry::default()),
         };
-        deps.sink = parent.clone();
         let tool = DispatchAgentTool::new(deps);
 
         let ctx = exec_ctx();
