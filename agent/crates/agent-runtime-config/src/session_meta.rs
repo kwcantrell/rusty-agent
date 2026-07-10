@@ -141,6 +141,9 @@ fn atomic_write_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no filename"))?;
     let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    // A crash can leave a stale tmp with pre-fix (or foreign) modes;
+    // OpenOptions::mode() applies only at creation, so clear it first.
+    let _ = std::fs::remove_file(&tmp);
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -244,5 +247,32 @@ mod tests {
         if let Some(r) = root {
             assert!(r.ends_with(".rusty-agent/sessions"), "{}", r.display());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_wide_mode_tmp_does_not_leak_into_descriptor() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let d = SessionDescriptor {
+            schema: DESCRIPTOR_SCHEMA,
+            session_id: "1751-0badf00d".into(),
+            workspace: PathBuf::from("/w"),
+            created_ms: 1,
+            config_path: None,
+        };
+        // seed crash residue: a world-readable stale tmp
+        let dir = session_dir(root.path(), &d.session_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("descriptor.json.tmp");
+        std::fs::write(&tmp, b"stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_descriptor(root.path(), &d).unwrap();
+        let mode = std::fs::metadata(dir.join("descriptor.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
