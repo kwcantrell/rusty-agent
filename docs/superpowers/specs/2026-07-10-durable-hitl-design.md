@@ -111,8 +111,10 @@ Split per E4 into three plan slices sharing this spec.
 - `TraceWriter` (and the CLI) **consume** the session id instead of minting
   it (`mint_session_id`'s `{secs}-{pid}` moves behind the descriptor);
   trace JSONL filename/shape unchanged otherwise.
-- Startup index: daemon scans the sessions dir and rebuilds the
-  session→workspace map for attach.
+- Startup index: the scan capability (`scan_descriptors`, tested +
+  exported). *Owner-ratified narrowing (2026-07-10, 4B-0 whole-branch
+  gate): the daemon-startup caller that rebuilds the session→workspace
+  map lands in 4B-1 with attach-to-resume, its only consumer.*
 - Daemon-local secret file for E6b HMAC (created on first use, `0o600`).
 
 **IN — Slice 4B-1 (durability core):**
@@ -589,6 +591,9 @@ comment on skipped Approval events, config.example.json, the
   coverage capped at depth 1 (E6a); parked runs hold their session slot
   until answered or auto-denied via the E5 knob (inherent to parking).
 - **2026-07-10 — owner gate:** E1–E6 CLOSED (recorded above).
+- **2026-07-10 — 4B-0 whole-branch gate:** reviewer escalated one spec-IN
+  narrowing (startup index shipped as unwired capability); owner RATIFIED
+  — wiring moves to 4B-1 (§0 updated in place).
 - **2026-07-10 — light-tier consistency read (sonnet):** CLEAN on all
   substance (no stale E1/E2 language, dispositions match normative
   sections, slice assignments consistent); 4 mechanical citation fixes
