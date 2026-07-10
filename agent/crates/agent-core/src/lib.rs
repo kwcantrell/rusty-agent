@@ -18,9 +18,9 @@ pub mod testkit;
 mod todos;
 pub use artifacts::SessionArtifacts;
 pub use checkpoint::{
-    dump_artifacts, restore_artifacts, sanitize_dir_key, AskGuard, Checkpoint, CheckpointError,
-    Checkpointer, GateRecord, Guardrails, InvalidParked, ParkedTurn, PendingSnapshot,
-    CHECKPOINT_VERSION,
+    dump_artifacts, restore_artifacts, sanitize_dir_key, verify_tally_floor, AskGuard, Checkpoint,
+    CheckpointError, Checkpointer, GateRecord, Guardrails, InvalidParked, ParkedTurn,
+    PendingSnapshot, CHECKPOINT_VERSION,
 };
 pub use compactor::*;
 pub use context::*;

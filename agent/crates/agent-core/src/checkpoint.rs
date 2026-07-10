@@ -386,6 +386,56 @@ pub async fn restore_artifacts(
     }
 }
 
+impl Checkpoint {
+    /// The mechanical `Checkpoint → ResumeTurn` projection: the decision is
+    /// injected separately by the caller (from a durable answer.json, or None
+    /// to re-ask live). No verification here — the caller runs
+    /// `verify_tally_floor` + manifest checks before building this.
+    pub fn resume_turn(&self, parked_decision: Option<bool>) -> crate::ResumeTurn {
+        crate::ResumeTurn {
+            assistant_text: self.parked.assistant_text.clone(),
+            tool_calls: self.parked.tool_calls.clone(),
+            invalid: self.parked.invalid.clone(),
+            gate_records: self.parked.gate_records.clone(),
+            parked_index: self.parked.parked_index,
+            parked_decision,
+            turn: self.turn,
+            guardrails: self.guardrails,
+            goal_text: self
+                .context
+                .goal
+                .as_ref()
+                .map(|g| g.content.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// Monotonic tally clamp (spec §2.4 step 3): the restored tally may never be
+/// below what the checkpointed history implies. Implied floor = executed tool
+/// results after the last user message (this run's earlier turns). Rejected /
+/// invalid results in history also count `Role::Tool`, but never over-floor —
+/// they were still gate outcomes this run; an over-strict floor errs toward
+/// refuse, which is the fail-safe direction.
+pub fn verify_tally_floor(chk: &Checkpoint) -> Result<(), CheckpointError> {
+    let last_user = chk
+        .context
+        .history
+        .iter()
+        .rposition(|m| m.role == agent_model::Role::User);
+    let implied = chk.context.history[last_user.map_or(0, |i| i + 1)..]
+        .iter()
+        .filter(|m| m.role == agent_model::Role::Tool)
+        .count() as u64;
+    if chk.guardrails.tool_calls < implied {
+        return Err(CheckpointError::Corrupt(format!(
+            "tool tally {} below history-implied floor {implied}",
+            chk.guardrails.tool_calls
+        )));
+    }
+    Ok(())
+}
+
 /// A dispatch-kind checkpoint waiting in memory (flushed only if a
 /// descendant parks).
 pub struct PendingSnapshot {
@@ -677,6 +727,52 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_checkpoint(dir.path(), &key()).unwrap().is_none());
         assert!(!has_park(dir.path()));
+    }
+
+    #[test]
+    fn verify_tally_floor_rejects_below_and_accepts_at_or_above() {
+        // History: one user msg, then two tool results this run ⇒ implied
+        // floor 2.
+        let mut chk = sample();
+        chk.context.history = vec![
+            agent_model::Message::user("hi"),
+            agent_model::Message::assistant("go", None),
+            agent_model::Message::tool("c1", "execute_command", "ok"),
+            agent_model::Message::tool("c2", "execute_command", "ok"),
+        ];
+        // Below the floor ⇒ Corrupt.
+        chk.guardrails.tool_calls = 1;
+        assert!(matches!(
+            verify_tally_floor(&chk),
+            Err(CheckpointError::Corrupt(_))
+        ));
+        // At the floor ⇒ Ok.
+        chk.guardrails.tool_calls = 2;
+        assert!(verify_tally_floor(&chk).is_ok());
+        // Above the floor ⇒ Ok (earlier turns' tallies count too).
+        chk.guardrails.tool_calls = 9;
+        assert!(verify_tally_floor(&chk).is_ok());
+    }
+
+    #[test]
+    fn verify_tally_floor_counts_only_after_last_user() {
+        // A tool result BEFORE the last user message belongs to a prior run
+        // segment and must NOT raise this run's floor.
+        let mut chk = sample();
+        chk.context.history = vec![
+            agent_model::Message::user("first"),
+            agent_model::Message::tool("old", "execute_command", "ok"),
+            agent_model::Message::user("second"),
+            agent_model::Message::tool("c1", "execute_command", "ok"),
+        ];
+        // Implied floor is 1 (only the post-last-user tool result).
+        chk.guardrails.tool_calls = 1;
+        assert!(verify_tally_floor(&chk).is_ok());
+        chk.guardrails.tool_calls = 0;
+        assert!(matches!(
+            verify_tally_floor(&chk),
+            Err(CheckpointError::Corrupt(_))
+        ));
     }
 
     #[cfg(unix)]
