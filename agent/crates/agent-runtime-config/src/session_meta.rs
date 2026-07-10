@@ -111,6 +111,34 @@ pub fn load_descriptor(dir: &Path) -> Option<SessionDescriptor> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// 32 bytes of key material at <metadata_root>/secret, created 0o600 on
+/// first use. A wrong-length file is InvalidData — never silently
+/// regenerated (that would invalidate every existing checkpoint MAC).
+#[allow(dead_code)]
+pub fn load_or_create_secret(metadata_root: &Path) -> std::io::Result<[u8; 32]> {
+    let path = metadata_root.join("secret");
+    match std::fs::read(&path) {
+        Ok(bytes) => bytes.as_slice().try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: expected 32 bytes, found {}",
+                    path.display(),
+                    bytes.len()
+                ),
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            create_dir_0700(metadata_root)?;
+            let mut key = [0u8; 32];
+            entropy(&mut key);
+            atomic_write_0600(&path, &key)?;
+            Ok(key)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// All readable descriptors under root (corrupt/missing skipped), newest
 /// first by session-id name order.
 pub fn scan_descriptors(root: &Path) -> Vec<SessionDescriptor> {
@@ -382,5 +410,38 @@ mod tests {
             root.path().join("050-eeeeeeee.jsonl").exists(),
             "jsonl untouched"
         );
+    }
+
+    #[test]
+    fn secret_created_once_then_stable() {
+        let root = tempfile::tempdir().unwrap();
+        let a = load_or_create_secret(root.path()).unwrap();
+        let b = load_or_create_secret(root.path()).unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, [0u8; 32], "not all-zero");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        load_or_create_secret(root.path()).unwrap();
+        let mode = std::fs::metadata(root.path().join("secret"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn wrong_length_secret_is_a_loud_error_not_silent_regen() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("secret"), b"short").unwrap();
+        let err = load_or_create_secret(root.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // silent regeneration would invalidate every existing checkpoint MAC
+        assert_eq!(std::fs::read(root.path().join("secret")).unwrap(), b"short");
     }
 }
