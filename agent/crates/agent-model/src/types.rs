@@ -9,17 +9,21 @@ pub enum Role {
     Tool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Preserved chain-of-thought for this turn, kept as data rather than baked
     /// into `content`. Each model backend decides how (or whether) to render it
     /// back into the prompt — see `render_transcript` (claude_cli) and
     /// `messages_to_json` (openai). `None` unless `preserve_thinking` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
 }
 
@@ -435,5 +439,29 @@ mod tests {
             ModelError::Process("spawn claude: No such file or directory".into()).class(),
             ErrorClass::Retryable
         );
+    }
+
+    #[test]
+    fn message_serde_round_trips_all_fields() {
+        let mut m = Message::assistant(
+            "text".to_string(),
+            Some(vec![agent_tools::ToolCall {
+                id: "c1".into(),
+                name: "t".into(),
+                args: serde_json::json!({"k": 1}),
+            }]),
+        );
+        m.reasoning = Some("thought".into());
+        let json = serde_json::to_string(&m).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.role, m.role);
+        assert_eq!(back.content, m.content);
+        assert_eq!(back.reasoning, m.reasoning);
+        assert_eq!(back.tool_calls.as_ref().unwrap()[0].id, "c1");
+        // Lenient decode: absent optionals default (forward compat).
+        let sparse: Message =
+            serde_json::from_str(r#"{"role":"User","content":"hi"}"#).unwrap();
+        assert_eq!(sparse.content, "hi");
+        assert!(sparse.tool_calls.is_none());
     }
 }
