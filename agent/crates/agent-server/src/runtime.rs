@@ -44,6 +44,10 @@ pub struct RuntimeState {
     /// `{epoch}-{pid}` session id and interleave two writers into one file.
     stats: Arc<std::sync::RwLock<agent_core::SessionStats>>,
     trace: Option<Arc<agent_runtime_config::TraceWriter>>,
+    /// Durable session identity (4B-0): minted once here, shared with the
+    /// TraceWriter, recorded in sessions/<id>/descriptor.json. The
+    /// descriptor — not the trace — is what a restarted daemon indexes.
+    session_id: String,
     /// On-disk config content as of our last read/write. `apply` refuses to
     /// clobber a file some other process (CLI, editor) changed since.
     persisted_file: Mutex<Option<String>>,
@@ -74,6 +78,23 @@ impl RuntimeState {
         let todos: agent_core::TodoHandle = Arc::new(Mutex::new(Vec::new()));
         let stats: Arc<std::sync::RwLock<agent_core::SessionStats>> = Arc::default();
         let session_id = agent_runtime_config::mint_session_id();
+        if let Some(root) = agent_runtime_config::sessions_root(&config) {
+            let d = agent_runtime_config::SessionDescriptor {
+                schema: agent_runtime_config::DESCRIPTOR_SCHEMA,
+                session_id: session_id.clone(),
+                workspace: workspace.clone(),
+                created_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                config_path: Some(config_path.clone()),
+            };
+            if let Err(e) = agent_runtime_config::write_descriptor(&root, &d) {
+                tracing::warn!(target: "session", error = %e,
+                    "cannot write session descriptor; run will not be resumable");
+            }
+            agent_runtime_config::prune_session_dirs(&root, 50);
+        }
         let trace = agent_runtime_config::build_trace(&config, &session_id);
         let persisted_file = Mutex::new(std::fs::read_to_string(&config_path).ok());
         let built = build_loop(
@@ -110,6 +131,7 @@ impl RuntimeState {
             todos,
             stats,
             trace,
+            session_id,
             persisted_file,
         }
     }
@@ -117,6 +139,30 @@ impl RuntimeState {
     /// Session-stable stats handle (folded by the loop's ObservedSink; read by RPCs).
     pub fn stats(&self) -> Arc<std::sync::RwLock<agent_core::SessionStats>> {
         self.stats.clone()
+    }
+
+    /// Durable session identity (4B-0). Stable for the daemon's lifetime;
+    /// a restarted daemon re-learns it from descriptor.json, not from us.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Rewrite descriptor.json with a new workspace (workspace switch).
+    /// Resume must bind to the CURRENT workspace (spec §2.1/§3.3).
+    pub fn rewrite_descriptor_workspace(&self, workspace: &std::path::Path) {
+        let config = self.config.lock().unwrap().clone();
+        let Some(root) = agent_runtime_config::sessions_root(&config) else {
+            return;
+        };
+        let dir = agent_runtime_config::session_dir(&root, &self.session_id);
+        let Some(mut d) = agent_runtime_config::load_descriptor(&dir) else {
+            return; // construction never wrote one (warned there already)
+        };
+        d.workspace = workspace.to_path_buf();
+        if let Err(e) = agent_runtime_config::write_descriptor(&root, &d) {
+            tracing::warn!(target: "session", error = %e,
+                "cannot rewrite session descriptor on workspace switch");
+        }
     }
 
     /// Conversation-stable artifact stores (shared with the session's `CuratedContext`).
@@ -466,6 +512,64 @@ mod tests {
             crate::daemon::SYSTEM_PROMPT.to_string(),
         );
         (rs, dir)
+    }
+
+    /// Like `make()` but points `trace_dir` at a tempdir so the descriptor
+    /// (and trace) land there instead of the real `$HOME` — do NOT reuse
+    /// `make_with_tools`/`make`, whose config leaves `trace_dir: None`.
+    fn make_with_trace_dir() -> (RuntimeState, tempfile::TempDir, tempfile::TempDir) {
+        let (sink, approval) = parts();
+        let ws = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let path = ws.path().join("rt.json");
+        let mut cfg = RuntimeConfig::from_launch(
+            "openai".into(),
+            "http://localhost:8080".into(),
+            "m1".into(),
+            "native".into(),
+            8192,
+        );
+        cfg.trace_dir = Some(sessions.path().to_string_lossy().into_owned());
+        let rs = RuntimeState::new(
+            cfg,
+            sink,
+            approval,
+            ws.path().to_path_buf(),
+            None,
+            "claude".into(),
+            path,
+            Arc::from(Vec::<Arc<dyn Tool>>::new()),
+            crate::daemon::SYSTEM_PROMPT.to_string(),
+        );
+        (rs, ws, sessions)
+    }
+
+    #[test]
+    fn runtime_writes_descriptor_at_construction_and_exposes_id() {
+        let (rs, ws, sessions) = make_with_trace_dir();
+        let id = rs.session_id().to_string();
+        assert!(!id.is_empty());
+        let dir = agent_runtime_config::session_dir(sessions.path(), &id);
+        let d = agent_runtime_config::load_descriptor(&dir).expect("descriptor written");
+        assert_eq!(d.session_id, id);
+        assert_eq!(d.workspace, ws.path());
+        assert_eq!(d.schema, agent_runtime_config::DESCRIPTOR_SCHEMA);
+        assert!(d.config_path.is_some());
+        // trace (enabled by from_launch) shares the SAME id
+        assert!(sessions.path().join(format!("{id}.jsonl")).exists());
+    }
+
+    #[test]
+    fn rewrite_descriptor_workspace_updates_only_workspace() {
+        let (rs, _ws, sessions) = make_with_trace_dir();
+        let id = rs.session_id().to_string();
+        let dir = agent_runtime_config::session_dir(sessions.path(), &id);
+        let before = agent_runtime_config::load_descriptor(&dir).unwrap();
+        rs.rewrite_descriptor_workspace(std::path::Path::new("/elsewhere"));
+        let after = agent_runtime_config::load_descriptor(&dir).unwrap();
+        assert_eq!(after.workspace, std::path::Path::new("/elsewhere"));
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.created_ms, before.created_ms);
     }
 
     #[test]

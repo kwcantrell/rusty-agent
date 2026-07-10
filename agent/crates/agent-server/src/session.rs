@@ -219,6 +219,7 @@ impl Session {
     /// Cancel any run, then reset the conversation context (workspace switch).
     pub async fn set_workspace(self: &Arc<Self>, dir: PathBuf) {
         self.cancel();
+        self.runtime.rewrite_descriptor_workspace(&dir);
         *self.workspace.lock().unwrap() = dir;
         let mut guard = self.ctx.lock().await;
         *guard = CuratedContext::new(
@@ -236,6 +237,13 @@ impl Session {
     #[cfg(test)]
     fn mark_active_for_test(&self) {
         *self.active.lock().unwrap() = Some(CancellationToken::new());
+    }
+
+    /// Durable session identity (4B-0), delegated from `RuntimeState`. Exposed
+    /// `pub(crate)` for tests that need to locate this session's descriptor.
+    #[cfg(test)]
+    pub(crate) fn session_id(&self) -> &str {
+        self.runtime.session_id()
     }
 }
 
@@ -306,6 +314,38 @@ mod tests {
         let snap = sess.context_get().await;
         assert!(snap.segments.iter().any(|s| s.category == "system"));
         assert!(snap.model_limit > 0);
+    }
+
+    #[tokio::test]
+    async fn set_workspace_rewrites_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        // Point config_path at a NON-EXISTENT file: Session::from_params calls
+        // RuntimeConfig::load_over(params.config, &params.config_path), which
+        // overlays the on-disk file over our in-memory config — an existing
+        // file here would wipe the trace_dir override set below.
+        let mut params = crate::setup::local_params(
+            dir.path().to_path_buf(),
+            dir.path().join("rt.json"),
+            "http://localhost:8080".into(),
+            "m".into(),
+        );
+        params.config.trace_dir = Some(sessions.path().to_string_lossy().into_owned());
+
+        let sess = Session::from_params(params);
+        let id = sess.session_id().to_string();
+        let descriptor_dir = agent_runtime_config::session_dir(sessions.path(), &id);
+        let before = agent_runtime_config::load_descriptor(&descriptor_dir)
+            .expect("descriptor written at construction");
+        assert_eq!(before.workspace, dir.path());
+
+        sess.set_workspace(PathBuf::from("/elsewhere")).await;
+
+        let after = agent_runtime_config::load_descriptor(&descriptor_dir)
+            .expect("descriptor still present after rewrite");
+        assert_eq!(after.workspace, PathBuf::from("/elsewhere"));
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.created_ms, before.created_ms);
     }
 
     #[tokio::test]
