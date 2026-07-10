@@ -360,6 +360,7 @@ impl Session {
                     "session {sid} answered but a run is active; reattach after it finishes"
                 ));
                 self.resuming.lock().unwrap().remove(sid);
+                agent_core::checkpoint::release_resume(&root_dir);
                 return;
             }
             *active = Some(CancellationToken::new());
@@ -1622,6 +1623,57 @@ mod tests {
             !agent_core::checkpoint::claim_resume(&root_dir).unwrap(),
             "the pre-held lock must still be held; a refused resume must not touch it"
         );
+
+        std::mem::forget(ws);
+        std::mem::forget(sessions);
+    }
+
+    /// The active-slot conflict branch ("answered but a run is active;
+    /// reattach after it finishes") fires AFTER `claim_resume` already
+    /// succeeded — it must release the cross-process lock before bouncing,
+    /// same as the sticky-guard and lock-refused branches above. Otherwise
+    /// the lock leaks and every subsequent resume attempt for this session
+    /// spuriously hits "being resumed elsewhere" (Task 5 review finding).
+    #[tokio::test]
+    async fn active_conflict_resume_releases_the_lock() {
+        let ws = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let prior_id = "100-cccccccc";
+
+        let (sess, cap, _key) = plant_parked_session(ws.path(), sessions.path(), prior_id).await;
+        let root_dir =
+            agent_runtime_config::session_dir(sessions.path(), prior_id).join("checkpoint");
+
+        let ask_id = wait_for_ask_id(&cap, Duration::from_secs(5)).await;
+
+        // Occupy the session's `active` slot as if a run were already live,
+        // mirroring how other tests in this module drive the busy path.
+        *sess.active.lock().unwrap() = Some(CancellationToken::new());
+
+        sess.approve(&ask_id, Decision::Approve);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let saw_conflict = cap.0.lock().unwrap().iter().any(|ev| {
+                matches!(ev, ServerEvent::Error { message } if message.contains("run is active"))
+            });
+            if saw_conflict {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no 'run is active' error frame emitted; captured: {:#?}",
+                cap.0.lock().unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            agent_core::checkpoint::claim_resume(&root_dir).unwrap(),
+            "the active-conflict early return must release the cross-process lock \
+             so a later resume attempt can claim it"
+        );
+        agent_core::checkpoint::release_resume(&root_dir); // undo the probe claim above
 
         std::mem::forget(ws);
         std::mem::forget(sessions);
