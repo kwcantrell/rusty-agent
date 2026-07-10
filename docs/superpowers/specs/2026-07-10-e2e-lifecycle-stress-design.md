@@ -1,7 +1,7 @@
 # E2E lifecycle & stress suite — GUI, CLI, and surface-switching
 
 **Date:** 2026-07-10 (rev 2 — post-panel)
-**Status:** Panel-reworked — pending owner gate
+**Status:** Gate-approved 2026-07-10 (E1 adopted, E2 adopted, E3 gaps accepted, E4 queued) — feeding the implementation plan
 **Depends on:** Phase 4B (durable HITL: park-point checkpoints, cross-process resume, CLI sessions list/reopen, GUI parked-run frames) — merged to main at `a6f2f3b`.
 
 ## 1. Problem & goals
@@ -40,7 +40,7 @@ for the resume lock from two directions.
   suite covers only what they structurally cannot (multi-process,
   multi-surface, real kills). §5 lists the cuts made to avoid duplication.
 - No new product behavior, **except two small, explicitly declared test
-  seams escalated to the owner gate** (§9 E1, E2). Everything else asserts
+  seams, gate-approved 2026-07-10** (§9 E1, E2). Everything else asserts
   current behavior; known gaps are asserted as-documented with a
   `// PRODUCT-GAP:` marker.
 - No CI provisioning for WebDriver (xvfb etc.); Tier 2 remains on-demand on
@@ -137,7 +137,7 @@ onto different keys (every cross-surface MAC check fails) or silently touches
 the developer's real `~/.rusty-agent`. Neither is acceptable, and
 process-global `env::set_var` inside a parallel test binary is racy.
 
-**Mechanism (E1, escalated to gate):** add a metadata-root override to
+**Mechanism (E1, gate-approved):** add a metadata-root override to
 `RuntimeConfig` (mirroring `trace_dir`), honored by `metadata_root()`
 consumers on both surfaces. It is a small, declared product seam — the one
 exception to the no-product-changes non-goal, alongside E2. With it:
@@ -152,9 +152,8 @@ exception to the no-product-changes non-goal, alongside E2. With it:
 - no test reads or writes the real `~/.rusty-agent`, and tests are
   parallel-safe (disjoint tempdirs, no env mutation in-process).
 
-If E1 is rejected at the gate, the fallback is running **both** legs as
-subprocesses with per-process `HOME` (heavier: the in-process Session driver
-moves wholesale into the harness bin), and Tier 2 pre-seeding is descoped.
+(A subprocess-only fallback existed for the case of E1 being rejected; E1
+was adopted at the gate, so the seam above is the mechanism.)
 
 ### 2.4 Determinism rules
 
@@ -242,7 +241,7 @@ content (AGENTS.md).
 | # | Scenario | Invariant guarded |
 |---|----------|-------------------|
 | 1 | Park via Session driver → CLI `sessions reopen` → approve → completes | attach-to-resume across surfaces; shared checkpoint semantics |
-| 2 | CLI parks (mechanism per gate decision **E2**: timeout park-and-exit via new knob, or SIGINT park) → fresh Session attach → `parked_runs` + re-derived `approval_request` → approve → `resumed` → done | re-derivation from stored args; frame ordering; CLI→GUI direction |
+| 2 | CLI parks via timeout park-and-exit (E2 knob, gate-approved) → fresh Session attach → `parked_runs` + re-derived `approval_request` → approve → `resumed` → done | re-derivation from stored args; frame ordering; CLI→GUI direction |
 | 3 | Park → deny **with feedback** on one surface — including a hostile-content variant (multibyte unicode, control chars, JSON-meta chars, ~10KB) → stub *matcher* asserts the feedback text in the recorded next request → repark → approve on the other surface → complete | MAC-bound deny feedback travels e2e; canonicalization/serialization under hostile input |
 | 4 | **Soak** (merges old #4+#22): N=4 lifecycle cycles alternating deny-with-feedback and approve, alternating CLI↔Session surfaces, on one session; one cycle carries a large artifact store (multi-MB checkpoint) | tally-floor clamp (regression `2fad367`); tally monotonicity; no cumulative drift; checkpoint stays verifiable at size |
 | 5 | Cancel mid-resume (**[real-kill]** SIGINT on CLI reopen; cancel path on Session) → park retained → reopen succeeds | "Ok ≠ completed" reap guards — regressions `01179d8`, `76d81d5`. CLI leg targets the **reopen** flow (the plain REPL path never claims `resume.lock`) |
@@ -296,12 +295,11 @@ content (AGENTS.md).
   refusal mechanics: unit-covered; only the surface-level deltas survive
   (in #17, #18).
 
-### Recorded gaps → escalated to gate (E3)
+### Recorded gaps — accepted at gate (E3, 2026-07-10)
 
 Multi-ask dispatch-tree resume (multiple parked children); workspace *moved*
-(not deleted) across restart; the timeout-park arm if E2 resolves to
-SIGINT-park. Each is an explicit accept-the-gap decision, not a silent
-deferral.
+(not deleted) across restart. (A third candidate — the timeout-park arm — is
+moot: E2 adopted the knob, so scenario 2 covers that arm.)
 
 ## 6. Error handling & flakiness policy
 
@@ -338,19 +336,19 @@ tracked as its own follow-up.
   descopes per §3.
 - Binary-freshness mechanism: `cargo build` shellout vs `escargot`.
 
-## 9. Gate decisions required (escalated, not adopted)
+## 9. Gate decisions (decided 2026-07-10)
 
 - **E1 — metadata-root override** (small product seam in `RuntimeConfig` +
-  `metadata_root()` consumers): required for cross-surface secret sharing and
-  true isolation (§2.3). Recommended: **adopt**. Fallback documented in §2.3.
-- **E2 — CLI approval-timeout knob**: the terminal park-and-exit arm is
-  hardwired to 300s (`DEFAULT_TERMINAL_APPROVAL_TIMEOUT`), unreachable in a
-  <2-min suite. Options: (i) small config/flag knob (recommended — also
-  user-useful), or (ii) scenario 2 uses SIGINT-park and the timeout arm stays
-  unit-covered only (recorded gap under E3).
-- **E3 — accepted gaps**: the list in §5 "Recorded gaps".
-- **E4 — de-stale the auto-drive-tauri skill** (normative doc, separate
-  pass with its own review per AGENTS.md).
+  `metadata_root()` consumers), required for cross-surface secret sharing and
+  true isolation (§2.3): **ADOPTED**.
+- **E2 — CLI approval-timeout knob** (the terminal park-and-exit arm is
+  hardwired to 300s, unreachable in a <2-min suite): **ADOPTED** — small
+  config/flag knob; scenario 2 tests the real timeout-park-and-exit arm.
+- **E3 — accepted gaps**: both gaps in §5 "Recorded gaps" **ACCEPTED**
+  (multi-ask dispatch-tree resume; workspace moved across restart).
+- **E4 — de-stale the auto-drive-tauri skill** (normative doc, separate pass
+  with its own review per AGENTS.md): **APPROVED as follow-up**, not part of
+  this suite's plan.
 
 ## Panel & review log
 
@@ -382,7 +380,9 @@ Synthesis applied as rev 2.**
   only for mid-stream drop (which wiremock cannot express).
 - testkit lifting over copying (§2.2 item 4); budget enforcement (§4).
 
-**Escalated to the gate:** E1, E2, E3, E4 (§9).
+**Escalated to the gate:** E1, E2, E3, E4 — all decided at the owner gate
+2026-07-10 (E1 adopt, E2 adopt-knob, E3 accept both gaps, E4 approved as
+follow-up); dispositions recorded in §9 and folded into §1/§2.3/§5.
 
 **Minors accepted as residual:** epoch-classification assertion depends on
 plan-time verification of the ownership mechanism (#12); error-substring
