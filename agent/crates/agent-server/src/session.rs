@@ -106,12 +106,18 @@ impl Session {
         self.spawn_parked_reemit();
     }
 
+    /// Emit a wire event on the current outbound channel (no-op if none is
+    /// attached).
+    fn send_event(&self, ev: crate::wire::ServerEvent) {
+        if let Some(out) = self.slot.lock().unwrap().clone() {
+            out.send(ev);
+        }
+    }
+
     /// Emit a wire `Error` frame on the current outbound channel (no-op if
     /// none is attached — the resume driver's failures are surfaced here).
     fn emit_error(&self, message: String) {
-        if let Some(out) = self.slot.lock().unwrap().clone() {
-            out.send(crate::wire::ServerEvent::Error { message });
-        }
+        self.send_event(crate::wire::ServerEvent::Error { message });
     }
 
     /// Re-emit every parked ask from PRIOR sessions (spec §2.4 steps 1–5).
@@ -143,7 +149,25 @@ impl Session {
             let Ok(key) = agent_runtime_config::load_or_create_secret(&meta) else {
                 return;
             };
-            for parked in crate::resume::scan_parked(&root, &key, sess.runtime.session_id()) {
+            let parked_list = crate::resume::scan_parked(&root, &key, sess.runtime.session_id());
+
+            let resuming = sess.resuming.lock().unwrap().clone();
+            let runs: Vec<crate::wire::ParkedRunDto> = parked_list
+                .iter()
+                .filter(|p| !resuming.contains(&p.descriptor.session_id))
+                .map(|p| crate::wire::ParkedRunDto {
+                    session_id: p.descriptor.session_id.clone(),
+                    workspace: p.descriptor.workspace.display().to_string(),
+                    created_ms: p.descriptor.created_ms,
+                    asks: p.asks.iter().filter(|a| !a.answered).count() as u32,
+                    error: p.errors.first().cloned(),
+                })
+                .collect();
+            if !runs.is_empty() {
+                sess.send_event(crate::wire::ServerEvent::ParkedRuns { runs });
+            }
+
+            for parked in parked_list {
                 for err in &parked.errors {
                     sess.emit_error(format!(
                         "session {}: checkpoint unreadable; run cannot be resumed ({err})",
@@ -328,6 +352,9 @@ impl Session {
             }
             *active = Some(CancellationToken::new());
         }
+        self.send_event(crate::wire::ServerEvent::Resumed {
+            session_id: sid.to_string(),
+        });
         let cancel = self.active.lock().unwrap().as_ref().unwrap().clone();
         // First answer wins for THIS tree: retract our other re-emitted
         // externals so a stale prompt cannot mint a second resume or an
@@ -774,6 +801,357 @@ mod tests {
         );
 
         std::mem::forget(ws); // keep temp dirs alive for the process
+        std::mem::forget(sessions);
+    }
+
+    /// On attach, the `ParkedRuns` snapshot carries one `ParkedRunDto` per PRIOR
+    /// parked session (4B-2) — session id, workspace, unanswered-ask count, no
+    /// error. A session already in `resuming` (a resume for its tree already in
+    /// flight or attempted) must NOT appear, since attach also skips re-emitting
+    /// its ask (mirrors `attach_skips_reemit_for_already_resuming_session`).
+    #[tokio::test]
+    async fn attach_sends_parked_runs_snapshot() {
+        use agent_core::checkpoint::{Checkpoint, Checkpointer, Guardrails, ParkedTurn};
+        use agent_policy::ApprovalOrigin;
+
+        let ws = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+
+        let meta = agent_runtime_config::metadata_root().expect("HOME set");
+        let key = agent_runtime_config::load_or_create_secret(&meta).expect("secret");
+
+        let prior_id = "100-aaaaaaaa";
+        agent_runtime_config::write_descriptor(
+            sessions.path(),
+            &agent_runtime_config::SessionDescriptor {
+                schema: agent_runtime_config::DESCRIPTOR_SCHEMA,
+                session_id: prior_id.into(),
+                workspace: ws.path().to_path_buf(),
+                created_ms: 1,
+                config_path: None,
+            },
+        )
+        .unwrap();
+        let prior_ck =
+            agent_runtime_config::session_dir(sessions.path(), prior_id).join("checkpoint");
+        let ckr = Checkpointer::new(prior_ck.clone(), key, prior_id.into());
+        let planted_args = serde_json::json!({"command": "echo real"});
+        let origin = ApprovalOrigin {
+            delegation_id: "c9".into(),
+            subagent_name: "explore".into(),
+            depth: 1,
+        };
+        let chk = Checkpoint {
+            version: agent_core::checkpoint::CHECKPOINT_VERSION,
+            session_id: prior_id.into(),
+            subagent_path: vec![],
+            turn: 0,
+            context: agent_core::CuratedContextState {
+                goal: None,
+                history: vec![Message::user("hi")],
+                compaction_summary: None,
+                folded_facts: vec![],
+                folded_sections: vec![],
+                seq: 0,
+                history_has_spans: false,
+                history_incomplete: false,
+                artifact_prefix: String::new(),
+                todos: vec![],
+            },
+            guardrails: Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            parked: ParkedTurn {
+                assistant_text: "running".into(),
+                tool_calls: vec![agent_tools::ToolCall {
+                    id: "c9".into(),
+                    name: "execute_command".into(),
+                    args: planted_args.clone(),
+                }],
+                invalid: vec![],
+                gate_records: vec![],
+                parked_index: Some(0),
+                origin: Some(origin.clone()),
+            },
+        };
+        ckr.write_park(chk, &agent_core::SessionArtifacts::new())
+            .await
+            .unwrap();
+
+        let mut params = crate::setup::local_params(
+            ws.path().to_path_buf(),
+            ws.path().join("rt.json"),
+            "http://localhost:8080".into(),
+            "m".into(),
+        );
+        params.config.trace_dir = Some(sessions.path().to_string_lossy().into_owned());
+        let sess = Session::from_params(params);
+
+        let cap = Arc::new(Captured::default());
+        sess.set_event_out(cap.clone());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let runs = loop {
+            let found = cap.0.lock().unwrap().iter().find_map(|ev| match ev {
+                ServerEvent::ParkedRuns { runs } => Some(runs.clone()),
+                _ => None,
+            });
+            if let Some(r) = found {
+                break r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no ParkedRuns snapshot sent on attach"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(runs.len(), 1, "exactly one prior parked session");
+        let run = &runs[0];
+        assert_eq!(run.session_id, prior_id);
+        assert_eq!(run.workspace, ws.path().display().to_string());
+        assert_eq!(run.asks, 1);
+        assert_eq!(run.error, None);
+
+        std::mem::forget(ws);
+        std::mem::forget(sessions);
+    }
+
+    /// A session id already in `resuming` at attach time must NOT appear in the
+    /// `ParkedRuns` snapshot — mirrors the ask-suppression rule in
+    /// `attach_skips_reemit_for_already_resuming_session`.
+    #[tokio::test]
+    async fn attach_parked_runs_snapshot_excludes_already_resuming_session() {
+        use agent_core::checkpoint::{Checkpoint, Checkpointer, Guardrails, ParkedTurn};
+        use agent_policy::ApprovalOrigin;
+
+        let ws = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+
+        let meta = agent_runtime_config::metadata_root().expect("HOME set");
+        let key = agent_runtime_config::load_or_create_secret(&meta).expect("secret");
+
+        let prior_id = "100-cccccccc";
+        agent_runtime_config::write_descriptor(
+            sessions.path(),
+            &agent_runtime_config::SessionDescriptor {
+                schema: agent_runtime_config::DESCRIPTOR_SCHEMA,
+                session_id: prior_id.into(),
+                workspace: ws.path().to_path_buf(),
+                created_ms: 1,
+                config_path: None,
+            },
+        )
+        .unwrap();
+        let prior_ck =
+            agent_runtime_config::session_dir(sessions.path(), prior_id).join("checkpoint");
+        let ckr = Checkpointer::new(prior_ck.clone(), key, prior_id.into());
+        let planted_args = serde_json::json!({"command": "echo real"});
+        let origin = ApprovalOrigin {
+            delegation_id: "c9".into(),
+            subagent_name: "explore".into(),
+            depth: 1,
+        };
+        let chk = Checkpoint {
+            version: agent_core::checkpoint::CHECKPOINT_VERSION,
+            session_id: prior_id.into(),
+            subagent_path: vec![],
+            turn: 0,
+            context: agent_core::CuratedContextState {
+                goal: None,
+                history: vec![Message::user("hi")],
+                compaction_summary: None,
+                folded_facts: vec![],
+                folded_sections: vec![],
+                seq: 0,
+                history_has_spans: false,
+                history_incomplete: false,
+                artifact_prefix: String::new(),
+                todos: vec![],
+            },
+            guardrails: Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            parked: ParkedTurn {
+                assistant_text: "running".into(),
+                tool_calls: vec![agent_tools::ToolCall {
+                    id: "c9".into(),
+                    name: "execute_command".into(),
+                    args: planted_args.clone(),
+                }],
+                invalid: vec![],
+                gate_records: vec![],
+                parked_index: Some(0),
+                origin: Some(origin.clone()),
+            },
+        };
+        ckr.write_park(chk, &agent_core::SessionArtifacts::new())
+            .await
+            .unwrap();
+
+        let mut params = crate::setup::local_params(
+            ws.path().to_path_buf(),
+            ws.path().join("rt.json"),
+            "http://localhost:8080".into(),
+            "m".into(),
+        );
+        params.config.trace_dir = Some(sessions.path().to_string_lossy().into_owned());
+        let sess = Session::from_params(params);
+        sess.resuming.lock().unwrap().insert(prior_id.to_string());
+
+        let cap = Arc::new(Captured::default());
+        sess.set_event_out(cap.clone());
+
+        // No positive event to await (the exclusion IS the assertion) — sleep past
+        // where the sibling test reliably observes its snapshot, then check.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let saw_prior_run = cap.0.lock().unwrap().iter().any(|ev| match ev {
+            ServerEvent::ParkedRuns { runs } => runs.iter().any(|r| r.session_id == prior_id),
+            _ => false,
+        });
+        assert!(
+            !saw_prior_run,
+            "already-resuming session must not appear in the ParkedRuns snapshot"
+        );
+
+        std::mem::forget(ws);
+        std::mem::forget(sessions);
+    }
+
+    /// Approving a re-emitted parked ask drives the answer through
+    /// `checkpoint::write_answer` and into `start_resume` (mirrors
+    /// `attach_reemits_parked_ask_with_rederived_display`'s rig, then answers).
+    /// `start_resume` must emit a `Resumed { session_id }` frame right after the
+    /// `resuming`/`active` guards succeed — i.e. synchronously, before the
+    /// resumed run itself is even spawned (so it necessarily precedes whatever
+    /// that run's first event turns out to be).
+    #[tokio::test]
+    async fn approving_a_parked_ask_emits_resumed_before_the_resumed_runs_first_event() {
+        use agent_core::checkpoint::{Checkpoint, Checkpointer, Guardrails, ParkedTurn};
+        use agent_policy::ApprovalOrigin;
+
+        let ws = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+
+        let meta = agent_runtime_config::metadata_root().expect("HOME set");
+        let key = agent_runtime_config::load_or_create_secret(&meta).expect("secret");
+
+        let prior_id = "100-dddddddd";
+        agent_runtime_config::write_descriptor(
+            sessions.path(),
+            &agent_runtime_config::SessionDescriptor {
+                schema: agent_runtime_config::DESCRIPTOR_SCHEMA,
+                session_id: prior_id.into(),
+                workspace: ws.path().to_path_buf(),
+                created_ms: 1,
+                config_path: None,
+            },
+        )
+        .unwrap();
+        let prior_ck =
+            agent_runtime_config::session_dir(sessions.path(), prior_id).join("checkpoint");
+        let ckr = Checkpointer::new(prior_ck.clone(), key, prior_id.into());
+        let planted_args = serde_json::json!({"command": "echo real"});
+        let origin = ApprovalOrigin {
+            delegation_id: "c9".into(),
+            subagent_name: "explore".into(),
+            depth: 1,
+        };
+        let chk = Checkpoint {
+            version: agent_core::checkpoint::CHECKPOINT_VERSION,
+            session_id: prior_id.into(),
+            subagent_path: vec![],
+            turn: 0,
+            context: agent_core::CuratedContextState {
+                goal: None,
+                history: vec![Message::user("hi")],
+                compaction_summary: None,
+                folded_facts: vec![],
+                folded_sections: vec![],
+                seq: 0,
+                history_has_spans: false,
+                history_incomplete: false,
+                artifact_prefix: String::new(),
+                todos: vec![],
+            },
+            guardrails: Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            parked: ParkedTurn {
+                assistant_text: "running".into(),
+                tool_calls: vec![agent_tools::ToolCall {
+                    id: "c9".into(),
+                    name: "execute_command".into(),
+                    args: planted_args.clone(),
+                }],
+                invalid: vec![],
+                gate_records: vec![],
+                parked_index: Some(0),
+                origin: Some(origin.clone()),
+            },
+        };
+        ckr.write_park(chk, &agent_core::SessionArtifacts::new())
+            .await
+            .unwrap();
+
+        let mut params = crate::setup::local_params(
+            ws.path().to_path_buf(),
+            ws.path().join("rt.json"),
+            "http://localhost:8080".into(),
+            "m".into(),
+        );
+        params.config.trace_dir = Some(sessions.path().to_string_lossy().into_owned());
+        let sess = Session::from_params(params);
+
+        let cap = Arc::new(Captured::default());
+        sess.set_event_out(cap.clone());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let ask_id = loop {
+            let found = cap.0.lock().unwrap().iter().find_map(|ev| match ev {
+                ServerEvent::ApprovalRequest { id, .. } => Some(id.clone()),
+                _ => None,
+            });
+            if let Some(id) = found {
+                break id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no ApprovalRequest re-emitted from the parked prior session"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        // Snapshot the frame count before answering: `Resumed` is emitted
+        // synchronously in `start_resume`, before the resumed run's driving task
+        // is even spawned — so it must appear at (or after) this index, and
+        // nothing the resumed run itself produces can have beaten it there.
+        let before_answer = cap.0.lock().unwrap().len();
+        sess.approve(&ask_id, Decision::Approve);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let resumed_index = loop {
+            let idx = cap.0.lock().unwrap().iter().position(
+                |ev| matches!(ev, ServerEvent::Resumed { session_id } if session_id == prior_id),
+            );
+            if let Some(i) = idx {
+                break i;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no Resumed frame emitted for the answered parked session"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            resumed_index >= before_answer,
+            "Resumed frame must be captured no earlier than the answer that triggers it"
+        );
+
+        std::mem::forget(ws);
         std::mem::forget(sessions);
     }
 

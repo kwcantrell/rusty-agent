@@ -128,6 +128,31 @@ pub enum ServerEvent {
         tool_calls: u64,
         duration_ms: u64,
     },
+    /// Attach-time snapshot of PRIOR sessions parked on approvals (4B-2).
+    ParkedRuns {
+        runs: Vec<ParkedRunDto>,
+    },
+    /// An approval was answered/retracted somewhere else — drop the prompt.
+    ApprovalResolved {
+        id: String,
+    },
+    /// A parked session's resume has started; its banner row should drop.
+    Resumed {
+        session_id: String,
+    },
+}
+
+/// One PRIOR session parked on an approval, surfaced in the `ParkedRuns`
+/// attach-time snapshot (4B-2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParkedRunDto {
+    pub session_id: String,
+    pub workspace: String,
+    pub created_ms: u64,
+    /// Unanswered asks awaiting a human (0 with error set ⇒ unresumable).
+    pub asks: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Wire form of `agent_policy::ApprovalOrigin` — sub-agent attribution carried
