@@ -115,7 +115,22 @@ impl Session {
     }
 
     /// Re-emit every parked ask from PRIOR sessions (spec §2.4 steps 1–5).
+    ///
+    /// Defense in depth: this must never abort a caller that has no Tokio
+    /// reactor in scope (e.g. a sync Tauri command running on the glib main
+    /// thread — `tokio::spawn` there panics non-unwinding across the C-FFI
+    /// boundary and takes the whole app down). The `subscribe` command is
+    /// `async` in production, which makes this branch unreachable there; the
+    /// guard turns a future regression from an abort into a logged
+    /// degradation instead.
     fn spawn_parked_reemit(self: &Arc<Self>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::warn!(
+                target: "session",
+                "no async runtime at attach; parked-run re-emit skipped"
+            );
+            return;
+        }
         let sess = self.clone();
         tokio::spawn(async move {
             let cfg = sess.runtime.settings_state().settings;
@@ -766,5 +781,31 @@ mod tests {
             "description was lost on edit; got: {:?}",
             got.description
         );
+    }
+
+    /// `set_event_out` (the `subscribe` command body) must never abort a caller
+    /// with no Tokio reactor in scope — e.g. a sync Tauri command running on the
+    /// glib main thread, where `tokio::spawn` panics non-unwinding across the
+    /// C-FFI boundary and takes the whole app down. Regression test for that
+    /// live-drive bug: build + attach entirely on a plain `std::thread`, no
+    /// `#[tokio::test]` runtime anywhere in scope.
+    #[test]
+    fn set_event_out_from_non_tokio_thread_does_not_panic() {
+        let handle = std::thread::spawn(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let params = crate::setup::local_params(
+                dir.path().to_path_buf(),
+                dir.path().join("rt.json"),
+                "http://localhost:8080".into(),
+                "m".into(),
+            );
+            let sess = Session::from_params(params);
+            let cap = Arc::new(Captured::default());
+            sess.set_event_out(cap.clone()); // must not panic/abort
+            std::mem::forget(dir);
+        });
+        handle
+            .join()
+            .expect("set_event_out must not panic off a Tokio reactor");
     }
 }
