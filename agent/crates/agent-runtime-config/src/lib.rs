@@ -13,9 +13,9 @@ pub use project_key::project_key;
 mod session_meta;
 // Durable session metadata (4B-0): identity, descriptors, daemon-local secret.
 pub use session_meta::{
-    load_descriptor, load_or_create_secret, metadata_root, mint_session_id, prune_session_dirs,
-    scan_descriptors, session_dir, sessions_root, write_descriptor, SessionDescriptor,
-    DESCRIPTOR_SCHEMA,
+    load_descriptor, load_or_create_secret, metadata_root, metadata_root_for, mint_session_id,
+    prune_session_dirs, scan_descriptors, session_dir, sessions_root, write_descriptor,
+    SessionDescriptor, DESCRIPTOR_SCHEMA,
 };
 
 mod assemble;
