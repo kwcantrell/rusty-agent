@@ -496,7 +496,7 @@ pub fn build_trace(cfg: &crate::RuntimeConfig) -> Option<Arc<TraceWriter>> {
     let dir = match &cfg.trace_dir {
         Some(d) => std::path::PathBuf::from(d),
         None => std::path::PathBuf::from(std::env::var_os("HOME")?)
-            .join(".agent")
+            .join(".rusty-agent")
             .join("sessions"),
     };
     TraceWriter::create(&dir, cfg.trace_max_mb)

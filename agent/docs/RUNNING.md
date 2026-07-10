@@ -241,8 +241,8 @@ The daemon takes the same `--mcp-config` flag on its `run` subcommand.
 
 A *skill* is a directory containing a `SKILL.md` (YAML-style frontmatter with `name` + `description`, then a markdown body) and any bundled files. Skills are discovered from:
 
-- `<workspace>/.agent/skills` (project-local, writable — where `create_skill` writes), and
-- `~/.agent/skills` (user-global, read-only),
+- `<workspace>/.rusty-agent/skills` (project-local, writable — where `create_skill` writes), and
+- `~/.rusty-agent/skills` (user-global, read-only),
 
 or from explicit `--skills-dir <path>` flags (repeatable; the first is the writable root). Earlier roots win on a name conflict.
 

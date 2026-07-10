@@ -19,7 +19,7 @@ impl SkillRegistry {
     }
 
     /// Explicit `--skills-dir` roots if any (writable = first); otherwise the
-    /// defaults: `<workspace>/.agent/skills` (writable) + `~/.agent/skills`.
+    /// defaults: `<workspace>/.rusty-agent/skills` (writable) + `~/.rusty-agent/skills`.
     pub fn from_config(skills_dirs: &[String], workspace: &Path) -> Self {
         let filtered: Vec<String> = skills_dirs
             .iter()
@@ -31,10 +31,10 @@ impl SkillRegistry {
             roots.extend(rest.iter().map(PathBuf::from));
             Self::new(roots, PathBuf::from(first))
         } else {
-            let project = workspace.join(".agent").join("skills");
+            let project = workspace.join(".rusty-agent").join("skills");
             let mut roots = vec![project.clone()];
             if let Some(home) = std::env::var_os("HOME") {
-                roots.push(PathBuf::from(home).join(".agent").join("skills"));
+                roots.push(PathBuf::from(home).join(".rusty-agent").join("skills"));
             }
             Self::new(roots, project)
         }
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn from_config_defaults_to_workspace_dotagent() {
         let reg = SkillRegistry::from_config(&[], Path::new("/ws"));
-        assert_eq!(reg.writable_root(), Path::new("/ws/.agent/skills"));
+        assert_eq!(reg.writable_root(), Path::new("/ws/.rusty-agent/skills"));
     }
 
     #[test]
@@ -304,7 +304,7 @@ mod tests {
         // An explicit but empty --skills-dir entry must not become a relative root;
         // it falls through to the workspace default.
         let reg = SkillRegistry::from_config(&["".to_string()], Path::new("/ws"));
-        assert_eq!(reg.writable_root(), Path::new("/ws/.agent/skills"));
+        assert_eq!(reg.writable_root(), Path::new("/ws/.rusty-agent/skills"));
     }
 
     #[test]

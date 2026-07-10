@@ -33,5 +33,5 @@ AGENT_E2E_URL=… AGENT_E2E_MODEL=… cargo test -p agent-core --test e2e_sglang
 
 - `config.example.toml` — runtime config reference; `mcp.example.json` — MCP client config example.
 - `docs/RUNNING.md` — full model-server setup (llama.cpp / SGLang / vLLM / Claude CLI).
-- Session traces land in `~/.agent/sessions/<id>.jsonl` (disable with `"trace": false`
+- Session traces land in `~/.rusty-agent/sessions/<id>.jsonl` (disable with `"trace": false`
   in the runtime config).
