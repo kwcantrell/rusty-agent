@@ -10,12 +10,13 @@ interface Handlers {
 // A ServerEvent is the legacy WireEvent shape plus an `approval_request` case.
 type ServerEvent =
   | WireEvent
-  | { type: "approval_request"; id: string; summary: string; command?: string; display?: unknown };
+  | { type: "approval_request"; id: string; summary: string; command?: string; display?: unknown;
+      origin?: import("./wire").ApprovalOrigin };
 
 function toInbound(ev: ServerEvent): Inbound {
   if (ev.type === "approval_request") {
     return { v: 1, session_id: "", id: ev.id, kind: "approval_request",
-      summary: ev.summary, command: ev.command, display: ev.display as never };
+      summary: ev.summary, command: ev.command, display: ev.display as never, origin: ev.origin };
   }
   return { v: 1, session_id: "", kind: "event", payload: ev };
 }
