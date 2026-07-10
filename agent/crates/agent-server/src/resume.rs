@@ -36,21 +36,34 @@ pub fn scan_parked(root: &Path, key: &[u8; 32], own_session_id: &str) -> Vec<Par
         if d.session_id == own_session_id {
             continue; // live session: pending_frames covers its asks
         }
-        let ck_dir = agent_runtime_config::session_dir(root, &d.session_id).join("checkpoint");
-        if !checkpoint::has_park(&ck_dir) {
-            continue;
+        if let Some(s) = scan_parked_session(root, key, d) {
+            out.push(s);
         }
-        let mut s = ParkedSession {
-            descriptor: d,
-            root_dir: ck_dir.clone(),
-            root: None,
-            asks: Vec::new(),
-            errors: Vec::new(),
-        };
-        walk(&ck_dir, key, &mut s);
-        out.push(s);
     }
     out
+}
+
+/// Scan a single session's checkpoint tree for a park (CLI `sessions reopen`,
+/// Task 10 — the per-descriptor body `scan_parked` loops over). `None` ⇔ no
+/// park under this session's checkpoint dir.
+pub fn scan_parked_session(
+    root: &Path,
+    key: &[u8; 32],
+    descriptor: SessionDescriptor,
+) -> Option<ParkedSession> {
+    let ck_dir = agent_runtime_config::session_dir(root, &descriptor.session_id).join("checkpoint");
+    if !checkpoint::has_park(&ck_dir) {
+        return None;
+    }
+    let mut s = ParkedSession {
+        descriptor,
+        root_dir: ck_dir.clone(),
+        root: None,
+        asks: Vec::new(),
+        errors: Vec::new(),
+    };
+    walk(&ck_dir, key, &mut s);
+    Some(s)
 }
 
 /// Recursively load + verify one checkpoint level, then descend into
@@ -241,6 +254,37 @@ mod tests {
             vec![vec!["call_1".to_string()], vec!["call_2".to_string()]]
         );
         assert!(parked[0].asks.iter().all(|a| a.origin.is_some()));
+    }
+
+    #[tokio::test]
+    async fn scan_parked_session_finds_the_single_session_tree() {
+        let root = tempfile::tempdir().unwrap();
+        descriptor(root.path(), "200-bbbbbbbb");
+        let other_ck =
+            agent_runtime_config::session_dir(root.path(), "200-bbbbbbbb").join("checkpoint");
+        plant_child_gate(&other_ck, "call_1").await;
+
+        let descs = agent_runtime_config::scan_descriptors(root.path());
+        let d = descs
+            .into_iter()
+            .find(|d| d.session_id == "200-bbbbbbbb")
+            .unwrap();
+        let parked = scan_parked_session(root.path(), &key(), d).expect("park present");
+        assert_eq!(parked.descriptor.session_id, "200-bbbbbbbb");
+        assert!(parked.root.is_some());
+        assert_eq!(parked.asks.len(), 1);
+        assert!(parked.errors.is_empty());
+
+        descriptor(root.path(), "300-cccccccc");
+        let descs = agent_runtime_config::scan_descriptors(root.path());
+        let empty = descs
+            .into_iter()
+            .find(|d| d.session_id == "300-cccccccc")
+            .unwrap();
+        assert!(
+            scan_parked_session(root.path(), &key(), empty).is_none(),
+            "no checkpoint dir => None"
+        );
     }
 
     #[tokio::test]

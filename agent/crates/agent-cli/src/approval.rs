@@ -1,3 +1,4 @@
+use agent_core::checkpoint::ParkedAnswer;
 use agent_policy::{ApprovalChannel, ApprovalRequest, ApprovalResponse};
 use async_trait::async_trait;
 use std::io::Write;
@@ -100,6 +101,40 @@ impl TerminalApproval {
 impl Default for TerminalApproval {
     fn default() -> Self {
         Self::new(DEFAULT_TERMINAL_APPROVAL_TIMEOUT)
+    }
+}
+
+/// Reopen-path prompt: y/n/always, then an optional feedback line on deny.
+pub fn prompt_for_answer_with_reader<R: std::io::BufRead>(
+    summary: &str,
+    who: &str,
+    mut input: R,
+) -> ParkedAnswer {
+    print!("\n\x1b[35mAllow:\x1b[0m {who}{summary} ? [y]es / [n]o / [a]lways: ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if input.read_line(&mut line).is_err() {
+        return ParkedAnswer {
+            approve: false,
+            feedback: None,
+        };
+    }
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" | "a" | "always" => ParkedAnswer {
+            approve: true,
+            feedback: None,
+        }, // E2: always = plain approve
+        _ => {
+            print!("Feedback for the agent (optional, Enter to skip): ");
+            let _ = std::io::stdout().flush();
+            let mut fb = String::new();
+            let _ = input.read_line(&mut fb);
+            let fb = fb.trim();
+            ParkedAnswer {
+                approve: false,
+                feedback: (!fb.is_empty()).then(|| fb.to_string()),
+            }
+        }
     }
 }
 
@@ -236,6 +271,42 @@ mod tests {
         );
         let resp = ch.request(req()).await;
         assert!(matches!(resp, ApprovalResponse::Deny { feedback: None }));
+    }
+
+    #[test]
+    fn deny_prompt_collects_optional_feedback() {
+        let with_feedback = prompt_for_answer_with_reader(
+            "run echo",
+            "",
+            std::io::Cursor::new(&b"n\nuse staging\n"[..]),
+        );
+        assert_eq!(
+            with_feedback,
+            ParkedAnswer {
+                approve: false,
+                feedback: Some("use staging".into())
+            }
+        );
+
+        let no_feedback =
+            prompt_for_answer_with_reader("run echo", "", std::io::Cursor::new(&b"n\n\n"[..]));
+        assert_eq!(
+            no_feedback,
+            ParkedAnswer {
+                approve: false,
+                feedback: None
+            }
+        );
+
+        let approved =
+            prompt_for_answer_with_reader("run echo", "", std::io::Cursor::new(&b"y\n"[..]));
+        assert_eq!(
+            approved,
+            ParkedAnswer {
+                approve: true,
+                feedback: None
+            }
+        );
     }
 
     #[tokio::test]

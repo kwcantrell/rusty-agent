@@ -77,10 +77,209 @@ async fn run_sessions_cmd(cmd: &SessionsCmd, cli: &Cli) {
             }
             println!("\nreopen a parked session: agent sessions reopen <id>");
         }
-        SessionsCmd::Reopen { session_id: _ } => {
-            // 4B-2 Task 10
-            eprintln!("sessions reopen: not yet implemented");
+        SessionsCmd::Reopen { session_id } => {
+            run_sessions_reopen(session_id, cli).await;
+        }
+    }
+}
+
+/// `agent sessions reopen <id>`: re-prompt one parked run's first unanswered
+/// ask (feedback-capable) and resume its tree to completion (spec §2.4, CLI
+/// surface — 4B-2 Task 10).
+async fn run_sessions_reopen(session_id: &str, cli: &Cli) {
+    let rt = runtime_config_from_cli(cli, "prompted");
+    let Some(root) = agent_runtime_config::sessions_root(&rt) else {
+        eprintln!("error: cannot determine sessions root (is $HOME set?)");
+        std::process::exit(2);
+    };
+    let Some(descriptor) = agent_runtime_config::scan_descriptors(&root)
+        .into_iter()
+        .find(|d| d.session_id == session_id)
+    else {
+        eprintln!("session {session_id}: not found");
+        std::process::exit(2);
+    };
+    if !descriptor.workspace.is_dir() {
+        eprintln!(
+            "session {session_id}: workspace no longer exists; refusing to reopen (parks retained)"
+        );
+        std::process::exit(2);
+    }
+
+    let Some(meta_root) = agent_runtime_config::metadata_root() else {
+        eprintln!("error: cannot determine metadata root (is $HOME set?)");
+        std::process::exit(2);
+    };
+    let key = match agent_runtime_config::load_or_create_secret(&meta_root) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("error: cannot load session secret: {e}");
             std::process::exit(2);
+        }
+    };
+    let Some(parked) = agent_server::resume::scan_parked_session(&root, &key, descriptor.clone())
+    else {
+        eprintln!("session {session_id}: nothing parked");
+        std::process::exit(2);
+    };
+    if !parked.errors.is_empty() {
+        for e in &parked.errors {
+            eprintln!("checkpoint unreadable; run cannot be resumed ({e})");
+        }
+        std::process::exit(2);
+    }
+    let Some(root_chk) = parked.root.clone() else {
+        eprintln!("session {session_id}: parked tree has no root checkpoint; cannot resume");
+        std::process::exit(2);
+    };
+
+    // Claim the resume lock BEFORE prompting the human (refinement 11 — no
+    // wasted answer). Every error exit from here on releases it.
+    match agent_core::checkpoint::claim_resume(&parked.root_dir) {
+        Ok(true) => {}
+        _ => {
+            eprintln!(
+                "session {session_id} is being resumed elsewhere (another daemon may hold it); \
+                 if that process crashed, remove {}/resume.lock",
+                parked.root_dir.display()
+            );
+            std::process::exit(2);
+        }
+    }
+
+    // Assemble the loop FIRST — display re-derivation needs it. Mirrors
+    // session.rs wire_parked_session/start_resume: the loop (and its
+    // system_prompt) is built before the CuratedContext restore.
+    let artifacts = Arc::new(agent_core::SessionArtifacts::new());
+    let todos: agent_core::TodoHandle = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let compact_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let checkpoint =
+        agent_core::Checkpointer::new(parked.root_dir.clone(), key, descriptor.session_id.clone());
+    let approval = TerminalApproval::with_park_exit(Some(ParkExit {
+        session_id: descriptor.session_id.clone(),
+        trace: None,
+        release_lock: Some(parked.root_dir.clone()),
+        exit: Box::new(|code| std::process::exit(code)),
+    }));
+    let model = build_model(
+        &cli.backend,
+        &cli.base_url,
+        &cli.model,
+        &cli.claude_binary,
+        std::env::var("AGENT_API_KEY").ok(),
+        claude_cli_opts(&rt),
+    );
+    let sandbox = build_sandbox(&rt);
+    let stats = Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default()));
+    let trace = agent_runtime_config::build_trace(&rt, &descriptor.session_id);
+    let built = assemble_loop(
+        &rt,
+        LoopParts {
+            model,
+            sink: Arc::new(TerminalSink::default()),
+            approval: Arc::new(approval),
+            workspace: descriptor.workspace.clone(),
+            mcp_tools: Vec::new(),
+            stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
+            base_system_prompt: BASE_SYSTEM_PROMPT.to_string(),
+            artifacts: artifacts.clone(),
+            compact_flag: compact_flag.clone(),
+            todos: todos.clone(),
+            sandbox,
+            stats: stats.clone(),
+            trace,
+            api_key: std::env::var("AGENT_API_KEY").ok(),
+            claude_binary: cli.claude_binary.clone(),
+            checkpoint: Some(checkpoint),
+        },
+    );
+    if !built.unknown_presets.is_empty() {
+        eprintln!(
+            "skills: unknown active skill(s): {}",
+            built.unknown_presets.join(", ")
+        );
+        agent_core::checkpoint::release_resume(&parked.root_dir);
+        std::process::exit(2);
+    }
+
+    if let Ok(dump) = agent_core::checkpoint::load_artifact_dump(&parked.root_dir, &key) {
+        agent_core::checkpoint::restore_artifacts(&artifacts, &dump).await;
+    }
+    let mut ctx = CuratedContext::restore(
+        Message::system(built.system_prompt.clone()),
+        artifacts.clone(),
+        compact_flag.clone(),
+        todos.clone(),
+        root_chk.context.clone(),
+    );
+
+    // Find the first unanswered ask; already-answered asks (crash-after-commit
+    // window) resume directly with no re-prompt.
+    let answer_opt = match parked.asks.iter().find(|a| !a.answered) {
+        Some(ask) => {
+            let idx = ask.checkpoint.parked.parked_index.expect("gate-kind");
+            let call = &ask.checkpoint.parked.tool_calls[idx];
+            let Some(intent) = built.loop_.derive_intent(&call.name, &call.args) else {
+                eprintln!(
+                    "session {session_id}: parked tool {} unavailable under current config; \
+                     answer it after restoring the tool or start a new run",
+                    call.name
+                );
+                agent_core::checkpoint::release_resume(&parked.root_dir);
+                std::process::exit(2);
+            };
+            let who = match &ask.origin {
+                Some(o) => format!("[sub-agent {} (depth {})] ", o.subagent_name, o.depth),
+                None => String::new(),
+            };
+            let answer = approval::prompt_for_answer_with_reader(
+                &intent.summary,
+                &who,
+                std::io::stdin().lock(),
+            );
+            if let Err(e) = agent_server::resume::commit_answer(ask, &answer, &key) {
+                eprintln!("cannot commit answer: {e}");
+                agent_core::checkpoint::release_resume(&parked.root_dir);
+                std::process::exit(2);
+            }
+            if ask.subagent_path.is_empty() {
+                Some(answer)
+            } else {
+                None
+            }
+        }
+        None => None, // every ask already answered; crash-after-commit window
+    };
+
+    let resume = root_chk.resume_turn(answer_opt);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let run = built
+        .loop_
+        .resume_with_cancel(&mut ctx, resume, cancel.clone());
+    tokio::pin!(run);
+    let result = loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                cancel.cancel();
+                eprintln!(
+                    "\n^C — a pending approval was left parked; answer later with:\n  agent sessions reopen {session_id}"
+                );
+            }
+            r = &mut run => break r,
+        }
+    };
+    match result {
+        Ok(()) => {
+            if let Ok(s) = stats.read() {
+                eprintln!("\x1b[2m{}\x1b[0m", render::format_stats_line(&s));
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("resumed run failed: {e}");
+            agent_core::checkpoint::release_resume(&parked.root_dir);
+            std::process::exit(1);
         }
     }
 }
