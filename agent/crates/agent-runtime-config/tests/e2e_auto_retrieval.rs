@@ -48,7 +48,7 @@ fn env() -> (String, String) {
     )
 }
 
-/// Build a `MemoryParts` over an isolated temp DB (never touches ~/.agent/memory.db),
+/// Build a `MemoryParts` over an isolated temp DB (never touches ~/.rusty-agent/memory.db),
 /// seed one distinctive fact scoped to `workspace`, and return the assembled retriever + tools.
 async fn seed_memory(
     workspace: &std::path::Path,

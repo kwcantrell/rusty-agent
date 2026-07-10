@@ -101,7 +101,7 @@ struct Cli {
     /// a leading-dot suffix, e.g. --allow-host docs.rs --allow-host .rust-lang.org
     #[arg(long = "allow-host")]
     allow_host: Vec<String>,
-    /// Skill search directory (repeatable). Default: <workspace>/.agent/skills + ~/.agent/skills.
+    /// Skill search directory (repeatable). Default: <workspace>/.rusty-agent/skills + ~/.rusty-agent/skills.
     #[arg(long = "skills-dir")]
     skills_dir: Vec<String>,
     /// Preload a skill as a preset by name (repeatable): its body is injected into the system prompt.
@@ -168,7 +168,7 @@ struct Cli {
     /// Enable long-term memory (remember/recall/forget tools).
     #[arg(long, default_value_t = false)]
     memory: bool,
-    /// Override the memory DB path (default ~/.agent/memory.db).
+    /// Override the memory DB path (default ~/.rusty-agent/memory.db).
     #[arg(long)]
     memory_db: Option<std::path::PathBuf>,
     /// Override the embedding-model cache dir.
@@ -266,7 +266,7 @@ async fn main() {
     let stats = Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default()));
     let trace = agent_runtime_config::build_trace(&rt);
     if let Some(t) = &trace {
-        let dir = rt.trace_dir.as_deref().unwrap_or("~/.agent/sessions");
+        let dir = rt.trace_dir.as_deref().unwrap_or("~/.rusty-agent/sessions");
         eprintln!("\x1b[2mtrace: {}/{}.jsonl\x1b[0m", dir, t.session_id());
     }
     let built = assemble_loop(

@@ -437,7 +437,7 @@ mod tests {
 
         // Seed a skill whose directory name is "Greeter" (has uppercase → slug is "greeter").
         let ws = sess.settings_get().workspace;
-        let skills_root = std::path::Path::new(&ws).join(".agent").join("skills");
+        let skills_root = std::path::Path::new(&ws).join(".rusty-agent").join("skills");
         let skill_dir = skills_root.join("Greeter");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(

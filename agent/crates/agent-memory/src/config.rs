@@ -23,7 +23,7 @@ pub fn default_db_path() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".agent").join("memory.db")
+    home.join(".rusty-agent").join("memory.db")
 }
 
 impl Default for MemoryConfig {

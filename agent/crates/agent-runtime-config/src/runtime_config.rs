@@ -1506,13 +1506,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rt.json");
         let mut c = base();
-        c.skills_dirs = vec!["/ws/.agent/skills".into()];
+        c.skills_dirs = vec!["/ws/.rusty-agent/skills".into()];
         c.active_skills = vec!["greeter".into()];
         c.save(&path).unwrap();
 
         // A different base proves the file wins; a partial file falls back per-field.
         let loaded = RuntimeConfig::load_over(base(), &path);
-        assert_eq!(loaded.skills_dirs, vec!["/ws/.agent/skills".to_string()]);
+        assert_eq!(loaded.skills_dirs, vec!["/ws/.rusty-agent/skills".to_string()]);
         assert_eq!(loaded.active_skills, vec!["greeter".to_string()]);
 
         std::fs::write(&path, r#"{"model":"only-model"}"#).unwrap();
