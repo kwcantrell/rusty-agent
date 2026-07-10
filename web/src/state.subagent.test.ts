@@ -70,6 +70,22 @@ describe("placeholder card", () => {
     expect(t[0]).toMatchObject({ name: "dispatch_agent", id: "orphan", status: "running" });
     expect(t[0].subagent).toMatchObject({ text: "surviving text", status: "running" });
   });
+
+  it("subagent_end landing on a placeholder (no tool_start ever arrived) finalizes the OUTER status too", () => {
+    let s = initialState([]);
+    s = red(s, { type: "subagent_text", id: "orphan", text: "surviving text" });
+    s = red(s, {
+      type: "subagent_end", id: "orphan", outcome: "completed",
+      turns: 1, tool_calls: 0, duration_ms: 10,
+    });
+    const t = tools(s.items);
+    expect(t).toHaveLength(1);
+    // The OUTER status must flip to "done" — a placeholder never receives a
+    // real tool_result, so leaving it "running" would pulse forever
+    // (finding 2, 3B-2 review).
+    expect(t[0].status).toBe("done");
+    expect(t[0].subagent).toMatchObject({ status: "done", outcome: "completed" });
+  });
 });
 
 describe("subagent transcript cap", () => {
@@ -135,6 +151,28 @@ describe("finalize-on-done safety net", () => {
     s = red(s, { type: "done", reason: "stop" });
     const t = tools(s.items);
     expect(t[0].subagent).toMatchObject({ status: "done", outcome: "unknown" });
+  });
+
+  it("flips the OUTER status of a placeholder card but leaves a REAL running dispatch row untouched", () => {
+    let s = initialState([]);
+    // A placeholder card: subagent frames arrived with no matching tool_start.
+    s = red(s, { type: "subagent_text", id: "orphan", text: "partial" });
+    // A REAL dispatch row still awaiting its tool_result: tool_start fired,
+    // subagent_start attached a card, but no tool_result and no subagent_end
+    // has arrived yet.
+    s = red(s, { type: "tool_start", id: "c1", name: "dispatch_agent", args: {} });
+    s = red(s, { type: "subagent_start", id: "c1", subagent_type: "explore" });
+    s = red(s, { type: "done", reason: "stop" });
+    const t = tools(s.items);
+    const placeholder = t.find((it) => it.id === "orphan")!;
+    const real = t.find((it) => it.id === "c1")!;
+    expect(placeholder.status).toBe("done");
+    expect(placeholder.subagent).toMatchObject({ status: "done", outcome: "unknown" });
+    // The real row's card is also finalized as "unknown" (safety net), but its
+    // OUTER status must stay "running" — tool_result correlation matches on
+    // it, and a real tool_result may still be in flight.
+    expect(real.status).toBe("running");
+    expect(real.subagent).toMatchObject({ status: "done", outcome: "unknown" });
   });
 });
 

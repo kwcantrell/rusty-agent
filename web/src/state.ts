@@ -33,7 +33,12 @@ export type Item =
   | { kind: "reasoning"; text: string }
   | { kind: "tool"; name: string; args: unknown; status: "running" | "done";
       id?: string; parentId?: string; subagent?: SubagentCard;
-      content?: string; display?: Display; resultStatus?: string; durationMs?: number }
+      content?: string; display?: Display; resultStatus?: string; durationMs?: number;
+      /** Set only by `placeholderCardItem`: this row was materialized from a
+       *  subagent frame, not a real `tool_start` — no `tool_result` will ever
+       *  arrive for it, so its outer `status` must be flipped explicitly
+       *  wherever its card finalizes (finding 2, 3B-2 review). */
+      placeholder?: true }
   | { kind: "context"; text: string }
   | { kind: "error"; message: string };
 
@@ -161,7 +166,7 @@ function findLiveCardIndex(items: Item[], id: string): number {
  *  reused call id whose old card is done). */
 function placeholderCardItem(id: string, card: SubagentCard): Item {
   return { kind: "tool", name: "dispatch_agent", args: {}, status: "running", id,
-    subagent: card };
+    subagent: card, placeholder: true };
 }
 
 /** Emit the stored user message that heads the current turn, if not already emitted. */
@@ -347,9 +352,16 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
         i = items.length - 1;
         it = items[i];
       }
-      items[i] = { ...(it as ToolItem), subagent: { ...(it as ToolItem).subagent!, status: "done",
+      const ti = it as ToolItem;
+      items[i] = { ...ti, subagent: { ...ti.subagent!, status: "done",
         outcome: p.outcome, stop: p.stop, detail: p.detail,
-        turns: p.turns, toolCalls: p.tool_calls, durationMs: p.duration_ms } };
+        turns: p.turns, toolCalls: p.tool_calls, durationMs: p.duration_ms },
+        // Placeholder rows never get a real tool_result (spec §2.4 / gate G3),
+        // so the outer status would otherwise pulse "running" forever
+        // (finding 2, 3B-2 review). A REAL dispatch row awaiting its
+        // tool_result must keep outer status "running" — that correlation
+        // matches on it — so only flip placeholders.
+        ...(ti.placeholder ? { status: "done" as const } : {}) };
       return { ...s, items };
     }
     case "done": {
@@ -359,11 +371,17 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
         items[items.length - 1] = { ...last, done: p.reason };
       }
       // Safety net: a card still running at run end lost its End somewhere —
-      // finalize as "unknown" so nothing spins forever (spec §2.4).
+      // finalize as "unknown" so nothing spins forever (spec §2.4). Only
+      // placeholder rows get their OUTER status flipped here too — a real
+      // dispatch row awaiting its tool_result must keep outer status
+      // "running" since tool_result correlation matches on it (finding 2,
+      // 3B-2 review); a placeholder never gets a real tool_result, so its
+      // outer status would otherwise pulse "running" forever.
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
         if (it.kind === "tool" && it.subagent?.status === "running") {
-          items[i] = { ...it, subagent: { ...it.subagent, status: "done", outcome: "unknown" } };
+          items[i] = { ...it, subagent: { ...it.subagent, status: "done", outcome: "unknown" },
+            ...(it.placeholder ? { status: "done" as const } : {}) };
         }
       }
       // Close the turn: next event starts a new one and re-emits the next user message.

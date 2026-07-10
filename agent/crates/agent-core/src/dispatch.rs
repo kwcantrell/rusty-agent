@@ -161,8 +161,19 @@ impl SubagentSink {
         }
     }
 
+    /// Poison-tolerant: `EndGuard::drop` calls `emit` → `summary` during
+    /// unwind (e.g. from the `expect("segments never empty")` panics above),
+    /// so this MUST NOT re-panic on a poisoned lock or the drop-guard's whole
+    /// purpose — guaranteeing exactly one `End` even on a child panic — turns
+    /// into a process abort on the very path it exists to cover. Recovers via
+    /// `into_inner()` rather than propagating the poison; the captured data is
+    /// still coherent for read-out (same posture as `RunShared`'s
+    /// `into_inner()` poison recovery, 3A).
     pub fn summary(&self) -> CaptureSummary {
-        let cap = self.cap.lock().unwrap();
+        let cap = self
+            .cap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tail = cap.segments.last().cloned().unwrap_or_default();
         let final_text = if tail.trim().is_empty() {
             cap.segments.concat().trim().to_string()
@@ -2936,6 +2947,53 @@ mod tests {
         );
         assert_eq!(ends[0].2, "failed");
         assert_eq!(ends[0].3, "dispatch aborted (panic or executor drop)");
+    }
+
+    #[test]
+    fn summary_recovers_from_poisoned_capture_lock() {
+        // A panic on another thread while holding the sink's `cap` Mutex poisons
+        // it. `EndGuard::drop → emit → summary()` must still be callable during
+        // unwind (finding 1, 3B-2 review) — if summary() re-panics on a poisoned
+        // lock, the panic path this guard exists to cover becomes a process
+        // abort instead of a clean Failed End.
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            let default = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let is_sentinel = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| *s == "SENTINEL_TEST_PANIC_POISON")
+                    .unwrap_or(false);
+                if !is_sentinel {
+                    default(info);
+                }
+            }));
+        });
+
+        let parent = Arc::new(FullSink::default());
+        let sink = Arc::new(SubagentSink::new(parent.clone(), 1, "call1".into(), None));
+
+        // Capture some real text before poisoning, so we can assert it survives.
+        sink.emit(AgentEvent::Token("hello ".into()));
+        sink.emit(AgentEvent::Token("world".into()));
+
+        let poison_sink = sink.clone();
+        let joined = std::thread::spawn(move || {
+            let _guard = poison_sink.cap.lock().unwrap();
+            panic!("SENTINEL_TEST_PANIC_POISON");
+        })
+        .join();
+        assert!(
+            joined.is_err(),
+            "the spawned thread's panic must propagate on its own thread"
+        );
+
+        // The lock is now poisoned; summary() must not panic and must still
+        // reflect the previously captured text.
+        let s = sink.summary();
+        assert_eq!(s.final_text, "hello world");
     }
 
     #[tokio::test]
