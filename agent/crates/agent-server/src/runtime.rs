@@ -440,7 +440,7 @@ mod tests {
     fn parts() -> (Arc<ChannelEventSink>, Arc<IpcApprovalChannel>) {
         let s = slot();
         let sink = Arc::new(ChannelEventSink::new(s.clone()));
-        let approval = Arc::new(IpcApprovalChannel::new(s, Duration::from_secs(1)));
+        let approval = Arc::new(IpcApprovalChannel::new(s, Some(Duration::from_secs(1))));
         (sink, approval)
     }
 

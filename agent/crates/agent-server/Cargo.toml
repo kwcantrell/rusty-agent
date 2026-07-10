@@ -24,6 +24,8 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `tokio::time::pause`/`advance` in approval.rs tests (park-vs-auto-deny timing).
+tokio = { workspace = true, features = ["test-util"] }
 # Enable agent-core's `testkit` feature for the Task 4 integration test
 # (ScriptedModel/PassthroughProtocol live behind `#[cfg(any(test, feature = "testkit"))]`).
 agent-core = { path = "../agent-core", features = ["testkit"] }

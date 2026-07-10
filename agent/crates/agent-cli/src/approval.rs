@@ -3,9 +3,10 @@ use async_trait::async_trait;
 use std::io::Write;
 use std::time::Duration;
 
-/// Default interactive approval window. Matches the server's `APPROVAL_TIMEOUT`
-/// (`agent-server/src/session.rs`) so both front-ends share the same human-friendly
-/// timeout before auto-denying.
+/// Default interactive approval window for the terminal front-end. The CLI keeps
+/// a fixed 300s auto-deny in 4B-1 (parks-and-exits is 4B-2); the *server* channel,
+/// by contrast, now parks indefinitely unless its `approval_auto_deny_secs` knob
+/// is set, so the two front-ends no longer share one constant.
 const DEFAULT_TERMINAL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 type BlockingPrompt = std::sync::Arc<dyn Fn(String) -> ApprovalResponse + Send + Sync>;
@@ -73,7 +74,13 @@ impl ApprovalChannel for TerminalApproval {
         // — an accepted residual: a clean cancel would need raw-fd polling, not worth
         // the complexity for a CLI approval prompt.
         let _serialized = self.gate.lock().await;
-        let summary = req.intent.summary.clone();
+        // Attribute the prompt to its originating sub-agent (if any) so a
+        // parallel-dispatch operator can tell whose Ask they are answering.
+        let who = match &req.origin {
+            Some(o) => format!("[sub-agent {} (depth {})] ", o.subagent_name, o.depth),
+            None => String::new(),
+        };
+        let summary = format!("{who}{}", req.intent.summary);
         let prompt = self.prompt.clone();
         let handle = tokio::task::spawn_blocking(move || prompt(summary));
         match tokio::time::timeout(self.timeout, handle).await {

@@ -23,8 +23,6 @@ pub struct SkillDto {
     pub files: Vec<String>,
 }
 
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
-
 pub enum SendOutcome {
     Started,
     Busy,
@@ -48,8 +46,13 @@ impl Session {
     pub fn from_params(params: DaemonParams) -> Arc<Self> {
         let slot: EventSlot = Arc::new(Mutex::new(None));
         let sink = Arc::new(ChannelEventSink::new(slot.clone()));
-        let approval = Arc::new(IpcApprovalChannel::new(slot.clone(), APPROVAL_TIMEOUT));
         let config = RuntimeConfig::load_over(params.config.clone(), &params.config_path);
+        // E5: no configured window ⇒ an unanswered ask parks indefinitely; the
+        // `approval_auto_deny_secs` knob opts headless/eval callers into auto-deny.
+        let approval = Arc::new(IpcApprovalChannel::new(
+            slot.clone(),
+            config.approval_auto_deny_secs.map(Duration::from_secs),
+        ));
         let max_tool_result_bytes = config.max_tool_result_bytes;
         let runtime = Arc::new(RuntimeState::new(
             config,
@@ -87,7 +90,10 @@ impl Session {
 
     /// Register/replace the outbound channel (the `subscribe` command body).
     pub fn set_event_out(&self, out: Arc<dyn EventOut>) {
-        *self.slot.lock().unwrap() = Some(out);
+        *self.slot.lock().unwrap() = Some(out.clone());
+        // Daemon-alive reattach (spec §2.4 step 5): pending asks re-emit under
+        // their LIVE ids — no duplicate is minted.
+        self.approval.reemit_pending(&out);
     }
 
     /// Start a run unless one is active (A1 guard).

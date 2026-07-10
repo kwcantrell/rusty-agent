@@ -199,6 +199,10 @@ pub struct RuntimeConfig {
     /// claude-cli backend: `--effort` level. None = CLI default.
     #[serde(default)]
     pub claude_effort: Option<String>,
+    /// E5 knob: auto-deny an unanswered approval after N seconds (headless/eval
+    /// callers). None (default) = an unanswered Ask parks indefinitely.
+    #[serde(default)]
+    pub approval_auto_deny_secs: Option<u64>,
     /// claude-cli backend: `--fallback-model` when the primary is unavailable.
     #[serde(default)]
     pub claude_fallback_model: Option<String>,
@@ -277,6 +281,7 @@ struct PartialRuntimeConfig {
     preserve_thinking: Option<bool>,
     claude_session_reuse: Option<bool>,
     claude_effort: Option<String>,
+    approval_auto_deny_secs: Option<u64>,
     claude_fallback_model: Option<String>,
     skills_dirs: Option<Vec<String>>,
     active_skills: Option<Vec<String>>,
@@ -391,6 +396,7 @@ impl RuntimeConfig {
             preserve_thinking: false,
             claude_session_reuse: true,
             claude_effort: None,
+            approval_auto_deny_secs: None,
             claude_fallback_model: None,
             skills_dirs: Vec::new(),
             active_skills: Vec::new(),
@@ -794,6 +800,9 @@ impl RuntimeConfig {
         }
         if let Some(v) = p.claude_effort {
             self.claude_effort = Some(v);
+        }
+        if let Some(v) = p.approval_auto_deny_secs {
+            self.approval_auto_deny_secs = Some(v);
         }
         if let Some(v) = p.claude_fallback_model {
             self.claude_fallback_model = Some(v);
@@ -1276,6 +1285,7 @@ mod tests {
             preserve_thinking: true,
             claude_session_reuse: false,
             claude_effort: Some("high".into()),
+            approval_auto_deny_secs: Some(30),
             claude_fallback_model: Some("claude-opus-4".into()),
             skills_dirs: vec!["/s".into()],
             active_skills: vec!["greeter".into()],
@@ -1889,6 +1899,18 @@ mod tests {
         assert!(c.claude_session_reuse);
         assert_eq!(c.claude_effort, None);
         assert_eq!(c.claude_fallback_model, None);
+    }
+
+    #[test]
+    fn approval_auto_deny_secs_defaults_none_and_roundtrips() {
+        // Default is park-forever (None).
+        assert_eq!(RuntimeConfig::default().approval_auto_deny_secs, None);
+        // A config JSON carrying the knob overlays onto the base.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"approval_auto_deny_secs": 30}"#).unwrap();
+        let loaded = RuntimeConfig::load_over(base(), &path);
+        assert_eq!(loaded.approval_auto_deny_secs, Some(30));
     }
 
     #[test]

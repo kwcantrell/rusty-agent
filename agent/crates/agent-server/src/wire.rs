@@ -73,6 +73,8 @@ pub enum ServerEvent {
         command: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<Display>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<ApprovalOriginDto>,
     },
     SandboxDegraded {
         mechanism: String,
@@ -126,6 +128,17 @@ pub enum ServerEvent {
         tool_calls: u64,
         duration_ms: u64,
     },
+}
+
+/// Wire form of `agent_policy::ApprovalOrigin` — sub-agent attribution carried
+/// on an `ApprovalRequest` frame so the frontend can label the prompt. Additive:
+/// the field is `#[serde(default, skip_serializing_if = "Option::is_none")]`, so
+/// old decoders ignore its absence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalOriginDto {
+    pub delegation_id: String,
+    pub subagent: String,
+    pub depth: usize,
 }
 
 /// Settings snapshot returned by the `settings_get` command (was `WireBody::SettingsState`).
@@ -683,10 +696,13 @@ mod tests {
             summary: "s".into(),
             command: None,
             display: None,
+            origin: None,
         };
         let j = serde_json::to_string(&ar).unwrap();
         assert!(j.contains(r#""type":"approval_request""#));
         assert!(j.contains(r#""id":"c0""#));
+        // None origin is omitted from the wire (old-SPA byte-compat).
+        assert!(!j.contains("origin"), "None origin must be skipped: {j}");
     }
 
     #[test]
