@@ -1,8 +1,8 @@
 # E2E lifecycle & stress suite — GUI, CLI, and surface-switching
 
-**Date:** 2026-07-10
-**Status:** Draft — pending adversarial panel + owner gate
-**Depends on:** Phase 4B (durable HITL: park-point checkpoints, cross-process resume, CLI sessions list/reopen, bridge parked-run frames) — merged to main at `a6f2f3b`.
+**Date:** 2026-07-10 (rev 2 — post-panel)
+**Status:** Panel-reworked — pending owner gate
+**Depends on:** Phase 4B (durable HITL: park-point checkpoints, cross-process resume, CLI sessions list/reopen, GUI parked-run frames) — merged to main at `a6f2f3b`.
 
 ## 1. Problem & goals
 
@@ -12,16 +12,20 @@ and vice versa. That cross-surface lifecycle is the newest, least-tested,
 highest-risk surface in the runtime. Existing coverage is strong at the unit
 and single-surface integration level (checkpoint MAC round-trips, re-emit
 re-derivation, reap guards) but **nothing today drives two surfaces against the
-same session on disk**, kills real processes at hostile moments, or races the
-resume lock from two directions.
+same session on disk**, kills real processes at hostile moments, or contends
+for the resume lock from two directions.
 
 **Goals:**
 
 - G1. An e2e suite that drives the CLI binary and the GUI's exact protocol
-  surface (the WS bridge) against shared session state, including switching
+  surface — the `agent_server::session::Session` API plus its
+  `ServerEvent` stream, which is precisely what the Tauri commands call and
+  the webview consumes — against shared session state, including switching
   surfaces mid-lifecycle.
 - G2. Deterministic stress coverage of the failure situations enumerated in §5
-  — crashes, races, corruption, adversarial tampering, model misbehavior.
+  — crashes, races, corruption, adversarial tampering, model misbehavior —
+  with **real process kills** for the scenarios that require them (§5 marks
+  them; the descope rule in §2.4 does not apply to those).
 - G3. The deterministic tier joins the `ci.sh` pre-push gate (no model, no
   display, no GTK required).
 - G4. A thin real-GUI (WebDriver) tier and a thin live-model tier as
@@ -34,196 +38,353 @@ resume lock from two directions.
 - Not a replacement for existing unit/integration tests in
   `checkpoint.rs` / `loop_.rs` / `session.rs` / `resume.rs` — those stay; this
   suite covers only what they structurally cannot (multi-process,
-  multi-surface, real kills).
-- No new product behavior. Where current behavior is a known gap (e.g. stale
-  `resume.lock` has no auto-recovery), tests assert the documented behavior
-  and mark it as a product-change candidate — they do not change it.
+  multi-surface, real kills). §5 lists the cuts made to avoid duplication.
+- No new product behavior, **except two small, explicitly declared test
+  seams escalated to the owner gate** (§9 E1, E2). Everything else asserts
+  current behavior; known gaps are asserted as-documented with a
+  `// PRODUCT-GAP:` marker.
 - No CI provisioning for WebDriver (xvfb etc.); Tier 2 remains on-demand on
   this machine.
 
 ## 2. Architecture
 
-### 2.1 Key enabling fact
+### 2.1 Key enabling fact (corrected by panel)
 
-The desktop app's bridge (`src-tauri/src/bridge.rs`) is a thin wrapper over
-`agent_server::daemon::serve`, which lives in the **`agent/` workspace**.
-Driving `agent-server`'s daemon directly exercises the byte-identical protocol
-the GUI uses, without `src-tauri` (whose ci.sh leg is conditional on GTK
-deps). This is what lets the cross-surface matrix be unconditionally CI-gated.
+There is **no WebSocket bridge**. The former WS control plane was removed in
+`7245526`; `agent-server` is a library crate and the desktop transport is
+Tauri IPC. `src-tauri/src/bridge.rs` merely holds an
+`Arc<Session>` built via `Session::from_params(agent_server::setup::local_params(...))`,
+and the Tauri commands (`send_input`, `approve`, `cancel`, `subscribe`, …)
+call `Session` methods directly, with events flowing out through an
+`EventOut` sink as `ServerEvent` values (`agent-server/src/wire.rs`).
+
+Consequence: the GUI's exact surface is drivable **in-process from the
+`agent/` workspace** — construct a `Session` against a sessions root, register
+an `EventOut` capture (the pattern `src-tauri/tests/smoke_context_explorer.rs`
+already uses), call the same methods the Tauri commands call, and assert on
+`ServerEvent` variants (`parked_runs`, `approval_request`,
+`approval_resolved`, `resumed`, `token`, `done`, `error` — these wire names
+are verified current). No ports, no frame (de)serialization helpers, and the
+compiler — not hand-maintained fixtures — tracks protocol changes, because
+the driver imports `agent_server::wire::ServerEvent`.
+
+"GUI restart" = drop the `Session`, construct a new one over the same
+sessions root (`spawn_parked_reemit` fires on subscribe/attach).
 
 ### 2.2 New crate: `agent/crates/agent-e2e`
 
-A tests-only crate (empty or near-empty `lib.rs`; all substance in `tests/`
-plus shared test-support modules). It owns three drivers and the scenario
-matrix:
+A tests-only crate (near-empty `lib.rs`; substance in `tests/` + test-support
+modules). Components:
 
-1. **Scripted model stub** — an in-process HTTP server speaking
-   OpenAI-compatible `/v1/chat/completions`, driven by a per-test scenario
-   queue: each incoming request pops the next scripted response. Response
-   kinds: a tool call that triggers an approval gate, plain text completion,
-   malformed JSON, a stalled/slow stream, a mid-stream connection drop.
-   The stub **records all incoming requests** so tests can assert on what
-   reached the model (e.g. deny-feedback text present in the next request).
-   Both entry surfaces accept an arbitrary `base_url` for the `openai`
-   backend (CLI flags; daemon launch params), so injection needs no code
-   changes to the product.
-2. **CLI driver** — spawns the real `agent` binary (workspace-built) as a
-   subprocess with an isolated sessions root (`trace_dir` override in a
-   per-test runtime config) and scripted stdin for the terminal approval
-   prompt. Can deliver signals (`SIGKILL`, `SIGINT`) at chosen,
-   *observably-synchronized* moments.
-3. **Bridge driver** — starts `agent_server::daemon::serve` in-process on an
-   ephemeral port against the same sessions root and exchanges JSON frames
-   over `tokio_tungstenite`. "GUI restart" = tear down the daemon and serve
-   again on the same root. Frame helpers cover: `user_input`,
-   approval-resolution, and assertions on `parked_runs`, `approval_request`,
-   `approval_resolved`, `resumed`, `event(done/error/token)` frames.
+1. **Scripted model stub** — **wiremock** (already a workspace dep, used by
+   four crates; `agent-model`'s own tests stub SSE streams with it) serving
+   OpenAI-compatible `/v1/chat/completions` from a per-test script.
+   Discipline (panel-mandated):
+   - each script step carries a **request matcher** (at minimum message
+     count + an expected substring); a request that matches no step, or
+     arrives past the script's end, **fails the test immediately**;
+   - teardown asserts the script was **fully consumed**;
+   - assertions on "what reached the model" check the **recorded request
+     body text** (e.g. the deny-feedback string), never mere arrival.
+   Response kinds: an approval-gated tool call (`write_file` gates
+   deterministically under default policy: `Access::Write ⇒ Ask`), plain
+   text, malformed JSON, bogus tool name, delayed-whole-response.
+   **Mid-stream drop / stalled-mid-stream is not expressible in wiremock**
+   (it sends the body as one canned buffer): scenario 20 uses a ~20-line raw
+   `tokio::net::TcpListener` helper that sends partial SSE then closes.
+   Naming/shape follows `agent_core::testkit`'s `Scripted*` precedent.
+2. **CLI driver** — spawns the real `agent` binary as a subprocess with an
+   isolated `HOME` (tempdir; see §2.3) and a runtime config setting
+   `trace_dir`, `base_url` (stub), and low timeouts. Scripts the terminal
+   approval prompt over a **plain stdin pipe** (verified: `stdin_prompt` uses
+   `std::io::stdin().read_line`, no tty needed; reopen path takes any
+   `BufRead`). Stdin rules (panel-mandated): the REPL and the approval
+   prompt share one stdin, so scripts interleave task lines and answer lines
+   deliberately, **hold the pipe open** across multi-line answers
+   (deny + feedback = two lines), and never script a prompt *after* letting
+   a previous prompt time out (the orphaned blocking reader steals the next
+   line). Can deliver `SIGINT`/`SIGKILL` to the child at
+   observably-synchronized moments.
+3. **Session driver ("GUI leg")** — in-process `Session` construction per
+   §2.1 for the bulk of the matrix, **plus a tiny harness binary**
+   (`[[bin]]` in `agent-e2e`) that hosts the same Session driver as a real
+   subprocess for the scenarios that must SIGKILL the daemon side (§5 marks
+   them). The harness bin exists because in-process teardown runs `Drop`
+   impls and graceful paths that a real death does not — and the daemon-side
+   hard-death class is exactly where 4B-1's live drive found a real bug.
+4. **Shared helpers are lifted, not copied**: the park-planting / ask-waiting
+   / event-capture helpers that `agent-server`'s `session.rs` test mod
+   already grew (`plant_parked_session`, `wait_for_ask_id`, capture sink)
+   move into a `testkit` feature of `agent-server` (mirroring `agent-core`'s
+   `#[cfg(any(test, feature = "testkit"))]` pattern) and are consumed from
+   both places. MAC-forging/tampering helpers (§5d) take an explicit
+   `key: [u8; 32]` parameter — **never** a path defaulting to
+   `metadata_root()` — and live unexported in the tests-only crate.
+5. **CLI binary freshness** — `CARGO_BIN_EXE_*` is only provided to the
+   defining crate's own tests, and a bare `target/debug/agent` lookup can
+   silently run a **stale** binary. The harness resolves the binary by
+   invoking `cargo build -p agent-cli --quiet` once per test-binary run
+   (`OnceLock`; a no-op when fresh) and reading the path from its JSON
+   output (or via `escargot`) — bare target-path lookup is forbidden.
+   Decide `cargo`-shellout vs `escargot` in the plan.
 
-### 2.3 Isolation & determinism rules
+### 2.3 Isolation (corrected by panel)
 
-- Every test gets a fresh tempdir workspace **and** a fresh tempdir sessions
-  root. The CLI and bridge legs of one scenario share that root — that is
-  what makes surface-switching real. No test touches `~/.rusty-agent`.
+`trace_dir` moves only the **sessions** root. The checkpoint HMAC secret
+loads from `metadata_root()` = `$HOME/.rusty-agent/secret` on **both**
+surfaces, so sessions-root isolation alone either splits the two surfaces
+onto different keys (every cross-surface MAC check fails) or silently touches
+the developer's real `~/.rusty-agent`. Neither is acceptable, and
+process-global `env::set_var` inside a parallel test binary is racy.
+
+**Mechanism (E1, escalated to gate):** add a metadata-root override to
+`RuntimeConfig` (mirroring `trace_dir`), honored by `metadata_root()`
+consumers on both surfaces. It is a small, declared product seam — the one
+exception to the no-product-changes non-goal, alongside E2. With it:
+
+- every test gets a tempdir **metadata root** (secret), tempdir **sessions
+  root**, and tempdir **workspace**; the CLI and Session legs of one scenario
+  share all three;
+- the harness **pre-creates the 32-byte secret file** before spawning
+  anything (`load_or_create_secret` has a documented create race under
+  concurrent first-touch);
+- CLI subprocesses additionally get `HOME=<tempdir>` for belt-and-braces;
+- no test reads or writes the real `~/.rusty-agent`, and tests are
+  parallel-safe (disjoint tempdirs, no env mutation in-process).
+
+If E1 is rejected at the gate, the fallback is running **both** legs as
+subprocesses with per-process `HOME` (heavier: the in-process Session driver
+moves wholesale into the harness bin), and Tier 2 pre-seeding is descoped.
+
+### 2.4 Determinism rules
+
 - No wall-clock sleeps as synchronization. Kill points and phase transitions
   synchronize on observable events: a file appearing (`parked.json`,
-  `manifest.json`, `resume.lock`), a frame arriving, a stub request landing,
-  or subprocess stdout markers. The stub controls all model-side timing.
-- Tests are parallel-safe across each other (disjoint tempdirs, ephemeral
-  ports); no global state.
-- A test that needs "kill between checkpoint payload write and manifest
-  write" gets that window via the stub (hold the model response that
-  triggers the next step) or via filesystem watching — never via timing
-  guesses. If a window proves impossible to hit deterministically from
-  outside the process, the scenario is descoped to a synthesized on-disk
-  state (write the torn state directly) — equally valid for testing the
-  *reader's* behavior, and noted as such in the test.
+  `manifest.json`, `resume.lock`), a `ServerEvent`, a stub request landing,
+  or subprocess stdout markers.
+- **Watchdog policy (panel-mandated):** every external wait — file
+  appearance, event, subprocess exit — is deadline-bounded (~30s cap); on
+  expiry the harness SIGKILLs the child's **process group**, fails the test,
+  and prints captured stdout/stderr. Spawned CLIs always get explicit low
+  `--stream-timeout-secs`. In a pre-push hook, a hang is strictly worse than
+  a failure.
+- **Process hygiene (panel-mandated):** spawned children are wrapped in a
+  KillOnDrop guard (process-group kill via held `Child`, the
+  `src-tauri/tests/e2e_harness` pattern); **no test ever kills by
+  name/pattern** (pkill self-match footgun is repo history).
+- **Synthesized-state rule:** a scenario may substitute hand-written on-disk
+  state for a hard-to-hit crash window **only if** the state is produced by
+  running the real writer up to a step boundary, or is pinned by a companion
+  unit assertion on the writer's actual write order — and the descope is
+  listed in the Panel & review log for owner sign-off, naming the real crash
+  window it stands in for. Scenarios marked **[real-kill]** in §5 may not
+  descope at all.
+- **Positive-artifact rule:** checkpointing degrades silently to live-only
+  when the secret/metadata root is unavailable, which would hollow out any
+  scenario asserting only "no corruption". Every kill/reopen/tamper step is
+  preceded by a positive assertion that `parked.json` exists.
+- **Error assertions:** assert a stable short substring or discriminant plus
+  two separate facts — "no panic" and "session dir intact" — never full
+  error text, never bare `is_err()`.
+- Gate-triggering tool calls must not *execute* files from the temp
+  workspace (`/tmp` is noexec on this machine); `write_file` is the standard
+  gated call.
 
 ## 3. Tiers
 
 | Tier | What | Where | Gate |
 |------|------|-------|------|
-| 1 | Deterministic mock-backed matrix (§5) — CLI subprocess + in-process daemon | `agent/crates/agent-e2e/tests/` | **ci.sh, unconditional** |
+| 1 | Deterministic mock-backed matrix (§5) — CLI subprocess + in-process/harness-bin Session driving | `agent/crates/agent-e2e/tests/` | **ci.sh, unconditional** |
 | 2 | Real-GUI WebDriver checks of GUI-only surfaces | `src-tauri/tests/` beside `gui_smoke.rs`, reusing `e2e_harness` | `--ignored`, on-demand, serialized |
 | 3 | Live-model reality check | `agent/crates/agent-e2e/tests/`, `--ignored` | on-demand, needs :8080 |
 
 **Tier 2 content** (small, DOM-asserted, one WebDriver session per test,
-`--test-threads=1`): parked-run banner appears after app restart with a parked
-session on disk; approval prompt renders the re-derived intent; deny with
-feedback flows from the real DOM; resume clears the banner. Session state is
-pre-seeded on disk by harness code (not driven turn-by-turn through the DOM)
-to keep each WebDriver session short.
+`--test-threads=1`):
+
+- T2.1 parked-run banner appears after app restart with a parked session on
+  disk; **Approve is clicked in the real DOM** and the banner clears.
+- T2.2 deny **with feedback** typed in the real DOM reaches the checkpoint.
+- T2.3 **real cross-surface switch** (panel addition): a run parks via a live
+  turn driven from the real GUI DOM, then `agent sessions list` sees it and
+  `agent sessions reopen` resumes it — guarding the `src-tauri` parameter
+  plumbing (`local_params` wiring, workspace switching) that Tier 1's
+  in-process driver bypasses.
+
+Tier 2 requires launching the app with its sessions/metadata roots pointed at
+temp dirs (via E1's seam + config file; exact env/config injection for the
+WebDriver-launched app is a plan-verification item). If the app cannot be
+pointed away from the real roots, Tier 2 state seeding is **descoped, not
+worked around** — no harness code ever loads the user's real secret.
 
 **Tier 3 content**: one full-fidelity pass — the real model (qwen3.6 on
-:8080) is prompted so it emits a genuinely approval-gated tool call; park via
-bridge; reopen via CLI; approve; run completes. Accepts model nondeterminism
-by allowing retry-with-stronger-prompt once before failing.
+:8080) is prompted to `write_file` (deterministically gated), parks via the
+Session driver, reopened via CLI, approved, completes. One
+retry-with-stronger-prompt allowed; says so in output.
 
 ## 4. Budget
 
-Whole Tier 1 target: **under ~2 minutes** on this machine, on top of the
-existing `cargo test` build. If the matrix outgrows that, split a `soak`
-subset behind `--ignored` before slowing the pre-push gate.
+Whole Tier 1 target: **under ~2 minutes** on this machine on top of the
+existing build. Enforcement, not hope (panel-mandated): the plan implements
+~3 representative scenarios first, measures, and extrapolates before writing
+the rest; the soak (§5 #4) is pre-committed at N=4 and is the designated
+first candidate for an `--ignored` split if measured Tier 1 exceeds ~90s.
+Note the new crate also joins the workspace `clippy --all-targets` and
+`cargo test` legs (compile-time tax) — acceptable, but measured.
 
 ## 5. Scenario catalog
 
-Each scenario names the invariant it guards; regression anchors reference the
-bug/commit that motivated them. (Anchors are orientation only — locate code by
-content, per AGENTS.md.)
+**[real-kill]** = must deliver a real signal to a real subprocess; §2.4's
+descope rule is unavailable. Anchors are orientation only — locate code by
+content (AGENTS.md).
 
 ### 5a. Cross-surface lifecycle
 
 | # | Scenario | Invariant guarded |
 |---|----------|-------------------|
-| 1 | Park via bridge → CLI `sessions reopen` → approve → completes | attach-to-resume across surfaces; shared checkpoint semantics |
-| 2 | CLI park-and-exit → bridge attach → `parked_runs` + re-derived `approval_request` → approve → `resumed` → done | re-derivation from stored args (never persisted display text); frame ordering (`resumed` before task output) |
-| 3 | Park → **deny with feedback** on one surface → stub asserts feedback text in the next model request → repark → approve on the other surface → complete | MAC-bound deny feedback travels e2e |
-| 4 | Deny→repark→reopen ×N (N≥3) alternating surfaces | tally-floor clamp — regression `2fad367` (deny desynced persisted tally; next checkpoint read as corrupt) |
-| 5 | Cancel mid-resume (SIGINT on CLI; cancel path on bridge) → park retained → reopen succeeds | "Ok ≠ completed" reap guards — regressions `01179d8` (server), `76d81d5` (CLI) |
-| 6 | Answer committed (`answer.json` written), process killed before resume runs → reopen consumes the committed answer without re-prompting, exactly once | answer durability + consumed-once; committed-root-answer path in reopen (`76d81d5`) |
+| 1 | Park via Session driver → CLI `sessions reopen` → approve → completes | attach-to-resume across surfaces; shared checkpoint semantics |
+| 2 | CLI parks (mechanism per gate decision **E2**: timeout park-and-exit via new knob, or SIGINT park) → fresh Session attach → `parked_runs` + re-derived `approval_request` → approve → `resumed` → done | re-derivation from stored args; frame ordering; CLI→GUI direction |
+| 3 | Park → deny **with feedback** on one surface — including a hostile-content variant (multibyte unicode, control chars, JSON-meta chars, ~10KB) → stub *matcher* asserts the feedback text in the recorded next request → repark → approve on the other surface → complete | MAC-bound deny feedback travels e2e; canonicalization/serialization under hostile input |
+| 4 | **Soak** (merges old #4+#22): N=4 lifecycle cycles alternating deny-with-feedback and approve, alternating CLI↔Session surfaces, on one session; one cycle carries a large artifact store (multi-MB checkpoint) | tally-floor clamp (regression `2fad367`); tally monotonicity; no cumulative drift; checkpoint stays verifiable at size |
+| 5 | Cancel mid-resume (**[real-kill]** SIGINT on CLI reopen; cancel path on Session) → park retained → reopen succeeds | "Ok ≠ completed" reap guards — regressions `01179d8`, `76d81d5`. CLI leg targets the **reopen** flow (the plain REPL path never claims `resume.lock`) |
+| 6 | Answer committed (`answer.json` on disk), **[real-kill]** SIGKILL before resume runs → reopen consumes the committed answer without re-prompting, exactly once | answer durability + consumed-once (`76d81d5`) |
+| 7 | Park under `openai`/native → reopen with divergent flags (`--backend claude-cli` forces prompted protocol) | park/resume config-divergence behavior is *defined and asserted* (current behavior documented; `PRODUCT-GAP` if it silently diverges) — reopen takes workspace from the descriptor but model/backend/protocol from current flags |
+| 8 | ApproveAlways granted → restart (drop+rebuild Session) → identical tool call | the 4B deliberate downgrade: persisted "always" arrives as plain approve; the next identical call must **park again**, never silently auto-approve (security-relevant) |
+| 9 | `send_input` of a *new* task on a session holding a parked run (not mid-turn) | defined behavior asserted: the park must survive or be resolved deliberately — never silently clobbered/orphaned (the GUI banner makes this the most reachable hostile ordering) |
 
 ### 5b. Crash & kill
 
 | # | Scenario | Invariant guarded |
 |---|----------|-------------------|
-| 7 | Torn checkpoint (payload written, no manifest — synthesized or kill-window per §2.3) → reopen + list | manifest-written-last: torn checkpoint refused as corrupt with a clean error; `sessions list` unaffected |
-| 8 | SIGKILL while `resume.lock` held → second reopen attempt | documented stale-lock behavior: explicit contention error, no corruption. Asserted as-documented; flagged as product-change candidate (no auto-recovery today) |
-| 9 | Daemon torn down and re-served over existing session dirs → attach | epoch-prefixed ownership of orphaned dirs; `spawn_parked_reemit` re-emits parked runs from prior epochs |
+| 10 | Torn checkpoint (payload without manifest — per §2.4 synthesized-state rule) → reopen + `sessions list` | manifest-written-last: torn tree refused as corrupt with clean error; list unaffected |
+| 11 | **[real-kill]** SIGKILL the harness-bin daemon while it holds `resume.lock` → second resume attempt from CLI | documented stale-lock behavior: explicit contention error naming the lock path; no corruption. `PRODUCT-GAP:` no auto-recovery today |
+| 12 | **[real-kill]** SIGKILL the harness-bin daemon mid-run after park → start a new harness-bin process over the same roots → attach | orphaned-dir ownership across a real process boundary; `spawn_parked_reemit` re-emits; assert the new process's *classification* of the prior dir, not just the re-emitted event |
+| 13 | Sessions root made read-only (chmod) before the park write | park-write failure is clean: run errors or degrades per documented behavior; the ask is not wedged; no torn tree |
 
-### 5c. Concurrency & races
+### 5c. Concurrency (directed loser-paths, panel-reworked)
 
 | # | Scenario | Invariant guarded |
 |---|----------|-------------------|
-| 10 | CLI reopen and bridge resume race the same parked run | exactly one wins `O_EXCL` on `resume.lock`; loser gets a clean, actionable error |
-| 11 | Approve via bridge while CLI reopen is mid-prompt on the same ask | double-resolution safety: one resolution wins, the other observes resolved state (no double-resume, no panic) |
-| 12 | Several parked + completed sessions → `sessions list` order and marks; reopen addresses the right session | epoch sort newest-first; parked marking; id addressing |
-| 13 | Bridge attach while an ask is live vs attach after park | both re-emit paths (`reemit_pending` vs `spawn_parked_reemit`) produce a correct, single `approval_request` |
+| 14 | Session driver holds `resume.lock` → CLI reopen attempts | loser path, deterministic: CLI prints the contention guidance; park intact |
+| 15 | CLI reopen holds the lock (mid-prompt, pipe held open) → Session resume attempts; then approve lands on the CLI | reverse loser path + double-resolution: one resolution wins, the other observes resolved state. Plan first verifies what the Session path does under a held lock (the CLI claims the lock *before* prompting, so mid-prompt contention may be structurally excluded — if so, assert that exclusion) |
+| 16 | One barrier-synchronized genuine race (both contenders released simultaneously) | **symmetric postconditions only**: exactly one success, one clean error, park consumed exactly once — either order accepted |
+| 17 | Several parked + completed sessions → reopen addresses the chosen one through the real binary | id addressing e2e (list marks/order stay unit-covered — `list_sessions_marks_parked`) |
 
 ### 5d. Adversarial & corruption
 
 | # | Scenario | Invariant guarded |
 |---|----------|-------------------|
-| 14 | Flip bytes in `parked.json` / `manifest.json` | HMAC verification refuses; both surfaces produce clean errors, not panics |
-| 15 | Forged `answer.json` (wrong MAC) and legacy-format answer (pre-versioning) | fail-closed: answer discarded, re-prompt occurs |
-| 16 | `descriptor.json` missing or regenerated | checkpoint MACs invalidated **cleanly** (refusal path, not crash) |
-| 17 | Workspace directory deleted before reopen | workspace validation error; session dir left intact |
+| 18 | **Corruption sweep** (merges old #14/#15/#16): one parked session; iterate {tampered `parked.json` bytes, tampered `manifest.json`, forged `answer.json` MAC, legacy-format answer, missing `descriptor.json`} → assert per §2.4 error style on **both** scan surfaces (CLI reopen and Session attach diverge above the shared verifier) | e2e delta over existing unit coverage: each *surface* refuses cleanly — no panic, session dir intact, other sessions unaffected; forged answer ⇒ re-prompt occurs |
+| 19 | Workspace directory deleted before reopen | workspace validation error; session dir left intact |
 
 ### 5e. General robustness
 
 | # | Scenario | Invariant guarded |
 |---|----------|-------------------|
-| 18 | Stub drops the connection mid-stream | error surfaced to the surface in use; session not corrupted; next turn on same session works |
-| 19 | Stub returns malformed output (invalid JSON; tool call naming a nonexistent tool) | loop error handling on both surfaces; no wedged session |
-| 20 | Rapid-fire `user_input` frames while a turn is running | input handling stays serialized; no interleaved/corrupt transcript state |
-| 21 | WS client disconnects mid-turn, reattaches | reattach shows consistent state (running, parked, or done — never wedged); live ask re-emitted |
-| 22 | Soak: N park/approve cycles alternating CLI↔bridge on one session (N≥5) | no cumulative state drift; checkpoint stays verifiable; tally monotonicity holds |
+| 20 | Mid-stream connection drop (raw-socket helper, not wiremock) | *recovery* signal: session not corrupted; next turn on the same session works (error-surfacing itself is covered by `e2e_robustness` T4 — not re-asserted on both surfaces) |
+| 21 | Malformed model output (invalid JSON; tool call naming a nonexistent tool) | no wedged session; clean error; next turn works |
+| 22 | Event-sink detach/reattach mid-turn (`set_event_out` swap — the Tauri Channel re-subscribe path) | consistent state on reattach (running/parked/done — never wedged); live ask re-emitted; guards the 4B-1 sync-subscribe abort class (`b86e21c`) |
 
-### Deliberately not covered here
+### Cut as duplicate coverage (panel-verified against existing tests)
 
-Covered by existing tests (do not duplicate): checkpoint MAC round-trip unit
-coverage (`checkpoint.rs` tests), single-surface re-emit derivation
-(`session.rs` tests), reap-guard state machine units (`loop_.rs`,
-`resume_cleanup_decision` in `agent-cli`), answer-lifecycle units
-(`resume.rs`).
+- old #13 (both re-emit paths): `attach_reemits_parked_ask_with_rederived_display`,
+  `attach_sends_parked_runs_snapshot`, `attach_skips_reemit_for_already_resuming_session`
+  already cover it at the same (now in-process) level; the cross-process half
+  lives in #12.
+- old #20 (rapid input during turn): `second_input_during_run_is_busy` is
+  this test; no transport exists to add behavior.
+- old #12's list-marking half, old #15's forgery mechanics, old #14/#16's
+  refusal mechanics: unit-covered; only the surface-level deltas survive
+  (in #17, #18).
 
-Known coverage gaps this suite also does **not** take on (recorded for a
-future phase): multi-ask dispatch-tree resume with multiple parked children;
-workspace *moved* (not deleted) across restart.
+### Recorded gaps → escalated to gate (E3)
+
+Multi-ask dispatch-tree resume (multiple parked children); workspace *moved*
+(not deleted) across restart; the timeout-park arm if E2 resolves to
+SIGINT-park. Each is an explicit accept-the-gap decision, not a silent
+deferral.
 
 ## 6. Error handling & flakiness policy
 
-- Zero tolerated flakes in Tier 1: any intermittent failure is a bug in the
-  test (fix the synchronization) or in the product (file it), never retried
+- Zero tolerated flakes in Tier 1: an intermittent failure is a bug in the
+  test (fix the synchronization) or the product (file it) — never retried
   into green.
 - Tier 3 may retry once (model nondeterminism), and says so in its output.
-- Tests asserting known-gap behavior (scenario 8) carry a
-  `// PRODUCT-GAP:` comment so a future behavior change knows to update them
-  deliberately.
+- Known-gap assertions carry `// PRODUCT-GAP:` (scenarios 7, 11 today).
+- Watchdog, process-hygiene, artifact, and error-assertion rules: §2.4.
 
 ## 7. CI integration
 
-`agent/crates/agent-e2e` is a member of the `agent/` workspace, so the
-existing `cargo test` leg in `scripts/ci.sh` picks it up with no new leg.
-The CLI subprocess tests depend on the `agent` binary being built;
-`cargo test` builds workspace bins for integration tests via Cargo's
-convention (verify in planning: if bin-dependency isn't automatic, add an
-explicit `cargo build -p agent-cli` before the test leg — a one-line ci.sh
-change).
+`agent/crates/agent-e2e` joins the `agent/` workspace (`members = ["crates/*"]`
+picks it up), so the existing `cargo test --workspace` leg in `scripts/ci.sh`
+runs it, and `clippy --workspace --all-targets -D warnings` gates it.
+Binary freshness is the harness's job (§2.2 item 5) — **not** a bare ci.sh build
+line, so the guarantee holds in dev loops too, not just CI.
 
-Tier 2 documentation lands in the auto-drive-tauri skill (a one-paragraph
-pointer), since that skill is the discovery surface for GUI e2e on this
-machine.
+Tier 2 documentation lands in the auto-drive-tauri skill. Separately (E4),
+that skill's "Bridge wire protocol" section still describes the removed WS
+transport and misled rev 1 of this spec — it needs a factual de-stale pass,
+tracked as its own follow-up.
 
 ## 8. Open questions (for planning, not blocking)
 
-- Exact mechanism for the CLI approval prompt scripting (pty vs plain stdin
-  pipe) — depends on how `TerminalApproval` reads input; resolve in the plan
-  by reading the source.
-- Whether the daemon exposes a clean in-process shutdown for "GUI restart"
-  teardown or the test drops the serve future; resolve in the plan.
-- Stub implementation base: hand-rolled axum vs wiremock (repo already uses
-  wiremock in `llama_health.rs`); pick whichever expresses scripted
-  sequential responses + request recording more simply.
+- Scenario 15: what the Session resume path does under a held lock — verify
+  before promising double-resolution coverage; assert structural exclusion if
+  that's the truth.
+- Scenarios 7, 9, 13: current behavior is asserted, but the plan must first
+  *characterize* it (read the code, run it) and mark anything surprising as
+  `PRODUCT-GAP` + gate escalation rather than blessing it silently.
+- Tier 2: how to inject config/env into the WebDriver-launched app
+  (tauri-driver capabilities vs wrapper script); if impossible, T2 seeding
+  descopes per §3.
+- Binary-freshness mechanism: `cargo build` shellout vs `escargot`.
+
+## 9. Gate decisions required (escalated, not adopted)
+
+- **E1 — metadata-root override** (small product seam in `RuntimeConfig` +
+  `metadata_root()` consumers): required for cross-surface secret sharing and
+  true isolation (§2.3). Recommended: **adopt**. Fallback documented in §2.3.
+- **E2 — CLI approval-timeout knob**: the terminal park-and-exit arm is
+  hardwired to 300s (`DEFAULT_TERMINAL_APPROVAL_TIMEOUT`), unreachable in a
+  <2-min suite. Options: (i) small config/flag knob (recommended — also
+  user-useful), or (ii) scenario 2 uses SIGINT-park and the timeout arm stays
+  unit-covered only (recorded gap under E3).
+- **E3 — accepted gaps**: the list in §5 "Recorded gaps".
+- **E4 — de-stale the auto-drive-tauri skill** (normative doc, separate
+  pass with its own review per AGENTS.md).
 
 ## Panel & review log
 
-_(pending)_
+**2026-07-10 — adversarial spec panel (4 reviewers: requirements,
+assumptions, failure/abuse, scope/simpler-design). All four: REWORK.
+Synthesis applied as rev 2.**
+
+**Blockers/majors fixed in place:**
+- False §2.1 premise (WS `daemon::serve` removed in `7245526`) — all four
+  reviewers; §2 rewritten around in-process `Session` + `EventOut`; scenarios
+  20/21/old-#20 re-expressed; verified against live source by the
+  orchestrator before rework.
+- HMAC-secret isolation contradiction — rewritten as §2.3 + escalation E1.
+- Park-and-exit 300s hardwired — scenario 2 now gated on E2.
+- No daemon-side real kill in-process — harness bin added (§2.2 item 3);
+  [real-kill] markers added; descope loophole closed (§2.4).
+- Stale-binary misleading green — §2.2.5 freshness rule.
+- Stub-desync/stdin discipline — §2.2 items 1–2; watchdog/orphan-process
+  discipline — §2.4.
+- Forging-helper hygiene + Tier 2 real-state pollution — §2.2 item 4, §3.
+- Nondeterministic races — §5c reworked to directed loser-paths + one
+  symmetric-postcondition race.
+- Missing scenarios added: config/protocol divergence (#7), ApproveAlways
+  downgrade (#8), input-while-parked (#9), park-write failure (#13),
+  hostile-content feedback (in #3), real-GUI cross-surface switch (T2.3).
+- Duplicate coverage cut/merged: old #13, #20 cut; #14/15/16 → #18;
+  #4+#22 → #4 soak; #12, #18 trimmed to their e2e deltas.
+- wiremock-vs-axum conflict resolved: wiremock default; raw-socket helper
+  only for mid-stream drop (which wiremock cannot express).
+- testkit lifting over copying (§2.2 item 4); budget enforcement (§4).
+
+**Escalated to the gate:** E1, E2, E3, E4 (§9).
+
+**Minors accepted as residual:** epoch-classification assertion depends on
+plan-time verification of the ownership mechanism (#12); error-substring
+choices deferred to implementation under §2.4's style rule; Tier 2 config
+injection unresolved until plan (§8).
