@@ -67,17 +67,6 @@ fn entropy(buf: &mut [u8]) {
     }
 }
 
-/// Not yet called within this task (Task 2/3 construct `SessionDescriptor`
-/// values and will stamp `created_ms` from this); kept here per the brief's
-/// exact interface so those tasks don't need to add it later.
-#[allow(dead_code)]
-fn epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 /// $HOME/.rusty-agent (the 4A-0 metadata root).
 pub fn metadata_root() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("HOME")?).join(".rusty-agent"))

@@ -248,7 +248,7 @@ async fn main() {
     let compact_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let todos: agent_core::TodoHandle = Arc::new(std::sync::Mutex::new(Vec::new()));
     // Session-lifetime observability handles: created ONCE (a per-assemble
-    // TraceWriter would mint a colliding {epoch}-{pid} session id).
+    // TraceWriter would interleave two writers into one file).
     let stats = Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default()));
     let session_id = agent_runtime_config::mint_session_id();
     if let Some(root) = agent_runtime_config::sessions_root(&rt) {

@@ -40,8 +40,7 @@ pub struct RuntimeState {
     /// change never orphans the plan from `write_todos` (spec §5.4/§5.6).
     todos: agent_core::TodoHandle,
     /// Session-stable observability handles. Created ONCE here and reused across
-    /// every loop rebuild — a per-rebuild TraceWriter would mint a colliding
-    /// `{epoch}-{pid}` session id and interleave two writers into one file.
+    /// every loop rebuild — a per-rebuild TraceWriter would interleave two writers into one file.
     stats: Arc<std::sync::RwLock<agent_core::SessionStats>>,
     trace: Option<Arc<agent_runtime_config::TraceWriter>>,
     /// Durable session identity (4B-0): minted once here, shared with the
