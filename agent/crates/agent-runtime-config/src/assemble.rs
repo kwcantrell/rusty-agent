@@ -704,7 +704,14 @@ mod tests {
         // With a trace writer → also assembles fine (tap constructed).
         let mut p = parts(dir.path().to_path_buf());
         let tdir = tempfile::tempdir().unwrap();
-        p.trace = Some(crate::trace::TraceWriter::create(tdir.path(), 1024 * 1024).unwrap());
+        p.trace = Some(
+            crate::trace::TraceWriter::create(
+                tdir.path(),
+                1024 * 1024,
+                crate::session_meta::mint_session_id(),
+            )
+            .unwrap(),
+        );
         let _ = assemble_loop(&cfg(), p);
     }
 

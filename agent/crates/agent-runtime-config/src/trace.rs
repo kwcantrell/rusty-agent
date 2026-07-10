@@ -30,14 +30,13 @@ impl TraceWriter {
         &self.session_id
     }
 
-    pub fn create(dir: &Path, max_mb: u64) -> Option<Arc<TraceWriter>> {
+    pub fn create(dir: &Path, max_mb: u64, session_id: String) -> Option<Arc<TraceWriter>> {
         if let Err(e) = fs::create_dir_all(dir) {
             tracing::warn!(target: "trace", error = %e, dir = %dir.display(),
                 "cannot create trace dir; session tracing disabled");
             return None;
         }
         prune_retention(dir, RETAIN_FILES - 1); // -1: our new file makes 50
-        let session_id = mint_session_id();
         let path = dir.join(format!("{session_id}.jsonl"));
         // Traces hold full conversation content: create new files 0600 so a
         // permissive umask can't leave them world-readable. Unix-only (mode has
@@ -159,13 +158,6 @@ fn write_disabled_marker(inner: &mut Inner, reason: &str, newline_first: bool) {
     let _ = w.flush();
 }
 
-fn mint_session_id() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("{secs}-{}", std::process::id())
-}
 fn epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -489,17 +481,12 @@ impl EventSink for ObservedSink {
 }
 
 /// Frontend helper: config → optional trace writer (None when disabled or dir unusable).
-pub fn build_trace(cfg: &crate::RuntimeConfig) -> Option<Arc<TraceWriter>> {
+pub fn build_trace(cfg: &crate::RuntimeConfig, session_id: &str) -> Option<Arc<TraceWriter>> {
     if !cfg.trace {
         return None;
     }
-    let dir = match &cfg.trace_dir {
-        Some(d) => std::path::PathBuf::from(d),
-        None => std::path::PathBuf::from(std::env::var_os("HOME")?)
-            .join(".rusty-agent")
-            .join("sessions"),
-    };
-    TraceWriter::create(&dir, cfg.trace_max_mb)
+    let dir = crate::session_meta::sessions_root(cfg)?;
+    TraceWriter::create(&dir, cfg.trace_max_mb, session_id.to_string())
 }
 
 #[cfg(test)]
@@ -525,7 +512,8 @@ mod tests {
     #[test]
     fn trace_parent_id_skipped_when_none_present_when_some() {
         let dir = tempfile::tempdir().unwrap();
-        let w = TraceWriter::create(dir.path(), 64).unwrap();
+        let w =
+            TraceWriter::create(dir.path(), 64, crate::session_meta::mint_session_id()).unwrap();
         w.record(&agent_core::AgentEvent::ToolStart {
             id: "a".into(),
             name: "t".into(),
@@ -549,7 +537,12 @@ mod tests {
     #[test]
     fn record_child_lines_carry_sub_ordinal_and_normal_lines_do_not() {
         let dir = tempfile::tempdir().unwrap();
-        let w = TraceWriter::create(dir.path(), 1024 * 1024).unwrap();
+        let w = TraceWriter::create(
+            dir.path(),
+            1024 * 1024,
+            crate::session_meta::mint_session_id(),
+        )
+        .unwrap();
         w.record(&agent_core::AgentEvent::Token("parent".into()));
         w.record_child(3, "d1", &agent_core::AgentEvent::Token("child".into()));
         w.record(&AgentEvent::Done(agent_model::StopReason::Stop)); // flushes the BufWriter
@@ -570,7 +563,12 @@ mod tests {
     fn subagent_lifecycle_traced_and_deltas_skipped() {
         use agent_core::{SubagentEvent, SubagentOutcome};
         let dir = tempfile::tempdir().unwrap();
-        let writer = TraceWriter::create(dir.path(), 1024 * 1024).unwrap();
+        let writer = TraceWriter::create(
+            dir.path(),
+            1024 * 1024,
+            crate::session_meta::mint_session_id(),
+        )
+        .unwrap();
         writer.record(&AgentEvent::Subagent(SubagentEvent::Start {
             id: "c1".into(),
             subagent_type: "researcher".into(),
@@ -622,7 +620,12 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let writer = TraceWriter::create(dir.path(), 1024 * 1024).unwrap();
+        let writer = TraceWriter::create(
+            dir.path(),
+            1024 * 1024,
+            crate::session_meta::mint_session_id(),
+        )
+        .unwrap();
         let observed = Arc::new(ObservedSink {
             inner: Arc::new(NullSink),
             stats: Arc::new(RwLock::new(SessionStats::default())),
@@ -656,7 +659,8 @@ mod tests {
     #[test]
     fn run_start_record_carries_input_and_system() {
         let dir = tempfile::tempdir().unwrap();
-        let t = TraceWriter::create(dir.path(), 64).unwrap();
+        let t =
+            TraceWriter::create(dir.path(), 64, crate::session_meta::mint_session_id()).unwrap();
         t.record(&AgentEvent::RunStart {
             input: "fix the bug".into(),
             system: Some("SYSTEM PROMPT".into()),
@@ -674,7 +678,8 @@ mod tests {
     #[test]
     fn child_run_start_joins_via_parent_id() {
         let dir = tempfile::tempdir().unwrap();
-        let t = TraceWriter::create(dir.path(), 64).unwrap();
+        let t =
+            TraceWriter::create(dir.path(), 64, crate::session_meta::mint_session_id()).unwrap();
         t.record_child(
             2,
             "call-7",
@@ -696,7 +701,8 @@ mod tests {
     #[test]
     fn trace_writes_parseable_jsonl_with_header() {
         let dir = tempfile::tempdir().unwrap();
-        let w = TraceWriter::create(dir.path(), 64).unwrap();
+        let w =
+            TraceWriter::create(dir.path(), 64, crate::session_meta::mint_session_id()).unwrap();
         w.record(&ev_ok());
         w.record(&AgentEvent::Done(agent_model::StopReason::Stop)); // Done flushes
         let path = dir.path().join(format!("{}.jsonl", w.session_id()));
@@ -716,7 +722,7 @@ mod tests {
     #[test]
     fn trace_respects_size_cap() {
         let dir = tempfile::tempdir().unwrap();
-        let w = TraceWriter::create(dir.path(), 0).unwrap(); // 0 MB => cap hit immediately
+        let w = TraceWriter::create(dir.path(), 0, crate::session_meta::mint_session_id()).unwrap(); // 0 MB => cap hit immediately
         w.record(&ev_ok());
         w.record(&AgentEvent::Done(agent_model::StopReason::Stop));
         let path = dir.path().join(format!("{}.jsonl", w.session_id()));
@@ -735,7 +741,8 @@ mod tests {
         for i in 0..60 {
             std::fs::write(dir.path().join(format!("{:010}-1.jsonl", i)), "x").unwrap();
         }
-        let _w = TraceWriter::create(dir.path(), 64).unwrap();
+        let _w =
+            TraceWriter::create(dir.path(), 64, crate::session_meta::mint_session_id()).unwrap();
         let count = std::fs::read_dir(dir.path()).unwrap().count();
         assert!(count <= 50, "expected <=50 files after prune, got {count}");
     }
@@ -745,7 +752,8 @@ mod tests {
     fn trace_file_is_created_0600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let w = TraceWriter::create(dir.path(), 64).unwrap();
+        let w =
+            TraceWriter::create(dir.path(), 64, crate::session_meta::mint_session_id()).unwrap();
         let path = dir.path().join(format!("{}.jsonl", w.session_id()));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "trace file must be owner-only");
@@ -754,7 +762,7 @@ mod tests {
     #[test]
     fn cap_breach_writes_terminal_trace_disabled_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let t = TraceWriter::create(dir.path(), 1).unwrap(); // 1 MB cap
+        let t = TraceWriter::create(dir.path(), 1, crate::session_meta::mint_session_id()).unwrap(); // 1 MB cap
         let big = "x".repeat(64 * 1024);
         for _ in 0..20 {
             // 20 × 64KB ≈ 1.25MB — guaranteed breach
@@ -816,6 +824,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("blocked");
         std::fs::write(&blocker, "not a dir").unwrap();
-        assert!(TraceWriter::create(&blocker, 64).is_none()); // None, no panic
+        assert!(
+            TraceWriter::create(&blocker, 64, crate::session_meta::mint_session_id()).is_none()
+        ); // None, no panic
+    }
+
+    #[test]
+    fn trace_filename_is_flat_session_id_jsonl_beside_descriptor_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = TraceWriter::create(dir.path(), 10, "123-cafebabe".into()).unwrap();
+        assert_eq!(t.session_id(), "123-cafebabe");
+        // flat file, NOT inside the per-session dir (spec §3.6: trace
+        // naming/shape unchanged; descriptor dirs sit beside it)
+        assert!(dir.path().join("123-cafebabe.jsonl").is_file());
+        assert!(!dir
+            .path()
+            .join("123-cafebabe")
+            .join("123-cafebabe.jsonl")
+            .exists());
     }
 }

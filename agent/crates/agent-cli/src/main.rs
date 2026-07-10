@@ -250,7 +250,8 @@ async fn main() {
     // Session-lifetime observability handles: created ONCE (a per-assemble
     // TraceWriter would mint a colliding {epoch}-{pid} session id).
     let stats = Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default()));
-    let trace = agent_runtime_config::build_trace(&rt);
+    let session_id = agent_runtime_config::mint_session_id();
+    let trace = agent_runtime_config::build_trace(&rt, &session_id);
     if let Some(t) = &trace {
         let dir = rt.trace_dir.as_deref().unwrap_or("~/.rusty-agent/sessions");
         eprintln!("\x1b[2mtrace: {}/{}.jsonl\x1b[0m", dir, t.session_id());

@@ -73,7 +73,8 @@ impl RuntimeState {
         let compact_flag = Arc::new(AtomicBool::new(false));
         let todos: agent_core::TodoHandle = Arc::new(Mutex::new(Vec::new()));
         let stats: Arc<std::sync::RwLock<agent_core::SessionStats>> = Arc::default();
-        let trace = agent_runtime_config::build_trace(&config);
+        let session_id = agent_runtime_config::mint_session_id();
+        let trace = agent_runtime_config::build_trace(&config, &session_id);
         let persisted_file = Mutex::new(std::fs::read_to_string(&config_path).ok());
         let built = build_loop(
             &config,
