@@ -80,7 +80,20 @@ impl Backend for HostBackend {
                 .await
                 .map_err(|e| FsError::Io(e.to_string()))?;
         }
-        tokio::fs::write(&full, content)
+        // Atomic replace: same-dir temp + rename, so readers see old or new
+        // complete content, never a truncated file (spec §2.4 atomic writes).
+        let tmp = full.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        tokio::fs::write(&tmp, content)
+            .await
+            .map_err(|e| FsError::Io(e.to_string()))?;
+        tokio::fs::rename(&tmp, &full)
             .await
             .map_err(|e| FsError::Io(e.to_string()))
     }
@@ -193,5 +206,26 @@ mod tests {
         let hits = b.grep("needle", None).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "real.txt");
+    }
+
+    #[tokio::test]
+    async fn write_is_atomic_no_torn_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let be = std::sync::Arc::new(HostBackend::new(tmp.path().to_path_buf()));
+        be.write("f.txt", &"A".repeat(1 << 20)).await.unwrap();
+        let w = {
+            let be = be.clone();
+            tokio::spawn(async move {
+                for _ in 0..50 {
+                    be.write("f.txt", &"B".repeat(1 << 20)).await.unwrap();
+                }
+            })
+        };
+        for _ in 0..200 {
+            let s = be.read("f.txt").await.unwrap();
+            // Old or new complete content only — never empty/partial.
+            assert!(s.len() == 1 << 20, "torn read: len {}", s.len());
+        }
+        w.await.unwrap();
     }
 }
