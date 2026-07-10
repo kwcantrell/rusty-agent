@@ -297,47 +297,6 @@ pub trait Middleware: Send + Sync {
     }
 }
 
-/// Memory: ships the frontend-built memory tools (child-visible) and injects
-/// auto-recall at run start (spec §5.5). Retriever None ⇒ tools only, no
-/// set_recall call — matching today's cfg.memory-without-retriever gating.
-pub struct MemoryRecallMiddleware {
-    tools: Vec<Arc<dyn agent_tools::Tool>>,
-    retriever: Option<Arc<dyn crate::Retriever>>,
-}
-
-impl MemoryRecallMiddleware {
-    pub fn new(
-        tools: Vec<Arc<dyn agent_tools::Tool>>,
-        retriever: Option<Arc<dyn crate::Retriever>>,
-    ) -> Self {
-        Self { tools, retriever }
-    }
-}
-
-#[async_trait]
-impl Middleware for MemoryRecallMiddleware {
-    fn name(&self) -> &str {
-        "memory-recall"
-    }
-    fn tools(&self) -> Vec<ToolContribution> {
-        self.tools
-            .iter()
-            .map(|t| ToolContribution {
-                tool: t.clone(),
-                child_visible: true,
-            })
-            .collect()
-    }
-    async fn on_run_start(&self, cx: &mut RunCx<'_>, input: &str) -> Flow {
-        if let Some(r) = &self.retriever {
-            // Unconditional when a retriever exists: empty retrieval clears
-            // the prior run's block (loop_.rs spec §2 / audit Spine B #4).
-            cx.ctx.set_recall(r.retrieve(input).await);
-        }
-        Flow::Continue
-    }
-}
-
 /// Scheduled context curation: loop-bottom maintain each tool turn, plus the
 /// text-only-exit maintain when no tool turn ran (spec §5.5). Ships the
 /// context tools (child-invisible; children get per-dispatch instances).

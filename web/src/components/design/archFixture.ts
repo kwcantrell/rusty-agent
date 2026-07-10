@@ -6,7 +6,7 @@ export const archFixture: ArchitectureSnapshot = {
     enable_thinking: true, preserve_thinking: true },
   tools: [
     { name: "render", summary: "Render an artifact", kind: "builtin" },
-    { name: "remember", summary: "Store a memory", kind: "memory" },
+    { name: "use_skill", summary: "Load a skill", kind: "skills" },
     { name: "grep", summary: "Search file contents", kind: "builtin" },
   ],
   policy: { allowlist: ["ls"], denylist: ["rm -rf /"], hard_floor: ["rm -rf /"], http_allow_hosts: [] },

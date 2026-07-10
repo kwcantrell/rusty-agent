@@ -2,7 +2,7 @@ export type BlockId = "model" | "loop" | "tools" | "policy" | "sandbox" | "conte
 
 export interface ToolEntry {
   name: string; summary: string;
-  kind: "builtin" | "mcp" | "memory" | "skills" | "context";
+  kind: "builtin" | "mcp" | "skills" | "context";
 }
 
 export interface ArchitectureSnapshot {

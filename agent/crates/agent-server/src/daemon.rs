@@ -1,4 +1,3 @@
-use agent_core::Retriever;
 use agent_runtime_config::RuntimeConfig;
 use agent_tools::Tool;
 use std::path::PathBuf;
@@ -14,10 +13,6 @@ pub struct DaemonParams {
     pub workspace: PathBuf,
     pub system_prompt: String,
     pub mcp_tools: Arc<[Arc<dyn Tool>]>,
-    pub memory_tools: Arc<[Arc<dyn Tool>]>,
-    pub memory_retriever: Option<Arc<dyn Retriever>>,
-    pub recall_token_budget: usize,
-    pub memory_parts: Option<agent_memory::MemoryParts>,
 }
 
 /// Re-export of the shared role prompt — single source of truth lives in

@@ -19,8 +19,8 @@ impl Tool for GrepTool {
     }
     fn when_not_to_call(&self) -> Option<&str> {
         Some(
-            "Not for semantic search of saved memories — use recall. Use grep to \
-             search current file contents, including offloaded tool results.",
+            "Use grep to search current file contents, including offloaded tool \
+             results under large_tool_results/.",
         )
     }
     fn schema(&self) -> ToolSchema {

@@ -2,8 +2,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// Stable per-project key: SHA256 hex of the git toplevel (stable across
-/// subdirs), else the canonicalized workspace root. Byte-identical to the
-/// hash scheme in `agent-memory::scope::project_scope` (spec §3 invariant 7).
+/// subdirs), else the canonicalized workspace root (spec §3 invariant 7).
 pub fn project_key(workspace: &Path) -> String {
     let canonical = workspace
         .canonicalize()

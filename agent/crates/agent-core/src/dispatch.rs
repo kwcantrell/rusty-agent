@@ -2016,7 +2016,7 @@ mod tests {
     // --- Task 7: child-stack invariant pin -----------------------------------
 
     /// A trivial memory-shaped tool: exercises "memory tools present in
-    /// base_tools" without any real agent-memory coupling. Named `remember`
+    /// base_tools" without any real memory-crate coupling. Named `remember`
     /// so it reads unambiguously as a memory tool in the captured schema list.
     struct RememberStub;
     #[async_trait::async_trait]

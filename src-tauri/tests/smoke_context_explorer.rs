@@ -7,8 +7,7 @@
 //!      the breakdown bar reconciles against — this was the Critical bug: it used to
 //!      be dropped, so the UI only ever saw the estimate);
 //!   3. `context_get` returns a populated snapshot (system + messages segments);
-//!   4. `skill_save` → `skill_get` round-trips under the writable root;
-//!   5. `memory_list` responds without error.
+//!   4. `skill_save` → `skill_get` round-trips under the writable root.
 //!
 //! Run: `cd src-tauri && cargo test --test smoke_context_explorer -- --ignored --nocapture`
 //! Requires `curl localhost:8080/health` == {"status":"ok"}.
@@ -130,10 +129,6 @@ async fn context_explorer_live_smoke() {
     assert_eq!(got.name, "smoke-skill");
     assert!(got.body.contains("Smoke body"), "skill body not persisted: {:?}", got.body);
     println!("[smoke] skill round-trip ok · {} -> {:?}", got.name, got.body);
-
-    // --- Assertion 5: memory_list responds (empty is fine when memory is disabled) ---
-    let mem = session.memory_list(10, 0).await.expect("memory_list ok");
-    println!("[smoke] memory_list ok · {} rows", mem.len());
 
     println!("[smoke] ALL CONTEXT-EXPLORER SMOKE CHECKS PASSED");
 }

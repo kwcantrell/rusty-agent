@@ -23,7 +23,6 @@ pub mod eval;
 
 use agent_http::{FetchUrl, NetworkPolicy};
 use agent_mcp::McpServersConfig;
-use agent_memory::{build_tools, build_tools_and_retriever, MemoryConfig};
 use agent_model::{
     ClaudeCliClient, ClaudeCliOptions, ModelClient, NativeProtocol, OpenAiCompatClient,
     PromptedJsonProtocol, ToolCallProtocol,
@@ -163,80 +162,6 @@ pub fn build_skills(
         Arc::new(CreateSkill::new(registry.clone())),
     ];
     (registry, tools)
-}
-
-/// Build the three memory tools, or an empty vec when disabled or when construction fails
-/// (model unavailable, DB unopenable). Memory is best-effort: failure disables it, never aborts.
-pub fn build_memory(
-    enabled: bool,
-    db_path: Option<PathBuf>,
-    model_dir: Option<PathBuf>,
-    workspace: &Path,
-) -> Vec<Arc<dyn Tool>> {
-    if !enabled {
-        return Vec::new();
-    }
-    let mut cfg = MemoryConfig::default();
-    if let Some(p) = db_path {
-        cfg.db_path = p;
-    }
-    cfg.model_cache_dir = model_dir;
-    match build_tools(cfg, workspace) {
-        Ok(tools) => tools,
-        Err(e) => {
-            tracing::warn!(target: "memory", "disabled: {e}");
-            Vec::new()
-        }
-    }
-}
-
-/// Result of building memory with auto-retrieval: the tools to register, an
-/// optional retriever to attach to the loop, and the recall-block token budget.
-pub struct MemoryBuild {
-    pub tools: Vec<Arc<dyn Tool>>,
-    pub retriever: Option<Arc<dyn agent_core::Retriever>>,
-    pub recall_token_budget: usize,
-}
-
-/// Build memory tools AND an auto-retrieval retriever sharing the same store/embedder.
-/// Disabled, `auto_recall = false`, or a build failure all yield `retriever: None`
-/// (memory is best-effort — never fatal). `recall_token_budget` always reflects config.
-pub fn build_memory_full(
-    enabled: bool,
-    db_path: Option<PathBuf>,
-    model_dir: Option<PathBuf>,
-    workspace: &Path,
-) -> MemoryBuild {
-    let mut cfg = MemoryConfig::default();
-    if let Some(p) = db_path {
-        cfg.db_path = p;
-    }
-    cfg.model_cache_dir = model_dir;
-    let recall_token_budget = cfg.recall_token_budget;
-    let auto_recall = cfg.auto_recall;
-
-    if !enabled {
-        return MemoryBuild {
-            tools: Vec::new(),
-            retriever: None,
-            recall_token_budget,
-        };
-    }
-    match build_tools_and_retriever(cfg, workspace) {
-        Ok((tools, retriever)) => MemoryBuild {
-            tools,
-            retriever: if auto_recall { Some(retriever) } else { None },
-            recall_token_budget,
-        },
-        Err(e) => {
-            tracing::warn!(target: "memory", "disabled: {e}");
-            MemoryBuild {
-                tools: Vec::new(),
-                retriever: None,
-                recall_token_budget,
-            }
-        }
-    }
 }
 
 /// Project-scope memory store root: <memories_dir>/projects/<project_key>.
@@ -535,33 +460,6 @@ mod tests {
     }
 
     #[test]
-    fn build_memory_disabled_returns_no_tools() {
-        let tools = build_memory(false, None, None, std::path::Path::new("/tmp/ws"));
-        assert!(tools.is_empty());
-    }
-
-    #[test]
-    #[ignore = "constructs the real embedding model (network/model download)"]
-    fn build_memory_enabled_returns_three_tools() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("memory.db");
-        let cache = tmp.path().join("models");
-        let tools = build_memory(true, Some(db), Some(cache), tmp.path());
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        for n in ["remember", "recall", "forget"] {
-            assert!(names.contains(&n), "missing {n}");
-        }
-    }
-
-    #[test]
-    fn build_memory_full_disabled_has_no_retriever() {
-        let mb = build_memory_full(false, None, None, std::path::Path::new("/tmp/ws"));
-        assert!(mb.tools.is_empty());
-        assert!(mb.retriever.is_none());
-        assert_eq!(mb.recall_token_budget, 512);
-    }
-
-    #[test]
     fn resolve_sandbox_image_falls_back_only_for_missing_default() {
         use crate::runtime_config::{DEFAULT_SANDBOX_IMAGE, FALLBACK_SANDBOX_IMAGE};
         // default + definitely missing (image_missing=true) → fallback
@@ -589,16 +487,6 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "constructs the real embedding model (network/model download)"]
-    fn build_memory_full_enabled_has_retriever_and_tools() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("memory.db");
-        let mb = build_memory_full(true, Some(db), None, tmp.path());
-        assert_eq!(mb.tools.len(), 3);
-        assert!(mb.retriever.is_some());
-    }
-
     /// Spec 3B-1c §2.4: permission floors key on `intent.tool`; every registered
     /// tool must author it equal to its registry name or a configured floor
     /// silently misses. (MCP tools pin this in agent-mcp: `tool: self.namespaced`.)
@@ -611,13 +499,7 @@ mod tests {
     /// namespaced convention. `dispatch_agent` needs a full `DispatchDeps` and
     /// is instead covered by
     /// `agent_core::dispatch::tests::dispatch_agent_intent_name_matches_registry_name`
-    /// in agent-core. The 3 memory tools (`remember`/`recall`/`forget`,
-    /// `agent_memory::build_tools`) need a real embedding model/DB to
-    /// construct (see the `#[ignore]`d `build_memory_enabled_returns_three_tools`
-    /// test above) and are NOT construction-covered here — verified
-    /// conformant at source (`agent-memory`'s tool `intent()` impls each set
-    /// `tool:` to their own registry name) but recorded as a gap rather than
-    /// silently assumed.
+    /// in agent-core.
     #[test]
     fn tool_intent_names_match_registry_names() {
         let mut reg = build_registry(&[], 65_536);

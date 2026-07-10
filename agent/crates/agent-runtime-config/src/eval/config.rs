@@ -2,7 +2,8 @@ use agent_core::OffloadConfig;
 use serde::{Deserialize, Serialize};
 
 /// A full set of context-management knobs across BOTH curation surfaces — in-window
-/// curation (`agent-core`) and long-term memory (`agent-memory`) — that one eval run
+/// curation (`agent-core`) and long-term memory (retired vector store; fields below
+/// are dead pending the eval harness's file-based-memory rework) — that one eval run
 /// is driven under. Tier-A optimization edits these fields; no rebuild required.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateConfig {

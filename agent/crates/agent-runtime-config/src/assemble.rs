@@ -729,6 +729,31 @@ mod tests {
         );
     }
 
+    /// Permanent guard (4A-1 B2): the retired vector-memory tools must never
+    /// reappear in either the parent registry or the child dispatch-base
+    /// snapshot, even with `cfg.memory = true` (the file-based replacement
+    /// ships no tools of its own — it only renders `index.md` into the
+    /// pinned memory block).
+    #[test]
+    fn memory_tools_absent_from_registry_and_child_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.memory = true;
+        let built = assemble_loop(&c, parts(dir.path().to_path_buf()));
+        let base = built.dispatch_base_names.expect("subagents on by default");
+        for n in ["remember", "recall", "forget"] {
+            assert!(
+                !built.registered_names.iter().any(|x| x == n),
+                "{n} must not be registered: {:?}",
+                built.registered_names
+            );
+            assert!(
+                !base.iter().any(|x| x == n),
+                "{n} must not be in the child dispatch base: {base:?}"
+            );
+        }
+    }
+
     #[test]
     fn memory_off_pinned_assembly_byte_identical() {
         // cfg.memory=false: nothing on the pinned-assembly path changed. The
@@ -1010,8 +1035,7 @@ mod tests {
     #[test]
     fn every_required_param_is_described_in_the_assembled_registry() {
         let dir = tempfile::tempdir().unwrap();
-        // Default config (memory off): base + context + skill tools are real; the
-        // runtime-injected `recall` is intentionally absent (enforced in agent-memory).
+        // Default config (memory off): base + context + skill tools are real.
         let built = assemble_loop(&cfg(), parts(dir.path().to_path_buf()));
         for s in &built.schemas {
             let missing = agent_tools::required_params_missing_description(s);
@@ -1052,10 +1076,10 @@ mod tests {
             }
         }
 
-        // Coverage ratchet: the ONLY confusable tool absent from this assembly is
-        // `recall` (runtime-injected, enforced in agent-memory). If a future
-        // confusable tool becomes invisible here without separate coverage, this
-        // fails and forces a decision.
+        // Coverage ratchet: every confusable tool must be present in this
+        // assembly (memory=false doesn't hide any of them post-vector-fork).
+        // If a future confusable tool becomes invisible here without separate
+        // coverage, this fails and forces a decision.
         let absent: HashSet<&str> = agent_tools::CONFUSABLE_TOOLS
             .iter()
             .copied()
@@ -1063,7 +1087,7 @@ mod tests {
             .collect();
         assert_eq!(
             absent,
-            HashSet::from(["recall"]),
+            HashSet::new(),
             "unexpected confusable tools missing from the assembled registry: {absent:?}"
         );
     }

@@ -12,7 +12,6 @@ The agent core. One of two Cargo workspaces in this repo (the other is
 | `agent-tools` | shared tool vocabulary and the `Tool` trait |
 | `agent-http` | outbound HTTP fetch tool; gates egress in-tool |
 | `agent-mcp` | MCP client — connect to external MCP servers |
-| `agent-memory` | long-term semantic memory (remember/recall/forget over a local vector store) |
 | `agent-policy` | permission policy engine + approval channel |
 | `agent-sandbox` | sandboxed tool/command execution |
 | `agent-skills` | discover, load-on-demand, author, preload markdown skills |
