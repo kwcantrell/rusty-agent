@@ -731,7 +731,31 @@ impl AgentLoop {
         // claude_cli inline). Plain config still controls the tool-less case.
         let preserve_thinking = self.config.preserve_thinking || !self.tools.schemas().is_empty();
 
-        for turn in 0..self.config.max_turns {
+        self.turn_loop(
+            ctx,
+            &mut mw_state,
+            &run_shared,
+            cancel,
+            0,
+            preserve_thinking,
+        )
+        .await
+    }
+
+    /// The per-turn model→tool loop plus the budget wrap-up epilogue — moved
+    /// verbatim from `run_with_cancel`. `run_with_cancel` is now prologue +
+    /// `turn_loop(.., 0, ..)`; Task 8 re-enters here with a non-zero start.
+    #[allow(clippy::too_many_arguments)]
+    async fn turn_loop(
+        &self,
+        ctx: &mut dyn ContextManager,
+        mw_state: &mut crate::RunState,
+        run_shared: &crate::RunShared,
+        cancel: CancellationToken,
+        start_turn: usize,
+        preserve_thinking: bool,
+    ) -> Result<(), AgentError> {
+        for turn in start_turn..self.config.max_turns {
             if cancel.is_cancelled() {
                 self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
                 return Ok(());
@@ -770,7 +794,7 @@ impl AgentLoop {
                     loop_: self,
                     chain: &self.middleware,
                     cancel: &cancel,
-                    shared: &run_shared,
+                    shared: run_shared,
                 }
                 .run(base.clone())
                 .await;
@@ -863,8 +887,8 @@ impl AgentLoop {
                     match self
                         .fire_on_parse_failure(
                             ctx,
-                            &mut mw_state,
-                            &run_shared,
+                            &mut *mw_state,
+                            run_shared,
                             &cancel,
                             turn,
                             &assistant,
@@ -916,7 +940,7 @@ impl AgentLoop {
                     .collect(),
             };
             let flow = self
-                .fire_after_model(ctx, &mut mw_state, &cancel, turn, &turn_view, &run_shared)
+                .fire_after_model(ctx, &mut *mw_state, &cancel, turn, &turn_view, run_shared)
                 .await;
             if let crate::Flow::EndRun(reason) = flow {
                 self.sink.emit(AgentEvent::Done(reason));
@@ -957,301 +981,40 @@ impl AgentLoop {
                 //
                 // Node hook: after_final_reply (spec §5.1) — text-only exit only
                 // (spec §6 J5); no Flow, the run is already ending.
-                self.fire_final_reply(ctx, &mut mw_state, &cancel, turn, &run_shared)
+                self.fire_final_reply(ctx, &mut *mw_state, &cancel, turn, run_shared)
                     .await;
 
                 self.sink.emit(AgentEvent::Done(assistant.stop));
                 return Ok(());
             }
 
-            // Phase 1 — gate every call sequentially (one approval prompt at a time).
-            let mut order: Vec<String> = Vec::with_capacity(all_calls.len());
-            let mut results: HashMap<String, (String, Resolved)> = HashMap::new();
-            let mut ready: Vec<ReadyCall> = Vec::new();
-            // Seed the unparseable calls first: each emits a ToolStart and joins the
-            // Phase-3 drain as a per-call ERROR result (the "re-emit only this call"
-            // prompt). N-1 good calls still gate + execute normally below.
-            for inv in &parsed.invalid {
-                self.sink.emit(AgentEvent::ToolStart {
-                    id: inv.id.clone(),
-                    name: inv.name.clone(),
-                    args: serde_json::json!({}),
-                    parent_id: None,
-                });
-                order.push(inv.id.clone());
-                results.insert(
-                    inv.id.clone(),
-                    (
-                        inv.name.clone(),
-                        Resolved::Err {
-                            status: ToolStatus::Error,
-                            content: format!(
-                                "ERROR: this tool call could not be parsed ({}); the other \
-                                 calls in this turn ran normally — re-emit only this call, \
-                                 with valid JSON arguments",
-                                inv.error
-                            ),
-                            duration_ms: 0,
-                        },
-                    ),
-                );
-            }
-            for call in parsed.tool_calls {
-                match self.gate_tool(call, &cancel).await {
-                    GateOutcome::Rejected { id, name, content } => {
-                        order.push(id.clone());
-                        results.insert(
-                            id,
-                            (
-                                name,
-                                Resolved::Err {
-                                    status: ToolStatus::Denied,
-                                    content,
-                                    duration_ms: 0,
-                                },
-                            ),
-                        );
-                    }
-                    GateOutcome::Ready(rc) => {
-                        order.push(rc.id.clone());
-                        ready.push(rc);
-                    }
-                }
-            }
-
-            // Phase 2 — execute approved calls concurrently, bounded. Each call is
-            // panic- and timeout-isolated (execute_isolated) so one bad tool can
-            // neither crash the loop nor wedge the batch.
-            let cap = if self.config.max_parallel_tools == 0 {
-                DEFAULT_MAX_PARALLEL_TOOLS
-            } else {
-                self.config.max_parallel_tools
-            };
-            let executed: Vec<(String, String, Executed, u64, Duration, agent_tools::Access)> =
-                futures::stream::iter(ready.into_iter().map(|rc| {
-                    let ReadyCall {
-                        tool,
-                        args,
-                        id,
-                        name,
-                        ctx,
-                        access,
-                    } = rc;
-                    // The effective per-call deadline (may be a tool's
-                    // timeout_override, not the loop default) — logged on timeout.
-                    let timeout = ctx.timeout;
-                    let middleware = &self.middleware;
-                    let shared = &run_shared;
-                    async move {
-                        let started = std::time::Instant::now();
-                        // The gate already ran (Phase 1); this call is the
-                        // already-approved ToolCall the wrap-tool chain sees.
-                        let call = ToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            args: args.clone(),
-                        };
-                        let ex = crate::ToolNext {
-                            tool,
-                            name: &name,
-                            tctx: &ctx,
-                            chain: middleware,
-                            call: &call,
-                            shared,
-                        }
-                        .run(args)
-                        .await;
-                        (
-                            id,
-                            name,
-                            ex,
-                            started.elapsed().as_millis() as u64,
-                            timeout,
-                            access,
-                        )
-                    }
-                }))
-                .buffer_unordered(cap)
-                .collect()
-                .await;
-            // A mutating turn is one where at least one Write/Destroy/TrustedWrite call ran to
-            // an Ok result. Read-only turns and turns whose only mutations failed
-            // do NOT trigger post-execution validation.
-            let turn_mutated = executed.iter().any(|(_, _, ex, _, _, access)| {
-                matches!(ex, Executed::Ok(_))
-                    && matches!(
-                        access,
-                        agent_tools::Access::Write
-                            | agent_tools::Access::Destroy
-                            | agent_tools::Access::TrustedWrite
-                    )
-            });
-            for (id, name, ex, duration_ms, timeout, _access) in executed {
-                let resolved = match ex {
-                    Executed::Ok(o) => Resolved::Ok(o, duration_ms),
-                    Executed::ToolErr(s) => Resolved::Err {
-                        status: ToolStatus::Error,
-                        content: s,
-                        duration_ms,
-                    },
-                    Executed::Panicked(s) => {
-                        tracing::error!(target: "loop", tool = %name,
-                            "tool panicked during parallel dispatch");
-                        self.sink.emit(AgentEvent::Error(s.clone()));
-                        Resolved::Err {
-                            status: ToolStatus::Panic,
-                            content: s,
-                            duration_ms,
-                        }
-                    }
-                    Executed::TimedOut(s) => {
-                        tracing::warn!(target: "loop", tool = %name,
-                            timeout = ?timeout,
-                            "tool timed out during parallel dispatch");
-                        self.sink.emit(AgentEvent::Error(s.clone()));
-                        Resolved::Err {
-                            status: ToolStatus::Timeout,
-                            content: s,
-                            duration_ms,
-                        }
-                    }
-                };
-                results.insert(id, (name, resolved));
-            }
-
-            // Phase 3 — append one tool message per call, in the model's call order.
-            for id in order {
-                // Normalization guarantees a slot per id; if that invariant is ever
-                // violated, drop the result rather than crash on untrusted input.
-                let (name, resolved) = match results.remove(&id) {
-                    Some(v) => v,
-                    // Unreachable while normalize_tool_call_ids and
-                    // normalize_invalid_ids hold. If a future change ever breaks
-                    // the one-slot-per-id invariant, emit an error
-                    // rather than silently drop the result and desync the transcript
-                    // (an assistant tool_call with no matching tool message).
-                    None => (
-                        String::new(),
-                        Resolved::Err {
-                            status: ToolStatus::Error,
-                            content: format!("ERROR: internal: no result for tool_call_id {id}"),
-                            duration_ms: 0,
-                        },
-                    ),
-                };
-                let content = match resolved {
-                    Resolved::Ok(output, duration_ms) => {
-                        self.sink.emit(AgentEvent::ToolResult {
-                            id: id.clone(),
-                            name: name.clone(),
-                            status: ToolStatus::Ok,
-                            output: output.clone(),
-                            duration_ms,
-                            parent_id: None,
-                        });
-                        output.content
-                    }
-                    Resolved::Err {
-                        status,
-                        content,
-                        duration_ms,
-                    } => {
-                        self.sink.emit(AgentEvent::ToolResult {
-                            id: id.clone(),
-                            name: name.clone(),
-                            status,
-                            output: agent_tools::ToolOutput {
-                                content: content.clone(),
-                                display: None,
-                            },
-                            duration_ms,
-                            parent_id: None,
-                        });
-                        content
-                    }
-                };
-                ctx.append(Message::tool(id, name, content));
-            }
-
-            // Post-execution validation: once per turn, only when a mutating call
-            // succeeded and validators are configured. Emits synthetic
-            // `post_tool_validate` tool events (reusing existing ToolStart/ToolResult
-            // wire kinds) and appends any failures as a single user message so the
-            // model sees them. Sits AFTER the Phase-3 tool results and BEFORE the
-            // stuck-nudge append (OpenAI-compat ordering: a user message must not
-            // land between the assistant tool_calls and its Role::Tool results).
-            if turn_mutated && !self.config.post_tool_validators.is_empty() {
-                let mut failures: Vec<String> = Vec::new();
-                for (n, command) in self.config.post_tool_validators.iter().enumerate() {
-                    let vid = format!("validate:{}:{}", turn + 1, n);
-                    self.sink.emit(AgentEvent::ToolStart {
-                        id: vid.clone(),
-                        name: "post_tool_validate".into(),
-                        args: serde_json::json!({ "command": command }),
-                        parent_id: None,
-                    });
-                    let started = std::time::Instant::now();
-                    let outcome = run_validator(
-                        &self.config.sandbox,
-                        &self.config.workspace,
-                        command,
-                        self.config.tool_timeout,
-                        &cancel,
-                    )
-                    .await;
-                    let (status, content) = match &outcome {
-                        ValidatorOutcome::Passed => {
-                            (ToolStatus::Ok, "validator passed".to_string())
-                        }
-                        ValidatorOutcome::Failed { code, output } => {
-                            failures.push(format!("$ {command}  (exit {code})\n{output}"));
-                            (ToolStatus::Error, format!("exit {code}\n{output}"))
-                        }
-                        ValidatorOutcome::Skipped { reason } => {
-                            (ToolStatus::Error, format!("validator skipped: {reason}"))
-                        }
-                    };
-                    self.sink.emit(AgentEvent::ToolResult {
-                        id: vid,
-                        name: "post_tool_validate".into(),
-                        status,
-                        output: agent_tools::ToolOutput {
-                            content,
-                            display: None,
-                        },
-                        duration_ms: started.elapsed().as_millis() as u64,
-                        parent_id: None,
-                    });
-                }
-                if !failures.is_empty() {
-                    ctx.append(Message::user(format!(
-                        "Post-edit validation reported problems. Fix these before continuing:\n\n{}",
-                        failures.join("\n\n")
-                    )));
-                }
-            }
-
-            // Node hook: after_tools (spec §5.1).
-            let flow = self
-                .fire_after_tools(ctx, &mut mw_state, &cancel, turn, &run_shared)
-                .await;
-            if let crate::Flow::EndRun(reason) = flow {
-                self.sink.emit(AgentEvent::Done(reason));
-                return Ok(());
-            }
-
-            // Scheduled loop-bottom maintain now lives in
-            // ContextCurationMiddleware::on_turn_end (spec §5.5), fired below;
-            // it also sets the Maintained run-state marker that gates the
-            // text-only-exit maintain in after_final_reply.
-            //
-            // Node hook: on_turn_end (spec §5.1).
-            let flow = self
-                .fire_turn_end(ctx, &mut mw_state, &cancel, turn, &run_shared)
-                .await;
-            if let crate::Flow::EndRun(reason) = flow {
-                self.sink.emit(AgentEvent::Done(reason));
-                return Ok(());
+            // (id, name, error) triples for the unparseable calls — re-seeded as
+            // per-call ERROR results inside tool_phase (Phase 1).
+            let invalid: Vec<crate::InvalidParked> = parsed
+                .invalid
+                .iter()
+                .map(|i| crate::InvalidParked {
+                    id: i.id.clone(),
+                    name: i.name.clone(),
+                    error: i.error.clone(),
+                })
+                .collect();
+            match self
+                .tool_phase(
+                    ctx,
+                    &mut *mw_state,
+                    run_shared,
+                    &cancel,
+                    turn,
+                    parsed.text.clone(),
+                    parsed.tool_calls,
+                    invalid,
+                    None,
+                )
+                .await
+            {
+                TurnFlow::Continue => {}
+                TurnFlow::End(r) => return r,
             }
         }
         // Budget exhausted with the model still tool-hungry (text-only replies
@@ -1310,6 +1073,364 @@ impl AgentLoop {
         Ok(())
     }
 
+    /// Phase 1 (gate) + Phase 2 (execute) + Phase 3 (drain) + post-tool
+    /// validators + after_tools/on_turn_end hooks — moved verbatim from the
+    /// turn loop. Task 7 parks inside Phase 1; Task 8 consumes `pre`.
+    #[allow(clippy::too_many_arguments)]
+    async fn tool_phase(
+        &self,
+        ctx: &mut dyn ContextManager,
+        mw_state: &mut crate::RunState,
+        run_shared: &crate::RunShared,
+        cancel: &CancellationToken,
+        turn: usize,
+        // The turn's model text (park record; Task 7). Unused this task.
+        assistant_text: String,
+        tool_calls: Vec<ToolCall>,
+        invalid: Vec<crate::InvalidParked>,
+        // Task 8; None in this task.
+        pre: Option<PreDecided>,
+    ) -> TurnFlow {
+        let _ = assistant_text;
+        debug_assert!(pre.is_none());
+        // Phase 1 — gate every call sequentially (one approval prompt at a time).
+        let mut order: Vec<String> = Vec::with_capacity(tool_calls.len() + invalid.len());
+        let mut results: HashMap<String, (String, Resolved)> = HashMap::new();
+        let mut ready: Vec<ReadyCall> = Vec::new();
+        // Seed the unparseable calls first: each emits a ToolStart and joins the
+        // Phase-3 drain as a per-call ERROR result (the "re-emit only this call"
+        // prompt). N-1 good calls still gate + execute normally below.
+        for inv in &invalid {
+            self.sink.emit(AgentEvent::ToolStart {
+                id: inv.id.clone(),
+                name: inv.name.clone(),
+                args: serde_json::json!({}),
+                parent_id: None,
+            });
+            order.push(inv.id.clone());
+            results.insert(
+                inv.id.clone(),
+                (
+                    inv.name.clone(),
+                    Resolved::Err {
+                        status: ToolStatus::Error,
+                        content: format!(
+                            "ERROR: this tool call could not be parsed ({}); the other \
+                                 calls in this turn ran normally — re-emit only this call, \
+                                 with valid JSON arguments",
+                            inv.error
+                        ),
+                        duration_ms: 0,
+                    },
+                ),
+            );
+        }
+        for call in tool_calls {
+            match self.gate_tool(call, cancel).await {
+                GateOutcome::Rejected { id, name, content } => {
+                    order.push(id.clone());
+                    results.insert(
+                        id,
+                        (
+                            name,
+                            Resolved::Err {
+                                status: ToolStatus::Denied,
+                                content,
+                                duration_ms: 0,
+                            },
+                        ),
+                    );
+                }
+                GateOutcome::Ready(rc) => {
+                    order.push(rc.id.clone());
+                    ready.push(rc);
+                }
+                GateOutcome::NeedsApproval(pa) => {
+                    let PendingAsk {
+                        tool,
+                        call,
+                        req,
+                        access,
+                    } = *pa;
+                    self.sink.emit(AgentEvent::Approval(req.clone()));
+                    // P2 deadline disarm: while this durable Ask waits,
+                    // every enclosing dispatch deadline is suspended.
+                    // RAII — deny/cancel/drop all unwind the count.
+                    let _ask_guard = self.checkpointer.as_ref().map(|ck| ck.enter_ask());
+                    // Race the approval wait against cancellation: Ctrl-C during a
+                    // pending prompt must end the run promptly rather than wedge until
+                    // the prompt is answered. Cancel-during-prompt counts as a deny.
+                    let allowed = tokio::select! {
+                        _ = cancel.cancelled() => false,
+                        resp = self.approval.request(req) => matches!(
+                            resp,
+                            ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
+                        ),
+                    };
+                    if allowed {
+                        let rc = self.ready_call(tool, call, access, cancel);
+                        order.push(rc.id.clone());
+                        ready.push(rc);
+                    } else {
+                        // Distinguish a cancel-driven denial (the run is ending) from
+                        // an explicit user "no" so the tool result reads correctly.
+                        let reason = if cancel.is_cancelled() {
+                            "run cancelled"
+                        } else {
+                            "user declined"
+                        };
+                        order.push(call.id.clone());
+                        results.insert(
+                            call.id,
+                            (
+                                call.name,
+                                Resolved::Err {
+                                    status: ToolStatus::Denied,
+                                    content: format!("ERROR: {}", ToolError::Denied(reason.into())),
+                                    duration_ms: 0,
+                                },
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Phase 2 — execute approved calls concurrently, bounded. Each call is
+        // panic- and timeout-isolated (execute_isolated) so one bad tool can
+        // neither crash the loop nor wedge the batch.
+        let cap = if self.config.max_parallel_tools == 0 {
+            DEFAULT_MAX_PARALLEL_TOOLS
+        } else {
+            self.config.max_parallel_tools
+        };
+        let executed: Vec<(String, String, Executed, u64, Duration, agent_tools::Access)> =
+            futures::stream::iter(ready.into_iter().map(|rc| {
+                let ReadyCall {
+                    tool,
+                    args,
+                    id,
+                    name,
+                    ctx,
+                    access,
+                } = rc;
+                // The effective per-call deadline (may be a tool's
+                // timeout_override, not the loop default) — logged on timeout.
+                let timeout = ctx.timeout;
+                let middleware = &self.middleware;
+                let shared = run_shared;
+                async move {
+                    let started = std::time::Instant::now();
+                    // The gate already ran (Phase 1); this call is the
+                    // already-approved ToolCall the wrap-tool chain sees.
+                    let call = ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
+                    };
+                    let ex = crate::ToolNext {
+                        tool,
+                        name: &name,
+                        tctx: &ctx,
+                        chain: middleware,
+                        call: &call,
+                        shared,
+                    }
+                    .run(args)
+                    .await;
+                    (
+                        id,
+                        name,
+                        ex,
+                        started.elapsed().as_millis() as u64,
+                        timeout,
+                        access,
+                    )
+                }
+            }))
+            .buffer_unordered(cap)
+            .collect()
+            .await;
+        // A mutating turn is one where at least one Write/Destroy/TrustedWrite call ran to
+        // an Ok result. Read-only turns and turns whose only mutations failed
+        // do NOT trigger post-execution validation.
+        let turn_mutated = executed.iter().any(|(_, _, ex, _, _, access)| {
+            matches!(ex, Executed::Ok(_))
+                && matches!(
+                    access,
+                    agent_tools::Access::Write
+                        | agent_tools::Access::Destroy
+                        | agent_tools::Access::TrustedWrite
+                )
+        });
+        for (id, name, ex, duration_ms, timeout, _access) in executed {
+            let resolved = match ex {
+                Executed::Ok(o) => Resolved::Ok(o, duration_ms),
+                Executed::ToolErr(s) => Resolved::Err {
+                    status: ToolStatus::Error,
+                    content: s,
+                    duration_ms,
+                },
+                Executed::Panicked(s) => {
+                    tracing::error!(target: "loop", tool = %name,
+                            "tool panicked during parallel dispatch");
+                    self.sink.emit(AgentEvent::Error(s.clone()));
+                    Resolved::Err {
+                        status: ToolStatus::Panic,
+                        content: s,
+                        duration_ms,
+                    }
+                }
+                Executed::TimedOut(s) => {
+                    tracing::warn!(target: "loop", tool = %name,
+                            timeout = ?timeout,
+                            "tool timed out during parallel dispatch");
+                    self.sink.emit(AgentEvent::Error(s.clone()));
+                    Resolved::Err {
+                        status: ToolStatus::Timeout,
+                        content: s,
+                        duration_ms,
+                    }
+                }
+            };
+            results.insert(id, (name, resolved));
+        }
+
+        // Phase 3 — append one tool message per call, in the model's call order.
+        for id in order {
+            // Normalization guarantees a slot per id; if that invariant is ever
+            // violated, drop the result rather than crash on untrusted input.
+            let (name, resolved) = match results.remove(&id) {
+                Some(v) => v,
+                // Unreachable while normalize_tool_call_ids and
+                // normalize_invalid_ids hold. If a future change ever breaks
+                // the one-slot-per-id invariant, emit an error
+                // rather than silently drop the result and desync the transcript
+                // (an assistant tool_call with no matching tool message).
+                None => (
+                    String::new(),
+                    Resolved::Err {
+                        status: ToolStatus::Error,
+                        content: format!("ERROR: internal: no result for tool_call_id {id}"),
+                        duration_ms: 0,
+                    },
+                ),
+            };
+            let content = match resolved {
+                Resolved::Ok(output, duration_ms) => {
+                    self.sink.emit(AgentEvent::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        status: ToolStatus::Ok,
+                        output: output.clone(),
+                        duration_ms,
+                        parent_id: None,
+                    });
+                    output.content
+                }
+                Resolved::Err {
+                    status,
+                    content,
+                    duration_ms,
+                } => {
+                    self.sink.emit(AgentEvent::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        status,
+                        output: agent_tools::ToolOutput {
+                            content: content.clone(),
+                            display: None,
+                        },
+                        duration_ms,
+                        parent_id: None,
+                    });
+                    content
+                }
+            };
+            ctx.append(Message::tool(id, name, content));
+        }
+
+        // Post-execution validation: once per turn, only when a mutating call
+        // succeeded and validators are configured. Emits synthetic
+        // `post_tool_validate` tool events (reusing existing ToolStart/ToolResult
+        // wire kinds) and appends any failures as a single user message so the
+        // model sees them. Sits AFTER the Phase-3 tool results and BEFORE the
+        // stuck-nudge append (OpenAI-compat ordering: a user message must not
+        // land between the assistant tool_calls and its Role::Tool results).
+        if turn_mutated && !self.config.post_tool_validators.is_empty() {
+            let mut failures: Vec<String> = Vec::new();
+            for (n, command) in self.config.post_tool_validators.iter().enumerate() {
+                let vid = format!("validate:{}:{}", turn + 1, n);
+                self.sink.emit(AgentEvent::ToolStart {
+                    id: vid.clone(),
+                    name: "post_tool_validate".into(),
+                    args: serde_json::json!({ "command": command }),
+                    parent_id: None,
+                });
+                let started = std::time::Instant::now();
+                let outcome = run_validator(
+                    &self.config.sandbox,
+                    &self.config.workspace,
+                    command,
+                    self.config.tool_timeout,
+                    cancel,
+                )
+                .await;
+                let (status, content) = match &outcome {
+                    ValidatorOutcome::Passed => (ToolStatus::Ok, "validator passed".to_string()),
+                    ValidatorOutcome::Failed { code, output } => {
+                        failures.push(format!("$ {command}  (exit {code})\n{output}"));
+                        (ToolStatus::Error, format!("exit {code}\n{output}"))
+                    }
+                    ValidatorOutcome::Skipped { reason } => {
+                        (ToolStatus::Error, format!("validator skipped: {reason}"))
+                    }
+                };
+                self.sink.emit(AgentEvent::ToolResult {
+                    id: vid,
+                    name: "post_tool_validate".into(),
+                    status,
+                    output: agent_tools::ToolOutput {
+                        content,
+                        display: None,
+                    },
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    parent_id: None,
+                });
+            }
+            if !failures.is_empty() {
+                ctx.append(Message::user(format!(
+                    "Post-edit validation reported problems. Fix these before continuing:\n\n{}",
+                    failures.join("\n\n")
+                )));
+            }
+        }
+
+        // Node hook: after_tools (spec §5.1).
+        let flow = self
+            .fire_after_tools(ctx, &mut *mw_state, cancel, turn, run_shared)
+            .await;
+        if let crate::Flow::EndRun(reason) = flow {
+            self.sink.emit(AgentEvent::Done(reason));
+            return TurnFlow::End(Ok(()));
+        }
+
+        // Scheduled loop-bottom maintain now lives in
+        // ContextCurationMiddleware::on_turn_end (spec §5.5), fired below;
+        // it also sets the Maintained run-state marker that gates the
+        // text-only-exit maintain in after_final_reply.
+        //
+        // Node hook: on_turn_end (spec §5.1).
+        let flow = self
+            .fire_turn_end(ctx, &mut *mw_state, cancel, turn, run_shared)
+            .await;
+        if let crate::Flow::EndRun(reason) = flow {
+            self.sink.emit(AgentEvent::Done(reason));
+            return TurnFlow::End(Ok(()));
+        }
+        TurnFlow::Continue
+    }
+
     /// Resolve, policy-check, and (if needed) get approval for one call — but do NOT
     /// execute it. Sequential by design so approval prompts never overlap.
     async fn gate_tool(&self, call: ToolCall, cancel: &CancellationToken) -> GateOutcome {
@@ -1356,8 +1477,8 @@ impl AgentLoop {
         // Capture the access tier before `intent` may be moved into the
         // `Decision::Ask` arm below (Access is Copy).
         let access = intent.access;
-        let allowed = match self.policy.check(&intent) {
-            Decision::Allow => true,
+        match self.policy.check(&intent) {
+            Decision::Allow => {}
             Decision::Deny(reason) => {
                 return GateOutcome::Rejected {
                     id: call.id,
@@ -1386,33 +1507,28 @@ impl AgentLoop {
                     display: None,
                     origin: None,
                 };
-                self.sink.emit(AgentEvent::Approval(req.clone()));
-                // Race the approval wait against cancellation: Ctrl-C during a
-                // pending prompt must end the run promptly rather than wedge until
-                // the prompt is answered. Cancel-during-prompt counts as a deny.
-                tokio::select! {
-                    _ = cancel.cancelled() => false,
-                    resp = self.approval.request(req) => matches!(
-                        resp,
-                        ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
-                    ),
-                }
+                // Policy said Ask; the CALLER prompts (and, Task 7, parks) —
+                // gate_tool no longer awaits the channel itself.
+                return GateOutcome::NeedsApproval(Box::new(PendingAsk {
+                    tool,
+                    call,
+                    req,
+                    access,
+                }));
             }
         };
-        if !allowed {
-            // Distinguish a cancel-driven denial (the run is ending) from an
-            // explicit user "no" so the tool result reads correctly downstream.
-            let reason = if cancel.is_cancelled() {
-                "run cancelled"
-            } else {
-                "user declined"
-            };
-            return GateOutcome::Rejected {
-                id: call.id,
-                name: call.name,
-                content: format!("ERROR: {}", ToolError::Denied(reason.into())),
-            };
-        }
+        GateOutcome::Ready(self.ready_call(tool, call, access, cancel))
+    }
+
+    /// Build the `ToolCtx` + `ReadyCall` for an approved call — the tail of the
+    /// old `gate_tool`. Shared by the Allow path and the Phase-1 approval arm.
+    fn ready_call(
+        &self,
+        tool: Arc<dyn Tool>,
+        call: ToolCall,
+        access: agent_tools::Access,
+        cancel: &CancellationToken,
+    ) -> ReadyCall {
         // The live run token: a tool that honors `ctx.cancel` (shell/git/fetch_url)
         // aborts when the caller cancels the run (Ctrl-C / SIGINT via the CLI).
         let ctx = ToolCtx {
@@ -1423,14 +1539,14 @@ impl AgentLoop {
             backend: self.backend.clone(),
             call_id: call.id.clone(),
         };
-        GateOutcome::Ready(ReadyCall {
+        ReadyCall {
             tool,
             args: call.args,
             id: call.id,
             name: call.name,
             ctx,
             access,
-        })
+        }
     }
 }
 
@@ -1456,6 +1572,40 @@ enum GateOutcome {
         name: String,
         content: String,
     },
+    /// Policy said Ask; the CALLER prompts (and, Task 7, parks) — `gate_tool`
+    /// no longer awaits the channel itself.
+    NeedsApproval(Box<PendingAsk>),
+}
+
+/// One gated-but-unanswered call: everything the caller needs to prompt +
+/// proceed once the human answers.
+struct PendingAsk {
+    tool: Arc<dyn Tool>,
+    call: ToolCall,
+    /// intent(+posture), display: None, origin: None
+    req: ApprovalRequest,
+    access: agent_tools::Access,
+}
+
+/// Pre-decided gate outcomes for a resumed batch (Task 8 fills it in).
+#[allow(dead_code)]
+struct PreDecided {
+    records: Vec<crate::GateRecord>,
+    parked_index: usize,
+    /// Some(_) when answer.json committed a decision; None ⇒ re-ask live.
+    parked_decision: Option<bool>,
+    /// Dispatch-kind resume (owner decision P1): Ready records re-execute
+    /// ONLY dispatch_agent calls; other siblings get a synthetic
+    /// lost-result error so host side effects never replay.
+    dispatch_kind: bool,
+}
+
+/// Control flow out of `tool_phase`.
+enum TurnFlow {
+    /// Turn completed; continue with the next turn.
+    Continue,
+    /// The run ended inside the phase (Done already emitted) or errored.
+    End(Result<(), AgentError>),
 }
 
 /// Final per-call result feeding the tool-result message + terminal event.
