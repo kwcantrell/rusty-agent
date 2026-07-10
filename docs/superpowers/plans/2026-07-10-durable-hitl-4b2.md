@@ -1039,6 +1039,12 @@ another process holds it:
         }
 ```
 
+The pre-existing active-slot conflict early-return (the "answered but a run
+is active" branch) sits AFTER the claim — it must `release_resume(&root_dir)`
+before returning, or the lock leaks and the next retry gets a spurious
+"being resumed elsewhere" (task-review finding, fixed in place — refinement
+11's "every error exit releases" governs).
+
 In the spawned task, the `Err` arm currently emits the error and leaves the
 guard set. At the task tail, AFTER `*sess.active.lock().unwrap() = None;`
 (ordering: the active slot must be free before a retry can claim it):
