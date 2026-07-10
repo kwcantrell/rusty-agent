@@ -19,6 +19,10 @@
 - Every kill/reopen/tamper step is preceded by a positive assertion that `parked.json` exists (spec §2.4 positive-artifact rule).
 - Error assertions: one stable substring + "no panic" + "session dir intact" — never full message text, never bare `is_err()`.
 - Gate-triggering tool calls are `write_file` (deterministic `Ask` under default policy); never execute files from the temp workspace (`/tmp` is noexec).
+- **Checkpoint artifact paths (plan-review F2):** `parked.json`, `manifest.json`, `answer.json`, `resume.lock` all live under the parked run's root dir = **`<session_dir>/checkpoint/`** (the root Checkpointer is built on `session_dir.join("checkpoint")` — `agent-cli/src/main.rs` ~:640). NEVER join these names onto the session dir directly; always go through `rig::ckpt(session_dir)` (Task 5).
+- **Runtime flavor (plan-review F3):** every `#[tokio::test]` in this plan is shorthand — write `#[tokio::test(flavor = "multi_thread")]` in real code. The sync waiters (`wait_for_output`, `wait_exit`, `wait_until`) block a thread; on current_thread they deadlock against the in-runtime wiremock/Session tasks until the watchdog.
+- **Prompts have no trailing newline (plan-review F1):** the approval/feedback/REPL prompts are `print!`-ed without `\n` — the CLI driver must read raw byte chunks, never `BufReader::lines()`.
+- The shared test-file preamble is a menu — **trim unused imports per file** (`clippy -D warnings` gates the crate). Every test that uses a `ScriptedStub` ends with `assert_consumed()`; where a test deliberately leaves spare steps (retry ambiguity), say so in a comment instead of calling it.
 - `bash scripts/ci.sh` must pass before the branch is called done.
 
 ## Verified source facts this plan builds on
@@ -240,18 +244,17 @@ git add -A && git commit -m "feat(cli,server): thread metadata_root_for through 
 - [ ] **Step 1: Write the failing test** (in `approval.rs` test mod)
 
 ```rust
-#[tokio::test]
-async fn with_park_exit_honors_custom_timeout() {
-    // 1ms window and no ParkExit → the timeout arm denies fast.
-    let ch = TerminalApproval::with_park_exit(None, Duration::from_millis(1));
-    let resp = ch.request(test_request()).await; // reuse the mod's existing request fixture
-    assert!(matches!(resp, ApprovalResponse::Deny { .. }));
+#[test]
+fn with_park_exit_honors_custom_timeout() {
+    // Same-module test may read the private field — no stdin involvement
+    // (plan-review F6: the public request() path would park an orphan
+    // blocking read_line on real process stdin).
+    let ch = TerminalApproval::with_park_exit(None, Duration::from_secs(7));
+    assert_eq!(ch.timeout, Duration::from_secs(7));
+    let d = TerminalApproval::with_park_exit(None, DEFAULT_TERMINAL_APPROVAL_TIMEOUT);
+    assert_eq!(d.timeout, Duration::from_secs(300));
 }
 ```
-
-(Reuse the existing fixtures from `denies_when_timeout_elapses` — copy how it builds the request; that test constructs via `with_prompt`, this one goes through the public constructor.)
-
-**Caution:** the real `with_park_exit` path reads process stdin. A 1ms timeout expires before any read completes, so the test is deterministic without stdin scripting; do not write to stdin here.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -311,8 +314,8 @@ git add -A && git commit -m "feat(cli): --approval-timeout-secs knob for the ter
 **Interfaces:**
 - Produces (under `#[cfg(any(test, feature = "testkit"))]`, module `agent_server::testkit`):
   - `pub struct Captured(pub Mutex<Vec<ServerEvent>>)` implementing `EventOut`, plus `impl Captured { pub fn snapshot(&self) -> Vec<ServerEvent> }`
-  - `pub async fn plant_parked_session(ws: &Path, sessions: &Path, prior_id: &str) -> (Arc<Session>, Arc<Captured>, [u8; 32])`
-  - `pub async fn plant_parked_session_with_command(ws: &Path, sessions: &Path, prior_id: &str, command: &str) -> (Arc<Session>, Arc<Captured>, [u8; 32])`
+  - `pub async fn plant_parked_session(ws: &Path, sessions: &Path, meta: &Path, prior_id: &str) -> (Arc<Session>, Arc<Captured>, [u8; 32])` — key from `load_or_create_secret(meta)`, `metadata_dir` set on the internal Session's config (plan-review F4: the 3-arg form would key against the developer's real `~/.rusty-agent` and break rig-rooted verification). Keep a thin `#[cfg(test)]` 3-arg wrapper in `session.rs` defaulting to `metadata_root()` so existing tests are untouched.
+  - `pub async fn plant_parked_session_with_command(ws: &Path, sessions: &Path, meta: &Path, prior_id: &str, command: &str) -> (Arc<Session>, Arc<Captured>, [u8; 32])`
   - `pub async fn wait_for_ask_id(cap: &Captured, timeout: Duration) -> String`
 
 - [ ] **Step 1: Move, don't rewrite.** Cut `Captured`, `plant_parked_session`, `plant_parked_session_with_command`, `wait_for_ask_id` (and any private fns only they use) from `session.rs`'s `#[cfg(test)] mod tests` into new `src/testkit.rs`, making items `pub` and fixing imports (`use crate::session::Session; use crate::wire::{EventOut, ServerEvent};` etc.). **E1 interaction:** the planted-session helpers currently resolve the secret via real `metadata_root()` (`.expect("HOME set")` pattern); parameterize them to accept the config they build so the rig can inject `metadata_dir` — keep the old behavior when `metadata_dir` is `None`. Add a `snapshot()` accessor so external crates don't reach into the `Mutex` field layout.
@@ -354,7 +357,7 @@ git add -A && git commit -m "refactor(server): lift session test helpers into fe
   - `Rig::session(&self, base_url: &str) -> (Arc<Session>, Arc<Captured>)` — the in-process GUI leg: `local_params(...)` with `params.config` overridden by `runtime_config()` fields, config-path JSON written into the rig with the same overrides (so a file overlay can't undo them), `Session::from_params`, `set_event_out(Captured)`.
   - `pub fn wait_until(deadline: Duration, poll: impl Fn() -> bool) -> bool` — bounded poll helper (10ms interval), the ONLY generic waiter; everything else waits on events/files through it.
   - `Rig::session_dirs(&self) -> Vec<PathBuf>` and `Rig::only_session_dir(&self) -> PathBuf` — session-dir discovery under `sessions` root.
-  - `Rig::parked_json(&self, dir: &Path) -> PathBuf` (= `dir.join("parked.json")`) and `assert_parked(&self, dir: &Path)` (positive-artifact rule).
+  - `pub fn ckpt(session_dir: &Path) -> PathBuf` (= `session_dir.join("checkpoint")`) — the ONLY way any test derives artifact paths (F2), and `Rig::assert_parked(&self, session_dir: &Path)` (positive-artifact rule, checks `ckpt(dir)/parked.json`).
 
 - [ ] **Step 1: Cargo.toml**
 
@@ -481,10 +484,16 @@ impl Rig {
 
     pub fn assert_parked(&self, dir: &Path) {
         assert!(
-            dir.join("parked.json").exists(),
-            "positive-artifact rule: parked.json missing in {}", dir.display()
+            ckpt(dir).join("parked.json").exists(),
+            "positive-artifact rule: parked.json missing in {}", ckpt(dir).display()
         );
     }
+}
+
+/// Root-ask checkpoint dir: ALL park artifacts (parked.json, manifest.json,
+/// answer.json, resume.lock) live here, never on the session dir itself (F2).
+pub fn ckpt(session_dir: &Path) -> PathBuf {
+    session_dir.join("checkpoint")
 }
 
 /// Bounded poll — the only generic waiter (spec §2.4 watchdog policy).
@@ -802,7 +811,7 @@ git add -A && git commit -m "feat(e2e): scripted wiremock model stub (strict mat
 
 ```rust
 use crate::rig::Rig;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -823,9 +832,16 @@ pub fn agent_bin() -> PathBuf {
                 .status()
                 .expect("cargo build -p agent-cli");
             assert!(status.success(), "agent-cli build failed");
-            ws.join("target/debug/agent")
+            target_dir(&ws).join("debug/agent")
         })
         .clone()
+}
+
+/// Honor CARGO_TARGET_DIR when set (plan-review F7).
+fn target_dir(ws: &std::path::Path) -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ws.join("target"))
 }
 
 fn workspace_root() -> PathBuf {
@@ -877,19 +893,26 @@ impl CliCmd {
         let mut child = self.cmd.spawn().expect("spawn agent");
         let stdin = child.stdin.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel::<String>();
-        for reader in [
-            Box::new(BufReader::new(child.stdout.take().unwrap())) as Box<dyn BufRead + Send>,
-            Box::new(BufReader::new(child.stderr.take().unwrap())),
-        ] {
-            let tx = tx.clone();
+        // F1: prompts are print!-ed with NO trailing newline — read raw byte
+        // chunks, never BufReader::lines() (a line reader never yields the
+        // approval/feedback/REPL prompt and every waiter deadlines).
+        fn pump(mut r: impl std::io::Read + Send + 'static, tx: std::sync::mpsc::Sender<String>) {
             std::thread::spawn(move || {
-                for line in reader.lines().map_while(Result::ok) {
-                    if tx.send(line).is_err() {
-                        return;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match r.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if tx.send(String::from_utf8_lossy(&buf[..n]).into_owned()).is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             });
         }
+        pump(child.stdout.take().unwrap(), tx.clone());
+        pump(child.stderr.take().unwrap(), tx);
         Cli { child, stdin: Some(stdin), rx, transcript: String::new() }
     }
 }
@@ -919,10 +942,7 @@ impl Cli {
     fn drain(&mut self) {
         loop {
             match self.rx.try_recv() {
-                Ok(line) => {
-                    self.transcript.push_str(&line);
-                    self.transcript.push('\n');
-                }
+                Ok(chunk) => self.transcript.push_str(&chunk), // raw chunks (F1)
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             }
         }
@@ -1133,7 +1153,7 @@ pub fn e2e_daemon_bin() -> PathBuf {
                 .status()
                 .expect("build e2e-daemon");
             assert!(status.success());
-            ws.join("target/debug/e2e-daemon")
+            target_dir(&ws).join("debug/e2e-daemon")
         })
 }
 
@@ -1235,7 +1255,9 @@ git add -A && git commit -m "feat(e2e): e2e-daemon harness bin (real-process Ses
 
 ```rust
 use agent_e2e::cli::{Cli, CliCmd, DaemonCmd};
-use agent_e2e::rig::{wait_until, wait_until_async, Rig};
+use agent_e2e::rig::{ckpt, wait_until, wait_until_async, Rig};
+// NOTE: trim unused imports per file (clippy -D warnings); every #[tokio::test]
+// below is written in full as #[tokio::test(flavor = "multi_thread")] (F3).
 use agent_e2e::stub::{gated_write, text_step, ScriptStep, ScriptedStub, StubResponse};
 use agent_server::wire::{Decision, ServerEvent};
 use std::time::Duration;
@@ -1270,7 +1292,7 @@ async fn s01_park_in_gui_reopen_in_cli() {
         .await
     );
     let dir = rig.only_session_dir();
-    assert!(wait_until_async(CAP, || dir.join("parked.json").exists()).await);
+    assert!(wait_until_async(CAP, || ckpt(&dir).join("parked.json").exists()).await);
     rig.assert_parked(&dir);
     // "GUI closes": drop the Session mid-park.
     drop(session);
@@ -1286,7 +1308,7 @@ async fn s01_park_in_gui_reopen_in_cli() {
     assert!(st.success(), "transcript:\n{}", cli.transcript());
     stub.assert_consumed();
     // Completed tree is reaped (delete-on-completion) — dir gone or no park.
-    assert!(!dir.join("parked.json").exists(), "park must be consumed");
+    assert!(!ckpt(&dir).join("parked.json").exists(), "park must be consumed");
 }
 ```
 
@@ -1392,7 +1414,7 @@ async fn deny_feedback_roundtrip(feedback: &str) {
     let dir_ready = wait_until_async(CAP, || !rig.session_dirs().is_empty()).await;
     assert!(dir_ready);
     let dir = rig.only_session_dir();
-    assert!(wait_until_async(CAP, || dir.join("parked.json").exists()).await);
+    assert!(wait_until_async(CAP, || ckpt(&dir).join("parked.json").exists()).await);
     drop(session);
     let sid = dir.file_name().unwrap().to_string_lossy().into_owned();
 
@@ -1490,7 +1512,7 @@ async fn s04_soak_alternating_deny_approve_across_surfaces() {
     let dir = {
         assert!(wait_until_async(CAP, || !rig.session_dirs().is_empty()).await);
         let d = rig.only_session_dir();
-        assert!(wait_until_async(CAP, || d.join("parked.json").exists()).await);
+        assert!(wait_until_async(CAP, || ckpt(d).join("parked.json").exists()).await);
         d
     };
     drop(session);
@@ -1514,7 +1536,7 @@ async fn s04_soak_alternating_deny_approve_across_surfaces() {
     // parked.json must exist before we act (positive-artifact rule) — the
     // session dir may be a NEW dir for the new Session; rediscover.
     let dirs = rig.session_dirs();
-    assert!(wait_until_async(CAP, || dirs.iter().any(|d| d.join("parked.json").exists())).await);
+    assert!(wait_until_async(CAP, || dirs.iter().any(|d| ckpt(d).join("parked.json").exists())).await);
     session.approve(&ask, Decision::Deny { feedback: Some("SOAK-FB-3".into()) });
     let ask2 = agent_server::testkit::wait_for_ask_id(&cap, CAP).await; // re-park
     session.approve(&ask2, Decision::Approve);
@@ -1568,7 +1590,7 @@ async fn s05_sigint_mid_resume_retains_park() {
     session.send_input("SQRL-5 go".into());
     assert!(wait_until_async(CAP, || !rig.session_dirs().is_empty()).await);
     let dir = rig.only_session_dir();
-    assert!(wait_until_async(CAP, || dir.join("parked.json").exists()).await);
+    assert!(wait_until_async(CAP, || ckpt(&dir).join("parked.json").exists()).await);
     drop(session);
     let sid = dir.file_name().unwrap().to_string_lossy().into_owned();
 
@@ -1583,7 +1605,7 @@ async fn s05_sigint_mid_resume_retains_park() {
     let _ = cli.wait_exit(CAP);
     // "Ok ≠ completed" guard: the park must still be there and the lock released.
     rig.assert_parked(&dir);
-    assert!(wait_until(CAP, || !dir.join("resume.lock").exists()),
+    assert!(wait_until(CAP, || !ckpt(&dir).join("resume.lock").exists()),
         "resume.lock must be released on cancel");
     // NOTE: the answer was consumed pre-resume, so a re-park is expected to
     // re-prompt on the next reopen. Approve and finish to prove recoverability.
@@ -1610,7 +1632,7 @@ async fn s06a_reopen_killed_while_parked_leaves_park_reopenable() {
     session.send_input("SQRL-6 go".into());
     assert!(wait_until_async(CAP, || !rig.session_dirs().is_empty()).await);
     let dir = rig.only_session_dir();
-    assert!(wait_until_async(CAP, || dir.join("parked.json").exists()).await);
+    assert!(wait_until_async(CAP, || ckpt(&dir).join("parked.json").exists()).await);
     drop(session);
     let sid = dir.file_name().unwrap().to_string_lossy().into_owned();
     // Real kill: reopen reaches the prompt (lock held), SIGKILL — no answer.
@@ -1624,7 +1646,7 @@ async fn s06a_reopen_killed_while_parked_leaves_park_reopenable() {
     // way the product's own error message instructs, then prove reopenability.
     // PRODUCT-GAP: no auto-recovery for stale locks (spec scenario 11 asserts
     // the contention message; here we just clear and move on).
-    std::fs::remove_file(dir.join("resume.lock")).unwrap();
+    std::fs::remove_file(ckpt(&dir).join("resume.lock")).unwrap();
     let mut cli2 = CliCmd::new(&rig, &stub.base_url())
         .sessions_sub(&["sessions", "reopen", &sid]).spawn();
     cli2.wait_for_output("[y]es / [n]o / [a]lways:", CAP);
@@ -1646,12 +1668,12 @@ async fn s06b_committed_answer_consumed_without_reprompt() {
     session.send_input("SQRL-6B go".into());
     assert!(wait_until_async(CAP, || !rig.session_dirs().is_empty()).await);
     let dir = rig.only_session_dir();
-    assert!(wait_until_async(CAP, || dir.join("parked.json").exists()).await);
+    assert!(wait_until_async(CAP, || ckpt(&dir).join("parked.json").exists()).await);
     drop(session);
     // Commit an approve answer with the real writer + the rig's real key.
     // (Exact fn signature: see agent-core/src/checkpoint.rs `write_answer` /
     // `ParkedAnswer` — bind to the parked manifest the way the CLI does.)
-    agent_e2e::forge::commit_answer_like_cli(&dir, &rig.key, /*approve=*/ true, None);
+    agent_e2e::forge::commit_answer_like_cli(&ckpt(&dir), &rig.key, /*approve=*/ true, None);
     let sid = dir.file_name().unwrap().to_string_lossy().into_owned();
     let mut cli = CliCmd::new(&rig, &stub.base_url())
         .sessions_sub(&["sessions", "reopen", &sid]).spawn();
@@ -1660,7 +1682,7 @@ async fn s06b_committed_answer_consumed_without_reprompt() {
     assert!(st.success(), "{t}");
     assert!(!t.contains("[y]es / [n]o"), "must NOT re-prompt — answer was committed:\n{t}");
     stub.assert_consumed();
-    assert!(!dir.join("answer.json").exists(), "answer must be consumed");
+    assert!(!ckpt(&dir).join("answer.json").exists(), "answer must be consumed");
 }
 ```
 
@@ -1698,7 +1720,7 @@ async fn s07_reopen_with_divergent_protocol_is_defined() {
     session.send_input("SQRL-7 go".into());
     assert!(wait_until_async(CAP, || !rig.session_dirs().is_empty()).await);
     let dir = rig.only_session_dir();
-    assert!(wait_until_async(CAP, || dir.join("parked.json").exists()).await);
+    assert!(wait_until_async(CAP, || ckpt(&dir).join("parked.json").exists()).await);
     drop(session);
     let sid = dir.file_name().unwrap().to_string_lossy().into_owned();
     let mut cli = CliCmd::new(&rig, &stub.base_url())
@@ -1757,10 +1779,10 @@ async fn s08_approve_always_does_not_survive_restart() {
 async fn s09_new_turn_does_not_clobber_existing_park() {
     let rig = Rig::new();
     let (planted_sess, _cap, _key) = agent_server::testkit::plant_parked_session(
-        rig.workspace.path(), rig.sessions.path(), "0-e2eprior").await;
+        rig.workspace.path(), rig.sessions.path(), rig.meta.path(), "0-e2eprior").await;
     drop(planted_sess);
     let parked_dir = rig.session_dirs().into_iter()
-        .find(|d| d.join("parked.json").exists()).expect("planted park");
+        .find(|d| ckpt(d).join("parked.json").exists()).expect("planted park");
 
     let stub = ScriptedStub::start(vec![text_step(Some("SQRL-9 new task"), "ok")]).await;
     let (session, cap) = rig.session(&stub.base_url());
@@ -1792,9 +1814,9 @@ git add -A && git commit -m "test(e2e): scenarios 7-9 — protocol divergence, A
 **Files:**
 - Modify: `agent/crates/agent-e2e/tests/crashkill.rs`
 
-- [ ] **Step 1: Scenario 10 — torn checkpoint refused, list unaffected.** Park for real (Session leg), then `std::fs::remove_file(dir.join("manifest.json"))` (synthesized torn state per §2.4: manifest-last means "payload without manifest" ≡ pre-manifest crash; companion pinning already exists — the write-order comment + torn-tree unit test in `agent-core/src/checkpoint.rs` (content-search `manifest.json` + "torn"); reference it in the test comment). Then: `sessions reopen` → clean corrupt error (stable substring: characterize the actual `CheckpointError::Corrupt` surface text, pin one word like `"corrupt"`), exit != 0, no panic (`!transcript.contains("panicked")`), dir intact; `sessions list` exits 0.
+- [ ] **Step 1: Scenario 10 — torn checkpoint refused, list unaffected.** Park for real (Session leg), then `std::fs::remove_file(ckpt(&dir).join("manifest.json"))` (synthesized torn state per §2.4: manifest-last means "payload without manifest" ≡ pre-manifest crash; companion pinning already exists — the write-order comment + torn-tree unit test in `agent-core/src/checkpoint.rs` (content-search `manifest.json` + "torn"); reference it in the test comment). Then: `sessions reopen` → clean corrupt error (stable substring: characterize the actual `CheckpointError::Corrupt` surface text, pin one word like `"corrupt"`), exit != 0, no panic (`!transcript.contains("panicked")`), dir intact; `sessions list` exits 0.
 
-- [ ] **Step 2: Scenario 11 — [real-kill] stale lock.** Park (Session leg). `DaemonCmd::hold_lock(&rig, &dir)` → wait `"LOCKED"`. SIGKILL it (`d.sigkill()`). `resume.lock` remains. CLI reopen → transcript contains `"is being resumed elsewhere"`, exit code 2, park intact, no panic. `// PRODUCT-GAP: stale resume.lock requires manual removal (spec §5#11)`.
+- [ ] **Step 2: Scenario 11 — [real-kill] stale lock.** Park (Session leg). `DaemonCmd::hold_lock(&rig, &ckpt(&dir))` → wait `"LOCKED"` (`--dir` is the **checkpoint** dir, F2). SIGKILL it (`d.sigkill()`). `resume.lock` remains. CLI reopen → transcript contains `"is being resumed elsewhere"`, exit code 2, park intact, no panic. `// PRODUCT-GAP: stale resume.lock requires manual removal (spec §5#11)`.
 
 - [ ] **Step 3: Scenario 12 — [real-kill] daemon SIGKILL + real-process restart re-emits.** `DaemonCmd::run(rig, stub, Some("SQRL-12 go"))` with a gated script step; wait for `ApprovalRequest` event line AND `parked.json`; `d.sigkill()`. Start a SECOND `DaemonCmd::run(rig, stub, None)` (no task) — wait for a `ParkedRuns` event with a non-empty `runs` naming the parked session id, then the re-derived `ApprovalRequest`; send `approve <id>` on its stdin; wait `Resumed` then `Done`. Assert the epoch classification: the second daemon's `ParkedRuns.runs[0].session_id` equals the FIRST process's session dir name (i.e. it owns a dir it did not create).
 
@@ -1807,7 +1829,7 @@ async fn s12_daemon_sigkill_then_restart_reemits_and_resumes() {
     d1.wait_for_output("READY", CAP);
     d1.wait_for_event(CAP, |e| matches!(e, ServerEvent::ApprovalRequest { .. }));
     let dir = rig.session_dirs().into_iter()
-        .find(|d| d.join("parked.json").exists()).expect("park on disk");
+        .find(|d| ckpt(d).join("parked.json").exists()).expect("park on disk");
     let parked_sid = dir.file_name().unwrap().to_string_lossy().into_owned();
     d1.sigkill();
     let _ = d1.wait_exit(CAP);
@@ -1827,7 +1849,7 @@ async fn s12_daemon_sigkill_then_restart_reemits_and_resumes() {
 }
 ```
 
-- [ ] **Step 4: Scenario 13 — park-write failure degrades cleanly.** Session leg; before sending the gated task, `chmod 0o555` the sessions root (`std::fs::set_permissions`). Expect: `ApprovalRequest` still arrives, plus an `Error` event containing `"checkpoint write failed"` (verified stable substring, `loop_.rs` content-search `"approval not durable"`), and NO `parked.json`. Then approve → `Done` (ask functions live-only). **Restore permissions in a scopeguard/finally** (0o755) so TempDir teardown works even on panic — use a small `struct RestorePerms(PathBuf)` with `Drop`.
+- [ ] **Step 4: Scenario 13 — park-write failure degrades cleanly.** Session leg; before sending the gated task, `chmod 0o555` the **session dir** (it pre-exists once the Session is constructed; a read-only sessions *root* would not block writes inside it — plan-review F5). Verify which level actually blocks the checkpoint-dir create on first run, then pin that level with a comment. Expect: `ApprovalRequest` still arrives, plus an `Error` event containing `"checkpoint write failed"` (verified stable substring, `loop_.rs` content-search `"approval not durable"`), and NO `parked.json`. Then approve → `Done` (ask functions live-only). **Restore permissions in a scopeguard/finally** (0o755) so TempDir teardown works even on panic — use a small `struct RestorePerms(PathBuf)` with `Drop`.
 
 - [ ] **Step 5: Run + commit**
 
@@ -1844,7 +1866,7 @@ git add -A && git commit -m "test(e2e): scenarios 10-13 — torn checkpoint, sta
 **Files:**
 - Create: `agent/crates/agent-e2e/tests/concurrency.rs`
 
-- [ ] **Step 1: Scenario 14 — in-process holder, CLI loser.** Park (Session leg); `agent_core::checkpoint::claim_resume(&dir)` in the test (same fn, explicit); CLI reopen → `"is being resumed elsewhere"`, exit 2, park intact.
+- [ ] **Step 1: Scenario 14 — in-process holder, CLI loser.** Park (Session leg); `agent_core::checkpoint::claim_resume(&ckpt(&dir))` in the test (same fn, explicit; checkpoint dir per F2); CLI reopen → `"is being resumed elsewhere"`, exit 2, park intact.
 
 - [ ] **Step 2: Scenario 15 — CLI holder, Session loser, CLI completes.** Park (Session leg); drop Session; CLI reopen to the prompt (lock now held, pipe open, do NOT answer yet); fresh Session attach on same roots → wait re-derived `ApprovalRequest` → `session.approve(id, Approve)` → expect `ServerEvent::Error` containing `"is being resumed elsewhere"` (the loser observes contention; double-resolution excluded structurally). THEN answer `y` on the CLI → exits 0, script consumed.
 
@@ -1975,6 +1997,10 @@ git add -A && git commit -m "test(e2e): scenarios 20-22 — mid-stream drop reco
 - [ ] **Step 5:** Use superpowers:finishing-a-development-branch (present merge/PR options; suite is done when ci.sh is green and Tier 2/3 have been run live at least once on this machine).
 
 ---
+
+## Plan review log
+
+**2026-07-10 — single plan reviewer (coverage/decomposition/buildability): APPROVE-WITH-FIXES; all 8 findings applied in place.** F1 raw-chunk stdout reader (prompts have no trailing newline); F2 all checkpoint artifacts under `<session_dir>/checkpoint/` — `rig::ckpt()` helper + full sweep; F3 `multi_thread` tokio flavor mandated; F4 `plant_parked_session` gains a `meta` root param (3-arg form would key against real `$HOME`); F5 s13 chmods the session dir, not the root; F6 E2 test asserts the timeout field, no stdin; F7 `CARGO_TARGET_DIR` honored; F8 trim-imports + `assert_consumed` discipline noted. Coverage/decomposition/buildability otherwise verified clean (from_launch signature, claim_resume pub, clap ordering, SSE shapes, rustc 1.96 process_group).
 
 ## Self-review notes (author)
 
