@@ -1,9 +1,11 @@
 # File-based memory — full switch (deepagents refactor, Phase 4A) — design
 
-**Status:** PANEL-REVIEWED 2026-07-09. Adversarial panel (4 reviewers, distinct
-mandates): all **APPROVE-WITH-FIXES**; one converged BLOCKER (src-tauri/web
-memory-admin surface unaccounted for → gate E1). All fix-in-place findings
-FOLDED (see Panel & review log). **OWNER GATE PENDING:** E1–E6 below.
+**Status:** PANEL-REVIEWED + **OWNER GATE CLOSED 2026-07-09**. Adversarial
+panel (4 reviewers, distinct mandates): all **APPROVE-WITH-FIXES**; one
+converged BLOCKER (src-tauri/web memory-admin surface) resolved at the gate
+(E1 = retire). All fix-in-place findings FOLDED; gate decisions E1–E6 applied
+(see Gate decisions + Panel & review log). **PLAN-READY** pending the
+light-tier consistency read.
 **Phase-4 decision round (owner, 2026-07-09, recorded here):** the bundle's three
 Phase-4 judgment calls were decided before this brainstorm — **memory = GO, full
 switch** (file-based memory replaces the vector store entirely; this spec);
@@ -33,66 +35,51 @@ before editing.**
 permissions/stream (4cf682d, 68e846b, 3490590, 602ae5d). Preserves all
 prior-phase invariants (§3).
 
-## Gate escalations (owner decisions required before plan)
+## Gate decisions (CLOSED 2026-07-09)
 
-- **E1 — Desktop/web memory-admin surface fate (BLOCKER).** `src-tauri`
-  exposes `memory_list` / `memory_update` / `memory_delete` /
-  `memory_recall_preview` IPC commands returning `agent_memory` types
-  (src-tauri/src/lib.rs ~154-213, bridge.rs), consumed by the web
-  MemorySection CRUD panel (web/src/explorer/MemorySection.tsx, api.ts,
-  types.ts, + SettingsForm "remember/recall across sessions" label,
-  ArchDetail/archFixture `recall_budget`). Crate deletion cannot land without
-  deciding: **(a)** retire the memory tab + the four IPC commands (web panel
-  removed; recommend for 4A — smallest honest cut; a file-browser view can be
-  a later feature), or **(b)** migrate MemorySection to a read-only file view
-  over `/memories/` (new UI feature — scope growth this cycle).
-  **Recommendation: (a).**
-- **E2 — Refresh cadence.** Panel converged (scope-YAGNI + requirements-
-  cacheability + failure-cost): the brainstorm's unconditional `after_tools`
-  re-read pays two host-fs reads + prefix-cache invalidation every tool turn
-  to serve an event (mid-run memory write) that is rare by design. Options:
-  **(a)** keep unconditional per-turn re-read (as brainstormed); **(b)**
-  dirty-flag — re-read only after a turn whose tool calls wrote under
-  `/memories/` (same visible freshness, cache-stable in the common case);
-  **(c)** run-start-only (cache-perfect; mid-run writes invisible until next
-  run). **Recommendation: (b).** §2.4 is written cadence-neutral with the
-  chosen option to be inlined at gate close.
-- **E3 — Split the metadata-root rename into its own slice.** The rename
-  (§2.2) is mechanical, spans both workspaces + docs, and has zero logical
-  dependency on the memory redesign; campaign precedent (3B split) argues for
-  **4A-0 (rename, land + ci.sh green first)** then **4A-1 (memory)**.
-  **Recommendation: split.** (Panel also flags, for conscious ownership: the
-  rename is cosmetic — its value is branding consistency, not behavior.)
-- **E4 — Injection blast-radius acceptance.** A poisoned `global/index.md`
-  line loads into **every future run of every project** — strictly larger
-  exposure than today's similarity-gated 512-token recall (the spec's earlier
-  "same trust class" claim was FALSE and is retracted). Standing mitigations:
-  every memory write already hits `Decision::Ask` (verified:
-  `Access::Write` ⇒ Ask in RulePolicy), trust framing, parent-only writes.
-  Proposed additional prompt-level mitigation (folded in §2.5, cuttable at
-  gate): discipline instructs **global writes only on explicit user request**;
-  same-turn auto-writes go to project scope. **Decision: accept the residual
-  with these mitigations, or require more (e.g. unconditional human
-  confirmation phrasing for global index edits)?**
-- **E5 — Two-tier scoping (weak finding, raised for honesty).** Panel found
-  zero evidence any global fact has ever existed (store empty; only test
-  seeds). Options: keep two-tier (owner mandate; nearly free; "user prefers
-  X"-class facts are genuinely cross-project) or ship project-only and add
-  `global/` when a real cross-project fact appears.
-  **Recommendation: keep two-tier.**
-- **E6 — "Forget" semantics honesty.** Real deletion is impossible with
-  ordinary tools (no delete tool; shell can't reach backend routes) — the
-  mechanism is **unindexing** (drop the index line; §2.5), and unindexed
-  files remain greppable. Relabeled throughout (no "forget" claims). Options:
-  accept (recommended; human `rm` covers true deletion) or add a delete tool
-  (new scope, new abuse surface). **Recommendation: accept.**
+- **E1 — Desktop/web memory-admin surface: RETIRE.** The four src-tauri IPC
+  commands (`memory_list` / `memory_update` / `memory_delete` /
+  `memory_recall_preview`; src-tauri/src/lib.rs ~154-213, bridge.rs) and the
+  web MemorySection CRUD panel (MemorySection.tsx + test, api.ts, types.ts
+  `MemoryRow`/`ScoredRow`, ContextExplorer wiring) are deleted; the
+  SettingsForm "remember/recall across sessions" label and
+  ArchDetail/archFixture `recall_budget` references update. A read-only
+  file-browser over `/memories/` is a possible later feature (§5), not this
+  cycle.
+- **E2 — Refresh cadence: DIRTY-FLAG.** The middleware re-reads the index
+  only after a turn whose tool calls wrote under `/memories/` (§2.4). Same
+  visible freshness as per-turn re-reading; prefix cache stays stable unless
+  memory actually changes.
+- **E3 — SPLIT: 4A-0 rename slice, then 4A-1 memory slice.** The
+  metadata-root rename lands first as its own mechanical slice (allowlisted
+  targets, full ci.sh green), then the memory work builds on it. One spec
+  (this one), two plan slices.
+- **E4 — Injection control: DISTINCT GLOBAL APPROVAL — moot this cycle via
+  E5, recorded as a BINDING CONDITION on any future global tier.** The owner
+  required more than trust-framing + ordinary write-Ask for global memory:
+  any write/edit under a global memories route must trigger a distinct,
+  explicit approval (never coalesced into ApproveAlways). E5 (project-only
+  v0) removes the global surface entirely, resolving the blast-radius
+  finding *by construction* for this cycle; the distinct-approval control is
+  the recorded precondition a future `global/` tier must implement (§5).
+- **E5 — Scoping: PROJECT-ONLY v0.** One scope: `projects/<project-key>/`.
+  The `global/` tier is deferred until a real cross-project need lands, and
+  arrives only together with the E4 control. (Panel found zero global facts
+  in the old store; the owner weighed the demonstrated-need argument and
+  chose to defer.) The on-disk layout keeps the `projects/` subdirectory so
+  a future `global/` sits beside it without moving files.
+- **E6 — Retire mechanism: UNINDEX, accepted.** No delete tool; removing a
+  memory's index line hides it from loading; unindexed files remain
+  greppable; true deletion is a human `rm`. Labeled honestly throughout
+  (never "forget").
 
 ## 0. Scope
 
-**IN (built this cycle; E3 may split it into 4A-0 + 4A-1):**
+Split per E3 into two plan slices sharing this spec.
 
-- **Metadata-root rename** (owner decision, whole root incl. workspace dirs):
-  `~/.agent/` → `~/.rusty-agent/` and the runtime's workspace-dir convention
+**IN — Slice 4A-0 (metadata-root rename, mechanical, lands first):**
+
+- `~/.agent/` → `~/.rusty-agent/` and the runtime's workspace-dir convention
   `<workspace>/.agent/` → `<workspace>/.rusty-agent/`. **Allowlist sweep, not
   a blind search-replace** (panel: a naive `.agent`→`.rusty-agent` sed would
   corrupt the repo's unrelated `.agents/` and `.claude/` trees). Verified
@@ -100,63 +87,71 @@ prior-phase invariants (§3).
   default dirs + 2 test asserts), `agent-runtime-config/src/trace.rs`
   (sessions default), `agent-server/src/session.rs` (independent hardcoded
   `.agent/skills` join), `agent-cli/src/main.rs` (`~/.agent/sessions` display
-  string + doc comments), runtime-config test literals, `README.md`,
-  config example, docs. **Corrections vs the brainstorm draft:** this repo
-  has NO checked-in `.agent/` tree (nothing to `git mv`), and
+  string + doc comments), runtime-config test literals, `README.md`, the
+  config example doc stub, docs. **Corrections vs the brainstorm draft:**
+  this repo has NO checked-in `.agent/` tree (nothing to `git mv`), and
   `scripts/skills_lint.py` does not reference the runtime dirs (no-op).
-  Guard test: zero `.agent` (non-`.agents`) literals remain in runtime code.
-- **Memory store as OKF-shaped mini-bundles** under
-  `~/.rusty-agent/memories/`: `global/` + `projects/<project-key>/`, each
-  with a reserved-form `index.md` (always loaded) and one-fact-per-file
-  concept docs with OKF frontmatter (§2.3).
+- Guard test: zero `.agent` (non-`.agents`) literals remain in runtime code.
+- One-line migration note (`mv ~/.agent ~/.rusty-agent`); no auto-migration.
+- Full ci.sh green; merged before 4A-1 starts.
+
+**IN — Slice 4A-1 (file-based memory + vector retirement):**
+
+- **Memory store as an OKF-shaped mini-bundle** per project under
+  `~/.rusty-agent/memories/projects/<project-key>/`: a reserved-form
+  `index.md` (always loaded) and one-fact-per-file concept docs with OKF
+  frontmatter (§2.3). No global tier (E5).
 - **`MemoryFilesMiddleware`** (agent-core) replacing `MemoryRecallMiddleware`
-  in the same optional stack slot (gated by `cfg.memory`): loads both scope
-  indexes via a **new middleware→backend read path** (net-new plumbing —
-  no middleware holds a backend today, §2.4), injects through the existing
-  (renamed) recall pinned-slot machinery with trust framing, **per-scope
-  budgets, and net-new honesty-pointer truncation** (§2.4). Refresh cadence
-  per gate E2.
-- **Composite-backend mounts**: `/memories/global/` and `/memories/project/`
-  — **read-write to the parent's tools (net-new mount shape; today's mounts
-  are read-only in BOTH parent and child), read-only in children** via the
-  Phase-2 `ReadOnlyToTools` wrapper (§2.6).
+  in the same optional stack slot (gated by `cfg.memory`): loads the project
+  index via a **new middleware→backend read path** (net-new plumbing — no
+  middleware holds a backend today, §2.4), injects through the existing
+  (renamed) recall pinned-slot machinery with trust framing and **net-new
+  honesty-pointer truncation** (§2.4). Refresh = dirty-flag (E2).
+- **Composite-backend mount**: `/memories/project/` — **read-write to the
+  parent's tools (net-new mount shape; today's mounts are read-only in BOTH
+  parent and child), read-only in children** via the Phase-2
+  `ReadOnlyToTools` wrapper (§2.6).
 - **Policy mount-awareness (small, net-new):** the policy engine must
   recognize backend-routed virtual prefixes so `/memories/` reads auto-allow
   like workspace reads while writes keep the existing Ask (§2.6 — without
   this, every memory read prompts, or misresolves against the workspace
   root).
-- **Editing contract = ordinary file tools** over `/memories/` plus a static
-  memory-discipline section in the system prompt (parent-only, gated by
-  `cfg.memory` — a `compose_system_prompt` signature change) (§2.5).
+- **Editing contract = ordinary file tools** over `/memories/project/` plus
+  a static memory-discipline section in the system prompt (parent-only,
+  gated by `cfg.memory` — a `compose_system_prompt` signature change)
+  (§2.5).
 - **Atomic index writes:** HostBackend write moves to temp-file + rename (or
-  at minimum for `/memories/` routes) to close the torn-read window the
-  refresh path can hit (§2.4, panel fix).
+  at minimum for `/memories/` routes) to close the torn-read window (§2.4,
+  panel fix).
 - **Retirement**: delete the `agent-memory` crate (embedder, SQLite store,
   retriever, remember/recall/forget tools, `MemoryConfig`, `fastembed`/
   `rusqlite` deps); relocate `project_scope()`; retire the `Retriever`
-  trait; rename the recall block machinery to the memory block; **resolve
-  the src-tauri/web surface per gate E1** (§2.7).
-- Config (JSON — the runtime config loader is `serde_json`;
-  `config.example.toml` is a doc-only stub, §2.7): new optional
-  `memories_dir` override (default `~/.rusty-agent/memories`; needed for
-  test isolation). Index budget is a **const** (`DEFAULT_MEMORY_INDEX_BUDGET
-  = 1024`), not a config field (panel trim — nothing tunes it).
-- Sweep: every reference to remember/recall/forget and `~/.agent` across
-  code, tests, eval/soak harnesses, config example, and docs — enumerated
-  targets in §2.7.
+  trait; rename the recall block machinery to the memory block; **retire the
+  src-tauri IPC commands + web MemorySection per E1** (§2.7).
+- Config (JSON — the runtime config loader is `serde_json`; the example file
+  is a doc-only stub, §2.7): new optional `memories_dir` override (default
+  `~/.rusty-agent/memories`; real consumer: test isolation). Index budget is
+  a **const** (`DEFAULT_MEMORY_INDEX_BUDGET = 1024`), not a config field
+  (panel trim).
+- Sweep: every reference to remember/recall/forget across code, tests,
+  eval/soak harnesses, config example, and docs — enumerated targets in
+  §2.7.
 - Tests incl. a `cfg.memory=false` byte-identical pin, `pinned_tokens()`
   lockstep, child read-only conformance, policy-decision pins for memory
-  reads/writes, per-scope truncation, and an `#[ignore]` cross-run live
-  soak (§6).
+  reads/writes, truncation honesty, dirty-flag cadence, and an `#[ignore]`
+  cross-run live soak (§6).
 
 **OUT / deferred:**
 
+- **No global memory tier (E5).** Deferred until a demonstrated
+  cross-project need; MUST arrive with the E4 distinct-approval control
+  (§5). Layout reserves the spot (`memories/projects/` subdirectory).
 - **No hybrid retrieval layer.** The owner rejected keeping the vector store
   under the file contract. If semantic retrieval is ever wanted again it is a
   new spec; nothing here reserves a seam for it beyond "memory is files."
 - **No auto-migration of `~/.agent/`.** The memory DB is empty (verified
-  2026-07-09: 0 rows); session traces are inert JSONL. Ship a one-line
-  migration note (`mv ~/.agent ~/.rusty-agent`), nothing mechanized.
+  2026-07-09: 0 rows); session traces are inert JSONL. One-line migration
+  note only (4A-0).
 - **No code-level format validation.** Memory files are agent-written with
   ordinary tools; readers follow OKF consumer rules (tolerate unknown types,
   broken links, malformed optional fields). `okf_check.py` is NOT run against
@@ -164,18 +159,20 @@ prior-phase invariants (§3).
   `ALLOWED_TYPES` is the doc-authoring vocabulary; memory types are
   runtime-local, §2.3). Do not wire it up.
 - **No child memory writes** (posture tightened vs today, deliberately —
-  §2.6) and **no auto-load of indexes into child prompts** (3A quarantine
+  §2.6) and **no auto-load of the index into child prompts** (3A quarantine
   preserved).
-- **No delete tool** (§2.5, gate E6): removal = unindexing; true deletion is
-  a human operation.
+- **No delete tool** (E6): removal = unindexing; true deletion is a human
+  operation.
 - **No semantic/similarity recall of any kind.** Finding memory is
-  `read_file`/`grep` over `/memories/` plus the always-loaded indexes.
+  `read_file`/`grep` over `/memories/project/` plus the always-loaded index.
   (There is no `glob` tool — fs tools are read/write/edit/ls/grep; the
   brainstorm draft's `glob` mention was wrong.)
 - **No `log.md`, no tombstone convention, no normative type vocabulary**
-  (panel trims): update history is frontmatter `timestamp`s; forget =
+  (panel trims): update history is frontmatter `timestamp`s; retire =
   unindex; `type` is required by OKF shape but its values are suggested,
   not enforced (§2.3).
+- **No memory UI** (E1): the tab + IPC commands retire; a read-only
+  file-browser is possible later work (§5).
 - **Interpreter/PTC** stays NO-GO (decision round, header) — recorded here so
   the campaign memory can cite one artifact.
 
@@ -195,24 +192,24 @@ surfaces; the human can't audit or edit it without SQL), **API-shaped**
 rather than substrate-shaped (three bespoke tools instead of the file tools
 the agent already has, on the backend seam Phase 2 already built), and
 **uncacheable** (recall content varies per input — a cost this design
-recovers to the degree gate E2 chooses: a static-per-run index block is
-prefix-cacheable; refresh-on-write invalidates only when memory actually
-changes). The store is empty in practice (0 rows after weeks of use) — the
-bespoke API failed to earn adoption even from its own agent. The owner
-decided full switch: files in, vectors out.
+recovers: with dirty-flag refresh (E2) the index block is static unless
+memory is actually written). The store is empty in practice (0 rows after
+weeks of use) — the bespoke API failed to earn adoption even from its own
+agent. The owner decided full switch: files in, vectors out.
 
 ## 2. Design
 
 ### 2.1 Approaches considered
 
 - **A — middleware + pinned block (CHOSEN):** `MemoryFilesMiddleware` reads
-  scope indexes via `/memories/` and injects through the existing pinned-slot
-  machinery. Reuses pinned-token accounting; the calibration change stays in
-  the one slot the eval already measures; refresh cadence per E2.
+  the project index via `/memories/project/` and injects through the
+  existing pinned-slot machinery. Reuses pinned-token accounting; the
+  calibration change stays in the one slot the eval already measures;
+  dirty-flag refresh keeps the block cache-stable.
 - **B — compose-time system-prompt block:** best prefix-cache behavior, but
   static per run, bypasses pinned-token accounting, and moves the
-  `cfg.memory` gate out of the loop into assembly. Rejected (E2 option (b)
-  recovers most of the cache benefit inside approach A).
+  `cfg.memory` gate out of the loop into assembly. Rejected (E2's dirty-flag
+  recovers the cache benefit inside approach A).
 - **C — bespoke file-backed remember/forget tools:** contradicts the adopted
   contract (ordinary tools, transparent files). Rejected.
 - **Load contract (owner):** index + on-demand (bounded prompt cost;
@@ -224,16 +221,18 @@ decided full switch: files in, vectors out.
   wants, and whose consumer rules spec the graceful degradation an
   agent-written store needs. Memory-local divergences are deliberate and
   listed (§2.3).
+- **Scoping (owner, gate E5):** project-only v0; the brainstormed two-tier
+  layout survives on disk as the `projects/` subdirectory so a future
+  `global/` (with the E4 control) is additive.
 
-### 2.2 Storage layout & metadata-root rename
+### 2.2 Storage layout & metadata-root rename (4A-0)
 
 ```
 ~/.rusty-agent/                      # home metadata root (was ~/.agent/)
 ├── memories/
-│   ├── global/                      # OKF-shaped mini-bundle
-│   │   ├── index.md                 #   reserved-form index — always loaded
-│   │   └── <slug>.md                #   one memory per file
-│   └── projects/<project-key>/      # same shape
+│   └── projects/<project-key>/      # OKF-shaped mini-bundle (one per project)
+│       ├── index.md                 #   reserved-form index — always loaded
+│       └── <slug>.md                #   one memory per file
 ├── sessions/                        # trace dir (was ~/.agent/sessions/)
 └── skills/                          # fallback skills dir (was ~/.agent/skills)
 ```
@@ -244,10 +243,9 @@ decided full switch: files in, vectors out.
   (`agent-memory/src/scope.rs` today; helper relocates, §2.7). Scheme
   unchanged ⇒ project identities survive the refactor.
 - **Mount mapping (agent-visible vs disk):** the composite mounts
-  `/memories/global/` → `<memories_dir>/global/` and `/memories/project/` →
-  `<memories_dir>/projects/<key>/`, with `<key>` resolved from the workspace
-  at assembly. The agent never sees the hash — its project memory is always
-  at the stable path `/memories/project/`.
+  `/memories/project/` → `<memories_dir>/projects/<key>/`, with `<key>`
+  resolved from the workspace at assembly. The agent never sees the hash —
+  its memory is always at the stable path `/memories/project/`.
 - Workspace convention renames too (owner: whole root):
   `<workspace>/.agent/skills` → `<workspace>/.rusty-agent/skills`. Real
   targets only (§0 allowlist) — there is no checked-in `.agent/` tree in
@@ -263,12 +261,12 @@ decided full switch: files in, vectors out.
 
 ### 2.3 Memory file format (OKF v0.1 shape, memory-local dialect)
 
-Each scope directory is a small OKF-shaped bundle. **Deliberate divergences
-from the repo's doc-bundle usage (panel: state them so nobody "fixes" them):**
-memory `type` values are runtime-local (not `okf_check.py`'s
-`ALLOWED_TYPES`); index lines use the memory-local form below (not the doc
-bundles' absolute-path em-dash form); `okf_check.py` is never pointed at
-memory (§0 OUT).
+The project scope directory is a small OKF-shaped bundle. **Deliberate
+divergences from the repo's doc-bundle usage (panel: state them so nobody
+"fixes" them):** memory `type` values are runtime-local (not
+`okf_check.py`'s `ALLOWED_TYPES`); index lines use the memory-local form
+below (not the doc bundles' absolute-path em-dash form); `okf_check.py` is
+never pointed at memory (§0 OUT).
 
 - **`index.md`** — reserved OKF index form, **no frontmatter**: bullet list,
   one line per memory, `* [Title](<slug>.md) - hook`. This is the only file
@@ -296,46 +294,44 @@ ToolCallLimit, Repair]` — **order and every other entry untouched** (§3).
   today holds a backend handle; `RunCx` has no backend field; today's
   injection goes through the `Retriever` port, and `SessionArtifacts` routes
   are `MemBackend`-backed. `MemoryFilesMiddleware` is constructed at
-  assembly with two `Arc<dyn Backend>` scope handles (agent-core already
-  depends on the crate that defines `Backend` — dep direction verified
-  workable); reading a backend from a middleware is a new capability the
-  plan must build, not find.
-- **`on_run_start`** (fires once pre-loop, verified): read both scope
-  indexes and set the memory block via the renamed pinned-slot setter
-  (§2.7). Missing dir/file ⇒ that scope contributes nothing; both missing ⇒
-  block omitted entirely (matches today's empty-recall behavior).
-- **Refresh** (gate E2): if (a)/(b), the refresh rides `after_tools` — which
-  fires **every tool turn but never on a text-only turn** (panel-verified;
-  benign: a text-only turn is the run's last model call, nothing consumes a
-  refresh). Option (b) re-reads only when the turn's tool calls touched
-  `/memories/`.
+  assembly with the project-scope `Arc<dyn Backend>` handle (agent-core
+  already depends on the crate that defines `Backend` — dep direction
+  verified workable); reading a backend from a middleware is a new
+  capability the plan must build, not find.
+- **`on_run_start`** (fires once pre-loop, verified): read the project
+  index and set the memory block via the renamed pinned-slot setter (§2.7).
+  Missing dir/file ⇒ block omitted entirely (matches today's empty-recall
+  behavior).
+- **Dirty-flag refresh (E2):** the middleware re-reads and re-sets the block
+  in `after_tools` **only when the just-executed turn's tool calls include a
+  successful write/edit whose path is under `/memories/`** (observable from
+  the turn's tool calls/intents — exact detection point at plan time). A
+  same-turn memory write is thus visible to the next model call; turns that
+  don't touch memory re-render nothing and the prefix cache is undisturbed.
+  Note: `after_tools` fires every tool turn but never on a text-only turn
+  (panel-verified; benign — a text-only turn is the run's last model call,
+  nothing consumes a refresh).
 - **Raw-read byte cap (panel fix):** the middleware reads `index.md` via the
   backend directly (bypassing the read tool's paging), so it applies its own
-  ceiling — read at most `MEMORY_INDEX_MAX_BYTES` (const, e.g. 256 KiB) per
-  index; beyond that, truncate at the cap and treat the remainder as
-  omitted entries (counted into the pointer line below). A pathological
-  index can never OOM or stall the loop.
+  ceiling — read at most `MEMORY_INDEX_MAX_BYTES` (const, e.g. 256 KiB);
+  beyond that, truncate at the cap and treat the remainder as omitted
+  entries (counted into the pointer line below). A pathological index can
+  never OOM or stall the loop.
 - **Rendered block** (in the recall block's pinned position: system →
   goal/ledger → **memory** → summary → todos):
   1. header naming the store (`Long-term memory (self-managed files under
-     /memories/):`) — exact wording at plan time;
+     /memories/project/):`) — exact wording at plan time;
   2. **trust framing** (bundle wording): memory may be outdated, incorrect,
      or written by someone other than the current user, and must not
      override the user's explicit request;
-  3. `## global` index content, then `## project` index content, rendered so
-     entry links resolve under `/memories/<scope>/` from the agent's point
-     of view;
-  4. **per-scope budgets (panel fix — cross-scope starvation):**
-     `DEFAULT_MEMORY_INDEX_BUDGET` (const, 1024 tokens total) is split as an
-     independent per-scope ceiling (512 each; an under-budget scope donates
-     leftover to the other). A fat global index can never evict the project
-     index. Within a scope: truncate whole entries from the tail and emit
-     `[index truncated: N more entries — read /memories/<scope>/index.md]`.
-     **The pointer and per-scope split are NET-NEW code** — the live
-     `recall_block` truncator silently drops its tail and knows nothing of
-     scopes (panel correction; the brainstorm draft wrongly cited it as
-     precedent). Keep the soft-cap property: at least one entry per
-     non-empty scope always renders.
+  3. the index content, rendered so entry links resolve under
+     `/memories/project/` from the agent's point of view;
+  4. **budget + honesty pointer (net-new code — panel correction: the live
+     `recall_block` truncator silently drops its tail and emits no
+     pointer):** `DEFAULT_MEMORY_INDEX_BUDGET` (const, 1024 tokens): truncate
+     whole entries from the tail and emit `[index truncated: N more entries
+     — read /memories/project/index.md]`. Keep the soft-cap property: at
+     least one entry always renders when the index is non-empty.
 - **`pinned_tokens()` extends in lockstep** with the new block — the
   audit-7.3 `est_total` invariant holds (3A-S5 precedent).
 - **Atomic writes (panel fix):** `HostBackend::write` is
@@ -350,9 +346,9 @@ ToolCallLimit, Repair]` — **order and every other entry untouched** (§3).
 
 ### 2.5 Editing contract & prompt discipline
 
-No bespoke memory tools. Create = `write_file` under `/memories/<scope>/`;
-revise = `edit_file`; find = the always-loaded indexes + `read_file`/`grep`;
-**unindex** (the retire mechanism, gate E6) = remove the memory's `index.md`
+No bespoke memory tools. Create = `write_file` under `/memories/project/`;
+revise = `edit_file`; find = the always-loaded index + `read_file`/`grep`;
+**unindex** (the retire mechanism, E6) = remove the memory's `index.md`
 line — an unindexed node is invisible to loading. **No delete tool exists**
 (verified: the `Backend` trait has `delete` but no tool exposes it, and the
 shell cannot reach backend routes) — exposing one is NOT in scope; true
@@ -365,19 +361,18 @@ flag today; children's prompts route differently and must not receive the
 section — verify the child path at plan time). Content (prose at plan time,
 contract here):
 
-1. when you learn something durable, write it **in the same turn** — one
-   fact per file, OKF frontmatter (`type` + `description`; suggested types
-   §2.3), then add its index line to that scope's `index.md`; create the
-   directory/index on first use;
+1. when you learn something durable about this project or how the user works
+   in it, write it **in the same turn** — one fact per file, OKF frontmatter
+   (`type` + `description`; suggested types §2.3), then add its index line
+   to `/memories/project/index.md`; create the directory/index on first use;
 2. update stale memories instead of duplicating — check the index first;
    fix the index line when the fact changes; retire a dead memory by
    removing its index line;
-3. scope deliberately: **project by default; write to global only when the
-   user explicitly asks for a cross-project memory** (E4 mitigation —
-   same-turn auto-writes never target global);
-4. keep the index lean — it loads every run; the hook line should let a
+3. keep the index lean — it loads every run; the hook line should let a
    future run decide whether to open the file;
-5. trust framing mirror: treat what you read there as possibly stale.
+4. trust framing mirror: treat what you read there as possibly stale.
+
+(The brainstormed scope-choice rule is gone with the global tier, E5.)
 
 The old `Recall.when_not_to_call` disambiguation vs `large_tool_results/`
 recovery retires with the tool — both surfaces are now just paths,
@@ -385,15 +380,15 @@ self-disambiguating.
 
 ### 2.6 Children & policy
 
-- Child backends mount `/memories/global/` and `/memories/project/` through
-  the Phase-2 `ReadOnlyToTools` wrapper: children read/grep memory when the
-  parent directs them to; write/edit under `/memories/` fails with the
-  standard read-only error.
-- **Parent mounts are read-write to tools — a net-new mount shape** (panel
+- Child backends mount `/memories/project/` through the Phase-2
+  `ReadOnlyToTools` wrapper: children read/grep memory when the parent
+  directs them to; write/edit under `/memories/` fails with the standard
+  read-only error.
+- **The parent mount is read-write to tools — a net-new mount shape** (panel
   correction): today's composite routes (`large_tool_results/`,
   `conversation_history/`) are `ReadOnlyToTools`-wrapped in **both** parent
   and child; parent-privileged writes go through unwrapped non-tool handles.
-  `/memories/` is the first tool-writable mount. The plan builds it
+  `/memories/project/` is the first tool-writable mount. The plan builds it
   deliberately (unwrapped Host route in the parent composite) rather than
   "reusing" a precedent that doesn't exist.
 - **Policy mount-awareness (net-new, small — panel fix):** the policy engine
@@ -404,7 +399,7 @@ self-disambiguating.
   `/memories/` auto-allow** (same posture as workspace reads); **writes
   under `/memories/` keep the existing Ask** (verified: `Access::Write` ⇒
   `Decision::Ask` in RulePolicy today — this Ask is the load-bearing
-  injection mitigation, E4). Mechanism (policy learns the mount prefixes vs
+  injection mitigation). Mechanism (policy learns the mount prefixes vs
   intent-path rewriting) is a plan decision; the workspace boundary posture
   for non-mount paths must not change (§3).
 - `MemoryFilesMiddleware` is **parent-only** — the dispatch child stack is
@@ -424,8 +419,8 @@ self-disambiguating.
 - **Delete the `agent-memory` crate** — embedder, stores, retriever, the
   three tools, `MemoryConfig`, and the `fastembed`(onnx)/`rusqlite` deps
   leave the workspace. Cargo dependents (panel-enumerated):
-  `agent-runtime-config`, `agent-server`, **`src-tauri`** (gate E1 decides
-  the desktop/web surface). Relocations, not losses:
+  `agent-runtime-config`, `agent-server`, **`src-tauri`** (E1: its four
+  memory IPC commands are deleted, not migrated). Relocations, not losses:
   - `project_scope()` moves to where assembly can use it — default
     `agent-runtime-config`; exact placement at plan time.
   - the `Retriever` trait (`agent-core/src/recall.rs`) retires with its only
@@ -443,23 +438,23 @@ self-disambiguating.
   `agent-runtime-config/src/lib.rs` imports + asserts;
   `agent-server/src/{setup,session,daemon}.rs`; `eval_context.rs` /
   `soak_live.rs` `MemoryParts`/`MemoryConfig` minting; src-tauri
-  `bridge.rs`/`lib.rs` (E1); web `MemorySection.tsx`/`api.ts`/`types.ts`/
-  `MemorySection.test.tsx`/`ContextExplorer.tsx` (E1), `SettingsForm.tsx`
-  memory label, `ArchDetail`/`archFixture` `recall_budget`; README;
-  `docs/`. Guard: registry test (tools absent) + grep-zero checks for the
-  string targets.
+  `bridge.rs`/`lib.rs` command registrations (E1); web
+  `MemorySection.tsx`/`MemorySection.test.tsx`/`api.ts`/`types.ts`/
+  `ContextExplorer.tsx` (E1), `SettingsForm.tsx` memory label,
+  `ArchDetail`/`archFixture` `recall_budget`; README; `docs/`. Guard:
+  registry test (tools absent) + grep-zero checks for the string targets.
 - **Config (JSON, panel correction):** the runtime config is parsed with
-  `serde_json` (`PartialRuntimeConfig` per-field merge); `config.example.toml`
-  is a **doc-only stub** that never round-trips the loader. `cfg.memory:
-  bool` keeps its name; it gates the middleware + the prompt-discipline
-  section. The `/memories/` mounts (parent rw, child ro) stay
-  **unconditional** so a flag flip never strands files half-visible. New
-  config field: `memories_dir` (override, default `~/.rusty-agent/memories`
-  — real consumer: test isolation). `DEFAULT_MEMORY_INDEX_BUDGET` and
-  `MEMORY_INDEX_MAX_BYTES` are consts, not config (panel trim). All
-  `MemoryConfig` knobs retire. The doc stub gains the memory fields; the
-  loader test exercises JSON (§6).
-- **Path-default renames ride along** (§2.2, allowlist): trace dir, skills
+  `serde_json` (`PartialRuntimeConfig` per-field merge); the example config
+  file is a **doc-only stub** that never round-trips the loader.
+  `cfg.memory: bool` keeps its name; it gates the middleware + the
+  prompt-discipline section. The `/memories/project/` mounts (parent rw,
+  child ro) stay **unconditional** so a flag flip never strands files
+  half-visible. New config field: `memories_dir` (override, default
+  `~/.rusty-agent/memories` — real consumer: test isolation).
+  `DEFAULT_MEMORY_INDEX_BUDGET` and `MEMORY_INDEX_MAX_BYTES` are consts, not
+  config (panel trim). All `MemoryConfig` knobs retire. The doc stub gains
+  the memory fields; the loader test exercises JSON (§6).
+- **Path-default renames are 4A-0** (§2.2, allowlist): trace dir, skills
   fallback, workspace skills dir, CLI display strings, README, docs.
 - The parked context-evolve ceilings already require re-measurement
   (`[[context-evolve-needs-backend-migration]]`); the recall-block→memory-
@@ -511,30 +506,34 @@ self-disambiguating.
   visible in soak runs.
 - **Unindexed files remain greppable** (E6): unindexing hides memory from
   loading, not from search. Accepted; labeled honestly (never "forget").
-- **Prefix-cache impact:** per gate E2 — option (b) invalidates the prefix
-  cache only on turns that actually wrote memory; option (a) accepts
-  index-mtime-independent re-render each turn (content-stable unless
-  written, so cache impact is write-gated either way).
-- **Concurrent sessions** writing the same scope's `index.md`: torn reads
+- **Prefix-cache impact:** with dirty-flag refresh (E2) the pinned block
+  re-renders only on turns that actually wrote memory — cache invalidation
+  is write-gated, rare by design.
+- **Concurrent sessions** writing the same project's `index.md`: torn reads
   are closed by atomic rename (§2.4), but **lost updates remain** (edit =
   read-modify-write; two concurrent sessions can drop one edit). Weaker
   than the SQLite it replaces; accepted for a single-user runtime, noted
   for any future multi-session work.
 - **Budget truncation hides tail entries** from the auto-loaded view — by
-  design; per-scope pointers name the full index path; whole-entry
-  truncation only; per-scope budgets prevent cross-scope starvation (§2.4).
+  design; the pointer names the full index path; whole-entry truncation
+  only.
 - **`~/.agent` left behind** on machines that never run the migration `mv`:
   the runtime starts fresh. Accepted; release-note line covers it. Explicit
   old-root paths in user JSON configs keep working (defaults-only rename).
-- **Trust boundary (E4):** memory files are a prompt-injection persistence
-  surface — and the global index has a strictly larger blast radius than
-  the similarity-gated recall it replaces (loads into every run of every
-  project). Mitigations: write-Ask (load-bearing, pinned by test §6), trust
-  framing, parent-only writes, global-only-on-explicit-request discipline.
-  Residual accepted at gate E4.
+- **Trust boundary:** memory files are a prompt-injection persistence
+  surface — a poisoned index line re-enters this project's every future
+  prompt (project-confined by construction under E5; the old "same trust
+  class as recall" claim was retracted at the panel). Mitigations:
+  write-Ask (load-bearing, pinned by test §6), trust framing, parent-only
+  writes. Residual accepted at the gate.
 
 ## 5. What this slice deliberately does not solve
 
+- **A global memory tier (E5).** Deferred until a demonstrated cross-project
+  need. **Binding condition (E4):** when added, writes/edits under the
+  global route MUST trigger a distinct, explicit approval (never coalesced
+  into ApproveAlways) — this is an owner-set precondition, not a suggestion.
+  The disk layout (`memories/projects/`) already leaves room.
 - **Semantic retrieval at scale.** If memory grows past what index+grep
   navigation handles, that's a future spec with fresh evidence (and the
   eval to show it) — not a reserved seam here.
@@ -550,21 +549,23 @@ self-disambiguating.
 - **Memory for the runtime's own sub-agents** beyond read-only reference:
   child-written memory needs a provenance/approval story first (4B's HITL
   machinery may supply one).
-- **A memory file-browser UI** (if E1 = retire): a later feature over
-  `/memories/`, not this cycle.
+- **A memory file-browser UI** (E1 retired the CRUD tab): a later feature
+  over `/memories/`, not this cycle.
 
 ## 6. Testing
 
-Unit (agent-core):
-- load: both scopes, one scope, neither (empty block ⇒ omitted),
-  global-then-project ordering.
-- budgets: per-scope ceilings + donation; whole-entry truncation; pointer
-  wording; at-least-one-entry-per-scope soft cap; **cross-scope starvation
-  pin** (fat global cannot evict project entries); `MEMORY_INDEX_MAX_BYTES`
+Slice 4A-0 (rename): default-path tests for trace dir, skills fallback,
+workspace skills dir (all `~/.rusty-agent`/`.rusty-agent` forms); guard
+test: zero `.agent` (non-`.agents`) literals in runtime code; full ci.sh.
+
+Slice 4A-1, unit (agent-core):
+- load: index present / missing (empty block ⇒ omitted).
+- budget: under/over `DEFAULT_MEMORY_INDEX_BUDGET`; whole-entry truncation;
+  pointer wording; at-least-one-entry soft cap; `MEMORY_INDEX_MAX_BYTES`
   raw-read cap.
-- refresh (per E2): a mid-run index write is visible in the next `pinned()`
-  render; if (b), a no-memory-write turn does NOT re-read (observable via a
-  counting fake backend).
+- dirty-flag cadence (E2): a turn with a `/memories/` write ⇒ next
+  `pinned()` reflects the new index; a turn without ⇒ NO re-read
+  (observable via a counting fake backend).
 - `pinned_tokens()` lockstep with the new block (extend the existing
   lockstep test).
 - trust-framing + header present when block non-empty.
@@ -575,7 +576,7 @@ Pins:
 - Stack composition: memory slot present iff `cfg.memory`, order unchanged.
 - Child stack contains no memory middleware (the existing quarantine test
   keys on the rendered header string — update it to the new header); child
-  `/memories/` write ⇒ read-only error; child read ⇒ ok (new-test
+  `/memories/project/` write ⇒ read-only error; child read ⇒ ok (new-test
   obligation, invariant 8).
 - **Policy decisions pinned (net-new, §2.6):** parent read under
   `/memories/` ⇒ Allow; parent write under `/memories/` ⇒ Ask; a
@@ -586,16 +587,14 @@ Pins:
 - Atomic-write: backend conformance gains a torn-read regression test
   (concurrent read during write never observes partial content).
 
-Config/paths:
-- default-path tests for `memories_dir`, trace dir, skills fallback,
-  workspace skills dir (all `~/.rusty-agent`/`.rusty-agent` forms); guard
-  test: zero `.agent` (non-`.agents`) literals in runtime code.
+Config:
 - JSON loader test: `memories_dir` override honored via
-  `PartialRuntimeConfig` merge; `config.example.toml` doc stub updated
-  (content-only — it does not round-trip the loader).
+  `PartialRuntimeConfig` merge; the example doc stub updated (content-only —
+  it does not round-trip the loader).
 
-Surfaces (per E1): src-tauri compiles with the crate gone; web typecheck +
-vitest green with MemorySection retired-or-migrated.
+Surfaces (E1): src-tauri compiles with the crate and its four memory
+commands gone; web typecheck + vitest green with MemorySection removed and
+SettingsForm/ArchDetail references updated.
 
 Live:
 - `#[ignore]` cross-run soak: run 1 is prompted to remember a fact (writes
@@ -605,19 +604,19 @@ Live:
   observability, §4).
 
 Suite: full `bash scripts/ci.sh` (fmt, clippy, both workspaces' legs, web)
-before merge, per campaign convention.
+before each slice's merge, per campaign convention.
 
 ## 7. Success criterion
 
 Memory persists across runs as human-auditable OKF-shaped files under
-`~/.rusty-agent/memories/`, self-edited by the agent with its ordinary file
-tools under prompt discipline, loaded index-first into the retired recall
-block's exact pinned position with trust framing, per-scope budgets, and
-honest truncation pointers. The vector fork (crate, deps, tools, DB) is
-fully gone, including the E1-resolved desktop/web surface; children read but
-never write memory; memory writes prompt Ask while reads auto-allow;
-`cfg.memory=false` remains byte-identical; all §3 invariants hold; ci.sh
-green.
+`~/.rusty-agent/memories/projects/<key>/`, self-edited by the agent with its
+ordinary file tools under prompt discipline, loaded index-first into the
+retired recall block's exact pinned position with trust framing and honest
+truncation pointers, refreshed only when memory is actually written. The
+vector fork (crate, deps, tools, DB, desktop IPC commands, web panel) is
+fully gone; children read but never write memory; memory writes prompt Ask
+while reads auto-allow; `cfg.memory=false` remains byte-identical; all §3
+invariants hold; ci.sh green on both slices.
 
 ## Panel & review log
 
@@ -625,10 +624,10 @@ green.
 
 Phase-4 decision round: memory GO full-switch (4A, this spec); durable HITL
 GO (4B, next cycle); interpreter/PTC NO-GO behind an eval precondition.
-Design decisions, owner-selected: two-tier scoping under a renamed
-`~/.rusty-agent` root (rename extends to workspace `.agent` dirs and
-sessions); load contract = index + on-demand; children = read-only, no
-auto-load; architecture = middleware + pinned block (A); format = OKF v0.1
+Design decisions, owner-selected: scoping under a renamed `~/.rusty-agent`
+root (rename extends to workspace `.agent` dirs and sessions); load
+contract = index + on-demand; children = read-only, no auto-load;
+architecture = middleware + pinned block (A); format = OKF v0.1
 mini-bundles. Verified during brainstorm: memory DB empty (0 rows) ⇒ no data
 migration; hook inventory supports on_run_start + after_tools; no delete
 tool exists.
@@ -639,14 +638,14 @@ Reviewers: requirements, assumptions (16 claims verified at live source),
 failure & abuse, scope & simpler-design. Dispositions in three buckets per
 AGENTS.md:
 
-**Fixed in place (blockers/majors/minors folded into this revision):**
+**Fixed in place (blockers/majors/minors folded):**
 - Net-new framing corrections (assumptions F4/F5): parent-rw mount shape and
   middleware→backend handle are new capabilities, not reuse — today's mounts
   are read-only in both parent and child; no middleware reads a backend;
   today's injection rides the `Retriever` port (§2.4, §2.6).
 - Truncation is net-new (failure M1): live `recall_block` silently drops its
-  tail (no pointer); added per-scope budgets + pointers + starvation pin
-  (§2.4, §6).
+  tail (no pointer); added budget + pointer + soft-cap contract (§2.4, §6).
+  (The panel's per-scope starvation fix was subsumed by E5 project-only.)
 - Unbudgeted raw index read (failure M2): added `MEMORY_INDEX_MAX_BYTES`
   ceiling (§2.4).
 - Policy mount-awareness (failure): virtual `/memories/` paths misresolve
@@ -661,9 +660,8 @@ AGENTS.md:
   grep `when_not_to_call` prose, runtime.rs tool-kind, session.rs hardcoded
   join, CLI display string, web SettingsForm/ArchDetail refs — all named
   (§2.7).
-- Config is JSON (assumptions F15): loader is serde_json;
-  `config.example.toml` is a doc stub; tests target the JSON loader (§2.7,
-  §6).
+- Config is JSON (assumptions F15): loader is serde_json; the example config
+  is a doc stub; tests target the JSON loader (§2.7, §6).
 - `project_scope` description corrected to single-value hash (assumptions
   F9; §2.2, §3.7).
 - `after_tools` fires only on tool turns (F1, benign — §2.4); quarantine
@@ -678,15 +676,25 @@ AGENTS.md:
   vocabulary demoted to suggestion, `memory_index_budget` const-not-config
   (scope minors — §0, §2.3, §2.5, §2.7).
 
-**Escalated to the owner gate (decisions pending, top of file):** E1
-src-tauri/web surface fate (converged BLOCKER); E2 refresh cadence
-(YAGNI/cacheability convergence; recommendation dirty-flag); E3 rename
-slice split (decomposition + cosmetic-cost honesty); E4 injection
-blast-radius acceptance (global index > today's recall exposure — "same
-trust class" claim retracted; discipline mitigation added §2.5.3, cuttable);
-E5 two-tier scoping (weak finding vs owner mandate; recommendation keep);
-E6 forget-semantics honesty (relabeled unindex; accept vs delete tool).
+**Escalated to the owner gate:** E1 src-tauri/web surface fate (converged
+BLOCKER); E2 refresh cadence (YAGNI/cacheability convergence); E3 rename
+slice split; E4 injection blast-radius (global index > today's recall
+exposure — "same trust class" claim retracted); E5 two-tier scoping; E6
+forget-semantics honesty.
 
 **Accepted as residual (minors):** lost updates on concurrent-session edits
 (§4); unindexed-file greppability (§4, E6); symbol-rename churn (mechanical
-final step, §2.7); enum-free type values unenforced (§2.3).
+final step, §2.7); type values unenforced (§2.3).
+
+### 2026-07-09 — Owner gate (CLOSED)
+
+**E1 = RETIRE** the memory tab + four IPC commands (delete, don't migrate;
+file-browser is possible later work). **E2 = DIRTY-FLAG** refresh (re-read
+only after a turn that wrote under `/memories/`). **E3 = SPLIT** into 4A-0
+(rename) + 4A-1 (memory). **E4 = REQUIRE MORE: distinct global approval** —
+made moot this cycle by E5 (no global surface); recorded in §5 as a binding
+condition on any future global tier. **E5 = PROJECT-ONLY v0** (owner weighed
+the demonstrated-need evidence — including live examples of global-shaped
+facts from the assistant's own store — and chose to defer the tier).
+**E6 = ACCEPT** unindex semantics. All decisions applied to this revision;
+light-tier consistency read pending.
