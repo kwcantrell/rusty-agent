@@ -485,7 +485,7 @@ impl Middleware for MemoryFilesMiddleware {
                 .args
                 .get("path")
                 .and_then(|p| p.as_str())
-                .is_some_and(|p| p.starts_with("memories/"));
+                .is_some_and(|p| p.trim_start_matches('/').starts_with("memories/"));
         // RunShared derives Clone (Arc<Mutex<..>> — cheap bump); clone BEFORE
         // next.run(self) consumes `next`, set the flag AFTER on success.
         let shared = next.shared().clone();
@@ -1245,6 +1245,80 @@ mod tests {
         assert!(
             prompt.contains("hook c"),
             "after_tools must reload the index once the dirty flag is set: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_files_dirty_flag_refreshes_leading_slash() {
+        // CompositeBackend::route trims a leading '/' before dispatch, so an
+        // approved write to `/memories/...` lands in the memory store — the
+        // dirty-flag check must normalize the same way or the pinned index
+        // goes stale (whole-branch review, 4A-1).
+        let mem: Arc<dyn Backend> = Arc::new(MemBackend::new());
+        mem.write("index.md", "* [A](a.md) - hook a\n")
+            .await
+            .unwrap();
+        let m = MemoryFilesMiddleware::new(mem.clone());
+
+        let mut ctx = crate::WindowContext::new(agent_model::Message::system("sys"));
+        let mut state = RunState::default();
+        let shared = RunShared::default();
+        let cancel = CancellationToken::new();
+        let sink: Arc<dyn EventSink> = Arc::new(crate::testkit::CollectingSink::default());
+        let model: Arc<dyn ModelClient> = Arc::new(crate::testkit::ScriptedModel::new(vec![]));
+
+        // Run-start load: index has one entry.
+        {
+            let mut cx = mem_files_cx(&mut ctx, &mut state, &shared, &cancel, &sink, &model, None);
+            m.on_run_start(&mut cx, "go").await;
+        }
+        assert!(rendered(&ctx).contains("hook a"));
+
+        // Turn 1: a scripted `write_file` call under `/memories/` (leading
+        // slash) succeeds — drive `wrap_tool_call` directly.
+        let tool: Arc<dyn agent_tools::Tool> = Arc::new(AlwaysWrites);
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "write_file".into(),
+            args: serde_json::json!({"path": "/memories/project/index.md", "content": "..."}),
+        };
+        let tctx = test_tool_ctx();
+        let next = ToolNext {
+            tool: tool.clone(),
+            name: "write_file",
+            tctx: &tctx,
+            chain: &[],
+            call: &call,
+            shared: &shared,
+        };
+        let out = m.wrap_tool_call(call.clone(), next).await;
+        assert!(matches!(out, crate::Executed::Ok(_)));
+
+        // Simulate the write actually landing in the backend (CompositeBackend
+        // trims the leading slash before routing) before after_tools re-reads.
+        mem.write("index.md", "* [A](a.md) - hook a\n* [C](c.md) - hook c\n")
+            .await
+            .unwrap();
+
+        // after_tools sees the dirty flag set by wrap_tool_call and reloads.
+        {
+            let mut cx = mem_files_cx(
+                &mut ctx,
+                &mut state,
+                &shared,
+                &cancel,
+                &sink,
+                &model,
+                Some(0),
+            );
+            let flow = m.after_tools(&mut cx).await;
+            assert_eq!(flow, Flow::Continue);
+        }
+        let prompt = rendered(&ctx);
+        assert!(prompt.contains("hook a"));
+        assert!(
+            prompt.contains("hook c"),
+            "after_tools must reload the index for a leading-slash memory write: {prompt}"
         );
     }
 
