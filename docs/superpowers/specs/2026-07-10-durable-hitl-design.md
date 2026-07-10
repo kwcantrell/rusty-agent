@@ -510,9 +510,14 @@ comment on skipped Approval events, config.example.json, the
   + parked banner.
 - Deny-feedback reaches the model as tool-result text (native + prompted
   protocols).
-- Cross-surface: two attached frontends, first answer wins,
-  `approval_resolved` retracts the second's prompt; daemon-alive reattach
-  reuses the live pending id (no duplicate).
+- Cross-surface: sequential attach — surface A answers, a later-attached
+  surface B sees no re-emitted prompt and an `approval_resolved` was
+  emitted; cross-process first-answer-wins is enforced by the 4B-2
+  `resume.lock` claim + the answer commit point. *(Amended at the 4B-2
+  plan gate, 2026-07-10: the single-subscriber event slot makes literally
+  simultaneous frontends unrepresentable — owner-ratified; see the 4B-2
+  plan's Panel & review log.)* Daemon-alive reattach reuses the live
+  pending id (no duplicate).
 - E5: headless knob auto-denies after N and deletes the park; CLI timeout
   parks-and-exits.
 - One **live kill-restart WebDriver drive** (3B-2 precedent): trigger a
@@ -599,3 +604,14 @@ comment on skipped Approval events, config.example.json, the
   sections, slice assignments consistent); 4 mechanical citation fixes
   applied (§2.4 list-item pseudo-headings ×2, §3.7→§3.8 miscite, orphan
   "OQ3" label). Owner spec review pending.
+- **2026-07-10 — 4B-2 plan gate (owner):** two plan-review escalations
+  decided — **P1** cancel-while-parked retains the park on BOTH surfaces
+  (fixes a verified baseline bug where the cancel arm cleared the park;
+  parks are cleared only by answers — a server-side behavior change,
+  accepted); **P2** §6's cross-surface row amended in place from
+  "two attached frontends" to sequential-attach (single-subscriber slot;
+  cross-process first-answer-wins = the 4B-2 `resume.lock` + answer
+  commit point; multi-subscriber broadcast stays deferred). Also folded
+  into 4B-2 per the 4B-1 merge-gate dispositions: resumed-run trace
+  attribution + in-life failed-resume retry. Details in
+  `docs/superpowers/plans/2026-07-10-durable-hitl-4b2.md`.
