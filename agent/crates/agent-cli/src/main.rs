@@ -94,11 +94,52 @@ fn reap_root(root_dir: &Path) {
     let _ = std::fs::remove_dir_all(root_dir);
 }
 
+/// What a resumed run's exit should do to its root checkpoint tree.
+/// `resume_with_cancel`/`turn_loop` return `Ok(())` on BOTH true completion
+/// AND cancellation (background fact, branch review C-1) — `Ok` alone is
+/// never enough to decide reap vs. retain.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeCleanup {
+    /// The tree truly finished: delete-on-completion (spec §2.3).
+    Reap,
+    /// Cancelled (or failed) mid-resume: retain the park, release the
+    /// resume lock + guard so a later reopen can retry (mirrors the
+    /// server's Err arm and dispatch.rs's is_cancelled()-before-Ok check).
+    Retain,
+}
+
+/// Decide cleanup from a resumed run's `Result` and whether its cancel token
+/// tripped. Pure/unit-testable seam for the C-1 fix (`run_sessions_reopen`'s
+/// Ok(()) arm previously reaped unconditionally, destroying a park that was
+/// deliberately retained because the run was cancelled while re-parked).
+fn resume_cleanup_decision<E>(result: &Result<(), E>, cancelled: bool) -> ResumeCleanup {
+    match result {
+        Ok(()) if cancelled => ResumeCleanup::Retain,
+        Ok(()) => ResumeCleanup::Reap,
+        Err(_) => ResumeCleanup::Retain,
+    }
+}
+
+/// claude-cli is a pure text generator; tool calls must come via the
+/// prompted protocol — forced regardless of `--protocol`. Shared by the
+/// normal run path and `sessions reopen` (I-2, 4B-2 branch review) so both
+/// derive the same protocol from the same conditions.
+fn select_protocol(cli: &Cli) -> &str {
+    if cli.backend == "claude-cli" {
+        if cli.protocol != "prompted" {
+            eprintln!("note: forcing --protocol prompted for claude-cli backend");
+        }
+        "prompted"
+    } else {
+        cli.protocol.as_str()
+    }
+}
+
 /// `agent sessions reopen <id>`: re-prompt one parked run's first unanswered
 /// ask (feedback-capable) and resume its tree to completion (spec §2.4, CLI
 /// surface — 4B-2 Task 10).
 async fn run_sessions_reopen(session_id: &str, cli: &Cli) {
-    let rt = runtime_config_from_cli(cli, "prompted");
+    let rt = runtime_config_from_cli(cli, select_protocol(cli));
     let Some(root) = agent_runtime_config::sessions_root(&rt) else {
         eprintln!("error: cannot determine sessions root (is $HOME set?)");
         std::process::exit(2);
@@ -167,9 +208,15 @@ async fn run_sessions_reopen(session_id: &str, cli: &Cli) {
 
     let checkpoint =
         agent_core::Checkpointer::new(parked.root_dir.clone(), key, descriptor.session_id.clone());
+    // M-4 (4B-2 branch review): build the trace writer BEFORE the ParkExit
+    // that carries it, so a park-exit during THIS resumed run flushes the
+    // per-descriptor trace instead of hardcoding `trace: None` (process::exit
+    // skips Drop — a leaked trace tail-loss is a real audit gap, same
+    // rationale as ParkExit::trace's doc comment).
+    let trace = agent_runtime_config::build_trace(&rt, &descriptor.session_id);
     let approval = TerminalApproval::with_park_exit(Some(ParkExit {
         session_id: descriptor.session_id.clone(),
-        trace: None,
+        trace: trace.clone(),
         release_lock: Some(parked.root_dir.clone()),
         exit: Box::new(|code| std::process::exit(code)),
     }));
@@ -183,7 +230,6 @@ async fn run_sessions_reopen(session_id: &str, cli: &Cli) {
     );
     let sandbox = build_sandbox(&rt);
     let stats = Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default()));
-    let trace = agent_runtime_config::build_trace(&rt, &descriptor.session_id);
     let built = assemble_loop(
         &rt,
         LoopParts {
@@ -262,6 +308,14 @@ async fn run_sessions_reopen(session_id: &str, cli: &Cli) {
         }
         None => None, // every ask already answered; crash-after-commit window
     };
+    // I-3 (4B-2 branch review): mirror session.rs's `start_resume`, which
+    // calls `take_answer(&root_dir, &key)` before building the resume turn.
+    // When the ROOT park's answer was already committed (crash-after-commit
+    // window, or a prior partial reopen), consume it here too — otherwise
+    // `answer_opt` stays None and the tool re-asks a question that already
+    // has a durable answer sitting on disk.
+    let answer_opt =
+        answer_opt.or_else(|| agent_core::checkpoint::take_answer(&parked.root_dir, &key));
 
     let resume = root_chk.resume_turn(answer_opt);
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -273,15 +327,20 @@ async fn run_sessions_reopen(session_id: &str, cli: &Cli) {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 cancel.cancel();
-                eprintln!(
-                    "\n^C — a pending approval was left parked; answer later with:\n  agent sessions reopen {session_id}"
-                );
+                eprintln!("\n^C cancelling…");
             }
             r = &mut run => break r,
         }
     };
-    match result {
-        Ok(()) => {
+    // C-1 (4B-2 branch review): `resume_with_cancel`/`turn_loop` return
+    // Ok(()) on cancellation too (background fact) — the Ok(()) arm
+    // previously reaped unconditionally, destroying a park that the run
+    // deliberately retained because it was cancelled while re-parked at a
+    // NEW ask. Route through the same reap-vs-retain decision the fixed
+    // server `start_resume` makes; skip the completed-run epilogue on the
+    // cancelled-while-parked path and print an honest line instead.
+    match resume_cleanup_decision(&result, cancel.is_cancelled()) {
+        ResumeCleanup::Reap => {
             // Completed tree: mirror the server's delete-on-completion reap
             // (session.rs start_resume — `remove_dir_all(&root_dir)` on
             // success). Without this the root checkpoint dir (incl.
@@ -292,10 +351,24 @@ async fn run_sessions_reopen(session_id: &str, cli: &Cli) {
             }
             std::process::exit(0);
         }
-        Err(e) => {
-            eprintln!("resumed run failed: {e}");
+        ResumeCleanup::Retain => {
+            match &result {
+                Ok(()) => {
+                    // Cancelled mid-resume: gate the "left parked" claim on
+                    // an actual park existing on disk, mirroring the REPL's
+                    // Ctrl-C handler (`has_park` check before printing it).
+                    if agent_core::checkpoint::has_park(&parked.root_dir) {
+                        eprintln!(
+                            "run left parked; answer later with:\n  agent sessions reopen {session_id}"
+                        );
+                    } else {
+                        eprintln!("run cancelled");
+                    }
+                }
+                Err(e) => eprintln!("resumed run failed: {e}"),
+            }
             agent_core::checkpoint::release_resume(&parked.root_dir);
-            std::process::exit(1);
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
         }
     }
 }
@@ -496,14 +569,7 @@ async fn main() {
     }
     let api_key = std::env::var("AGENT_API_KEY").ok();
     // claude-cli is a pure text generator; tool calls must come via the prompted protocol.
-    let protocol_name = if cli.backend == "claude-cli" {
-        if cli.protocol != "prompted" {
-            eprintln!("note: forcing --protocol prompted for claude-cli backend");
-        }
-        "prompted"
-    } else {
-        cli.protocol.as_str()
-    };
+    let protocol_name = select_protocol(&cli);
     // Map every loop-relevant flag into one RuntimeConfig, then assemble the loop
     // through the same shared builder the server uses (no duplicated orchestration).
     let rt = runtime_config_from_cli(&cli, protocol_name);
@@ -888,5 +954,137 @@ mod tests {
         let missing = tmp.path().join("does-not-exist");
         // Must not panic even though there's nothing to remove.
         reap_root(&missing);
+    }
+
+    // ---- C-1 (4B-2 branch review): cancelled resumed runs retain their park ----
+
+    #[test]
+    fn resume_cleanup_decision_reaps_on_true_completion() {
+        let ok: Result<(), String> = Ok(());
+        assert_eq!(resume_cleanup_decision(&ok, false), ResumeCleanup::Reap);
+    }
+
+    #[test]
+    fn resume_cleanup_decision_retains_on_cancelled_ok() {
+        // The background fact this fix guards: `turn_loop` returns Ok(()) on
+        // cancellation too, so Ok(()) alone must never be read as "reap".
+        let ok: Result<(), String> = Ok(());
+        assert_eq!(resume_cleanup_decision(&ok, true), ResumeCleanup::Retain);
+    }
+
+    #[test]
+    fn resume_cleanup_decision_retains_on_err_regardless_of_cancel_flag() {
+        let err: Result<(), String> = Err("boom".into());
+        assert_eq!(resume_cleanup_decision(&err, false), ResumeCleanup::Retain);
+        assert_eq!(resume_cleanup_decision(&err, true), ResumeCleanup::Retain);
+    }
+
+    // ---- I-2 (4B-2 branch review): reopen derives the same protocol as run ----
+
+    #[test]
+    fn select_protocol_matches_run_path_for_native_backend() {
+        let cli = Cli::parse_from(["agent-cli", "--backend", "openai", "--protocol", "native"]);
+        assert_eq!(select_protocol(&cli), "native");
+    }
+
+    #[test]
+    fn select_protocol_defaults_to_native_for_openai_backend() {
+        let cli = Cli::parse_from(["agent-cli", "--backend", "openai"]);
+        assert_eq!(select_protocol(&cli), "native");
+    }
+
+    #[test]
+    fn select_protocol_forces_prompted_for_claude_cli_backend() {
+        let cli = Cli::parse_from(["agent-cli", "--backend", "claude-cli"]);
+        assert_eq!(select_protocol(&cli), "prompted");
+
+        // Even an explicit --protocol native is overridden (mirrors the run
+        // path's forcing block exactly).
+        let cli2 = Cli::parse_from([
+            "agent-cli",
+            "--backend",
+            "claude-cli",
+            "--protocol",
+            "native",
+        ]);
+        assert_eq!(select_protocol(&cli2), "prompted");
+    }
+
+    // ---- I-3 (4B-2 branch review): reopen consumes a pre-committed root answer ----
+
+    #[test]
+    fn take_answer_consumes_a_precommitted_root_answer_and_removes_it() {
+        // Mirrors the shape of the reopen arm's I-3 fix: a root park exists,
+        // an answer was already durably committed (crash-after-commit /
+        // prior partial reopen window), and `answer_opt` falls back to
+        // `take_answer` instead of staying None and re-asking live.
+        let tmp = tempfile::tempdir().unwrap();
+        let root_dir = tmp.path().join("checkpoint");
+        let key = [9u8; 32];
+        let ck = agent_core::Checkpointer::new(root_dir.clone(), key, "s1".into());
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let chk = agent_core::checkpoint::Checkpoint {
+                version: agent_core::checkpoint::CHECKPOINT_VERSION,
+                session_id: "s1".into(),
+                subagent_path: vec![],
+                turn: 0,
+                context: agent_core::CuratedContextState {
+                    goal: None,
+                    history: vec![],
+                    compaction_summary: None,
+                    folded_facts: vec![],
+                    folded_sections: vec![],
+                    seq: 0,
+                    history_has_spans: false,
+                    history_incomplete: false,
+                    artifact_prefix: String::new(),
+                    todos: vec![],
+                },
+                guardrails: agent_core::checkpoint::Guardrails {
+                    tool_calls: 0,
+                    model_calls: 0,
+                },
+                parked: agent_core::checkpoint::ParkedTurn {
+                    assistant_text: "running".into(),
+                    tool_calls: vec![agent_tools::ToolCall {
+                        id: "c1".into(),
+                        name: "execute_command".into(),
+                        args: serde_json::json!({"command": "echo hi"}),
+                    }],
+                    invalid: vec![],
+                    gate_records: vec![],
+                    parked_index: Some(0),
+                    origin: None,
+                },
+            };
+            ck.write_park(chk, &agent_core::SessionArtifacts::new())
+                .await
+                .unwrap();
+        });
+
+        // Pre-commit the root answer, same call session.rs's live-answer path
+        // makes (`agent_server::resume::commit_answer` bottoms out here too).
+        agent_core::checkpoint::write_answer(&root_dir, &key, true, Some("go ahead")).unwrap();
+        assert!(root_dir.join("answer.json").exists());
+
+        // The reopen arm's fallback: answer_opt.or_else(|| take_answer(..)).
+        let answer_opt: Option<agent_core::checkpoint::ParkedAnswer> = None;
+        let answer_opt =
+            answer_opt.or_else(|| agent_core::checkpoint::take_answer(&root_dir, &key));
+
+        assert_eq!(
+            answer_opt,
+            Some(agent_core::checkpoint::ParkedAnswer {
+                approve: true,
+                feedback: Some("go ahead".into()),
+            }),
+            "pre-committed root answer must be threaded through as Some(..)"
+        );
+        assert!(
+            !root_dir.join("answer.json").exists(),
+            "take_answer must consume (delete) the answer file"
+        );
     }
 }
