@@ -919,6 +919,7 @@ mod tests {
                 AgentEvent::SandboxDegraded { .. } => "sandbox_degraded",
                 AgentEvent::StreamRetry { .. } => "stream_retry",
                 AgentEvent::RunStart { .. } => "run_start",
+                AgentEvent::Subagent(_) => "subagent",
                 AgentEvent::ToolStart { .. }
                 | AgentEvent::ToolResult { .. }
                 | AgentEvent::ServerUsage { .. } => "FORWARDED-KIND-MUST-NOT-BE-TAPPED",

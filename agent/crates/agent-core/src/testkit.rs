@@ -1,5 +1,5 @@
 //! Test doubles for driving the loop deterministically.
-use crate::{AgentEvent, ContextEvent, EventSink};
+use crate::{AgentEvent, ContextEvent, EventSink, SubagentEvent};
 use agent_model::{
     AssistantTurn, Chunk, CompletionRequest, ModelClient, ModelError, ParsedTurn, ProtocolError,
     RawToolCall, StopReason, ToolCallProtocol,
@@ -228,6 +228,23 @@ impl EventSink for CollectingSink {
             AgentEvent::RunStart { input, system } => {
                 format!("run_start:{input}:system_none={}", system.is_none())
             }
+            AgentEvent::Subagent(se) => match se {
+                SubagentEvent::Start {
+                    id, subagent_type, ..
+                } => format!("subagent_start:{id}:{subagent_type}"),
+                SubagentEvent::Text { id, text } => format!("subagent_text:{id}:{text}"),
+                SubagentEvent::Reasoning { id, text } => {
+                    format!("subagent_reasoning:{id}:{text}")
+                }
+                SubagentEvent::StreamRetry {
+                    id,
+                    discarded_text_chars,
+                    ..
+                } => format!("subagent_stream_retry:{id}:{discarded_text_chars}"),
+                SubagentEvent::End { id, outcome, .. } => {
+                    format!("subagent_end:{id}:{}", outcome.as_str())
+                }
+            },
         };
         self.events.lock().unwrap().push(label);
     }
