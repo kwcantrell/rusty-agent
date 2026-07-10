@@ -8,7 +8,7 @@ use agent_runtime_config::{
     default_allowlist, default_denylist, LoopParts, RuntimeConfig, BASE_SYSTEM_PROMPT,
     DEFAULT_SANDBOX_IMAGE,
 };
-use approval::TerminalApproval;
+use approval::{ParkExit, TerminalApproval};
 use clap::Parser;
 use render::TerminalSink;
 use std::io::{BufRead, Write};
@@ -349,12 +349,30 @@ async fn main() {
         let dir = rt.trace_dir.as_deref().unwrap_or("~/.rusty-agent/sessions");
         eprintln!("\x1b[2mtrace: {}/{}.jsonl\x1b[0m", dir, t.session_id());
     }
+    // Durable parks (4B-2): CLI runs park at Ask exactly like server runs.
+    // Degrades to live-only (None) without HOME/secret — never fails boot.
+    let checkpoint = agent_runtime_config::metadata_root()
+        .and_then(|meta| agent_runtime_config::load_or_create_secret(&meta).ok())
+        .and_then(|key| {
+            let root = agent_runtime_config::sessions_root(&rt)?;
+            Some(agent_core::Checkpointer::new(
+                agent_runtime_config::session_dir(&root, &session_id).join("checkpoint"),
+                key,
+                session_id.clone(),
+            ))
+        });
+    let approval = TerminalApproval::with_park_exit(checkpoint.as_ref().map(|_| ParkExit {
+        session_id: session_id.clone(),
+        trace: trace.clone(),
+        release_lock: None, // ordinary runs hold no resume lock
+        exit: Box::new(|code| std::process::exit(code)),
+    }));
     let built = assemble_loop(
         &rt,
         LoopParts {
             model,
             sink: Arc::new(TerminalSink::default()),
-            approval: Arc::new(TerminalApproval::default()),
+            approval: Arc::new(approval),
             workspace: workspace.clone(),
             mcp_tools,
             stream_idle_timeout: Duration::from_secs(cli.stream_timeout_secs),
@@ -367,8 +385,7 @@ async fn main() {
             trace,
             api_key: api_key.clone(),
             claude_binary: cli.claude_binary.clone(),
-            // Non-durable in 4B-1 by design; the CLI's reopen surface lands in 4B-2.
-            checkpoint: None,
+            checkpoint: checkpoint.clone(),
         },
     );
     if !built.unknown_presets.is_empty() {
@@ -412,7 +429,14 @@ async fn main() {
         tokio::pin!(run);
         let result = loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => { cancel.cancel(); eprintln!("\n^C cancelling…"); }
+                _ = tokio::signal::ctrl_c() => {
+                    cancel.cancel();
+                    if checkpoint.as_ref().is_some_and(|c| agent_core::checkpoint::has_park(c.dir())) {
+                        eprintln!("\n^C — a pending approval was left parked; answer later with:\n  agent sessions reopen {session_id}");
+                    } else {
+                        eprintln!("\n^C cancelling…");
+                    }
+                }
                 r = &mut run => break r,
             }
         };

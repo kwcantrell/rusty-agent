@@ -86,6 +86,18 @@ impl TraceWriter {
         self.write_record(Some(n), Some(parent_id), event);
     }
 
+    /// Force the buffered writer to disk. Best-effort (matches the rest of
+    /// this type's infallible-by-design posture); call before any exit path
+    /// that skips `Drop` (e.g. `std::process::exit`), where a buffered tail
+    /// would otherwise be silently lost.
+    pub fn flush(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(w) = inner.w.as_mut() {
+                let _ = w.flush();
+            }
+        }
+    }
+
     fn write_record(&self, sub: Option<u64>, parent_id: Option<&str>, event: &AgentEvent) {
         let Ok(mut inner) = self.inner.lock() else {
             return;

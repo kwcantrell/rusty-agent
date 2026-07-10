@@ -665,6 +665,16 @@ impl Checkpointer {
         self.flushed.store(false, Ordering::SeqCst);
     }
 
+    /// Cancellation commit (P1, ratified): the park file on disk must
+    /// survive, but `flushed` still needs resetting — it's shared bookkeeping
+    /// between this level's own gate-kind write and a descendant's
+    /// dispatch-kind flush, and `end_turn`'s "a child flushed this turn"
+    /// cleanup would otherwise delete our just-retained park at the shared
+    /// turn-end tail. No file I/O: the park itself is untouched.
+    pub fn retain_park(&self) {
+        self.flushed.store(false, Ordering::SeqCst);
+    }
+
     /// P2: mark an Ask as blocked here — the count propagates up so every
     /// enclosing dispatch call disarms its deadline while we wait. RAII so
     /// a cancelled/denied/dropped await always unwinds the count.

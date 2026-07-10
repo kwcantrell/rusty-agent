@@ -1403,19 +1403,30 @@ impl AgentLoop {
                     // Race the approval wait against cancellation: Ctrl-C during a
                     // pending prompt must end the run promptly rather than wedge until
                     // the prompt is answered. Cancel-during-prompt counts as a deny.
-                    let resp = tokio::select! {
-                        _ = cancel.cancelled() => ApprovalResponse::Deny { feedback: None },
-                        resp = self.approval.request(req) => resp,
+                    let (resp, answered) = tokio::select! {
+                        _ = cancel.cancelled() => (ApprovalResponse::Deny { feedback: None }, false),
+                        resp = self.approval.request(req) => (resp, true),
                     };
                     let allowed = matches!(
                         resp,
                         ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
                     );
-                    // Answer commit (spec §2.3): delete the park before
-                    // proceeding. Auto-deny (E5 knob) and cancel-deny commit
-                    // the same way.
+                    // Answer commit (spec §2.3): delete the park only on a REAL
+                    // channel answer — approve / deny / E5 auto-deny (an
+                    // auto-deny IS an answer, delivered via the channel itself).
+                    // Cancellation must RETAIN the park (P1, ratified): it is the
+                    // CLI Ctrl-C / frontend-disconnect story (spec §2.7), and the
+                    // run must stay resumable via `agent sessions reopen`.
                     if let Some(ck) = self.checkpointer.as_ref() {
-                        ck.clear_park();
+                        if answered {
+                            ck.clear_park();
+                        } else {
+                            // Retain the file, but still reset the flushed flag
+                            // so the shared turn-end tail's cleanup (end_turn)
+                            // doesn't mistake our own retained gate-kind write
+                            // for a descendant's dispatch-kind flush and delete it.
+                            ck.retain_park();
+                        }
                     }
                     if allowed {
                         records.push(crate::GateRecord::Ready);
@@ -8960,6 +8971,57 @@ mod tests {
         );
         // Denial commits the answer the same way an approval does: park deleted.
         assert!(!crate::checkpoint::has_park(&ck_dir));
+    }
+
+    /// P1 (ratified owner decision, refinement 4b): cancellation must RETAIN
+    /// a parked ask — only a REAL channel answer (approve / deny / E5
+    /// auto-deny) clears it. Cancel-while-parked is the CLI Ctrl-C /
+    /// frontend-disconnect story (spec §2.7): the operator should be able to
+    /// reopen and answer later, not lose the park.
+    #[tokio::test]
+    async fn cancelled_while_parked_retains_the_park_file() {
+        struct NeverApprove;
+        #[async_trait::async_trait]
+        impl ApprovalChannel for NeverApprove {
+            async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+                std::future::pending().await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let (agent, _sink) = ask_agent(ws, Arc::new(NeverApprove), ck);
+
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        let run = tokio::spawn(async move {
+            let mut ctx = curated("ws");
+            agent.run_with_cancel(&mut ctx, "go".into(), cancel).await
+        });
+
+        // Poll for the park file to land (the loop writes it before blocking
+        // on the never-answering prompt) rather than assume timing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::checkpoint::has_park(&ck_dir) {
+            if std::time::Instant::now() > deadline {
+                panic!("park file never appeared before cancel");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        c2.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run must finish promptly after cancel, not wedge on the prompt")
+            .expect("run task must not panic")
+            .expect("run returns Ok");
+
+        assert!(
+            crate::checkpoint::has_park(&ck_dir),
+            "cancellation must not consume or clear a parked ask"
+        );
     }
 
     #[tokio::test]
