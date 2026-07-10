@@ -470,6 +470,8 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
                 description_overrides: cfg.tool_description_overrides.clone(),
                 subagents: subagents_reg.clone(),
                 memories: Some(memories.clone()),
+                // Task 11 wires the parent loop's checkpointer here.
+                checkpoint: None,
             },
         )));
     }

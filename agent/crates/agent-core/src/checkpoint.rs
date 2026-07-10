@@ -621,6 +621,22 @@ impl Checkpointer {
         take_answer(&self.dir, &self.key)
     }
 
+    /// Consume a child's durable answer (dispatch resume rebinding): the
+    /// answer.json committed against the child's park before restart.
+    pub fn load_child_answer(&self, call_id: &str) -> Option<bool> {
+        take_answer(
+            &self.dir.join("children").join(sanitize_dir_key(call_id)),
+            &self.key,
+        )
+    }
+
+    /// Remove this checkpointer's ENTIRE dir (its park, artifacts, and every
+    /// descendant child tree). Called on a child's Completed path: the child
+    /// checkpointer's `dir` IS the child dir, so this reaps the whole subtree.
+    pub fn clear_all(&self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+
     /// Load + verify a child's checkpoint (dispatch resume rebinding).
     pub fn load_child(&self, call_id: &str) -> Result<Option<Checkpoint>, CheckpointError> {
         load_checkpoint(

@@ -182,6 +182,7 @@ fn deps(model: ScriptedModel, sink: Arc<dyn EventSink>, base: Vec<Arc<dyn Tool>>
         description_overrides: Default::default(),
         subagents: Arc::new(SubAgentRegistry::default()),
         memories: None,
+        checkpoint: None,
     }
 }
 
@@ -1626,5 +1627,398 @@ async fn subagent_start_id_matches_an_already_emitted_tool_start() {
     assert_eq!(
         events[tool_start_index].1, events[start_index].1,
         "ToolStart and Subagent(Start) must carry the identical on-wire id: {events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 9: child checkpointers, wrap-at-dispatch attribution, resume rebinding.
+// These use a real Checkpointer wired into DispatchDeps.checkpoint so a child
+// parks on its Ask under children/<call_id> and its origin is stamped.
+// ---------------------------------------------------------------------------
+use agent_core::checkpoint::{write_answer, write_checkpoint};
+use agent_core::{
+    Checkpoint, Checkpointer, CuratedContextState, GateRecord, Guardrails, ParkedTurn,
+    PendingSnapshot, CHECKPOINT_VERSION,
+};
+
+const CKKEY: [u8; 32] = [9u8; 32];
+
+/// Records each request's `origin`; while blocked it snapshots whether the
+/// child + parent park dirs exist, then replies with a fixed response after an
+/// optional delay (P2 delayed-approve).
+struct CapturingApproval {
+    origins: Mutex<Vec<Option<agent_policy::ApprovalOrigin>>>,
+    /// (child_park_present, parent_park_present) observed AT ask time.
+    park_seen: Mutex<Vec<(bool, bool)>>,
+    child_dir: std::path::PathBuf,
+    parent_dir: std::path::PathBuf,
+    reply: agent_policy::ApprovalResponse,
+    delay: Option<Duration>,
+}
+#[async_trait::async_trait]
+impl agent_policy::ApprovalChannel for CapturingApproval {
+    async fn request(&self, req: agent_policy::ApprovalRequest) -> agent_policy::ApprovalResponse {
+        self.origins.lock().unwrap().push(req.origin.clone());
+        self.park_seen.lock().unwrap().push((
+            agent_core::checkpoint::has_park(&self.child_dir),
+            agent_core::checkpoint::has_park(&self.parent_dir),
+        ));
+        if let Some(d) = self.delay {
+            tokio::time::sleep(d).await;
+        }
+        self.reply
+    }
+}
+
+/// A minimal parked-turn Checkpoint over a single gate-kind Ask on `writey`.
+/// The last history entry is the parked assistant turn carrying the batch, so
+/// the resume replay produces a well-formed (non-orphaned) context.
+fn parked_writey_checkpoint(session_id: &str, subpath: Vec<String>) -> Checkpoint {
+    let batch = vec![agent_tools::ToolCall {
+        id: "c1".into(),
+        name: "writey".into(),
+        args: serde_json::json!({}),
+    }];
+    Checkpoint {
+        version: CHECKPOINT_VERSION,
+        session_id: session_id.into(),
+        subagent_path: subpath,
+        turn: 0,
+        context: CuratedContextState {
+            goal: Some(Message::user("go")),
+            history: vec![
+                Message::user("go"),
+                Message::assistant("calling writey", Some(batch.clone())),
+            ],
+            compaction_summary: None,
+            folded_facts: vec![],
+            folded_sections: vec![],
+            seq: 0,
+            history_has_spans: false,
+            history_incomplete: false,
+            artifact_prefix: "sub1-".into(),
+            todos: vec![],
+        },
+        guardrails: Guardrails {
+            tool_calls: 0,
+            model_calls: 1,
+        },
+        parked: ParkedTurn {
+            assistant_text: "calling writey".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![],
+            parked_index: Some(0),
+            origin: None,
+        },
+    }
+}
+
+#[tokio::test]
+async fn child_ask_carries_origin_and_parks_under_children_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let ckdir = dir.path().join("checkpoint");
+    let root = Checkpointer::new(ckdir.clone(), CKKEY, "s1".into());
+    // Mimic the parent loop's dispatch-bearing turn: a pending dispatch-kind
+    // snapshot that must flush to disk when the child parks (ancestor flush).
+    root.set_turn_snapshot(PendingSnapshot {
+        context: parked_writey_checkpoint("s1", vec![]).context,
+        guardrails: Guardrails::default(),
+        turn: 0,
+        assistant_text: "dispatching".into(),
+        tool_calls: vec![],
+        invalid: vec![],
+        gate_records: vec![GateRecord::Ready],
+        artifacts: Arc::new(SessionArtifacts::new()),
+    });
+    let child_dir = ckdir.join("children").join("d1");
+    let approval = Arc::new(CapturingApproval {
+        origins: Mutex::new(vec![]),
+        park_seen: Mutex::new(vec![]),
+        child_dir: child_dir.clone(),
+        parent_dir: ckdir.clone(),
+        reply: agent_policy::ApprovalResponse::Deny,
+        delay: None,
+    });
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "writey".into(), "{}".into()),
+            Scripted::Text("done".into()),
+        ]),
+        sink.clone(),
+        vec![Arc::new(Writey)],
+    );
+    d.approval = approval.clone();
+    d.checkpoint = Some(root.clone());
+    let tool = DispatchAgentTool::new(d);
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+
+    // Attribution: the child's Ask carries the dispatch origin.
+    assert_eq!(
+        approval.origins.lock().unwrap().as_slice(),
+        &[Some(agent_policy::ApprovalOrigin {
+            delegation_id: "d1".into(),
+            subagent_name: "general-purpose".into(),
+            depth: 1,
+        })]
+    );
+    // At ask time BOTH the child park and the ancestor dispatch-kind park were
+    // on disk.
+    assert_eq!(
+        approval.park_seen.lock().unwrap().as_slice(),
+        &[(true, true)],
+        "child + parent park present at ask time"
+    );
+    // Deny lets the run finish.
+    assert!(out.content.starts_with("done"));
+    // Completed child → its whole checkpoint tree reaped.
+    assert!(!child_dir.exists(), "child dir cleared after Completed");
+    // The parent's dispatch-kind park is removed when its turn ends.
+    root.end_turn();
+    assert!(
+        !agent_core::checkpoint::has_park(&ckdir),
+        "parent park gone"
+    );
+}
+
+#[tokio::test]
+async fn parent_ask_has_no_origin() {
+    // A top-level loop (no dispatch) issues asks with NO origin (spec §2.6):
+    // only the wrap-at-dispatch decorator stamps one.
+    let ws = workspace();
+    let approval = Arc::new(CapturingApproval {
+        origins: Mutex::new(vec![]),
+        park_seen: Mutex::new(vec![]),
+        child_dir: ws.clone(),
+        parent_dir: ws.clone(),
+        reply: agent_policy::ApprovalResponse::Deny,
+        delay: None,
+    });
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(Writey));
+    let config = LoopConfig {
+        model_limit: 16384,
+        max_turns: 3,
+        max_retries: 1,
+        tool_timeout: Duration::from_secs(5),
+        stream_idle_timeout: Duration::from_secs(3600),
+        workspace: ws.clone(),
+        ..LoopConfig::default()
+    };
+    let agent = AgentLoop::new(
+        Arc::new(ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "writey".into(), "{}".into()),
+            Scripted::Text("done".into()),
+        ])),
+        Arc::new(PassthroughProtocol),
+        Arc::new(reg),
+        Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        }),
+        approval.clone(),
+        Arc::new(FullSink::default()),
+        config,
+    );
+    let mut ctx = CuratedContext::new(
+        Message::system("s"),
+        Arc::new(SessionArtifacts::new()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    agent.run(&mut ctx, "go".into()).await.unwrap();
+    assert_eq!(
+        approval.origins.lock().unwrap().as_slice(),
+        &[None],
+        "top-level asks carry no origin"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_rebinds_a_parked_child_and_resumes_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let ckdir = dir.path().join("checkpoint");
+    let root = Checkpointer::new(ckdir.clone(), CKKEY, "s1".into());
+    // Pre-existing parked child under children/d1 (the call id the rig uses),
+    // with an approve=true answer committed against it.
+    let child_dir = ckdir.join("children").join("d1");
+    write_checkpoint(
+        &child_dir,
+        &CKKEY,
+        &parked_writey_checkpoint("s1", vec!["d1".into()]),
+        &Default::default(),
+    )
+    .unwrap();
+    write_answer(&child_dir, &CKKEY, true).unwrap();
+
+    // A recording approval proves NO prompt fires on resume.
+    let approval = Arc::new(RecordingApproval {
+        seen: Mutex::new(vec![]),
+        reply: agent_policy::ApprovalResponse::Deny,
+    });
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        // The resumed child consumes NO completion for the parked turn: it
+        // executes the batch, then serves the post-batch text turn.
+        ScriptedModel::new(vec![Scripted::Text("resumed done".into())]),
+        sink.clone(),
+        vec![Arc::new(Writey)],
+    );
+    d.approval = approval.clone();
+    d.checkpoint = Some(root.clone());
+    let tool = DispatchAgentTool::new(d);
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .unwrap();
+
+    // The parked writey call executed (approve consumed from answer.json).
+    let events = sink.events.lock().unwrap().clone();
+    assert!(
+        events
+            .iter()
+            .any(|(k, _, n, _)| k == "tool_result:ok" && n == "sub:writey"),
+        "parked writey must execute: {events:?}"
+    );
+    assert!(
+        approval.seen.lock().unwrap().is_empty(),
+        "no approval prompt on resume"
+    );
+    assert!(out.content.starts_with("resumed done"));
+    // Completed → child checkpoint dir reaped.
+    assert!(
+        !child_dir.exists(),
+        "child dir deleted after resume completes"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_deadline_disarms_while_child_ask_is_parked() {
+    // P2 pin: with a checkpointer wired, a tiny subagent_timeout does NOT kill
+    // a child parked at a durable Ask; the late approve lets it finish.
+    let dir = tempfile::tempdir().unwrap();
+    let ckdir = dir.path().join("checkpoint");
+    let root = Checkpointer::new(ckdir.clone(), CKKEY, "s1".into());
+    let child_dir = ckdir.join("children").join("d1");
+    let approval = Arc::new(CapturingApproval {
+        origins: Mutex::new(vec![]),
+        park_seen: Mutex::new(vec![]),
+        child_dir: child_dir.clone(),
+        parent_dir: ckdir.clone(),
+        reply: agent_policy::ApprovalResponse::Approve,
+        // Resolves at 5x the deadline.
+        delay: Some(Duration::from_millis(250)),
+    });
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "writey".into(), "{}".into()),
+            Scripted::Text("late done".into()),
+        ]),
+        sink.clone(),
+        vec![Arc::new(Writey)],
+    );
+    d.approval = approval.clone();
+    d.checkpoint = Some(root.clone());
+    d.subagent_timeout = Duration::from_millis(50);
+    let tool = DispatchAgentTool::new(d);
+    // Use a ctx whose timeout is the tiny deadline (dispatch reads ctx.timeout).
+    let mut ctx = tool_ctx();
+    ctx.timeout = Duration::from_millis(50);
+    let out = tool
+        .execute(serde_json::json!({"prompt": "p"}), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        out.content.starts_with("late done"),
+        "durable ask disarms the deadline; child finished: {}",
+        out.content
+    );
+
+    // Control: WITHOUT a checkpointer, the same tiny deadline still fires
+    // (live-only ask keeps today's hard deadline).
+    let approval2 = Arc::new(CapturingApproval {
+        origins: Mutex::new(vec![]),
+        park_seen: Mutex::new(vec![]),
+        child_dir: child_dir.clone(),
+        parent_dir: ckdir.clone(),
+        reply: agent_policy::ApprovalResponse::Approve,
+        delay: Some(Duration::from_millis(250)),
+    });
+    let sink2 = Arc::new(FullSink::default());
+    let mut d2 = deps(
+        ScriptedModel::new(vec![
+            Scripted::Call("c1".into(), "writey".into(), "{}".into()),
+            Scripted::Text("late done".into()),
+        ]),
+        sink2.clone(),
+        vec![Arc::new(Writey)],
+    );
+    d2.approval = approval2;
+    // d2.checkpoint stays None.
+    d2.subagent_timeout = Duration::from_millis(50);
+    let tool2 = DispatchAgentTool::new(d2);
+    let mut ctx2 = tool_ctx();
+    ctx2.timeout = Duration::from_millis(50);
+    let out2 = tool2
+        .execute(serde_json::json!({"prompt": "p"}), &ctx2)
+        .await
+        .unwrap();
+    assert!(
+        out2.content.contains("timed out"),
+        "live-only ask must still time out: {}",
+        out2.content
+    );
+}
+
+#[tokio::test]
+async fn corrupt_child_checkpoint_refuses_honestly() {
+    let dir = tempfile::tempdir().unwrap();
+    let ckdir = dir.path().join("checkpoint");
+    let root = Checkpointer::new(ckdir.clone(), CKKEY, "s1".into());
+    let child_dir = ckdir.join("children").join("d1");
+    write_checkpoint(
+        &child_dir,
+        &CKKEY,
+        &parked_writey_checkpoint("s1", vec!["d1".into()]),
+        &Default::default(),
+    )
+    .unwrap();
+    // Tamper parked.json (the see-benign/run-hostile forgery) so the manifest
+    // hash no longer matches.
+    let p = child_dir.join("parked.json");
+    let body = std::fs::read_to_string(&p)
+        .unwrap()
+        .replace("calling writey", "calling something else entirely");
+    std::fs::write(&p, body).unwrap();
+
+    let sink = Arc::new(FullSink::default());
+    let mut d = deps(
+        ScriptedModel::new(vec![Scripted::Text("should not run".into())]),
+        sink.clone(),
+        vec![Arc::new(Writey)],
+    );
+    d.checkpoint = Some(root.clone());
+    let tool = DispatchAgentTool::new(d);
+    let err = tool
+        .execute(serde_json::json!({"prompt": "p"}), &tool_ctx())
+        .await
+        .expect_err("corrupt checkpoint must refuse, never start fresh");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("checkpoint"),
+        "failure must mention the checkpoint: {msg}"
+    );
+    // The tampered dir is retained (offline inspection); no Subagent Start
+    // fired (refused pre-Start).
+    assert!(child_dir.exists(), "tampered dir retained");
+    let events = sink.events.lock().unwrap().clone();
+    assert!(
+        !events.iter().any(|(k, _, _, _)| k == "subagent_start"),
+        "no Subagent Start on a refused resume: {events:?}"
     );
 }
