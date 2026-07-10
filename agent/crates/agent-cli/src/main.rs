@@ -251,6 +251,22 @@ async fn main() {
     // TraceWriter would mint a colliding {epoch}-{pid} session id).
     let stats = Arc::new(std::sync::RwLock::new(agent_core::SessionStats::default()));
     let session_id = agent_runtime_config::mint_session_id();
+    if let Some(root) = agent_runtime_config::sessions_root(&rt) {
+        let d = agent_runtime_config::SessionDescriptor {
+            schema: agent_runtime_config::DESCRIPTOR_SCHEMA,
+            session_id: session_id.clone(),
+            workspace: workspace.clone(),
+            created_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            config_path: None, // CLI config is flag-derived — no file provenance
+        };
+        if let Err(e) = agent_runtime_config::write_descriptor(&root, &d) {
+            eprintln!("warning: cannot write session descriptor: {e}");
+        }
+        agent_runtime_config::prune_session_dirs(&root, 50);
+    }
     let trace = agent_runtime_config::build_trace(&rt, &session_id);
     if let Some(t) = &trace {
         let dir = rt.trace_dir.as_deref().unwrap_or("~/.rusty-agent/sessions");
