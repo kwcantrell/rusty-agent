@@ -151,30 +151,6 @@ async fn llama_health() -> llama::LlamaHealth {
 }
 
 #[tauri::command]
-async fn memory_list(state: tauri::State<'_, AppState>, limit: usize, offset: usize)
-    -> Result<Vec<agent_memory::MemoryRow>, String> {
-    session(&state).memory_list(limit, offset).await
-}
-
-#[tauri::command]
-async fn memory_update(state: tauri::State<'_, AppState>, id: String,
-    text: Option<String>, tags: Option<Vec<String>>)
-    -> Result<agent_memory::MemoryRow, String> {
-    session(&state).memory_update(id, text, tags).await
-}
-
-#[tauri::command]
-async fn memory_delete(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
-    session(&state).memory_delete(id).await
-}
-
-#[tauri::command]
-async fn memory_recall_preview(state: tauri::State<'_, AppState>, query: String)
-    -> Result<Vec<agent_memory::ScoredRow>, String> {
-    Ok(session(&state).memory_recall_preview(query).await)
-}
-
-#[tauri::command]
 async fn skill_get(state: tauri::State<'_, AppState>, name: String)
     -> Result<agent_server::session::SkillDto, String> {
     session(&state).skill_get(name).await
@@ -207,10 +183,6 @@ macro_rules! all_handlers {
             get_workspace,
             pick_workspace,
             llama_health,
-            memory_list,
-            memory_update,
-            memory_delete,
-            memory_recall_preview,
             skill_get,
             skill_save
         ]
