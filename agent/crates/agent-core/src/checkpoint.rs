@@ -3,6 +3,8 @@
 //! daemon-local secret; refuse-on-corrupt; delete-on-answer.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub const CHECKPOINT_VERSION: u32 = 1;
 
@@ -309,6 +311,294 @@ pub fn take_answer(dir: &Path, key: &[u8; 32]) -> Option<bool> {
     mac_eq(&a.mac, &answer_mac(key, a.approve, &m.hmac)).then_some(a.approve)
 }
 
+/// Path-component sanitizer for child checkpoint dirs (spec §2.3): keep
+/// `[A-Za-z0-9._-]`, replace everything else with '-'; a leading dot (or a
+/// name that becomes all dots, e.g. "..") is stripped so the joined path can
+/// never escape the tree or hide as a dotfile; empty → "call".
+pub fn sanitize_dir_key(call_id: &str) -> String {
+    let out: String = call_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '-' })
+        .collect();
+    // ".." would escape the tree even without '/' once joined recursively;
+    // a leading dot also hides the dir. Neutralize both.
+    let out = out.trim_start_matches('.').to_string();
+    if out.is_empty() {
+        "call".to_string()
+    } else {
+        out
+    }
+}
+
+/// Recursive `ls`+`read` walk of one backend (NEVER `glob`, which caps at
+/// `GLOB_MAX_RESULTS` — spec §2.3).
+async fn dump_backend(b: &Arc<dyn agent_tools::backend::Backend>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![String::new()]; // "" = root
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = b.ls(&dir).await else {
+            continue;
+        };
+        for e in entries {
+            let path = if dir.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{dir}/{}", e.name)
+            };
+            if e.is_dir {
+                stack.push(path);
+            } else if let Ok(content) = b.read(&path).await {
+                out.insert(path, content);
+            }
+        }
+    }
+    out
+}
+
+/// Dump both artifact stores through the Backend trait (recursive ls+read —
+/// NEVER glob, which caps at 500; spec §2.3).
+pub async fn dump_artifacts(
+    a: &crate::SessionArtifacts,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    BTreeMap::from([
+        ("results".to_string(), dump_backend(&a.results).await),
+        ("history".to_string(), dump_backend(&a.history).await),
+    ])
+}
+
+/// Restore a dump into fresh backends (spec §2.4 step 3).
+pub async fn restore_artifacts(
+    a: &crate::SessionArtifacts,
+    dump: &BTreeMap<String, BTreeMap<String, String>>,
+) {
+    for (store, backend) in [("results", &a.results), ("history", &a.history)] {
+        if let Some(tree) = dump.get(store) {
+            for (path, content) in tree {
+                let _ = backend.write(path, content).await;
+            }
+        }
+    }
+}
+
+/// A dispatch-kind checkpoint waiting in memory (flushed only if a
+/// descendant parks).
+pub struct PendingSnapshot {
+    pub context: crate::CuratedContextState,
+    pub guardrails: Guardrails,
+    pub turn: u64,
+    pub assistant_text: String,
+    pub tool_calls: Vec<agent_tools::ToolCall>,
+    pub invalid: Vec<InvalidParked>,
+    pub gate_records: Vec<GateRecord>,
+    pub artifacts: Arc<crate::SessionArtifacts>,
+}
+
+/// Everything a loop needs to park and everything dispatch needs to derive
+/// child checkpointers. Cheap to clone behind Arc.
+pub struct Checkpointer {
+    dir: PathBuf,
+    key: [u8; 32],
+    session_id: String,
+    subagent_path: Vec<String>,
+    origin: Option<agent_policy::ApprovalOrigin>,
+    parent: Option<Arc<Checkpointer>>,
+    /// Pre-Phase-2 snapshot for dispatch-bearing turns; memory-only unless a
+    /// descendant parks (E1). Cleared at turn end.
+    turn_snapshot: Mutex<Option<PendingSnapshot>>,
+    /// True once this level flushed a dispatch-kind park this turn.
+    flushed: AtomicBool,
+    /// Asks currently blocked at a gate in THIS loop or any descendant
+    /// (owner decision P2): incremented on self + every ancestor when a
+    /// durable Ask starts waiting, decremented when it resolves. Dispatch
+    /// disarms its deadline while a child's count is non-zero.
+    waiting_asks: AtomicUsize,
+}
+
+impl Checkpointer {
+    pub fn new(dir: PathBuf, key: [u8; 32], session_id: String) -> Arc<Self> {
+        Arc::new(Self {
+            dir,
+            key,
+            session_id,
+            subagent_path: Vec::new(),
+            origin: None,
+            parent: None,
+            turn_snapshot: Mutex::new(None),
+            flushed: AtomicBool::new(false),
+            waiting_asks: AtomicUsize::new(0),
+        })
+    }
+
+    /// Child checkpointer for one dispatch call (header note 1: keyed by the
+    /// parent's call id, which IS restart-stable).
+    pub fn child(
+        self: &Arc<Self>,
+        call_id: &str,
+        origin: agent_policy::ApprovalOrigin,
+    ) -> Arc<Checkpointer> {
+        let key_name = sanitize_dir_key(call_id);
+        let mut path = self.subagent_path.clone();
+        path.push(key_name.clone());
+        Arc::new(Self {
+            dir: self.dir.join("children").join(key_name),
+            key: self.key,
+            session_id: self.session_id.clone(),
+            subagent_path: path,
+            origin: Some(origin),
+            parent: Some(self.clone()),
+            turn_snapshot: Mutex::new(None),
+            flushed: AtomicBool::new(false),
+            waiting_asks: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn key(&self) -> &[u8; 32] {
+        &self.key
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn subagent_path(&self) -> &[String] {
+        &self.subagent_path
+    }
+
+    pub fn origin(&self) -> Option<&agent_policy::ApprovalOrigin> {
+        self.origin.as_ref()
+    }
+
+    pub fn set_turn_snapshot(&self, snap: PendingSnapshot) {
+        *self.turn_snapshot.lock().unwrap() = Some(snap);
+    }
+
+    /// Turn completed: drop the memory snapshot; if it was flushed to disk
+    /// this turn (a descendant parked), remove the dispatch-kind park.
+    pub fn end_turn(&self) {
+        *self.turn_snapshot.lock().unwrap() = None;
+        if self.flushed.swap(false, Ordering::SeqCst) {
+            clear_park(&self.dir);
+        }
+    }
+
+    /// Gate-kind park write (spec §2.3): dumps artifacts, writes checkpoint,
+    /// then flushes every ancestor's pending snapshot (dispatch-kind).
+    pub async fn write_park(
+        &self,
+        chk: Checkpoint,
+        artifacts: &crate::SessionArtifacts,
+    ) -> std::io::Result<()> {
+        let dump = dump_artifacts(artifacts).await;
+        write_checkpoint(&self.dir, &self.key, &chk, &dump)?;
+        self.flushed.store(true, Ordering::SeqCst);
+        let mut anc = self.parent.clone();
+        while let Some(a) = anc {
+            a.flush_snapshot().await;
+            anc = a.parent.clone();
+        }
+        Ok(())
+    }
+
+    /// Flush the pending dispatch-kind snapshot, once per turn. The snapshot
+    /// is taken OUT of the mutex before any `.await` below — a MutexGuard
+    /// must never cross an await point (same discipline as `RunShared::with`).
+    async fn flush_snapshot(&self) {
+        if self.flushed.load(Ordering::SeqCst) {
+            return; // already on disk this turn (gate park or earlier child)
+        }
+        let snap = self.turn_snapshot.lock().unwrap().take();
+        let Some(snap) = snap else { return };
+        let chk = Checkpoint {
+            version: CHECKPOINT_VERSION,
+            session_id: self.session_id.clone(),
+            subagent_path: self.subagent_path.clone(),
+            turn: snap.turn,
+            context: snap.context,
+            guardrails: snap.guardrails,
+            parked: ParkedTurn {
+                assistant_text: snap.assistant_text,
+                tool_calls: snap.tool_calls,
+                invalid: snap.invalid,
+                gate_records: snap.gate_records,
+                parked_index: None, // dispatch-kind
+                origin: self.origin.clone(),
+            },
+        };
+        let dump = dump_artifacts(&snap.artifacts).await;
+        if let Err(e) = write_checkpoint(&self.dir, &self.key, &chk, &dump) {
+            tracing::warn!(target: "checkpoint", error = %e,
+                "ancestor snapshot flush failed; restart resume may be partial");
+            return;
+        }
+        self.flushed.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer commit on the live path: delete this level's park.
+    pub fn clear_park(&self) {
+        clear_park(&self.dir);
+        self.flushed.store(false, Ordering::SeqCst);
+    }
+
+    /// P2: mark an Ask as blocked here — the count propagates up so every
+    /// enclosing dispatch call disarms its deadline while we wait. RAII so
+    /// a cancelled/denied/dropped await always unwinds the count.
+    pub fn enter_ask(self: &Arc<Self>) -> AskGuard {
+        let mut node = Some(self.clone());
+        let mut bumped = Vec::new();
+        while let Some(n) = node {
+            n.waiting_asks.fetch_add(1, Ordering::SeqCst);
+            node = n.parent.clone();
+            bumped.push(n);
+        }
+        AskGuard(bumped)
+    }
+
+    pub fn is_awaiting_ask(&self) -> bool {
+        self.waiting_asks.load(Ordering::SeqCst) > 0
+    }
+
+    pub fn take_answer(&self) -> Option<bool> {
+        take_answer(&self.dir, &self.key)
+    }
+
+    /// Load + verify a child's checkpoint (dispatch resume rebinding).
+    pub fn load_child(&self, call_id: &str) -> Result<Option<Checkpoint>, CheckpointError> {
+        load_checkpoint(
+            &self.dir.join("children").join(sanitize_dir_key(call_id)),
+            &self.key,
+        )
+    }
+
+    pub fn child_artifact_dump(
+        &self,
+        call_id: &str,
+    ) -> Result<BTreeMap<String, BTreeMap<String, String>>, CheckpointError> {
+        load_artifact_dump(
+            &self.dir.join("children").join(sanitize_dir_key(call_id)),
+            &self.key,
+        )
+    }
+
+    /// Remove a child's entire checkpoint dir (child finished).
+    pub fn clear_child(&self, call_id: &str) {
+        let _ = std::fs::remove_dir_all(self.dir.join("children").join(sanitize_dir_key(call_id)));
+    }
+}
+
+/// Decrements every bumped node on drop (P2 unwind safety).
+pub struct AskGuard(Vec<Arc<Checkpointer>>);
+impl Drop for AskGuard {
+    fn drop(&mut self) {
+        for n in &self.0 {
+            n.waiting_asks.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +761,184 @@ mod tests {
         )
         .unwrap();
         assert_eq!(take_answer(dir.path(), &key()), None);
+    }
+
+    #[tokio::test]
+    async fn dump_and_restore_artifacts_round_trip_via_backend_trait() {
+        let a = crate::SessionArtifacts::new();
+        a.results.write("r/deep/one.md", "alpha").await.unwrap();
+        a.results.write("two.md", "beta").await.unwrap();
+        a.history.write("history.md", "## s1\nhi").await.unwrap();
+        let dump = dump_artifacts(&a).await;
+        assert_eq!(dump["results"]["r/deep/one.md"], "alpha");
+        assert_eq!(dump["results"]["two.md"], "beta");
+        assert_eq!(dump["history"]["history.md"], "## s1\nhi");
+        let b = crate::SessionArtifacts::new();
+        restore_artifacts(&b, &dump).await;
+        assert_eq!(b.results.read("r/deep/one.md").await.unwrap(), "alpha");
+        assert_eq!(b.history.read("history.md").await.unwrap(), "## s1\nhi");
+    }
+
+    #[tokio::test]
+    async fn child_park_flushes_ancestor_snapshot_and_end_turn_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Checkpointer::new(dir.path().join("checkpoint"), key(), "s1".into());
+        let arts = Arc::new(crate::SessionArtifacts::new());
+        root.set_turn_snapshot(PendingSnapshot {
+            context: sample().context,
+            guardrails: Guardrails {
+                tool_calls: 1,
+                model_calls: 1,
+            },
+            turn: 0,
+            assistant_text: "dispatching".into(),
+            tool_calls: sample().parked.tool_calls,
+            invalid: vec![],
+            gate_records: vec![GateRecord::Ready],
+            artifacts: arts.clone(),
+        });
+        // E1: snapshot alone writes NOTHING
+        assert!(!root.dir().exists());
+
+        let child = root.child(
+            "call_1",
+            agent_policy::ApprovalOrigin {
+                delegation_id: "call_1".into(),
+                subagent_name: "general-purpose".into(),
+                depth: 1,
+            },
+        );
+        let mut chk = sample();
+        chk.subagent_path = vec!["call_1".into()];
+        child
+            .write_park(chk, &crate::SessionArtifacts::new())
+            .await
+            .unwrap();
+
+        // child park present under children/<call_id>; ancestor flushed
+        assert!(has_park(&root.dir().join("children").join("call_1")));
+        assert!(has_park(root.dir()), "ancestor dispatch-kind park flushed");
+        let parent = load_checkpoint(root.dir(), &key()).unwrap().unwrap();
+        assert_eq!(parent.parked.parked_index, None, "dispatch-kind");
+        assert_eq!(
+            load_checkpoint(&root.dir().join("children/call_1"), &key())
+                .unwrap()
+                .unwrap()
+                .subagent_path,
+            vec!["call_1".to_string()]
+        );
+
+        // parent turn completes → its dispatch-kind park is removed,
+        // child park untouched
+        root.end_turn();
+        assert!(!has_park(root.dir()));
+        assert!(has_park(&root.dir().join("children").join("call_1")));
+        // second end_turn is a no-op
+        root.end_turn();
+    }
+
+    #[tokio::test]
+    async fn grandchild_checkpointers_nest_recursively() {
+        // E6a: grandchild composition covered at unit level.
+        let dir = tempfile::tempdir().unwrap();
+        let root = Checkpointer::new(dir.path().join("checkpoint"), key(), "s1".into());
+        let child = root.child(
+            "call_a",
+            agent_policy::ApprovalOrigin {
+                delegation_id: "call_a".into(),
+                subagent_name: "x".into(),
+                depth: 1,
+            },
+        );
+        let grand = child.child(
+            "call_b",
+            agent_policy::ApprovalOrigin {
+                delegation_id: "sub1:call_b".into(),
+                subagent_name: "y".into(),
+                depth: 2,
+            },
+        );
+        assert_eq!(
+            grand.subagent_path(),
+            ["call_a".to_string(), "call_b".to_string()]
+        );
+        // give BOTH ancestors a pending turn snapshot (as the loop would on
+        // a dispatch-bearing turn) so the flush cascade is assertable
+        let snap = || PendingSnapshot {
+            context: sample().context,
+            guardrails: Guardrails::default(),
+            turn: 0,
+            assistant_text: String::new(),
+            tool_calls: vec![],
+            invalid: vec![],
+            gate_records: vec![],
+            artifacts: Arc::new(crate::SessionArtifacts::new()),
+        };
+        root.set_turn_snapshot(snap());
+        child.set_turn_snapshot(snap());
+        let mut chk = sample();
+        chk.subagent_path = grand.subagent_path().to_vec();
+        grand
+            .write_park(chk, &crate::SessionArtifacts::new())
+            .await
+            .unwrap();
+        // grandchild park lands two levels down; BOTH ancestors flushed
+        assert!(has_park(&root.dir().join("children/call_a/children/call_b")));
+        assert!(has_park(&root.dir().join("children").join("call_a")));
+        assert!(has_park(root.dir()));
+    }
+
+    #[test]
+    fn sanitize_dir_key_neutralizes_separators_and_dot_prefixes() {
+        assert_eq!(sanitize_dir_key("call_1"), "call_1");
+        assert!(!sanitize_dir_key("a/b").contains('/'));
+        assert!(!sanitize_dir_key("..\\..").contains('\\'));
+        assert!(!sanitize_dir_key("../../etc").starts_with('.'));
+        assert_eq!(sanitize_dir_key(""), "call");
+    }
+
+    #[test]
+    fn enter_ask_bumps_self_and_every_ancestor_raii() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Checkpointer::new(dir.path().join("checkpoint"), key(), "s1".into());
+        let child = root.child(
+            "call_a",
+            agent_policy::ApprovalOrigin {
+                delegation_id: "call_a".into(),
+                subagent_name: "x".into(),
+                depth: 1,
+            },
+        );
+        let grand = child.child(
+            "call_b",
+            agent_policy::ApprovalOrigin {
+                delegation_id: "sub1:call_b".into(),
+                subagent_name: "y".into(),
+                depth: 2,
+            },
+        );
+        assert!(!root.is_awaiting_ask());
+        assert!(!child.is_awaiting_ask());
+        assert!(!grand.is_awaiting_ask());
+
+        let guard = grand.enter_ask();
+        assert!(root.is_awaiting_ask());
+        assert!(child.is_awaiting_ask());
+        assert!(grand.is_awaiting_ask());
+
+        // a second, independent guard at a different level counts separately
+        let child_guard = child.enter_ask();
+        assert!(child.is_awaiting_ask());
+
+        drop(guard);
+        // child's own guard still holds child + root up
+        assert!(root.is_awaiting_ask());
+        assert!(child.is_awaiting_ask());
+        assert!(!grand.is_awaiting_ask());
+
+        drop(child_guard);
+        assert!(!root.is_awaiting_ask());
+        assert!(!child.is_awaiting_ask());
+        assert!(!grand.is_awaiting_ask());
     }
 }

@@ -165,6 +165,9 @@ pub struct AgentLoop {
     /// Default (see `new`): a `HostBackend` rooted at `config.workspace` —
     /// bare-loop parity with pre-backend-seam behavior.
     backend: Arc<dyn agent_tools::backend::Backend>,
+    /// Park-point checkpointer (spec 4B-1). None (default) ⇒ the loop is
+    /// byte-identical to pre-checkpoint behavior: zero checkpoint I/O (E1).
+    checkpointer: Option<Arc<crate::Checkpointer>>,
 }
 
 impl AgentLoop {
@@ -193,6 +196,7 @@ impl AgentLoop {
             calib_ratio_micros: std::sync::atomic::AtomicU64::new(1_000_000),
             middleware: Vec::new(),
             backend,
+            checkpointer: None,
         }
     }
 
@@ -217,6 +221,13 @@ impl AgentLoop {
     /// Default: a HostBackend rooted at `config.workspace` — bare-loop parity.
     pub fn with_backend(mut self, backend: Arc<dyn agent_tools::backend::Backend>) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Install the park-point checkpointer (spec 4B-1). Default: None — zero
+    /// checkpoint I/O, byte-identical to pre-checkpoint behavior (E1).
+    pub fn with_checkpointer(mut self, ck: Arc<crate::Checkpointer>) -> Self {
+        self.checkpointer = Some(ck);
         self
     }
 
