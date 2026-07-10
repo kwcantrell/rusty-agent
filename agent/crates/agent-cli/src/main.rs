@@ -12,8 +12,78 @@ use approval::TerminalApproval;
 use clap::Parser;
 use render::TerminalSink;
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Inspect and reopen past sessions.
+    Sessions {
+        #[command(subcommand)]
+        cmd: SessionsCmd,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum SessionsCmd {
+    /// List sessions, newest first; parked runs are marked.
+    List,
+    /// Reopen a parked session: re-prompt its pending approval and resume.
+    Reopen { session_id: String },
+}
+
+struct SessionRow {
+    session_id: String,
+    workspace: PathBuf,
+    created_ms: u64,
+    parked: bool,
+}
+
+fn list_sessions(root: &Path) -> Vec<SessionRow> {
+    agent_runtime_config::scan_descriptors(root)
+        .into_iter()
+        .map(|d| {
+            let parked = agent_core::checkpoint::has_park(
+                &agent_runtime_config::session_dir(root, &d.session_id).join("checkpoint"),
+            );
+            SessionRow {
+                session_id: d.session_id,
+                workspace: d.workspace,
+                created_ms: d.created_ms,
+                parked,
+            }
+        })
+        .collect()
+}
+
+async fn run_sessions_cmd(cmd: &SessionsCmd, cli: &Cli) {
+    match cmd {
+        SessionsCmd::List => {
+            let rt = runtime_config_from_cli(cli, "prompted");
+            let Some(root) = agent_runtime_config::sessions_root(&rt) else {
+                eprintln!("error: cannot determine sessions root (is $HOME set?)");
+                std::process::exit(2);
+            };
+            for row in list_sessions(&root) {
+                let marker = if row.parked { "  [PARKED]" } else { "" };
+                println!(
+                    "{}  {}  {}{}",
+                    row.session_id,
+                    row.created_ms,
+                    row.workspace.display(),
+                    marker
+                );
+            }
+            println!("\nreopen a parked session: agent sessions reopen <id>");
+        }
+        SessionsCmd::Reopen { session_id: _ } => {
+            // 4B-2 Task 10
+            eprintln!("sessions reopen: not yet implemented");
+            std::process::exit(2);
+        }
+    }
+}
 
 /// Map CLI flags to a complete `RuntimeConfig` so the loop is assembled the same
 /// way as the server (via `agent_runtime_config::assemble_loop`).
@@ -70,6 +140,8 @@ fn runtime_config_from_cli(cli: &Cli, protocol_name: &str) -> RuntimeConfig {
 #[derive(Parser)]
 #[command(name = "agent", about = "Local Rust agent core (CLI)")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// OpenAI-compatible base URL (e.g. http://localhost:30000 for SGLang)
     #[arg(long, default_value = "http://localhost:30000")]
     base_url: String,
@@ -192,6 +264,11 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
+
+    if let Some(Command::Sessions { cmd }) = &cli.command {
+        return run_sessions_cmd(cmd, &cli).await;
+    }
+
     let workspace = std::fs::canonicalize(&cli.workspace)
         .unwrap_or_else(|_| std::path::PathBuf::from(&cli.workspace));
 
@@ -354,6 +431,60 @@ async fn main() {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn sessions_list_parses() {
+        let cli = Cli::parse_from(["agent", "sessions", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sessions {
+                cmd: SessionsCmd::List
+            })
+        ));
+    }
+
+    #[test]
+    fn sessions_reopen_parses_with_id() {
+        let cli = Cli::parse_from(["agent", "sessions", "reopen", "100-aaaaaaaa"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sessions { cmd: SessionsCmd::Reopen { ref session_id } })
+                if session_id == "100-aaaaaaaa"
+        ));
+    }
+
+    #[test]
+    fn bare_invocation_still_parses_with_no_subcommand() {
+        let cli = Cli::parse_from(["agent"]);
+        assert!(cli.command.is_none()); // REPL default unchanged
+    }
+
+    #[test]
+    fn list_sessions_marks_parked() {
+        let root = tempfile::tempdir().unwrap();
+        for (id, ms) in [("100-aaaaaaaa", 1u64), ("200-bbbbbbbb", 2u64)] {
+            agent_runtime_config::write_descriptor(
+                root.path(),
+                &agent_runtime_config::SessionDescriptor {
+                    schema: agent_runtime_config::DESCRIPTOR_SCHEMA,
+                    session_id: id.into(),
+                    workspace: std::path::PathBuf::from("/w"),
+                    created_ms: ms,
+                    config_path: None,
+                },
+            )
+            .unwrap();
+        }
+        let parked_dir =
+            agent_runtime_config::session_dir(root.path(), "200-bbbbbbbb").join("checkpoint");
+        std::fs::create_dir_all(&parked_dir).unwrap();
+        std::fs::write(parked_dir.join("parked.json"), b"{}").unwrap();
+
+        let rows = list_sessions(root.path());
+        assert_eq!(rows[0].session_id, "200-bbbbbbbb");
+        assert!(rows[0].parked);
+        assert!(!rows[1].parked);
+    }
 
     #[test]
     fn sandbox_mode_flag_parsed() {

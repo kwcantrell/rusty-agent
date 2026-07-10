@@ -40,3 +40,4 @@ AGENT_E2E_URL=… AGENT_E2E_MODEL=… cargo test -p agent-core --test e2e_sglang
   `~/.rusty-agent/sessions/<id>/checkpoint/` — an HMAC'd `parked.json`
   (keyed by `~/.rusty-agent/secret`) that lets the run survive frontend
   disconnect and daemon restart; it's deleted once the approval is answered.
+  `agent sessions list|reopen <id>` — parked-run listing and reopen (4B-2).
