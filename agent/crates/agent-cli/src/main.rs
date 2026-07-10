@@ -83,6 +83,14 @@ async fn run_sessions_cmd(cmd: &SessionsCmd, cli: &Cli) {
     }
 }
 
+/// Delete a completed run's root checkpoint tree (`<session>/checkpoint/`,
+/// including `resume.lock`). Mirrors the server's delete-on-completion reap
+/// in `session.rs::start_resume` on the `Ok(())` arm; best-effort, same as
+/// the server's `let _ = remove_dir_all(..)`.
+fn reap_root(root_dir: &Path) {
+    let _ = std::fs::remove_dir_all(root_dir);
+}
+
 /// `agent sessions reopen <id>`: re-prompt one parked run's first unanswered
 /// ask (feedback-capable) and resume its tree to completion (spec §2.4, CLI
 /// surface — 4B-2 Task 10).
@@ -271,6 +279,11 @@ async fn run_sessions_reopen(session_id: &str, cli: &Cli) {
     };
     match result {
         Ok(()) => {
+            // Completed tree: mirror the server's delete-on-completion reap
+            // (session.rs start_resume — `remove_dir_all(&root_dir)` on
+            // success). Without this the root checkpoint dir (incl.
+            // resume.lock) is orphaned on disk after a clean CLI resume.
+            reap_root(&parked.root_dir);
             if let Ok(s) = stats.read() {
                 eprintln!("\x1b[2m{}\x1b[0m", render::format_stats_line(&s));
             }
@@ -850,5 +863,27 @@ mod tests {
         assert_eq!(rc.active_skills, vec!["greeter".to_string()]);
         assert!(!rc.command_allowlist.is_empty());
         assert!(!rc.command_denylist.is_empty());
+    }
+
+    #[test]
+    fn reap_root_removes_populated_checkpoint_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_dir = tmp.path().join("checkpoint");
+        std::fs::create_dir_all(&root_dir).unwrap();
+        std::fs::write(root_dir.join("root.json"), b"{}").unwrap();
+        std::fs::write(root_dir.join("resume.lock"), b"").unwrap();
+        assert!(root_dir.join("resume.lock").exists());
+
+        reap_root(&root_dir);
+
+        assert!(!root_dir.exists(), "checkpoint dir should be gone");
+    }
+
+    #[test]
+    fn reap_root_is_best_effort_on_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        // Must not panic even though there's nothing to remove.
+        reap_root(&missing);
     }
 }

@@ -1913,9 +1913,12 @@ pub fn prompt_for_answer_with_reader<R: std::io::BufRead>(
 7. Ctrl-C during the resumed run: same select! + parked messaging as
    Task 9 (lock note: leave the lock in place on Ctrl-C-park? NO —
    `release_resume` before exiting, the run is parked, not resuming; the
-   park must be claimable by the next reopen). On success the checkpoint
-   tree is gone (loop/dispatch reap, lock included); print the stats line;
-   exit 0. On error: print `resumed run failed: {e}`, parks retained,
+   park must be claimable by the next reopen). On success the CALLER reaps
+   the root checkpoint tree — `remove_dir_all(&parked.root_dir)` mirroring
+   the server's start_resume success arm (task-review correction: the
+   loop/dispatch reap covers CHILD trees only; the root reap is the resume
+   driver's job, lock included); print the stats line; exit 0. On error:
+   print `resumed run failed: {e}`, parks retained where not yet consumed,
    `release_resume`, exit 1.
 
 - [ ] **Step 4: Run tests + build**
