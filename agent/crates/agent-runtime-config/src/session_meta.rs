@@ -114,7 +114,6 @@ pub fn load_descriptor(dir: &Path) -> Option<SessionDescriptor> {
 /// 32 bytes of key material at <metadata_root>/secret, created 0o600 on
 /// first use. A wrong-length file is InvalidData — never silently
 /// regenerated (that would invalidate every existing checkpoint MAC).
-#[allow(dead_code)]
 pub fn load_or_create_secret(metadata_root: &Path) -> std::io::Result<[u8; 32]> {
     let path = metadata_root.join("secret");
     match std::fs::read(&path) {
