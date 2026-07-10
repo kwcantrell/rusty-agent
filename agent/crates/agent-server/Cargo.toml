@@ -29,6 +29,3 @@ tokio = { workspace = true, features = ["test-util"] }
 # Enable agent-core's `testkit` feature for the Task 4 integration test
 # (ScriptedModel/PassthroughProtocol live behind `#[cfg(any(test, feature = "testkit"))]`).
 agent-core = { path = "../agent-core", features = ["testkit"] }
-# Serializes tests that scope-override $HOME (checkpointer tests reach
-# load_or_create_secret(metadata_root()) — real $HOME must never be touched).
-serial_test = "3"

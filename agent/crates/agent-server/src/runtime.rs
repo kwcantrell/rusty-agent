@@ -970,58 +970,44 @@ mod tests {
         rs.apply(next).unwrap();
     }
 
-    /// Scopes `$HOME` to a tempdir for the duration of the closure, then
-    /// restores it — `RuntimeState::new` sources the daemon secret via
-    /// `load_or_create_secret(metadata_root())`, i.e. the REAL `$HOME`; tests
-    /// that reach that path must never write `~/.rusty-agent/secret` for
-    /// real. Paired with `#[serial]` on every caller (env vars are process-global).
-    fn with_scoped_home<T>(f: impl FnOnce() -> T) -> T {
-        let home_dir = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", home_dir.path());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match result {
-            Ok(v) => v,
-            Err(p) => std::panic::resume_unwind(p),
-        }
-    }
-
     #[test]
-    #[serial_test::serial]
     fn runtime_owns_a_checkpointer_rooted_in_the_session_dir() {
-        with_scoped_home(|| {
-            let (rs, _ws, sessions) = make_with_trace_dir();
-            let ck = rs.checkpointer().expect("checkpointer built");
-            let expect = agent_runtime_config::session_dir(sessions.path(), rs.session_id())
-                .join("checkpoint");
-            assert_eq!(ck.dir(), expect.as_path());
-            // E1: construction creates NOTHING on disk
-            assert!(!expect.exists());
-        });
+        // Reads/creates ~/.rusty-agent/secret via the REAL $HOME (RuntimeState::new
+        // -> load_or_create_secret(metadata_root())) — same pre-existing $HOME-touch
+        // precedent as `make_with_tools` (accepted residual). We no longer mutate the
+        // $HOME env var here: that raced ~15 other parallel tests that also read
+        // $HOME via metadata_root(), causing a flake. The dir assertions below target
+        // the `trace_dir` tempdir, so no other real-HOME writes happen.
+        let (rs, _ws, sessions) = make_with_trace_dir();
+        let ck = rs.checkpointer().expect("checkpointer built");
+        let expect =
+            agent_runtime_config::session_dir(sessions.path(), rs.session_id()).join("checkpoint");
+        assert_eq!(ck.dir(), expect.as_path());
+        // E1: construction creates NOTHING on disk
+        assert!(!expect.exists());
     }
 
     #[test]
-    #[serial_test::serial]
     fn build_resume_loop_binds_descriptor_workspace_and_checkpointer() {
-        with_scoped_home(|| {
-            let (rs, _ws, sessions) = make_with_trace_dir();
-            let other_ws = tempfile::tempdir().unwrap();
-            let ck = agent_core::Checkpointer::new(
-                sessions.path().join("old-1").join("checkpoint"),
-                [1u8; 32],
-                "old-1".into(),
-            );
-            let artifacts = Arc::new(SessionArtifacts::new());
-            let todos: agent_core::TodoHandle = Arc::new(Mutex::new(Vec::new()));
-            let flag = Arc::new(AtomicBool::new(false));
-            let built = rs.build_resume_loop(other_ws.path(), ck, &artifacts, &todos, &flag);
-            // system prompt composed from CURRENT config (live truth):
-            assert_eq!(built.system_prompt, rs.current_system_prompt());
-        });
+        // Reads/creates ~/.rusty-agent/secret via the REAL $HOME (RuntimeState::new
+        // -> load_or_create_secret(metadata_root())) — same pre-existing $HOME-touch
+        // precedent as `make_with_tools` (accepted residual). We no longer mutate the
+        // $HOME env var here: that raced ~15 other parallel tests that also read
+        // $HOME via metadata_root(), causing a flake. The dir assertions below target
+        // the `trace_dir` tempdir, so no other real-HOME writes happen.
+        let (rs, _ws, sessions) = make_with_trace_dir();
+        let other_ws = tempfile::tempdir().unwrap();
+        let ck = agent_core::Checkpointer::new(
+            sessions.path().join("old-1").join("checkpoint"),
+            [1u8; 32],
+            "old-1".into(),
+        );
+        let artifacts = Arc::new(SessionArtifacts::new());
+        let todos: agent_core::TodoHandle = Arc::new(Mutex::new(Vec::new()));
+        let flag = Arc::new(AtomicBool::new(false));
+        let built = rs.build_resume_loop(other_ws.path(), ck, &artifacts, &todos, &flag);
+        // system prompt composed from CURRENT config (live truth):
+        assert_eq!(built.system_prompt, rs.current_system_prompt());
     }
 
     #[test]
