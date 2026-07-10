@@ -212,6 +212,7 @@ impl Session {
             parked.descriptor.session_id.clone(),
         );
         let built = self.runtime.build_resume_loop(
+            &parked.descriptor.session_id,
             &parked.descriptor.workspace,
             ck,
             &artifacts,
@@ -1171,6 +1172,179 @@ mod tests {
         assert!(
             resumed_index >= before_answer,
             "Resumed frame must be captured no earlier than the answer that triggers it"
+        );
+
+        std::mem::forget(ws);
+        std::mem::forget(sessions);
+    }
+
+    /// A resumed run's trace must land in ITS OWN session's jsonl (4B-2 fix for a
+    /// 4B-1 merge-gate deferral) — not the resuming daemon's own trace file.
+    /// `max_turns: 1` on the daemon's config makes `resume_with_cancel` complete
+    /// without a model call: the checkpoint's `turn: 0` means the post-batch
+    /// `turn_loop(start_turn + 1 = 1)` runs zero iterations against `max_turns: 1`
+    /// and lands straight in the budget-exhaustion epilogue (loop_.rs), so the
+    /// executed `execute_command` tool events are the only thing traced — real
+    /// completion, no live model server needed.
+    #[tokio::test]
+    async fn resumed_run_traces_into_its_own_session_file() {
+        use agent_core::checkpoint::{Checkpoint, Checkpointer, Guardrails, ParkedTurn};
+        use agent_policy::ApprovalOrigin;
+
+        let ws = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+
+        let meta = agent_runtime_config::metadata_root().expect("HOME set");
+        let key = agent_runtime_config::load_or_create_secret(&meta).expect("secret");
+
+        let prior_id = "100-aaaaaaaa";
+        agent_runtime_config::write_descriptor(
+            sessions.path(),
+            &agent_runtime_config::SessionDescriptor {
+                schema: agent_runtime_config::DESCRIPTOR_SCHEMA,
+                session_id: prior_id.into(),
+                workspace: ws.path().to_path_buf(),
+                created_ms: 1,
+                config_path: None,
+            },
+        )
+        .unwrap();
+        let prior_ck =
+            agent_runtime_config::session_dir(sessions.path(), prior_id).join("checkpoint");
+        let ckr = Checkpointer::new(prior_ck.clone(), key, prior_id.into());
+        let planted_args = serde_json::json!({"command": "echo real"});
+        let origin = ApprovalOrigin {
+            delegation_id: "c9".into(),
+            subagent_name: "explore".into(),
+            depth: 1,
+        };
+        let chk = Checkpoint {
+            version: agent_core::checkpoint::CHECKPOINT_VERSION,
+            session_id: prior_id.into(),
+            subagent_path: vec![],
+            turn: 0,
+            context: agent_core::CuratedContextState {
+                goal: None,
+                // The parked assistant turn (tool_calls: [c9]) must already be in
+                // history — tool_phase appends only the Role::Tool result, never the
+                // assistant message, so its absence here would leave that result
+                // orphaned (curated.rs orphaned_tool_positions).
+                history: vec![
+                    Message::user("hi"),
+                    Message::assistant(
+                        "running",
+                        Some(vec![agent_tools::ToolCall {
+                            id: "c9".into(),
+                            name: "execute_command".into(),
+                            args: planted_args.clone(),
+                        }]),
+                    ),
+                ],
+                compaction_summary: None,
+                folded_facts: vec![],
+                folded_sections: vec![],
+                seq: 0,
+                history_has_spans: false,
+                history_incomplete: false,
+                artifact_prefix: String::new(),
+                todos: vec![],
+            },
+            guardrails: Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            parked: ParkedTurn {
+                assistant_text: "running".into(),
+                tool_calls: vec![agent_tools::ToolCall {
+                    id: "c9".into(),
+                    name: "execute_command".into(),
+                    args: planted_args.clone(),
+                }],
+                invalid: vec![],
+                gate_records: vec![],
+                parked_index: Some(0),
+                origin: Some(origin.clone()),
+            },
+        };
+        ckr.write_park(chk, &agent_core::SessionArtifacts::new())
+            .await
+            .unwrap();
+
+        let mut params = crate::setup::local_params(
+            ws.path().to_path_buf(),
+            ws.path().join("rt.json"),
+            "http://localhost:8080".into(),
+            "m".into(),
+        );
+        params.config.trace = true;
+        params.config.trace_dir = Some(sessions.path().to_string_lossy().into_owned());
+        params.config.max_turns = 1;
+        let sess = Session::from_params(params);
+        let own_id = sess.session_id().to_string();
+
+        let cap = Arc::new(Captured::default());
+        sess.set_event_out(cap.clone());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let ask_id = loop {
+            let found = cap.0.lock().unwrap().iter().find_map(|ev| match ev {
+                ServerEvent::ApprovalRequest { id, .. } => Some(id.clone()),
+                _ => None,
+            });
+            if let Some(id) = found {
+                break id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no ApprovalRequest re-emitted from the parked prior session"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let own_trace = sessions.path().join(format!("{own_id}.jsonl"));
+        let own_lines_before = std::fs::read_to_string(&own_trace)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        let prior_trace = sessions.path().join(format!("{prior_id}.jsonl"));
+        let prior_lines_before = std::fs::read_to_string(&prior_trace)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+
+        sess.approve(&ask_id, Decision::Approve);
+
+        // Wait for the resumed run to finish (active cleared in start_resume's
+        // spawned task) rather than for a specific event, since completion here
+        // is budget exhaustion, not a Done the harness names distinctly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if sess.resuming.lock().unwrap().contains(prior_id)
+                && sess.active.lock().unwrap().is_none()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resumed run never completed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Give the trace writer's fs write a beat past the active-flag clear.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let prior_lines_after = std::fs::read_to_string(&prior_trace)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert!(
+            prior_lines_after > prior_lines_before,
+            "resumed session's own trace file must gain records from the resumed run"
+        );
+
+        let own_lines_after = std::fs::read_to_string(&own_trace)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            own_lines_after, own_lines_before,
+            "the daemon's own trace file must NOT gain the resumed run's tool events"
         );
 
         std::mem::forget(ws);
