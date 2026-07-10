@@ -258,7 +258,7 @@ pub fn assemble_loop(cfg: &RuntimeConfig, parts: LoopParts) -> BuiltLoop {
         .system_prompt_override
         .as_deref()
         .unwrap_or(&parts.base_system_prompt);
-    let system_prompt = match compose_system_prompt(base, &skill_registry, &presets) {
+    let system_prompt = match compose_system_prompt(base, &skill_registry, &presets, cfg.memory) {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "compose_system_prompt failed unexpectedly; using base prompt");
