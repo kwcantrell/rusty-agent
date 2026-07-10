@@ -4124,3 +4124,29 @@ grant store (E2), retention/GC beyond delete-on-completion — §5 deferrals.
   empty checkpoint-dir skeletons may linger after live-answer cleanup
   (harmless; pruning ignores them).
 
+- **2026-07-10 — whole-branch merge review (fable, ce75d41..dff7c8d, 20
+  commits): READY-TO-MERGE = Yes.** All six cross-task seams verified at the
+  live tip (park→resume shape parity incl. dispatch-kind ancestor flow;
+  key/path arithmetic; answer-commit chain with no double-execute/re-prompt
+  path; E1 write-sweep; P2 counter seam incl. the T14 fix; child quarantine)
+  and all ten §3 invariants HELD. Fix wave applied post-review: I1
+  resume-guard bounce now surfaces an error + in-resume sessions are not
+  re-prompted; I3 torn-window comment; I4 P1 string unify; T12 dead binding.
+  **Dispositions recorded at the merge gate:**
+  - **NAMED 4B-2 DEFERRAL (T11/M1 — resumed-run trace attribution):**
+    `build_resume_loop` shares the resuming daemon's trace handle, so a
+    resumed (prior) session's events land in the CURRENT session's trace
+    file. §3.6's contract (naming/shape/0o600) is untouched and no events
+    are lost — they are misattributed. Proper fix (per-descriptor
+    TraceWriter on resume) belongs with 4B-2's session-reopen surface.
+  - **E1 NARROWED READING (I2):** on checkpointer-wired dispatch-bearing
+    turns, each dispatch call performs one `parked.json` stat (rebind
+    lookup) and one `remove_dir_all` attempt on completion (delete-on-
+    completion reap) — metadata syscalls, never writes, never dir creation.
+    Functionally required by the rebind design; "zero checkpoint I/O"
+    remains exact for the write path and for all non-dispatch turns.
+  - Live kill-restart drive (T14): PASSED end-to-end on a genuinely new
+    pid after the drive first caught and forced the fix of a real
+    abort-on-attach product bug (sync `subscribe` + reactor-less spawn) —
+    the exact class unit tests structurally miss.
+

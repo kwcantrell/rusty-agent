@@ -171,6 +171,7 @@ async fn run_once(
             trace: None,
             api_key: None,
             claude_binary: "claude".into(),
+            checkpoint: None,
         },
     );
     let agent = built.loop_;

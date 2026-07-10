@@ -61,12 +61,18 @@ export function AnimatedToolCall({ item, artifactKey, active, onSelect }: Props)
               style={{ background: "var(--cli-accent)", color: "var(--cli-bg, #000)" }}>
               agent[{item.subagent.subagentType}]
             </span>
-            <span className="text-xs" style={{
-              color: item.subagent.status === "running" ? "var(--cli-accent)"
-                : item.subagent.outcome === "completed" || item.subagent.outcome === undefined
-                  ? "var(--cli-ok)" : "var(--cli-err)" }}>
-              {item.subagent.status === "running" ? "running" : (item.subagent.outcome ?? "done")}
-            </span>
+            {(() => {
+              const waiting = item.subagent.status === "running" && item.subagent.waitingApproval;
+              return (
+                <span className="text-xs" style={{
+                  color: item.subagent.status === "running" ? "var(--cli-accent)"
+                    : item.subagent.outcome === "completed" || item.subagent.outcome === undefined
+                      ? "var(--cli-ok)" : "var(--cli-err)" }}>
+                  {waiting ? "waiting approval"
+                    : item.subagent.status === "running" ? "running" : (item.subagent.outcome ?? "done")}
+                </span>
+              );
+            })()}
             {(item.subagent.text || item.subagent.reasoning) && (
               <button type="button" onClick={() => setCardOpen((o) => !o)}
                 style={{ color: "var(--cli-dim)" }} className="text-xs">

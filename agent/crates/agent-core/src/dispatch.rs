@@ -436,6 +436,9 @@ pub struct DispatchDeps {
     /// `Some`, test rigs `None`. Mounted read-only at `memories/project/` in
     /// the child composite when present — a child never gets write access.
     pub memories: Option<Arc<dyn agent_tools::backend::Backend>>,
+    /// Parent loop's checkpointer; None ⇒ children are not durable (test
+    /// rigs, CLI in 4B-1). Children derive their own via `.child()`.
+    pub checkpoint: Option<Arc<crate::Checkpointer>>,
 }
 
 pub struct DispatchAgentTool {
@@ -711,6 +714,28 @@ impl Tool for DispatchAgentTool {
         for t in &filtered_base {
             reg.register(t.clone());
         }
+        // Visible parent id: at top level this is the raw call id; nested, the
+        // prefix makes it the child row's on-wire id (spec G8 attribution).
+        // Also the 3B-2 delegation id: Start/End and forwarded deltas all carry
+        // this exact string. Computed here (before the nested tool + child_ctx)
+        // so the attribution origin and child checkpointer can key on it.
+        let parent_id = format!("{}{}", self.deps.id_prefix, ctx.call_id);
+        let origin = agent_policy::ApprovalOrigin {
+            delegation_id: parent_id.clone(),
+            subagent_name: subagent_type.clone(),
+            depth: self.deps.depth,
+        };
+        let child_ckpt = self
+            .deps
+            .checkpoint
+            .as_ref()
+            .map(|ck| ck.child(&ctx.call_id, origin.clone()));
+        // Wrap-at-dispatch attribution (spec §2.6): every request the child
+        // issues is stamped; the sub{n}: sink rewrite never touches approvals.
+        let child_approval: Arc<dyn ApprovalChannel> = Arc::new(
+            agent_policy::AttributingApprovalChannel::new(self.deps.approval.clone(), origin),
+        );
+
         // Depth budget (spec G7/G8): a child may dispatch only while under the
         // configured depth AND (no allowlist, or the allowlist names it). The
         // nested tool's id_prefix is THIS call's visible prefix so a grandchild's
@@ -723,6 +748,9 @@ impl Tool for DispatchAgentTool {
             nested.depth = self.deps.depth + 1;
             nested.id_prefix = format!("sub{n}:");
             nested.policy = child_policy.clone();
+            // Grandchildren nest under THIS child's checkpointer so their
+            // parks land in children/<call>/children/... (spec §2.3).
+            nested.checkpoint = child_ckpt.clone();
             // Transitive scope: when an allowlist filtered the base, the nested
             // tool sees only that filtered set (grandchild ⊆ child). Without an
             // allowlist, the full snapshot passes through unchanged.
@@ -783,19 +811,66 @@ impl Tool for DispatchAgentTool {
                 None => self.deps.child_system_prompt.clone(),
             },
         };
-        let mut child_ctx = CuratedContext::new(Message::system(system), artifacts.clone(), flag)
-            .with_offload_config(OffloadConfig {
-                max_result_bytes: self.deps.max_result_bytes,
-                ..OffloadConfig::default()
-            })
-            .with_artifact_prefix(format!("sub{n}-"))
-            .with_todos(todos);
 
-        // Visible parent id: at top level this is the raw call id; nested, the
-        // prefix makes it the child row's on-wire id (spec G8 attribution).
-        // Also the 3B-2 delegation id: Start/End and forwarded deltas all
-        // carry this exact string.
-        let parent_id = format!("{}{}", self.deps.id_prefix, ctx.call_id);
+        // Resume rebinding (spec §2.5): a parked child restores in place
+        // instead of starting fresh. The child's park lives under the PARENT
+        // checkpointer's children/<call_id> (child_ckpt.dir IS that dir), so
+        // the load reads it via the parent's child-dir accessors. This runs
+        // BEFORE child_ctx so a corrupt checkpoint refuses honestly (spec §4)
+        // here — before Subagent Start fires and before any guard/sink exists
+        // (pre-Start error idiom).
+        let restored_child: Option<crate::Checkpoint> = match &self.deps.checkpoint {
+            Some(ck) => {
+                let loaded = ck.load_child(&ctx.call_id).and_then(|chk| {
+                    if let Some(c) = &chk {
+                        crate::checkpoint::verify_tally_floor(c)?;
+                    }
+                    Ok(chk)
+                });
+                match loaded {
+                    Ok(chk) => chk,
+                    Err(e) => {
+                        // Refuse honestly (spec §4): never start a fresh child
+                        // over a corrupt checkpoint. The tampered dir is
+                        // retained (no clear_child) for offline inspection.
+                        return Err(ToolError::Failed {
+                            message: format!("sub-agent checkpoint unreadable; cannot resume: {e}"),
+                            stderr: None,
+                        });
+                    }
+                }
+            }
+            None => None,
+        };
+        let mut child_ctx = match (&restored_child, &self.deps.checkpoint) {
+            (Some(chk), Some(ck)) => {
+                if let Ok(dump) = ck.child_artifact_dump(&ctx.call_id) {
+                    crate::checkpoint::restore_artifacts(&artifacts, &dump).await;
+                }
+                // Keep the ORIGINAL artifact_prefix from the restored state
+                // (its own sub{k}- prefix) so restored seq/prefix naming stays
+                // collision-free; do NOT re-apply sub{n}-.
+                CuratedContext::restore(
+                    Message::system(system),
+                    artifacts.clone(),
+                    flag,
+                    todos,
+                    chk.context.clone(),
+                )
+                .with_offload_config(OffloadConfig {
+                    max_result_bytes: self.deps.max_result_bytes,
+                    ..OffloadConfig::default()
+                })
+            }
+            _ => CuratedContext::new(Message::system(system), artifacts.clone(), flag)
+                .with_offload_config(OffloadConfig {
+                    max_result_bytes: self.deps.max_result_bytes,
+                    ..OffloadConfig::default()
+                })
+                .with_artifact_prefix(format!("sub{n}-"))
+                .with_todos(todos),
+        };
+
         let sink = Arc::new(SubagentSink::new(
             self.deps.sink.clone(),
             n,
@@ -841,7 +916,7 @@ impl Tool for DispatchAgentTool {
             child_protocol,
             Arc::new(reg),
             child_policy.clone(),
-            self.deps.approval.clone(),
+            child_approval,
             sink.clone(),
             child_loop_config,
         );
@@ -900,11 +975,58 @@ impl Tool for DispatchAgentTool {
             Some(m) => child.with_compaction_model(m.clone()),
             None => child,
         };
+        // A durable child gets its OWN checkpointer so its parks land under
+        // children/<call_id> (spec §2.3) and its asks disarm this deadline (P2).
+        let child = match &child_ckpt {
+            Some(ck) => child.with_checkpointer(ck.clone()),
+            None => child,
+        };
 
         // Parent cancel propagates down; child self-cancel never travels up (D8).
         let child_cancel = ctx.cancel.child_token();
-        let run = child.run_with_cancel(&mut child_ctx, prompt, child_cancel.clone());
-        match tokio::time::timeout(ctx.timeout, run).await {
+        let run = async {
+            match (&restored_child, &self.deps.checkpoint) {
+                (Some(chk), Some(ck)) => {
+                    // A resumed child gets a FRESH dispatch timeout by
+                    // construction — ctx.timeout is this (new) call's clock
+                    // (spec §2.5 child-deadline row). The pre-restart answer is
+                    // consumed from answer.json under the parent's
+                    // children/<call_id>; None ⇒ the ask re-prompts live.
+                    let decision = ck.load_child_answer(&ctx.call_id);
+                    child
+                        .resume_with_cancel(
+                            &mut child_ctx,
+                            chk.resume_turn(decision),
+                            child_cancel.clone(),
+                        )
+                        .await
+                }
+                _ => {
+                    child
+                        .run_with_cancel(&mut child_ctx, prompt, child_cancel.clone())
+                        .await
+                }
+            }
+        };
+        // P2 (owner 2026-07-10): the deadline covers WORK, not
+        // waiting-for-approval. While this child (or any descendant) is blocked
+        // at a durable Ask, an expiry does not kill it — the clock re-arms and
+        // checks again. Live-only asks (no checkpointer) keep today's hard
+        // deadline. Under this disarm the deadline never fires while parked, so
+        // a Timeout outcome only ever reaches a child doing real work.
+        let mut run = std::pin::pin!(run);
+        let timed_out = loop {
+            match tokio::time::timeout(ctx.timeout, run.as_mut()).await {
+                Ok(r) => break Ok(r),
+                Err(elapsed) => {
+                    if child_ckpt.as_ref().is_some_and(|ck| ck.is_awaiting_ask()) {
+                        continue; // parked at an ask — deadline disarmed
+                    }
+                    break Err(elapsed);
+                }
+            }
+        };
+        match timed_out {
             Err(_elapsed) => {
                 child_cancel.cancel();
                 let what = format!("sub-agent timed out after {}s", ctx.timeout.as_secs());
@@ -926,6 +1048,12 @@ impl Tool for DispatchAgentTool {
             });
         }
         guard.finish(SubagentOutcome::Completed, None);
+        // Completed: reap the whole child checkpoint tree (its dir IS the child
+        // dir). Timeout/Failed/Cancelled retain it — a parked descendant may
+        // still be resumable (under P2, a parked ask never reaches Timeout).
+        if let Some(ck) = &child_ckpt {
+            ck.clear_all();
+        }
 
         let s = sink.summary();
         let stop = s.stop.unwrap_or(StopReason::Stop);
@@ -1435,6 +1563,7 @@ mod tests {
             description_overrides: Default::default(),
             subagents: Arc::new(SubAgentRegistry::default()),
             memories: None,
+            checkpoint: None,
         }
     }
 
@@ -3022,6 +3151,7 @@ mod tests {
             description_overrides: Default::default(),
             subagents: Arc::new(SubAgentRegistry::default()),
             memories: None,
+            checkpoint: None,
         };
         let tool = DispatchAgentTool::new(deps);
 

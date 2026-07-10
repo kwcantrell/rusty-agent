@@ -26,6 +26,12 @@ export function ApprovalPrompt({ approval, onDecide }: { approval: PendingApprov
 
   return (
     <div className="mx-4 my-2 rounded-md p-3" style={{ border: "1px solid var(--cli-border)" }}>
+      {approval.origin && (
+        <div className="mb-1" style={{ color: "var(--cli-accent)" }}>
+          Sub-agent <b>{approval.origin.subagent}</b>
+          {approval.origin.depth > 1 ? ` (depth ${approval.origin.depth})` : ""} wants to run:
+        </div>
+      )}
       <div className="mb-2" style={{ color: "var(--cli-text)" }}>Allow: {approval.summary}</div>
       {approval.command && (
         <pre className="mb-2 overflow-x-auto" style={{ color: "var(--cli-accent)" }}>{approval.command}</pre>

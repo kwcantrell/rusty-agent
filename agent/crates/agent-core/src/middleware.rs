@@ -638,7 +638,7 @@ impl Middleware for RepairMiddleware {
 pub struct ToolCallCount(pub usize);
 
 #[derive(Default)]
-struct ModelCallCount(usize);
+pub(crate) struct ModelCallCount(pub(crate) usize);
 
 /// Always-on runaway backstop (spec §5.5): a runaway that VARIES its args each
 /// turn slips past `StuckDetection` and can burn the whole turn budget. Counts

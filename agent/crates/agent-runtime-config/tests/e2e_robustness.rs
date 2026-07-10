@@ -87,6 +87,7 @@ fn assemble_test(
             trace: None,
             api_key: None,
             claude_binary: "claude".into(),
+            checkpoint: None,
         },
     );
     (built, sink)

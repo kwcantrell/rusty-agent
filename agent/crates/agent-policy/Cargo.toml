@@ -7,3 +7,7 @@ agent-tools = { path = "../agent-tools" }
 async-trait.workspace = true
 tracing.workspace = true
 shell-words.workspace = true
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

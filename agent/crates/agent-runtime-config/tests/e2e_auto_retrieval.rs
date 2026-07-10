@@ -88,6 +88,7 @@ async fn assemble_loop_drives_a_real_tool_call() {
             trace: None,
             api_key: None,
             claude_binary: "claude".into(),
+            checkpoint: None,
         },
     );
     let mut ctx = WindowContext::new(Message::system(built.system_prompt.clone()));

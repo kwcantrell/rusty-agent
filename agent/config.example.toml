@@ -18,6 +18,11 @@ memory = true            # default true; false disables load + discipline (mount
                                    # default: ~/.rusty-agent/memories
                                    # (real consumer: test isolation)
 
+# Auto-deny an unanswered approval after N seconds (headless/eval callers).
+# Unset (default): an unanswered approval parks durably — the run survives
+# frontend disconnect and daemon restart, and resumes when answered.
+# approval_auto_deny_secs = 300
+
 # Named sub-agents (Phase 3B-1). Each becomes a `subagent_type` the model can
 # pick via dispatch_agent. Only name/description/system_prompt are required.
 # [[named_subagents]]

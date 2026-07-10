@@ -38,10 +38,57 @@ pub struct Gui {
     pub driver: WebDriver,
     tauri_driver: Child,
     vite: Option<Child>, // Some only if WE spawned it
+    /// PID of the launched app process (the prod desktop binary), discovered by
+    /// matching the binary path — used by the kill-restart drive to hard-kill the
+    /// daemon (SIGKILL) between two WebDriver sessions. `None` if never found.
+    app_pid: Option<i32>,
 }
+
+/// The prod desktop binary name — the process the WebDriver session launches and
+/// the ONLY process the kill-restart drive ever `SIGKILL`s (matched by exact
+/// path, never a broad pattern).
+const APP_BIN_NAME: &str = "rust-agent-runtime-desktop";
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// Find the PID of the running app by matching its EXACT binary path against
+/// each process's `/proc/<pid>/exe` symlink target (the app's argv[0] is the
+/// absolute path we handed tauri:options). Exact-path match, never a substring
+/// pattern — so we can only ever target the process we launched, not some other
+/// `rust-agent-runtime-desktop` a developer happens to be running. Retries
+/// briefly: WebKitWebDriver forks the app a beat after session-create returns.
+fn find_app_pid(app_bin_path: &str) -> Option<i32> {
+    let want = std::fs::canonicalize(app_bin_path).ok()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for e in entries.flatten() {
+                let name = e.file_name();
+                let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+                    continue;
+                };
+                if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+                    // Exact-path match against the binary we handed tauri:options.
+                    // (A rebuilt binary would show a " (deleted)" exe suffix and not
+                    // match — acceptable: we launched THIS on-disk binary.)
+                    if exe == want && exe.ends_with(APP_BIN_NAME) {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// True while a process with `pid` still exists (`kill(pid, 0)` succeeds).
+pub fn pid_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 async fn http_ok(url: &str) -> bool {
@@ -125,7 +172,24 @@ impl Gui {
         // Session established — transfer ownership out of the guards into Gui.
         let tauri_driver = tauri_driver_guard.into_inner();
         let vite = vite_guard.map(|g| g.into_inner());
-        Gui { driver, tauri_driver, vite }
+        // Discover the launched app PID by its exact binary path (never a broad
+        // pattern) so the kill-restart drive can SIGKILL only this process.
+        let app_pid = find_app_pid(app_bin.to_str().unwrap());
+        Gui { driver, tauri_driver, vite, app_pid }
+    }
+
+    /// PID of the launched prod app process, if discovered.
+    pub fn app_pid(&self) -> Option<i32> {
+        self.app_pid
+    }
+
+    /// Hard-kill ONLY the launched app process (SIGKILL), simulating a daemon
+    /// crash. tauri-driver / WebKitWebDriver / Vite are left alone; the caller
+    /// still `shutdown()`s the (now app-less) WebDriver session afterwards.
+    pub fn kill_app_hard(&self) {
+        if let Some(pid) = self.app_pid {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
     }
 
     /// Graceful end: deletes the session (closes the app), then Drop reaps

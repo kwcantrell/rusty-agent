@@ -51,6 +51,12 @@ export interface SessionStats {
 
 export interface DiscoveredSkill { name: string; description: string }
 
+export interface ApprovalOrigin {
+  delegation_id: string;
+  subagent: string;
+  depth: number;
+}
+
 export type WireEvent =
   | { type: "token"; text: string }
   | { type: "reasoning"; text: string }
@@ -77,7 +83,7 @@ export type WireEvent =
 
 export type Inbound =
   | { v: number; session_id: string; kind: "event"; payload: WireEvent }
-  | { v: number; session_id: string; id: string; kind: "approval_request"; summary: string; command?: string; display?: Display }
+  | { v: number; session_id: string; id: string; kind: "approval_request"; summary: string; command?: string; display?: Display; origin?: ApprovalOrigin }
   | { v: number; session_id: string; kind: "presence"; online: boolean }
   | { v: number; session_id: string; kind: "settings_state"; settings: RuntimeSettings; workspace: string; api_key_set: boolean; hard_floor: string[]; discovered_skills: DiscoveredSkill[]; sandbox_degraded?: { mechanism: string; reason: string } | null }
   | { v: number; session_id: string; kind: "settings_error"; message: string };

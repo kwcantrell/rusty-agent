@@ -165,6 +165,9 @@ pub struct AgentLoop {
     /// Default (see `new`): a `HostBackend` rooted at `config.workspace` —
     /// bare-loop parity with pre-backend-seam behavior.
     backend: Arc<dyn agent_tools::backend::Backend>,
+    /// Park-point checkpointer (spec 4B-1). None (default) ⇒ the loop is
+    /// byte-identical to pre-checkpoint behavior: zero checkpoint I/O (E1).
+    checkpointer: Option<Arc<crate::Checkpointer>>,
 }
 
 impl AgentLoop {
@@ -193,6 +196,7 @@ impl AgentLoop {
             calib_ratio_micros: std::sync::atomic::AtomicU64::new(1_000_000),
             middleware: Vec::new(),
             backend,
+            checkpointer: None,
         }
     }
 
@@ -206,6 +210,17 @@ impl AgentLoop {
         self.tools.schemas()
     }
 
+    /// Re-derive a tool's intent from stored args (resume display path —
+    /// spec §3.4: what the human sees is never a trusted stored string).
+    /// `None` when the named tool is not registered under the current config.
+    pub fn derive_intent(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Option<agent_tools::ToolIntent> {
+        self.tools.get(name)?.intent(args).ok()
+    }
+
     /// Route context compaction to a (typically cheaper) dedicated model
     /// (spec 2026-07-02 sub-spec #3, G4). None = the session model.
     pub fn with_compaction_model(mut self, model: Arc<dyn ModelClient>) -> Self {
@@ -217,6 +232,13 @@ impl AgentLoop {
     /// Default: a HostBackend rooted at `config.workspace` — bare-loop parity.
     pub fn with_backend(mut self, backend: Arc<dyn agent_tools::backend::Backend>) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Install the park-point checkpointer (spec 4B-1). Default: None — zero
+    /// checkpoint I/O, byte-identical to pre-checkpoint behavior (E1).
+    pub fn with_checkpointer(mut self, ck: Arc<crate::Checkpointer>) -> Self {
+        self.checkpointer = Some(ck);
         self
     }
 
@@ -720,7 +742,31 @@ impl AgentLoop {
         // claude_cli inline). Plain config still controls the tool-less case.
         let preserve_thinking = self.config.preserve_thinking || !self.tools.schemas().is_empty();
 
-        for turn in 0..self.config.max_turns {
+        self.turn_loop(
+            ctx,
+            &mut mw_state,
+            &run_shared,
+            cancel,
+            0,
+            preserve_thinking,
+        )
+        .await
+    }
+
+    /// The per-turn model→tool loop plus the budget wrap-up epilogue — moved
+    /// verbatim from `run_with_cancel`. `run_with_cancel` is now prologue +
+    /// `turn_loop(.., 0, ..)`; Task 8 re-enters here with a non-zero start.
+    #[allow(clippy::too_many_arguments)]
+    async fn turn_loop(
+        &self,
+        ctx: &mut dyn ContextManager,
+        mw_state: &mut crate::RunState,
+        run_shared: &crate::RunShared,
+        cancel: CancellationToken,
+        start_turn: usize,
+        preserve_thinking: bool,
+    ) -> Result<(), AgentError> {
+        for turn in start_turn..self.config.max_turns {
             if cancel.is_cancelled() {
                 self.sink.emit(AgentEvent::Done(StopReason::Cancelled));
                 return Ok(());
@@ -759,7 +805,7 @@ impl AgentLoop {
                     loop_: self,
                     chain: &self.middleware,
                     cancel: &cancel,
-                    shared: &run_shared,
+                    shared: run_shared,
                 }
                 .run(base.clone())
                 .await;
@@ -852,8 +898,8 @@ impl AgentLoop {
                     match self
                         .fire_on_parse_failure(
                             ctx,
-                            &mut mw_state,
-                            &run_shared,
+                            &mut *mw_state,
+                            run_shared,
                             &cancel,
                             turn,
                             &assistant,
@@ -905,7 +951,7 @@ impl AgentLoop {
                     .collect(),
             };
             let flow = self
-                .fire_after_model(ctx, &mut mw_state, &cancel, turn, &turn_view, &run_shared)
+                .fire_after_model(ctx, &mut *mw_state, &cancel, turn, &turn_view, run_shared)
                 .await;
             if let crate::Flow::EndRun(reason) = flow {
                 self.sink.emit(AgentEvent::Done(reason));
@@ -946,301 +992,40 @@ impl AgentLoop {
                 //
                 // Node hook: after_final_reply (spec §5.1) — text-only exit only
                 // (spec §6 J5); no Flow, the run is already ending.
-                self.fire_final_reply(ctx, &mut mw_state, &cancel, turn, &run_shared)
+                self.fire_final_reply(ctx, &mut *mw_state, &cancel, turn, run_shared)
                     .await;
 
                 self.sink.emit(AgentEvent::Done(assistant.stop));
                 return Ok(());
             }
 
-            // Phase 1 — gate every call sequentially (one approval prompt at a time).
-            let mut order: Vec<String> = Vec::with_capacity(all_calls.len());
-            let mut results: HashMap<String, (String, Resolved)> = HashMap::new();
-            let mut ready: Vec<ReadyCall> = Vec::new();
-            // Seed the unparseable calls first: each emits a ToolStart and joins the
-            // Phase-3 drain as a per-call ERROR result (the "re-emit only this call"
-            // prompt). N-1 good calls still gate + execute normally below.
-            for inv in &parsed.invalid {
-                self.sink.emit(AgentEvent::ToolStart {
-                    id: inv.id.clone(),
-                    name: inv.name.clone(),
-                    args: serde_json::json!({}),
-                    parent_id: None,
-                });
-                order.push(inv.id.clone());
-                results.insert(
-                    inv.id.clone(),
-                    (
-                        inv.name.clone(),
-                        Resolved::Err {
-                            status: ToolStatus::Error,
-                            content: format!(
-                                "ERROR: this tool call could not be parsed ({}); the other \
-                                 calls in this turn ran normally — re-emit only this call, \
-                                 with valid JSON arguments",
-                                inv.error
-                            ),
-                            duration_ms: 0,
-                        },
-                    ),
-                );
-            }
-            for call in parsed.tool_calls {
-                match self.gate_tool(call, &cancel).await {
-                    GateOutcome::Rejected { id, name, content } => {
-                        order.push(id.clone());
-                        results.insert(
-                            id,
-                            (
-                                name,
-                                Resolved::Err {
-                                    status: ToolStatus::Denied,
-                                    content,
-                                    duration_ms: 0,
-                                },
-                            ),
-                        );
-                    }
-                    GateOutcome::Ready(rc) => {
-                        order.push(rc.id.clone());
-                        ready.push(rc);
-                    }
-                }
-            }
-
-            // Phase 2 — execute approved calls concurrently, bounded. Each call is
-            // panic- and timeout-isolated (execute_isolated) so one bad tool can
-            // neither crash the loop nor wedge the batch.
-            let cap = if self.config.max_parallel_tools == 0 {
-                DEFAULT_MAX_PARALLEL_TOOLS
-            } else {
-                self.config.max_parallel_tools
-            };
-            let executed: Vec<(String, String, Executed, u64, Duration, agent_tools::Access)> =
-                futures::stream::iter(ready.into_iter().map(|rc| {
-                    let ReadyCall {
-                        tool,
-                        args,
-                        id,
-                        name,
-                        ctx,
-                        access,
-                    } = rc;
-                    // The effective per-call deadline (may be a tool's
-                    // timeout_override, not the loop default) — logged on timeout.
-                    let timeout = ctx.timeout;
-                    let middleware = &self.middleware;
-                    let shared = &run_shared;
-                    async move {
-                        let started = std::time::Instant::now();
-                        // The gate already ran (Phase 1); this call is the
-                        // already-approved ToolCall the wrap-tool chain sees.
-                        let call = ToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            args: args.clone(),
-                        };
-                        let ex = crate::ToolNext {
-                            tool,
-                            name: &name,
-                            tctx: &ctx,
-                            chain: middleware,
-                            call: &call,
-                            shared,
-                        }
-                        .run(args)
-                        .await;
-                        (
-                            id,
-                            name,
-                            ex,
-                            started.elapsed().as_millis() as u64,
-                            timeout,
-                            access,
-                        )
-                    }
-                }))
-                .buffer_unordered(cap)
-                .collect()
-                .await;
-            // A mutating turn is one where at least one Write/Destroy/TrustedWrite call ran to
-            // an Ok result. Read-only turns and turns whose only mutations failed
-            // do NOT trigger post-execution validation.
-            let turn_mutated = executed.iter().any(|(_, _, ex, _, _, access)| {
-                matches!(ex, Executed::Ok(_))
-                    && matches!(
-                        access,
-                        agent_tools::Access::Write
-                            | agent_tools::Access::Destroy
-                            | agent_tools::Access::TrustedWrite
-                    )
-            });
-            for (id, name, ex, duration_ms, timeout, _access) in executed {
-                let resolved = match ex {
-                    Executed::Ok(o) => Resolved::Ok(o, duration_ms),
-                    Executed::ToolErr(s) => Resolved::Err {
-                        status: ToolStatus::Error,
-                        content: s,
-                        duration_ms,
-                    },
-                    Executed::Panicked(s) => {
-                        tracing::error!(target: "loop", tool = %name,
-                            "tool panicked during parallel dispatch");
-                        self.sink.emit(AgentEvent::Error(s.clone()));
-                        Resolved::Err {
-                            status: ToolStatus::Panic,
-                            content: s,
-                            duration_ms,
-                        }
-                    }
-                    Executed::TimedOut(s) => {
-                        tracing::warn!(target: "loop", tool = %name,
-                            timeout = ?timeout,
-                            "tool timed out during parallel dispatch");
-                        self.sink.emit(AgentEvent::Error(s.clone()));
-                        Resolved::Err {
-                            status: ToolStatus::Timeout,
-                            content: s,
-                            duration_ms,
-                        }
-                    }
-                };
-                results.insert(id, (name, resolved));
-            }
-
-            // Phase 3 — append one tool message per call, in the model's call order.
-            for id in order {
-                // Normalization guarantees a slot per id; if that invariant is ever
-                // violated, drop the result rather than crash on untrusted input.
-                let (name, resolved) = match results.remove(&id) {
-                    Some(v) => v,
-                    // Unreachable while normalize_tool_call_ids and
-                    // normalize_invalid_ids hold. If a future change ever breaks
-                    // the one-slot-per-id invariant, emit an error
-                    // rather than silently drop the result and desync the transcript
-                    // (an assistant tool_call with no matching tool message).
-                    None => (
-                        String::new(),
-                        Resolved::Err {
-                            status: ToolStatus::Error,
-                            content: format!("ERROR: internal: no result for tool_call_id {id}"),
-                            duration_ms: 0,
-                        },
-                    ),
-                };
-                let content = match resolved {
-                    Resolved::Ok(output, duration_ms) => {
-                        self.sink.emit(AgentEvent::ToolResult {
-                            id: id.clone(),
-                            name: name.clone(),
-                            status: ToolStatus::Ok,
-                            output: output.clone(),
-                            duration_ms,
-                            parent_id: None,
-                        });
-                        output.content
-                    }
-                    Resolved::Err {
-                        status,
-                        content,
-                        duration_ms,
-                    } => {
-                        self.sink.emit(AgentEvent::ToolResult {
-                            id: id.clone(),
-                            name: name.clone(),
-                            status,
-                            output: agent_tools::ToolOutput {
-                                content: content.clone(),
-                                display: None,
-                            },
-                            duration_ms,
-                            parent_id: None,
-                        });
-                        content
-                    }
-                };
-                ctx.append(Message::tool(id, name, content));
-            }
-
-            // Post-execution validation: once per turn, only when a mutating call
-            // succeeded and validators are configured. Emits synthetic
-            // `post_tool_validate` tool events (reusing existing ToolStart/ToolResult
-            // wire kinds) and appends any failures as a single user message so the
-            // model sees them. Sits AFTER the Phase-3 tool results and BEFORE the
-            // stuck-nudge append (OpenAI-compat ordering: a user message must not
-            // land between the assistant tool_calls and its Role::Tool results).
-            if turn_mutated && !self.config.post_tool_validators.is_empty() {
-                let mut failures: Vec<String> = Vec::new();
-                for (n, command) in self.config.post_tool_validators.iter().enumerate() {
-                    let vid = format!("validate:{}:{}", turn + 1, n);
-                    self.sink.emit(AgentEvent::ToolStart {
-                        id: vid.clone(),
-                        name: "post_tool_validate".into(),
-                        args: serde_json::json!({ "command": command }),
-                        parent_id: None,
-                    });
-                    let started = std::time::Instant::now();
-                    let outcome = run_validator(
-                        &self.config.sandbox,
-                        &self.config.workspace,
-                        command,
-                        self.config.tool_timeout,
-                        &cancel,
-                    )
-                    .await;
-                    let (status, content) = match &outcome {
-                        ValidatorOutcome::Passed => {
-                            (ToolStatus::Ok, "validator passed".to_string())
-                        }
-                        ValidatorOutcome::Failed { code, output } => {
-                            failures.push(format!("$ {command}  (exit {code})\n{output}"));
-                            (ToolStatus::Error, format!("exit {code}\n{output}"))
-                        }
-                        ValidatorOutcome::Skipped { reason } => {
-                            (ToolStatus::Error, format!("validator skipped: {reason}"))
-                        }
-                    };
-                    self.sink.emit(AgentEvent::ToolResult {
-                        id: vid,
-                        name: "post_tool_validate".into(),
-                        status,
-                        output: agent_tools::ToolOutput {
-                            content,
-                            display: None,
-                        },
-                        duration_ms: started.elapsed().as_millis() as u64,
-                        parent_id: None,
-                    });
-                }
-                if !failures.is_empty() {
-                    ctx.append(Message::user(format!(
-                        "Post-edit validation reported problems. Fix these before continuing:\n\n{}",
-                        failures.join("\n\n")
-                    )));
-                }
-            }
-
-            // Node hook: after_tools (spec §5.1).
-            let flow = self
-                .fire_after_tools(ctx, &mut mw_state, &cancel, turn, &run_shared)
-                .await;
-            if let crate::Flow::EndRun(reason) = flow {
-                self.sink.emit(AgentEvent::Done(reason));
-                return Ok(());
-            }
-
-            // Scheduled loop-bottom maintain now lives in
-            // ContextCurationMiddleware::on_turn_end (spec §5.5), fired below;
-            // it also sets the Maintained run-state marker that gates the
-            // text-only-exit maintain in after_final_reply.
-            //
-            // Node hook: on_turn_end (spec §5.1).
-            let flow = self
-                .fire_turn_end(ctx, &mut mw_state, &cancel, turn, &run_shared)
-                .await;
-            if let crate::Flow::EndRun(reason) = flow {
-                self.sink.emit(AgentEvent::Done(reason));
-                return Ok(());
+            // (id, name, error) triples for the unparseable calls — re-seeded as
+            // per-call ERROR results inside tool_phase (Phase 1).
+            let invalid: Vec<crate::InvalidParked> = parsed
+                .invalid
+                .iter()
+                .map(|i| crate::InvalidParked {
+                    id: i.id.clone(),
+                    name: i.name.clone(),
+                    error: i.error.clone(),
+                })
+                .collect();
+            match self
+                .tool_phase(
+                    ctx,
+                    &mut *mw_state,
+                    run_shared,
+                    &cancel,
+                    turn,
+                    parsed.text.clone(),
+                    parsed.tool_calls,
+                    invalid,
+                    None,
+                )
+                .await
+            {
+                TurnFlow::Continue => {}
+                TurnFlow::End(r) => return r,
             }
         }
         // Budget exhausted with the model still tool-hungry (text-only replies
@@ -1299,6 +1084,646 @@ impl AgentLoop {
         Ok(())
     }
 
+    /// Re-enter a parked run (spec §2.4 step 6). `ctx` is ALREADY restored by
+    /// the caller (dispatch for children, the server coordinator for the root)
+    /// from a verified `Checkpoint` — the loop never reads checkpoint files
+    /// itself. This replays the checkpointed turn's gate outcomes (no model
+    /// call, no re-prompt for decided calls), executes Phase 2 fresh, then
+    /// continues as a normal run.
+    pub async fn resume_with_cancel(
+        &self,
+        ctx: &mut dyn ContextManager,
+        resume: ResumeTurn,
+        cancel: CancellationToken,
+    ) -> Result<(), AgentError> {
+        let d = self.sandbox_descriptor();
+        if let Some(reason) = d.degraded {
+            self.sink.emit(AgentEvent::SandboxDegraded {
+                mechanism: d.mechanism,
+                reason,
+            });
+        }
+        let mut mw_state = crate::RunState::default();
+        let run_shared = crate::RunShared::default();
+        // Tallies survive restart (spec §3.8): seed, never refill. The
+        // monotonic clamp against restored history ran at load time (caller
+        // side, verify_tally_floor); here the values are trusted-verified.
+        run_shared.with::<crate::ToolCallCount, _>(|c| c.0 = resume.guardrails.tool_calls as usize);
+        run_shared
+            .with::<crate::ModelCallCount, _>(|c| c.0 = resume.guardrails.model_calls as usize);
+        // run_start hooks fire (memory index re-load, curation setup); a
+        // middleware EndRun is honored exactly as on a fresh run. NO
+        // set_goal / NO user append — history is restored, goal pinned.
+        let flow = self
+            .fire_run_start(ctx, &mut mw_state, &cancel, &resume.goal_text, &run_shared)
+            .await;
+        if let crate::Flow::EndRun(reason) = flow {
+            self.sink.emit(AgentEvent::Done(reason));
+            return Ok(());
+        }
+        let preserve_thinking = self.config.preserve_thinking || !self.tools.schemas().is_empty();
+        let start_turn = resume.turn as usize;
+        // Dispatch-kind commit point (plan review finding 1c): the whole batch
+        // is pre-decided and about to execute — delete the stale park NOW. A
+        // crash from here loses the run (D1); it never replays the batch.
+        // Gate-kind parks are NOT cleared here: an answered ask clears at
+        // consume (inside tool_phase); an unanswered one keeps its park and
+        // rewrites it when the live re-ask parks again.
+        if resume.parked_index.is_none() {
+            if let Some(ck) = self.checkpointer.as_ref() {
+                ck.clear_park();
+            }
+        }
+        let pre = PreDecided {
+            records: resume.gate_records,
+            dispatch_kind: resume.parked_index.is_none(),
+            parked_index: resume.parked_index.unwrap_or(usize::MAX),
+            parked_decision: resume.parked_decision,
+        };
+        match self
+            .tool_phase(
+                ctx,
+                &mut mw_state,
+                &run_shared,
+                &cancel,
+                start_turn,
+                resume.assistant_text,
+                resume.tool_calls,
+                resume.invalid,
+                Some(pre),
+            )
+            .await
+        {
+            TurnFlow::End(r) => return r,
+            TurnFlow::Continue => {}
+        }
+        // `turn_loop(start_turn+1)` with start_turn+1 >= max_turns runs zero
+        // turns and lands in the budget wrap-up epilogue — exactly right for a
+        // final-turn park.
+        self.turn_loop(
+            ctx,
+            &mut mw_state,
+            &run_shared,
+            cancel,
+            start_turn + 1,
+            preserve_thinking,
+        )
+        .await
+    }
+
+    /// Phase 1 (gate) + Phase 2 (execute) + Phase 3 (drain) + post-tool
+    /// validators + after_tools/on_turn_end hooks — moved verbatim from the
+    /// turn loop. Task 7 parks inside Phase 1; Task 8 consumes `pre`.
+    #[allow(clippy::too_many_arguments)]
+    async fn tool_phase(
+        &self,
+        ctx: &mut dyn ContextManager,
+        mw_state: &mut crate::RunState,
+        run_shared: &crate::RunShared,
+        cancel: &CancellationToken,
+        turn: usize,
+        // The turn's model text (park record; Task 7). Unused this task.
+        assistant_text: String,
+        tool_calls: Vec<ToolCall>,
+        invalid: Vec<crate::InvalidParked>,
+        // Task 8; None in this task.
+        pre: Option<PreDecided>,
+    ) -> TurnFlow {
+        // Park-support state (E1: pure memory unless an Ask actually parks;
+        // None checkpointer ⇒ every branch below is a no-op).
+        let batch_for_park: Option<Vec<ToolCall>> =
+            self.checkpointer.as_ref().map(|_| tool_calls.clone());
+        let mut records: Vec<crate::GateRecord> = Vec::new();
+        // Phase 1 — gate every call sequentially (one approval prompt at a time).
+        let mut order: Vec<String> = Vec::with_capacity(tool_calls.len() + invalid.len());
+        let mut results: HashMap<String, (String, Resolved)> = HashMap::new();
+        let mut ready: Vec<ReadyCall> = Vec::new();
+        // Seed the unparseable calls first: each emits a ToolStart and joins the
+        // Phase-3 drain as a per-call ERROR result (the "re-emit only this call"
+        // prompt). N-1 good calls still gate + execute normally below.
+        for inv in &invalid {
+            self.sink.emit(AgentEvent::ToolStart {
+                id: inv.id.clone(),
+                name: inv.name.clone(),
+                args: serde_json::json!({}),
+                parent_id: None,
+            });
+            order.push(inv.id.clone());
+            results.insert(
+                inv.id.clone(),
+                (
+                    inv.name.clone(),
+                    Resolved::Err {
+                        status: ToolStatus::Error,
+                        content: format!(
+                            "ERROR: this tool call could not be parsed ({}); the other \
+                                 calls in this turn ran normally — re-emit only this call, \
+                                 with valid JSON arguments",
+                            inv.error
+                        ),
+                        duration_ms: 0,
+                    },
+                ),
+            );
+        }
+        for (idx, call) in tool_calls.into_iter().enumerate() {
+            // Task 8: on a resume, consult the pre-decided gate outcomes by
+            // index BEFORE gating — never re-prompt an already-decided call
+            // (spec §3.7). None (fresh run) ⇒ every arm falls through to
+            // gate_tool. `gate_preapproved` emits its own ToolStart, mirroring
+            // gate_tool, so the pre-decided arms must NOT emit before calling
+            // it (exactly one ToolStart per call id).
+            let outcome = match pre.as_ref() {
+                // P1 (owner 2026-07-10): on a dispatch-kind resume, a Ready
+                // NON-dispatch sibling must not re-execute — its pre-crash side
+                // effects persist on the host. Synthetic lost-result instead;
+                // the model re-runs it if needed.
+                Some(p)
+                    if p.dispatch_kind
+                        && idx < p.records.len()
+                        && matches!(p.records[idx], crate::GateRecord::Ready)
+                        && call.name != "dispatch_agent" =>
+                {
+                    self.sink.emit(AgentEvent::ToolStart {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        args: call.args.clone(),
+                        parent_id: None,
+                    });
+                    order.push(call.id.clone());
+                    // Build the message ONCE so the gate record and the tool
+                    // result never diverge (branch review I4).
+                    let lost_result_msg = "ERROR: result lost across daemon restart — \
+                                          re-run this call if it is still needed"
+                        .to_string();
+                    records.push(crate::GateRecord::Rejected {
+                        content: lost_result_msg.clone(),
+                    });
+                    results.insert(
+                        call.id,
+                        (
+                            call.name,
+                            Resolved::Err {
+                                status: ToolStatus::Error,
+                                content: lost_result_msg,
+                                duration_ms: 0,
+                            },
+                        ),
+                    );
+                    continue;
+                }
+                Some(p) if idx < p.records.len() => match &p.records[idx] {
+                    crate::GateRecord::Rejected { content } => {
+                        // Replay the decided rejection. No gate function runs,
+                        // so this arm emits its own ToolStart to keep the pair.
+                        self.sink.emit(AgentEvent::ToolStart {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            args: call.args.clone(),
+                            parent_id: None,
+                        });
+                        GateOutcome::Rejected {
+                            id: call.id,
+                            name: call.name,
+                            content: content.clone(),
+                        }
+                    }
+                    // gate_preapproved emits ToolStart itself — do NOT emit here.
+                    crate::GateRecord::Ready => self.gate_preapproved(call, cancel),
+                },
+                Some(p) if idx == p.parked_index && p.parked_decision.is_some() => {
+                    // The answered parked ask: consume the committed decision —
+                    // never re-prompt (spec §2.4 step 6). CONSUME-TIME COMMIT
+                    // (plan review BLOCKER 1): delete the park + answer NOW,
+                    // before anything executes — a crash after this point loses
+                    // the run from here (D1); it never re-prompts an
+                    // already-consumed approval, so the approved call can never
+                    // execute twice.
+                    if let Some(ck) = self.checkpointer.as_ref() {
+                        ck.clear_park();
+                    }
+                    let approve = p.parked_decision.unwrap();
+                    if approve {
+                        // gate_preapproved emits ToolStart itself.
+                        self.gate_preapproved(call, cancel)
+                    } else {
+                        self.sink.emit(AgentEvent::ToolStart {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            args: call.args.clone(),
+                            parent_id: None,
+                        });
+                        GateOutcome::Rejected {
+                            id: call.id,
+                            name: call.name,
+                            content: format!(
+                                "ERROR: {}",
+                                ToolError::Denied("user declined".into())
+                            ),
+                        }
+                    }
+                }
+                // Past the pre-decided prefix (or an unanswered parked ask):
+                // gate normally — a later Ask parks again (spec §2.4).
+                _ => self.gate_tool(call, cancel).await,
+            };
+            match outcome {
+                GateOutcome::Rejected { id, name, content } => {
+                    records.push(crate::GateRecord::Rejected {
+                        content: content.clone(),
+                    });
+                    order.push(id.clone());
+                    results.insert(
+                        id,
+                        (
+                            name,
+                            Resolved::Err {
+                                status: ToolStatus::Denied,
+                                content,
+                                duration_ms: 0,
+                            },
+                        ),
+                    );
+                }
+                GateOutcome::Ready(rc) => {
+                    records.push(crate::GateRecord::Ready);
+                    order.push(rc.id.clone());
+                    ready.push(rc);
+                }
+                GateOutcome::NeedsApproval(pa) => {
+                    let PendingAsk {
+                        tool,
+                        call,
+                        req,
+                        access,
+                    } = *pa;
+                    self.sink.emit(AgentEvent::Approval(req.clone()));
+                    // Park BEFORE blocking (spec §2.3). Write failure degrades
+                    // to live-only — log + event, never block the run.
+                    if let (Some(ck), Some(batch)) =
+                        (self.checkpointer.as_ref(), batch_for_park.as_ref())
+                    {
+                        if let Some(state) = ctx.checkpoint_state() {
+                            let idx = records.len();
+                            let chk = crate::Checkpoint {
+                                version: crate::CHECKPOINT_VERSION,
+                                session_id: ck.session_id().to_string(),
+                                subagent_path: ck.subagent_path().to_vec(),
+                                turn: turn as u64,
+                                context: state,
+                                guardrails: crate::Guardrails {
+                                    tool_calls: run_shared.with::<crate::ToolCallCount, _>(|c| c.0)
+                                        as u64,
+                                    model_calls: run_shared
+                                        .with::<crate::ModelCallCount, _>(|c| c.0)
+                                        as u64,
+                                },
+                                parked: crate::ParkedTurn {
+                                    assistant_text: assistant_text.clone(),
+                                    tool_calls: batch.clone(),
+                                    invalid: invalid.clone(),
+                                    gate_records: records.clone(),
+                                    parked_index: Some(idx),
+                                    origin: ck.origin().cloned(),
+                                },
+                            };
+                            let artifacts = ctx
+                                .artifacts()
+                                .unwrap_or_else(|| Arc::new(crate::SessionArtifacts::new()));
+                            if let Err(e) = ck.write_park(chk, &artifacts).await {
+                                tracing::warn!(target: "checkpoint", error = %e,
+                                    "park write failed; approval is live-only this ask");
+                                self.sink.emit(AgentEvent::Error(format!(
+                                    "checkpoint write failed (approval not durable): {e}"
+                                )));
+                            }
+                        }
+                    }
+                    // P2 deadline disarm: while this durable Ask waits,
+                    // every enclosing dispatch deadline is suspended.
+                    // RAII — deny/cancel/drop all unwind the count.
+                    let _ask_guard = self.checkpointer.as_ref().map(|ck| ck.enter_ask());
+                    // Race the approval wait against cancellation: Ctrl-C during a
+                    // pending prompt must end the run promptly rather than wedge until
+                    // the prompt is answered. Cancel-during-prompt counts as a deny.
+                    let allowed = tokio::select! {
+                        _ = cancel.cancelled() => false,
+                        resp = self.approval.request(req) => matches!(
+                            resp,
+                            ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
+                        ),
+                    };
+                    // Answer commit (spec §2.3): delete the park before
+                    // proceeding. Auto-deny (E5 knob) and cancel-deny commit
+                    // the same way.
+                    if let Some(ck) = self.checkpointer.as_ref() {
+                        ck.clear_park();
+                    }
+                    if allowed {
+                        records.push(crate::GateRecord::Ready);
+                        let rc = self.ready_call(tool, call, access, cancel);
+                        order.push(rc.id.clone());
+                        ready.push(rc);
+                    } else {
+                        // Distinguish a cancel-driven denial (the run is ending) from
+                        // an explicit user "no" so the tool result reads correctly.
+                        let reason = if cancel.is_cancelled() {
+                            "run cancelled"
+                        } else {
+                            "user declined"
+                        };
+                        let content = format!("ERROR: {}", ToolError::Denied(reason.into()));
+                        records.push(crate::GateRecord::Rejected {
+                            content: content.clone(),
+                        });
+                        order.push(call.id.clone());
+                        results.insert(
+                            call.id,
+                            (
+                                call.name,
+                                Resolved::Err {
+                                    status: ToolStatus::Denied,
+                                    content,
+                                    duration_ms: 0,
+                                },
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Ancestor snapshot (spec §2.5, header note 4): memory-only; flushed
+        // to disk only if a descendant parks. Dispatch-bearing turns only.
+        if let Some(ck) = self.checkpointer.as_ref() {
+            if ready.iter().any(|rc| rc.name == "dispatch_agent") {
+                if let Some(state) = ctx.checkpoint_state() {
+                    ck.set_turn_snapshot(crate::PendingSnapshot {
+                        context: state,
+                        guardrails: crate::Guardrails {
+                            tool_calls: run_shared.with::<crate::ToolCallCount, _>(|c| c.0) as u64,
+                            model_calls: run_shared.with::<crate::ModelCallCount, _>(|c| c.0)
+                                as u64,
+                        },
+                        turn: turn as u64,
+                        assistant_text: assistant_text.clone(),
+                        tool_calls: batch_for_park.clone().unwrap_or_default(),
+                        invalid: invalid.clone(),
+                        gate_records: records.clone(),
+                        artifacts: ctx
+                            .artifacts()
+                            .unwrap_or_else(|| Arc::new(crate::SessionArtifacts::new())),
+                    });
+                }
+            }
+        }
+
+        // Phase 2 — execute approved calls concurrently, bounded. Each call is
+        // panic- and timeout-isolated (execute_isolated) so one bad tool can
+        // neither crash the loop nor wedge the batch.
+        let cap = if self.config.max_parallel_tools == 0 {
+            DEFAULT_MAX_PARALLEL_TOOLS
+        } else {
+            self.config.max_parallel_tools
+        };
+        let executed: Vec<(String, String, Executed, u64, Duration, agent_tools::Access)> =
+            futures::stream::iter(ready.into_iter().map(|rc| {
+                let ReadyCall {
+                    tool,
+                    args,
+                    id,
+                    name,
+                    ctx,
+                    access,
+                } = rc;
+                // The effective per-call deadline (may be a tool's
+                // timeout_override, not the loop default) — logged on timeout.
+                let timeout = ctx.timeout;
+                let middleware = &self.middleware;
+                let shared = run_shared;
+                async move {
+                    let started = std::time::Instant::now();
+                    // The gate already ran (Phase 1); this call is the
+                    // already-approved ToolCall the wrap-tool chain sees.
+                    let call = ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
+                    };
+                    let ex = crate::ToolNext {
+                        tool,
+                        name: &name,
+                        tctx: &ctx,
+                        chain: middleware,
+                        call: &call,
+                        shared,
+                    }
+                    .run(args)
+                    .await;
+                    (
+                        id,
+                        name,
+                        ex,
+                        started.elapsed().as_millis() as u64,
+                        timeout,
+                        access,
+                    )
+                }
+            }))
+            .buffer_unordered(cap)
+            .collect()
+            .await;
+        // A mutating turn is one where at least one Write/Destroy/TrustedWrite call ran to
+        // an Ok result. Read-only turns and turns whose only mutations failed
+        // do NOT trigger post-execution validation.
+        let turn_mutated = executed.iter().any(|(_, _, ex, _, _, access)| {
+            matches!(ex, Executed::Ok(_))
+                && matches!(
+                    access,
+                    agent_tools::Access::Write
+                        | agent_tools::Access::Destroy
+                        | agent_tools::Access::TrustedWrite
+                )
+        });
+        for (id, name, ex, duration_ms, timeout, _access) in executed {
+            let resolved = match ex {
+                Executed::Ok(o) => Resolved::Ok(o, duration_ms),
+                Executed::ToolErr(s) => Resolved::Err {
+                    status: ToolStatus::Error,
+                    content: s,
+                    duration_ms,
+                },
+                Executed::Panicked(s) => {
+                    tracing::error!(target: "loop", tool = %name,
+                            "tool panicked during parallel dispatch");
+                    self.sink.emit(AgentEvent::Error(s.clone()));
+                    Resolved::Err {
+                        status: ToolStatus::Panic,
+                        content: s,
+                        duration_ms,
+                    }
+                }
+                Executed::TimedOut(s) => {
+                    tracing::warn!(target: "loop", tool = %name,
+                            timeout = ?timeout,
+                            "tool timed out during parallel dispatch");
+                    self.sink.emit(AgentEvent::Error(s.clone()));
+                    Resolved::Err {
+                        status: ToolStatus::Timeout,
+                        content: s,
+                        duration_ms,
+                    }
+                }
+            };
+            results.insert(id, (name, resolved));
+        }
+
+        // Phase 3 — append one tool message per call, in the model's call order.
+        for id in order {
+            // Normalization guarantees a slot per id; if that invariant is ever
+            // violated, drop the result rather than crash on untrusted input.
+            let (name, resolved) = match results.remove(&id) {
+                Some(v) => v,
+                // Unreachable while normalize_tool_call_ids and
+                // normalize_invalid_ids hold. If a future change ever breaks
+                // the one-slot-per-id invariant, emit an error
+                // rather than silently drop the result and desync the transcript
+                // (an assistant tool_call with no matching tool message).
+                None => (
+                    String::new(),
+                    Resolved::Err {
+                        status: ToolStatus::Error,
+                        content: format!("ERROR: internal: no result for tool_call_id {id}"),
+                        duration_ms: 0,
+                    },
+                ),
+            };
+            let content = match resolved {
+                Resolved::Ok(output, duration_ms) => {
+                    self.sink.emit(AgentEvent::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        status: ToolStatus::Ok,
+                        output: output.clone(),
+                        duration_ms,
+                        parent_id: None,
+                    });
+                    output.content
+                }
+                Resolved::Err {
+                    status,
+                    content,
+                    duration_ms,
+                } => {
+                    self.sink.emit(AgentEvent::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        status,
+                        output: agent_tools::ToolOutput {
+                            content: content.clone(),
+                            display: None,
+                        },
+                        duration_ms,
+                        parent_id: None,
+                    });
+                    content
+                }
+            };
+            ctx.append(Message::tool(id, name, content));
+        }
+
+        // Post-execution validation: once per turn, only when a mutating call
+        // succeeded and validators are configured. Emits synthetic
+        // `post_tool_validate` tool events (reusing existing ToolStart/ToolResult
+        // wire kinds) and appends any failures as a single user message so the
+        // model sees them. Sits AFTER the Phase-3 tool results and BEFORE the
+        // stuck-nudge append (OpenAI-compat ordering: a user message must not
+        // land between the assistant tool_calls and its Role::Tool results).
+        if turn_mutated && !self.config.post_tool_validators.is_empty() {
+            let mut failures: Vec<String> = Vec::new();
+            for (n, command) in self.config.post_tool_validators.iter().enumerate() {
+                let vid = format!("validate:{}:{}", turn + 1, n);
+                self.sink.emit(AgentEvent::ToolStart {
+                    id: vid.clone(),
+                    name: "post_tool_validate".into(),
+                    args: serde_json::json!({ "command": command }),
+                    parent_id: None,
+                });
+                let started = std::time::Instant::now();
+                let outcome = run_validator(
+                    &self.config.sandbox,
+                    &self.config.workspace,
+                    command,
+                    self.config.tool_timeout,
+                    cancel,
+                )
+                .await;
+                let (status, content) = match &outcome {
+                    ValidatorOutcome::Passed => (ToolStatus::Ok, "validator passed".to_string()),
+                    ValidatorOutcome::Failed { code, output } => {
+                        failures.push(format!("$ {command}  (exit {code})\n{output}"));
+                        (ToolStatus::Error, format!("exit {code}\n{output}"))
+                    }
+                    ValidatorOutcome::Skipped { reason } => {
+                        (ToolStatus::Error, format!("validator skipped: {reason}"))
+                    }
+                };
+                self.sink.emit(AgentEvent::ToolResult {
+                    id: vid,
+                    name: "post_tool_validate".into(),
+                    status,
+                    output: agent_tools::ToolOutput {
+                        content,
+                        display: None,
+                    },
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    parent_id: None,
+                });
+            }
+            if !failures.is_empty() {
+                ctx.append(Message::user(format!(
+                    "Post-edit validation reported problems. Fix these before continuing:\n\n{}",
+                    failures.join("\n\n")
+                )));
+            }
+        }
+
+        // Node hook: after_tools (spec §5.1). An EndRun here still falls
+        // through to the shared turn-end tail below (plan review finding 2):
+        // returning inline would leak a flushed dispatch-kind park.
+        let flow = self
+            .fire_after_tools(ctx, &mut *mw_state, cancel, turn, run_shared)
+            .await;
+        let out = if let crate::Flow::EndRun(reason) = flow {
+            self.sink.emit(AgentEvent::Done(reason));
+            TurnFlow::End(Ok(()))
+        } else {
+            // Scheduled loop-bottom maintain now lives in
+            // ContextCurationMiddleware::on_turn_end (spec §5.5), fired below;
+            // it also sets the Maintained run-state marker that gates the
+            // text-only-exit maintain in after_final_reply.
+            //
+            // Node hook: on_turn_end (spec §5.1).
+            let flow = self
+                .fire_turn_end(ctx, &mut *mw_state, cancel, turn, run_shared)
+                .await;
+            if let crate::Flow::EndRun(reason) = flow {
+                self.sink.emit(AgentEvent::Done(reason));
+                TurnFlow::End(Ok(()))
+            } else {
+                TurnFlow::Continue
+            }
+        };
+        // Turn over either way: drop the memory snapshot; remove a dispatch-kind
+        // park if a child flushed it this turn (all children finished — Phase 2
+        // drained). Zero I/O unless a flush happened. Runs on EVERY exit of this
+        // shared tail, including the two EndRun exits above.
+        if let Some(ck) = self.checkpointer.as_ref() {
+            ck.end_turn();
+        }
+        out
+    }
+
     /// Resolve, policy-check, and (if needed) get approval for one call — but do NOT
     /// execute it. Sequential by design so approval prompts never overlap.
     async fn gate_tool(&self, call: ToolCall, cancel: &CancellationToken) -> GateOutcome {
@@ -1345,8 +1770,8 @@ impl AgentLoop {
         // Capture the access tier before `intent` may be moved into the
         // `Decision::Ask` arm below (Access is Copy).
         let access = intent.access;
-        let allowed = match self.policy.check(&intent) {
-            Decision::Allow => true,
+        match self.policy.check(&intent) {
+            Decision::Allow => {}
             Decision::Deny(reason) => {
                 return GateOutcome::Rejected {
                     id: call.id,
@@ -1373,34 +1798,72 @@ impl AgentLoop {
                 let req = ApprovalRequest {
                     intent,
                     display: None,
+                    origin: None,
                 };
-                self.sink.emit(AgentEvent::Approval(req.clone()));
-                // Race the approval wait against cancellation: Ctrl-C during a
-                // pending prompt must end the run promptly rather than wedge until
-                // the prompt is answered. Cancel-during-prompt counts as a deny.
-                tokio::select! {
-                    _ = cancel.cancelled() => false,
-                    resp = self.approval.request(req) => matches!(
-                        resp,
-                        ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
+                // Policy said Ask; the CALLER prompts (and, Task 7, parks) —
+                // gate_tool no longer awaits the channel itself.
+                return GateOutcome::NeedsApproval(Box::new(PendingAsk {
+                    tool,
+                    call,
+                    req,
+                    access,
+                }));
+            }
+        };
+        GateOutcome::Ready(self.ready_call(tool, call, access, cancel))
+    }
+
+    /// Rebuild a `ReadyCall` for a call whose gate outcome was already decided
+    /// (resume splice, spec §3.7). No policy check, no prompt — the decision is
+    /// reused. Emits its own `ToolStart` (mirroring `gate_tool`) so the caller
+    /// must NOT emit before calling this. Resolution/intent failures (a tool
+    /// removed or its args invalidated by a config change since the run parked)
+    /// surface as honest per-call errors rather than silent re-approval.
+    fn gate_preapproved(&self, call: ToolCall, cancel: &CancellationToken) -> GateOutcome {
+        self.sink.emit(AgentEvent::ToolStart {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            args: call.args.clone(),
+            parent_id: None,
+        });
+        let tool = match self.tools.get(&call.name) {
+            Some(t) => t,
+            None => {
+                return GateOutcome::Rejected {
+                    id: call.id,
+                    name: call.name.clone(),
+                    content: format!(
+                        "ERROR: {}",
+                        ToolError::NotFound(format!(
+                            "unknown tool {} (removed since this run parked)",
+                            call.name
+                        ))
                     ),
                 }
             }
         };
-        if !allowed {
-            // Distinguish a cancel-driven denial (the run is ending) from an
-            // explicit user "no" so the tool result reads correctly downstream.
-            let reason = if cancel.is_cancelled() {
-                "run cancelled"
-            } else {
-                "user declined"
-            };
-            return GateOutcome::Rejected {
-                id: call.id,
-                name: call.name,
-                content: format!("ERROR: {}", ToolError::Denied(reason.into())),
-            };
-        }
+        let access = match tool.intent(&call.args) {
+            Ok(i) => i.access,
+            Err(e) => {
+                return GateOutcome::Rejected {
+                    id: call.id,
+                    name: call.name,
+                    content: format!("ERROR: {e}"),
+                }
+            }
+        };
+        GateOutcome::Ready(self.ready_call(tool, call, access, cancel))
+    }
+
+    /// Build the `ToolCtx` + `ReadyCall` for an approved call — the tail of the
+    /// old `gate_tool`. Shared by the Allow path and the Phase-1 approval arm.
+    fn ready_call(
+        &self,
+        tool: Arc<dyn Tool>,
+        call: ToolCall,
+        access: agent_tools::Access,
+        cancel: &CancellationToken,
+    ) -> ReadyCall {
         // The live run token: a tool that honors `ctx.cancel` (shell/git/fetch_url)
         // aborts when the caller cancels the run (Ctrl-C / SIGINT via the CLI).
         let ctx = ToolCtx {
@@ -1411,14 +1874,14 @@ impl AgentLoop {
             backend: self.backend.clone(),
             call_id: call.id.clone(),
         };
-        GateOutcome::Ready(ReadyCall {
+        ReadyCall {
             tool,
             args: call.args,
             id: call.id,
             name: call.name,
             ctx,
             access,
-        })
+        }
     }
 }
 
@@ -1444,6 +1907,60 @@ enum GateOutcome {
         name: String,
         content: String,
     },
+    /// Policy said Ask; the CALLER prompts (and, Task 7, parks) — `gate_tool`
+    /// no longer awaits the channel itself.
+    NeedsApproval(Box<PendingAsk>),
+}
+
+/// One gated-but-unanswered call: everything the caller needs to prompt +
+/// proceed once the human answers.
+struct PendingAsk {
+    tool: Arc<dyn Tool>,
+    call: ToolCall,
+    /// intent(+posture), display: None, origin: None
+    req: ApprovalRequest,
+    access: agent_tools::Access,
+}
+
+/// Everything needed to re-enter a checkpointed turn. Built by the caller
+/// (dispatch for children, the server coordinator for the root) from a
+/// verified `Checkpoint` — the loop never reads checkpoint files itself.
+pub struct ResumeTurn {
+    pub assistant_text: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub invalid: Vec<crate::InvalidParked>,
+    pub gate_records: Vec<crate::GateRecord>,
+    /// Some(i) = gate-kind (re-ask or consume `parked_decision` at i);
+    /// None = dispatch-kind (whole batch pre-decided; re-enter Phase 2).
+    pub parked_index: Option<usize>,
+    /// Some(_) when a durable answer.json committed a decision (E2 note: an
+    /// ApproveAlways answered pre-restart arrives as plain approve=true).
+    pub parked_decision: Option<bool>,
+    pub turn: u64,
+    pub guardrails: crate::Guardrails,
+    /// Goal text handed to fire_run_start (memory recall etc.); from the
+    /// restored context's goal, or empty.
+    pub goal_text: String,
+}
+
+/// Pre-decided gate outcomes for a resumed batch (Task 8 fills it in).
+struct PreDecided {
+    records: Vec<crate::GateRecord>,
+    parked_index: usize,
+    /// Some(_) when answer.json committed a decision; None ⇒ re-ask live.
+    parked_decision: Option<bool>,
+    /// Dispatch-kind resume (owner decision P1): Ready records re-execute
+    /// ONLY dispatch_agent calls; other siblings get a synthetic
+    /// lost-result error so host side effects never replay.
+    dispatch_kind: bool,
+}
+
+/// Control flow out of `tool_phase`.
+enum TurnFlow {
+    /// Turn completed; continue with the next turn.
+    Continue,
+    /// The run ended inside the phase (Done already emitted) or errored.
+    End(Result<(), AgentError>),
 }
 
 /// Final per-call result feeding the tool-result message + terminal event.
@@ -8181,5 +8698,954 @@ mod tests {
             Some("done"),
             "the truncation abort must still terminate with Done; events were: {events:?}"
         );
+    }
+
+    // ---- Task 7: park-point checkpoint (write at Ask, delete on answer) ----
+
+    /// Approval channel that answers `resp` and records how many times it
+    /// was asked plus whether a park existed on disk WHILE it blocked.
+    struct ParkApproval {
+        resp: ApprovalResponse,
+        asks: Arc<std::sync::atomic::AtomicUsize>,
+        /// Some(bool) once asked: did a park exist at ask time?
+        parked_at_ask: Arc<std::sync::Mutex<Option<bool>>>,
+        park_dir: std::path::PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl ApprovalChannel for ParkApproval {
+        async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+            self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.parked_at_ask.lock().unwrap() = Some(crate::checkpoint::has_park(&self.park_dir));
+            self.resp
+        }
+    }
+
+    /// Build a one-execute_command-call agent with an empty-allowlist policy
+    /// (⇒ Ask) wired to `approval` and `ck`. Mirrors the
+    /// `approval_summary_includes_sandbox_posture` rig.
+    fn ask_agent(
+        ws: std::path::PathBuf,
+        approval: Arc<dyn ApprovalChannel>,
+        ck: Arc<crate::Checkpointer>,
+    ) -> (AgentLoop, Arc<CollectingSink>) {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        });
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "execute_command".into(),
+                r#"{"command":"echo hi"}"#.into(),
+            ),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            approval,
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        )
+        .with_checkpointer(ck);
+        (agent, sink)
+    }
+
+    fn curated(ws_note: &str) -> crate::CuratedContext {
+        let _ = ws_note;
+        crate::CuratedContext::new(
+            Message::system("s"),
+            Arc::new(crate::SessionArtifacts::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    #[tokio::test]
+    async fn ask_parks_before_blocking_and_answer_deletes_the_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked_at_ask = Arc::new(std::sync::Mutex::new(None));
+        let approval = Arc::new(ParkApproval {
+            resp: ApprovalResponse::Approve,
+            asks: asks.clone(),
+            parked_at_ask: parked_at_ask.clone(),
+            park_dir: ck_dir.clone(),
+        });
+        let (agent, _sink) = ask_agent(ws, approval, ck);
+        // MUST be CuratedContext: the park write is gated on
+        // ctx.checkpoint_state() being Some — WindowContext silently skips it.
+        let mut ctx = curated("ws");
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        // park existed WHILE the ask was pending (spec §2.3: write BEFORE block)…
+        assert_eq!(*parked_at_ask.lock().unwrap(), Some(true));
+        // …and the answer deleted it before the run proceeded (commit point).
+        assert!(!crate::checkpoint::has_park(&ck_dir));
+        assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn deny_also_deletes_the_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked_at_ask = Arc::new(std::sync::Mutex::new(None));
+        let approval = Arc::new(ParkApproval {
+            resp: ApprovalResponse::Deny,
+            asks: asks.clone(),
+            parked_at_ask: parked_at_ask.clone(),
+            park_dir: ck_dir.clone(),
+        });
+        let (agent, _sink) = ask_agent(ws, approval, ck);
+        let mut ctx = curated("ws");
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert_eq!(
+            *parked_at_ask.lock().unwrap(),
+            Some(true),
+            "parked while blocked"
+        );
+        // Denial commits the answer the same way an approval does: park deleted.
+        assert!(!crate::checkpoint::has_park(&ck_dir));
+    }
+
+    #[tokio::test]
+    async fn non_ask_runs_write_zero_checkpoint_bytes() {
+        // E1: an allowlisted command auto-allows (Decision::Allow) so no Ask
+        // ever parks — the checkpoint dir must never be touched.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec!["echo".into()],
+            command_denylist: vec![],
+        });
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "execute_command".into(),
+                r#"{"command":"echo hi"}"#.into(),
+            ),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        )
+        .with_checkpointer(ck);
+        let mut ctx = curated("ws");
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        assert!(!ck_dir.exists(), "E1: no checkpoint I/O at all");
+    }
+
+    #[tokio::test]
+    async fn park_checkpoint_carries_context_records_and_parked_index() {
+        // Two calls in one turn: read_file (Allow) then execute_command (Ask).
+        // Approval channel loads the on-disk checkpoint WHILE blocked, then
+        // denies. Assertions run against the stashed checkpoint.
+        struct CapturingApproval {
+            ck_dir: std::path::PathBuf,
+            key: [u8; 32],
+            stash: Arc<std::sync::Mutex<Option<crate::Checkpoint>>>,
+        }
+        #[async_trait::async_trait]
+        impl ApprovalChannel for CapturingApproval {
+            async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+                *self.stash.lock().unwrap() =
+                    crate::checkpoint::load_checkpoint(&self.ck_dir, &self.key).unwrap();
+                ApprovalResponse::Deny
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        std::fs::write(ws.join("a.txt"), "FILEBODY").unwrap();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let stash = Arc::new(std::sync::Mutex::new(None));
+        let approval = Arc::new(CapturingApproval {
+            ck_dir: ck_dir.clone(),
+            key: [7u8; 32],
+            stash: stash.clone(),
+        });
+
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::fs::ReadFile {
+            max_bytes: 16 * 1024,
+        }));
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+        // read_file inside workspace -> Allow; execute_command empty allowlist -> Ask.
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        });
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Calls(vec![
+                (
+                    "c1".into(),
+                    "read_file".into(),
+                    r#"{"path":"a.txt"}"#.into(),
+                ),
+                (
+                    "c2".into(),
+                    "execute_command".into(),
+                    r#"{"command":"echo hi"}"#.into(),
+                ),
+            ]),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            approval,
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        )
+        .with_checkpointer(ck);
+        let mut ctx = curated("ws");
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let parked = stash
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("checkpoint present on disk while the ask blocked");
+        assert_eq!(
+            parked.parked.parked_index,
+            Some(1),
+            "blocked at call index 1"
+        );
+        assert_eq!(
+            parked.parked.gate_records,
+            vec![crate::GateRecord::Ready],
+            "one Ready record precedes the parked call"
+        );
+        assert_eq!(parked.parked.tool_calls.len(), 2, "full batch persisted");
+        assert_eq!(parked.session_id, "s1");
+        // The assistant message with both calls was appended pre-gate.
+        let last = parked.context.history.last().expect("history non-empty");
+        assert_eq!(last.role, agent_model::Role::Assistant);
+        assert_eq!(
+            last.tool_calls.as_ref().map(|c| c.len()),
+            Some(2),
+            "the appended assistant message carries the full pre-gate batch"
+        );
+        // Guardrail tallies are captured (0 here — no counting middleware in
+        // this rig; the ModelCallLimit/ToolCallLimit units feed these).
+        assert_eq!(parked.guardrails.model_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_write_failure_degrades_to_live_only() {
+        // Point the checkpoint dir at a FILE so the write fails; the run must
+        // still complete normally (spec §2.3: never block the run on I/O).
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        // A regular file where the dir needs to be -> write_checkpoint's
+        // create_dir_all under it fails.
+        std::fs::write(&ck_dir, "x").unwrap();
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked_at_ask = Arc::new(std::sync::Mutex::new(None));
+        let approval = Arc::new(ParkApproval {
+            resp: ApprovalResponse::Approve,
+            asks: asks.clone(),
+            parked_at_ask: parked_at_ask.clone(),
+            park_dir: ck_dir.clone(),
+        });
+        let (agent, sink) = ask_agent(ws, approval, ck);
+        let mut ctx = curated("ws");
+        // No panic, no error return.
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        // The tool still ran and the run reached a normal terminal Done.
+        assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.last().map(String::as_str), Some("done"));
+    }
+
+    /// Plan review finding 2 / brief Step-4 note: a dispatch-kind ancestor
+    /// snapshot flushed to disk this turn MUST be cleared at turn end on
+    /// EVERY exit of `tool_phase`, including the on_turn_end EndRun exit —
+    /// otherwise a later scan misreads the stale park as a phantom session.
+    ///
+    /// This repo has no in-loop dispatch wiring yet, so we pin the leak-prone
+    /// PATH directly: a middleware sets a turn snapshot + flushes it (mimicking
+    /// a descendant park) and then EndRuns at on_turn_end. Assert no
+    /// dispatch-kind park survives.
+    #[tokio::test]
+    async fn end_turn_clears_flushed_park_on_end_run_exit() {
+        use crate::{Flow, RunCx};
+        struct FlushThenEnd {
+            ck: Arc<crate::Checkpointer>,
+        }
+        #[async_trait::async_trait]
+        impl crate::Middleware for FlushThenEnd {
+            fn name(&self) -> &str {
+                "flush-then-end"
+            }
+            async fn after_tools(&self, _cx: &mut RunCx<'_>) -> Flow {
+                // Simulate a dispatch-bearing turn whose descendant parked:
+                // set a pending snapshot and force it to disk this turn.
+                self.ck.set_turn_snapshot(crate::PendingSnapshot {
+                    context: crate::CuratedContext::new(
+                        Message::system("s"),
+                        Arc::new(crate::SessionArtifacts::new()),
+                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    )
+                    .checkpoint_state(),
+                    guardrails: crate::Guardrails::default(),
+                    turn: 0,
+                    assistant_text: String::new(),
+                    tool_calls: vec![],
+                    invalid: vec![],
+                    gate_records: vec![],
+                    artifacts: Arc::new(crate::SessionArtifacts::new()),
+                });
+                self.ck
+                    .write_park(
+                        crate::Checkpoint {
+                            version: crate::CHECKPOINT_VERSION,
+                            session_id: "s1".into(),
+                            subagent_path: vec![],
+                            turn: 0,
+                            context: crate::CuratedContext::new(
+                                Message::system("s"),
+                                Arc::new(crate::SessionArtifacts::new()),
+                                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            )
+                            .checkpoint_state(),
+                            guardrails: crate::Guardrails::default(),
+                            parked: crate::ParkedTurn {
+                                assistant_text: String::new(),
+                                tool_calls: vec![],
+                                invalid: vec![],
+                                gate_records: vec![],
+                                parked_index: None,
+                                origin: None,
+                            },
+                        },
+                        &crate::SessionArtifacts::new(),
+                    )
+                    .await
+                    .unwrap();
+                Flow::Continue
+            }
+            async fn on_turn_end(&self, _cx: &mut RunCx<'_>) -> Flow {
+                Flow::EndRun(StopReason::Error)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec!["echo".into()],
+            command_denylist: vec![],
+        });
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "execute_command".into(),
+                r#"{"command":"echo hi"}"#.into(),
+            ),
+            Scripted::Text("Done.".into()),
+        ]));
+        let sink = Arc::new(CollectingSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            Arc::new(AlwaysApprove),
+            sink,
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        )
+        .with_checkpointer(ck.clone())
+        .with_middleware(vec![Arc::new(FlushThenEnd { ck: ck.clone() })]);
+        let mut ctx = curated("ws");
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+        // The run ended at on_turn_end (EndRun), yet the flushed dispatch-kind
+        // park must NOT survive — end_turn ran on that exit.
+        assert!(
+            !crate::checkpoint::has_park(&ck_dir),
+            "flushed dispatch-kind park leaked past an EndRun exit"
+        );
+    }
+
+    // ---- Task 8: resume entry — pre-decided gate splice + tally seeding ----
+
+    /// A sink that records every ToolStart / ToolResult with its call id so a
+    /// test can assert exactly-one-ToolStart-per-id and per-id terminal status
+    /// (the string CollectingSink drops ids). Runs alongside nothing else.
+    #[derive(Default)]
+    struct IdSink {
+        starts: Mutex<Vec<String>>,
+        results: Mutex<Vec<(String, String, String)>>, // (id, name, status)
+        done: Mutex<Vec<StopReason>>,
+    }
+    impl crate::EventSink for IdSink {
+        fn emit(&self, event: AgentEvent) {
+            match event {
+                AgentEvent::ToolStart { id, .. } => self.starts.lock().unwrap().push(id),
+                AgentEvent::ToolResult {
+                    id, name, status, ..
+                } => self
+                    .results
+                    .lock()
+                    .unwrap()
+                    .push((id, name, status.as_str().into())),
+                AgentEvent::Done(r) => self.done.lock().unwrap().push(r),
+                _ => {}
+            }
+        }
+    }
+    impl IdSink {
+        fn starts_for(&self, id: &str) -> usize {
+            self.starts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| *s == id)
+                .count()
+        }
+        fn status_of(&self, id: &str) -> Option<String> {
+            self.results
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(i, _, _)| i == id)
+                .map(|(_, _, s)| s.clone())
+        }
+    }
+
+    /// Approval channel that counts prompts and answers `resp`. Optionally
+    /// records whether a park existed on disk while it blocked (re-ask test).
+    struct SpliceApproval {
+        resp: ApprovalResponse,
+        asks: Arc<std::sync::atomic::AtomicUsize>,
+        parked_at_ask: Arc<std::sync::Mutex<Option<bool>>>,
+        park_dir: Option<std::path::PathBuf>,
+    }
+    #[async_trait::async_trait]
+    impl ApprovalChannel for SpliceApproval {
+        async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+            self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(d) = &self.park_dir {
+                *self.parked_at_ask.lock().unwrap() = Some(crate::checkpoint::has_park(d));
+            }
+            self.resp
+        }
+    }
+
+    /// Build a restored `CuratedContext` whose history ends with the assistant
+    /// message carrying `batch` (mirrors what park writes pre-gate).
+    fn restore_with_batch(goal: &str, batch: &[ToolCall]) -> crate::CuratedContext {
+        let state = crate::CuratedContextState {
+            goal: Some(Message::system(format!("Original goal: {goal}"))),
+            history: vec![
+                Message::user(goal.to_string()),
+                Message::assistant("running the batch", Some(batch.to_vec())),
+            ],
+            compaction_summary: None,
+            folded_facts: vec![],
+            folded_sections: vec![],
+            seq: 0,
+            history_has_spans: false,
+            history_incomplete: false,
+            artifact_prefix: String::new(),
+            todos: vec![],
+        };
+        crate::CuratedContext::restore(
+            Message::system("s"),
+            Arc::new(crate::SessionArtifacts::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            state,
+        )
+    }
+
+    /// execute_command agent (empty allowlist ⇒ Ask), IdSink, optional ck.
+    fn resume_agent(
+        ws: std::path::PathBuf,
+        approval: Arc<dyn ApprovalChannel>,
+        ck: Option<Arc<crate::Checkpointer>>,
+        model: Vec<Scripted>,
+        extra_middleware: Vec<Arc<dyn crate::Middleware>>,
+    ) -> (AgentLoop, Arc<IdSink>) {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        let tools = Arc::new(r);
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        });
+        let sink = Arc::new(IdSink::default());
+        let mut agent = AgentLoop::new(
+            Arc::new(ScriptedModel::new(model)),
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            approval,
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        );
+        if !extra_middleware.is_empty() {
+            agent = agent.with_middleware(extra_middleware);
+        }
+        if let Some(ck) = ck {
+            agent = agent.with_checkpointer(ck);
+        }
+        (agent, sink)
+    }
+
+    fn echo_batch() -> Vec<ToolCall> {
+        vec![
+            ToolCall {
+                id: "c1".into(),
+                name: "execute_command".into(),
+                args: serde_json::json!({"command": "echo one"}),
+            },
+            ToolCall {
+                id: "c2".into(),
+                name: "execute_command".into(),
+                args: serde_json::json!({"command": "echo two"}),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn resume_splices_records_without_reprompting_and_executes_phase2() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let approval = Arc::new(SpliceApproval {
+            resp: ApprovalResponse::Approve,
+            asks: asks.clone(),
+            parked_at_ask: Arc::new(std::sync::Mutex::new(None)),
+            park_dir: None,
+        });
+        // The RESUMED turn consumes no completion; the model only serves the
+        // turn AFTER the batch.
+        let (agent, sink) = resume_agent(
+            ws.clone(),
+            approval,
+            None,
+            vec![Scripted::Text("wrapped up".into())],
+            vec![],
+        );
+        let batch = echo_batch();
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![crate::GateRecord::Ready],
+            parked_index: Some(1),
+            parked_decision: Some(true),
+            turn: 3,
+            guardrails: crate::Guardrails {
+                tool_calls: 5,
+                model_calls: 4,
+            },
+            goal_text: "the goal".into(),
+        };
+        agent
+            .resume_with_cancel(&mut ctx, resume, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            asks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no re-prompt (spec §3.7)"
+        );
+        // exactly one ToolStart per call id (double-emit guard)
+        assert_eq!(sink.starts_for("c1"), 1, "one ToolStart for c1");
+        assert_eq!(sink.starts_for("c2"), 1, "one ToolStart for c2");
+        // both executed to Ok
+        assert_eq!(sink.status_of("c1").as_deref(), Some("ok"));
+        assert_eq!(sink.status_of("c2").as_deref(), Some("ok"));
+        // the run then finished on the scripted text turn: Done(Stop)
+        assert_eq!(
+            sink.done.lock().unwrap().last(),
+            Some(&StopReason::Stop),
+            "run finished on the post-batch text turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_denial_yields_denied_result_without_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let approval = Arc::new(SpliceApproval {
+            resp: ApprovalResponse::Approve,
+            asks: asks.clone(),
+            parked_at_ask: Arc::new(std::sync::Mutex::new(None)),
+            park_dir: None,
+        });
+        let (agent, sink) = resume_agent(
+            ws.clone(),
+            approval,
+            None,
+            vec![Scripted::Text("wrapped up".into())],
+            vec![],
+        );
+        let batch = echo_batch();
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![crate::GateRecord::Ready],
+            parked_index: Some(1),
+            parked_decision: Some(false),
+            turn: 3,
+            guardrails: crate::Guardrails {
+                tool_calls: 0,
+                model_calls: 0,
+            },
+            goal_text: "the goal".into(),
+        };
+        agent
+            .resume_with_cancel(&mut ctx, resume, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            asks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "denial is consumed from the committed decision, never re-prompted"
+        );
+        assert_eq!(sink.status_of("c1").as_deref(), Some("ok"), "c1 still ran");
+        assert_eq!(
+            sink.status_of("c2").as_deref(),
+            Some("denied"),
+            "c2's committed deny replays as a Denied result"
+        );
+        // content carries "user declined"
+        let c2 = sink
+            .results
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(i, _, _)| i == "c2")
+            .cloned();
+        assert!(c2.is_some());
+    }
+
+    #[tokio::test]
+    async fn resume_without_decision_reasks_live_and_can_park_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let ck_dir = dir.path().join("checkpoint");
+        let ck = crate::Checkpointer::new(ck_dir.clone(), [7u8; 32], "s1".into());
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked_at_ask = Arc::new(std::sync::Mutex::new(None));
+        let approval = Arc::new(SpliceApproval {
+            resp: ApprovalResponse::Approve,
+            asks: asks.clone(),
+            parked_at_ask: parked_at_ask.clone(),
+            park_dir: Some(ck_dir.clone()),
+        });
+        let (agent, sink) = resume_agent(
+            ws.clone(),
+            approval,
+            Some(ck),
+            vec![Scripted::Text("wrapped up".into())],
+            vec![],
+        );
+        let batch = echo_batch();
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![crate::GateRecord::Ready],
+            parked_index: Some(1),
+            parked_decision: None, // unanswered ⇒ re-ask live
+            turn: 3,
+            guardrails: crate::Guardrails::default(),
+            goal_text: "the goal".into(),
+        };
+        agent
+            .resume_with_cancel(&mut ctx, resume, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            asks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the unanswered parked ask re-prompts live exactly once"
+        );
+        assert_eq!(
+            *parked_at_ask.lock().unwrap(),
+            Some(true),
+            "a park was re-written before the live block"
+        );
+        assert!(
+            !crate::checkpoint::has_park(&ck_dir),
+            "the answered live ask deletes the park"
+        );
+        assert_eq!(sink.status_of("c2").as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn guardrail_tallies_survive_resume_without_refill() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let approval = Arc::new(SpliceApproval {
+            resp: ApprovalResponse::Approve,
+            asks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            parked_at_ask: Arc::new(std::sync::Mutex::new(None)),
+            park_dir: None,
+        });
+        // Counting middleware in the stack so ToolCallCount is live. Seed the
+        // resumed tally to ONE below the limit: after the resumed batch runs
+        // (2 calls), the pre-turn backstop must trip on the NEXT turn.
+        let (agent, sink) = resume_agent(
+            ws.clone(),
+            approval,
+            None,
+            // model would serve a call turn next, but the pre-turn backstop
+            // fires before any completion — script one anyway.
+            vec![Scripted::Text("never reached".into())],
+            vec![Arc::new(crate::ToolCallLimit::new())],
+        );
+        let batch = echo_batch();
+        let mut ctx = restore_with_batch("the goal", &batch);
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![crate::GateRecord::Ready],
+            parked_index: Some(1),
+            parked_decision: Some(true),
+            turn: 3,
+            guardrails: crate::Guardrails {
+                tool_calls: (crate::TOOL_CALL_LIMIT - 1) as u64,
+                model_calls: 0,
+            },
+            goal_text: "the goal".into(),
+        };
+        agent
+            .resume_with_cancel(&mut ctx, resume, CancellationToken::new())
+            .await
+            .unwrap();
+        // The batch executed…
+        assert_eq!(sink.status_of("c1").as_deref(), Some("ok"));
+        assert_eq!(sink.status_of("c2").as_deref(), Some("ok"));
+        // …and the tally did NOT refill: seeded at LIMIT-1, +2 in the batch ⇒
+        // over LIMIT, so the run ends on the guardrail Error, not Stop.
+        assert_eq!(
+            sink.done.lock().unwrap().last(),
+            Some(&StopReason::Error),
+            "the seeded tally tripped the guardrail — the budget did not refill (spec §3.8)"
+        );
+    }
+
+    /// A stub Tool named "dispatch_agent": the P1 splice keys on the NAME, so a
+    /// trivial registered tool is enough to prove the dispatch-kind arm gates
+    /// through and executes while non-dispatch siblings are lost-result'd.
+    struct DispatchStub;
+    #[async_trait::async_trait]
+    impl agent_tools::Tool for DispatchStub {
+        fn name(&self) -> &str {
+            "dispatch_agent"
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn schema(&self) -> agent_tools::ToolSchema {
+            agent_tools::ToolSchema {
+                name: "dispatch_agent".into(),
+                description: "stub".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        fn intent(
+            &self,
+            _a: &serde_json::Value,
+        ) -> Result<agent_tools::ToolIntent, agent_tools::ToolError> {
+            Ok(agent_tools::ToolIntent {
+                tool: "dispatch_agent".into(),
+                access: agent_tools::Access::Read,
+                paths: vec![],
+                command: None,
+                summary: "dispatch".into(),
+            })
+        }
+        async fn execute(
+            &self,
+            _a: serde_json::Value,
+            _ctx: &agent_tools::ToolCtx,
+        ) -> Result<agent_tools::ToolOutput, agent_tools::ToolError> {
+            Ok(agent_tools::ToolOutput {
+                content: "child done".into(),
+                display: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_kind_resume_lost_results_non_dispatch_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let marker = ws.join("side-effect.txt");
+        // Register execute_command + a dispatch_agent stub.
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(agent_tools::shell::ExecuteCommand));
+        r.register(Arc::new(DispatchStub));
+        let tools = Arc::new(r);
+        let pol = Arc::new(RulePolicy {
+            workspace: ws.clone(),
+            command_allowlist: vec![],
+            command_denylist: vec![],
+        });
+        let sink = Arc::new(IdSink::default());
+        let agent = AgentLoop::new(
+            Arc::new(ScriptedModel::new(vec![Scripted::Text(
+                "wrapped up".into(),
+            )])),
+            Arc::new(PassthroughProtocol),
+            tools,
+            pol,
+            Arc::new(SpliceApproval {
+                resp: ApprovalResponse::Approve,
+                asks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                parked_at_ask: Arc::new(std::sync::Mutex::new(None)),
+                park_dir: None,
+            }),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                temperature: 0.0,
+                workspace: ws.clone(),
+                tool_timeout: std::time::Duration::from_secs(5),
+                sandbox: Arc::new(agent_tools::HostExecutor),
+                ..Default::default()
+            },
+        );
+        let batch = vec![
+            ToolCall {
+                id: "c1".into(),
+                name: "execute_command".into(),
+                // would create the marker file if it ran
+                args: serde_json::json!({"command":
+                    format!("touch {}", marker.display())}),
+            },
+            ToolCall {
+                id: "c2".into(),
+                name: "dispatch_agent".into(),
+                args: serde_json::json!({}),
+            },
+        ];
+        let mut ctx = restore_with_batch("the goal", &batch);
+        // dispatch-kind resume: parked_index None, whole batch pre-decided Ready.
+        let resume = crate::ResumeTurn {
+            assistant_text: "running the batch".into(),
+            tool_calls: batch,
+            invalid: vec![],
+            gate_records: vec![crate::GateRecord::Ready, crate::GateRecord::Ready],
+            parked_index: None,
+            parked_decision: None,
+            turn: 3,
+            guardrails: crate::Guardrails::default(),
+            goal_text: "the goal".into(),
+        };
+        agent
+            .resume_with_cancel(&mut ctx, resume, CancellationToken::new())
+            .await
+            .unwrap();
+        // The non-dispatch sibling must NOT execute: synthetic lost-result.
+        assert_eq!(
+            sink.status_of("c1").as_deref(),
+            Some("error"),
+            "the non-dispatch sibling is lost-result'd, not re-executed"
+        );
+        assert!(
+            !marker.exists(),
+            "the execute_command side effect must not replay"
+        );
+        // The dispatch_agent call gates through gate_preapproved and executes.
+        assert_eq!(
+            sink.status_of("c2").as_deref(),
+            Some("ok"),
+            "dispatch_agent re-executes on a dispatch-kind resume"
+        );
+        // exactly one ToolStart per call id, no prompts.
+        assert_eq!(sink.starts_for("c1"), 1);
+        assert_eq!(sink.starts_for("c2"), 1);
     }
 }

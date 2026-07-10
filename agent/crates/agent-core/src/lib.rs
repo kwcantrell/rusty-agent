@@ -1,5 +1,6 @@
 //! Agent loop, context manager, and event model.
 mod artifacts;
+pub mod checkpoint;
 mod compactor;
 mod context;
 mod context_tools;
@@ -16,6 +17,11 @@ pub mod stats;
 pub mod testkit;
 mod todos;
 pub use artifacts::SessionArtifacts;
+pub use checkpoint::{
+    dump_artifacts, restore_artifacts, sanitize_dir_key, verify_tally_floor, AskGuard, Checkpoint,
+    CheckpointError, Checkpointer, GateRecord, Guardrails, InvalidParked, ParkedTurn,
+    PendingSnapshot, CHECKPOINT_VERSION,
+};
 pub use compactor::*;
 pub use context::*;
 pub use context_tools::*;

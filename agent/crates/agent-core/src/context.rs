@@ -234,6 +234,18 @@ pub trait ContextManager: Send + Sync {
     /// (managers without a compaction concept ignore it). `CuratedContext`
     /// sets the same flag the `context_compact` tool uses.
     fn request_compaction(&mut self) {}
+    /// Serializable pinned state for park-time checkpointing. Default None:
+    /// implementations without durable state (WindowContext, test doubles)
+    /// are unaffected and unparkable state simply isn't persisted.
+    fn checkpoint_state(&self) -> Option<crate::CuratedContextState> {
+        None
+    }
+    /// Durable artifact stores to dump alongside a park checkpoint (spec §2.3).
+    /// Default None: implementations without durable stores (WindowContext,
+    /// test doubles) contribute an empty dump. Overridden by `CuratedContext`.
+    fn artifacts(&self) -> Option<Arc<crate::SessionArtifacts>> {
+        None
+    }
 }
 
 /// Sliding-window context: always keeps the system prompt; evicts oldest

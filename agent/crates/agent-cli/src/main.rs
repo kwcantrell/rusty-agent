@@ -290,6 +290,8 @@ async fn main() {
             trace,
             api_key: api_key.clone(),
             claude_binary: cli.claude_binary.clone(),
+            // Non-durable in 4B-1 by design; the CLI's reopen surface lands in 4B-2.
+            checkpoint: None,
         },
     );
     if !built.unknown_presets.is_empty() {

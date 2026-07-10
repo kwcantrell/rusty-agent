@@ -249,6 +249,7 @@ async fn eval_context_run() {
                 trace: None,
                 api_key: None,
                 claude_binary: "claude".into(),
+                checkpoint: None,
             },
         );
         let agent = built.loop_;

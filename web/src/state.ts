@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import type { Display, Inbound, RuntimeSettings, SessionStats } from "./wire";
+import type { ApprovalOrigin, Display, Inbound, RuntimeSettings, SessionStats } from "./wire";
 import { displayDesignId } from "./designStore";
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
@@ -25,6 +25,9 @@ export interface SubagentCard {
   turns?: number;
   toolCalls?: number;
   durationMs?: number;
+  /** True while a nested approval_request attributed to this delegation is
+   *  pending an answer (spec 4B-1). */
+  waitingApproval?: boolean;
 }
 
 export type Item =
@@ -54,6 +57,7 @@ export interface PendingApproval {
   summary: string;
   command?: string;
   display?: Display;
+  origin?: ApprovalOrigin;
 }
 
 export interface ConversationState {
@@ -188,7 +192,15 @@ export function reduce(state: ConversationState, action: Action): ConversationSt
       return { ...state, items: [...state.items, { kind: "user", text: action.text }], inTurn: true };
     }
     case "approval_sent":
-      return { ...state, pendingApproval: null };
+      return {
+        ...state,
+        pendingApproval: null,
+        items: state.items.map((it) =>
+          isToolItem(it) && it.subagent?.waitingApproval
+            ? { ...it, subagent: { ...it.subagent, waitingApproval: false } }
+            : it,
+        ),
+      };
     case "dismiss_sandbox_banner":
       return { ...state, sandboxDegraded: null };
     case "frame":
@@ -209,7 +221,18 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
     return { ...state, settingsError: frame.message };
   }
   if (frame.kind === "approval_request") {
-    return { ...state, pendingApproval: { id: frame.id, summary: frame.summary, command: frame.command, display: frame.display } };
+    let items = state.items;
+    if (frame.origin) {
+      items = [...items];
+      const i = findLiveCardIndex(items, frame.origin.delegation_id);
+      const it = i >= 0 ? items[i] : undefined;
+      if (it && isToolItem(it) && it.subagent) {
+        items[i] = { ...it, subagent: { ...it.subagent, waitingApproval: true } };
+      }
+    }
+    return { ...state, items, pendingApproval: {
+      id: frame.id, summary: frame.summary, command: frame.command,
+      display: frame.display, origin: frame.origin } };
   }
   // frame.kind === "event"
   const p = frame.payload;
@@ -355,7 +378,8 @@ function reduceFrame(state: ConversationState, frame: Inbound): ConversationStat
       const ti = it as ToolItem;
       items[i] = { ...ti, subagent: { ...ti.subagent!, status: "done",
         outcome: p.outcome, stop: p.stop, detail: p.detail,
-        turns: p.turns, toolCalls: p.tool_calls, durationMs: p.duration_ms },
+        turns: p.turns, toolCalls: p.tool_calls, durationMs: p.duration_ms,
+        waitingApproval: false },
         // Placeholder rows never get a real tool_result (spec §2.4 / gate G3),
         // so the outer status would otherwise pulse "running" forever
         // (finding 2, 3B-2 review). A REAL dispatch row awaiting its

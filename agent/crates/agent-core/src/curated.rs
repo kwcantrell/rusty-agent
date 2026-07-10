@@ -16,6 +16,25 @@ use std::sync::Arc;
 /// Default fraction of `model_limit` at which `maintain` triggers a compaction pass.
 pub const DEFAULT_HIGH_WATER_PCT: f32 = 0.85;
 
+/// The serializable pinned state of a CuratedContext (spec §2.2). NOT
+/// persisted: system prompt (live truth, recomposed from current config),
+/// memory index (re-loads via the 4A dirty-flag path), offload config /
+/// high-water (live config), compact_flag + last_evicted (transient),
+/// artifacts (dumped separately, §2.3).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CuratedContextState {
+    pub goal: Option<Message>,
+    pub history: Vec<Message>,
+    pub compaction_summary: Option<Message>,
+    pub folded_facts: Vec<String>,
+    pub folded_sections: Vec<u64>,
+    pub seq: u64,
+    pub history_has_spans: bool,
+    pub history_incomplete: bool,
+    pub artifact_prefix: String,
+    pub todos: Vec<crate::TodoItem>,
+}
+
 /// A curating context manager. Pins `system → re-grounding → memory index →
 /// compaction summary → windowed recent history`, offloads stale/large tool
 /// results into a side table each turn, and compacts the old span when over
@@ -252,6 +271,46 @@ impl CuratedContext {
             &todos,
         )
     }
+
+    /// Snapshot the pinned state for a park-time checkpoint (spec §2.2).
+    pub fn checkpoint_state(&self) -> CuratedContextState {
+        CuratedContextState {
+            goal: self.goal.clone(),
+            history: self.history.clone(),
+            compaction_summary: self.compaction_summary.clone(),
+            folded_facts: self.folded_facts.clone(),
+            folded_sections: self.folded_sections.clone(),
+            seq: self.seq,
+            history_has_spans: self.history_has_spans,
+            history_incomplete: self.history_incomplete,
+            artifact_prefix: self.artifact_prefix.clone(),
+            todos: self.todos.lock().unwrap().clone(),
+        }
+    }
+
+    /// Rebuild from a checkpoint. System prompt, offload config, high-water,
+    /// and memory index are NOT restored — they re-derive from live config
+    /// (spec §3.3); callers apply `with_offload_config` etc. after this.
+    pub fn restore(
+        system: Message,
+        artifacts: Arc<crate::SessionArtifacts>,
+        compact_flag: Arc<std::sync::atomic::AtomicBool>,
+        todos: crate::TodoHandle,
+        state: CuratedContextState,
+    ) -> Self {
+        *todos.lock().unwrap() = state.todos;
+        let mut ctx = Self::new(system, artifacts, compact_flag).with_todos(todos);
+        ctx.goal = state.goal;
+        ctx.history = state.history;
+        ctx.compaction_summary = state.compaction_summary;
+        ctx.folded_facts = state.folded_facts;
+        ctx.folded_sections = state.folded_sections;
+        ctx.seq = state.seq;
+        ctx.history_has_spans = state.history_has_spans;
+        ctx.history_incomplete = state.history_incomplete;
+        ctx.artifact_prefix = state.artifact_prefix;
+        ctx
+    }
 }
 
 #[async_trait]
@@ -355,6 +414,14 @@ impl ContextManager for CuratedContext {
 
     fn request_compaction(&mut self) {
         self.compact_flag.store(true, Ordering::SeqCst);
+    }
+
+    fn checkpoint_state(&self) -> Option<crate::CuratedContextState> {
+        Some(CuratedContext::checkpoint_state(self))
+    }
+
+    fn artifacts(&self) -> Option<Arc<crate::SessionArtifacts>> {
+        Some(self.artifacts.clone())
     }
 }
 
@@ -2231,5 +2298,56 @@ mod tests {
             snap.segments.iter().any(|s| s.category == "todos"),
             "a non-empty plan surfaces a todos segment"
         );
+    }
+
+    #[test]
+    fn checkpoint_state_round_trips_through_restore() {
+        let artifacts = Arc::new(crate::SessionArtifacts::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut ctx = CuratedContext::new(Message::system("sys"), artifacts.clone(), flag.clone())
+            .with_artifact_prefix("sub3-");
+        ctx.set_goal("build the thing".into());
+        ctx.append(Message::user("build the thing"));
+        ctx.append(Message::assistant("ok", None));
+        ctx.compaction_summary = Some(Message::system("summary"));
+        ctx.folded_facts.push("name = value".into());
+        // private fields set via the state struct below instead where needed
+        let todos: crate::TodoHandle = Arc::new(std::sync::Mutex::new(vec![crate::TodoItem {
+            content: "step".into(),
+            status: crate::TodoStatus::Pending,
+        }]));
+        let ctx = ctx.with_todos(todos);
+
+        let mut state = ctx.checkpoint_state();
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.artifact_prefix, "sub3-");
+        assert_eq!(state.todos.len(), 1);
+        state.seq = 7;
+        state.folded_sections = vec![3];
+        state.history_has_spans = true;
+
+        // serde round-trip (what the checkpoint file does)
+        let state: CuratedContextState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+
+        let todos2: crate::TodoHandle = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let restored = CuratedContext::restore(
+            Message::system("fresh-sys"),
+            Arc::new(crate::SessionArtifacts::new()),
+            Arc::new(AtomicBool::new(false)),
+            todos2.clone(),
+            state.clone(),
+        );
+        assert_eq!(restored.checkpoint_state(), state, "restore is lossless");
+        // the SHARED handle was filled (write_todos sees the restored plan)
+        assert_eq!(todos2.lock().unwrap().len(), 1);
+        // system is LIVE truth — the restored context uses the fresh prompt
+        assert_eq!(restored.system().unwrap().content, "fresh-sys");
+    }
+
+    #[test]
+    fn context_manager_default_checkpoint_state_is_none() {
+        let w = crate::WindowContext::new(Message::system("s"));
+        assert!(crate::ContextManager::checkpoint_state(&w).is_none());
     }
 }
