@@ -10,6 +10,15 @@ pub use runtime_config::{
 mod project_key;
 pub use project_key::project_key;
 
+mod session_meta;
+// Task 2 adds scan_descriptors/prune_session_dirs; Task 3 adds
+// load_or_create_secret — re-export the full set (per brief) once all three
+// tasks have landed.
+pub use session_meta::{
+    load_descriptor, metadata_root, mint_session_id, session_dir, sessions_root, write_descriptor,
+    SessionDescriptor, DESCRIPTOR_SCHEMA,
+};
+
 mod assemble;
 pub use assemble::{assemble_loop, loop_config_from, BuiltLoop, LoopParts};
 
