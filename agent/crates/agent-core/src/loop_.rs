@@ -2909,10 +2909,10 @@ mod tests {
         agent.run(&mut ctx, "hello".into()).await.unwrap();
 
         let built = ctx.build(100_000);
-        assert!(built.iter().any(
-            |m| m.content.contains("Relevant memories from past sessions:")
-                && m.content.contains("user prefers rust 2021")
-        ));
+        assert!(built
+            .iter()
+            .any(|m| m.content.contains(crate::context::MEMORY_HEADER)
+                && m.content.contains("user prefers rust 2021")));
     }
 
     #[tokio::test]

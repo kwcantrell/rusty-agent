@@ -1,8 +1,8 @@
 use crate::compactor::{compaction_is_worthwhile, run_compaction, run_extraction};
 use crate::context::{
-    estimate_tokens, message_tokens, orphaned_tool_positions, plan_retention, recall_block,
+    estimate_tokens, memory_block, message_tokens, orphaned_tool_positions, plan_retention,
     snap_split_to_unit_boundary, turn_unit_ranges, ContextManager, MaintCtx, MaintReport,
-    DEFAULT_RECALL_TOKEN_BUDGET,
+    DEFAULT_MEMORY_INDEX_BUDGET,
 };
 use crate::event::{AgentEvent, ContextEvent};
 use crate::offload_policy::{
@@ -63,7 +63,7 @@ impl CuratedContext {
             goal: None,
             history: Vec::new(),
             recall: Vec::new(),
-            recall_budget: DEFAULT_RECALL_TOKEN_BUDGET,
+            recall_budget: DEFAULT_MEMORY_INDEX_BUDGET,
             compaction_summary: None,
             folded_facts: Vec::new(),
             artifacts,
@@ -134,7 +134,7 @@ impl CuratedContext {
             (None, false) => out.push(Message::system(self.folded_block_body())),
             (None, true) => {}
         }
-        if let Some(r) = recall_block(&self.recall, self.recall_budget) {
+        if let Some(r) = memory_block(&self.recall, self.recall_budget) {
             out.push(r);
         }
         if let Some(c) = &self.compaction_summary {
@@ -198,7 +198,7 @@ impl CuratedContext {
         if !self.folded_facts.is_empty() {
             t += message_tokens(&self.folded_block());
         }
-        if let Some(r) = recall_block(&self.recall, self.recall_budget) {
+        if let Some(r) = memory_block(&self.recall, self.recall_budget) {
             t += message_tokens(&r);
         }
         if let Some(c) = &self.compaction_summary {
@@ -368,7 +368,7 @@ const PLACEHOLDER_UNIT_MAX_TOKENS: usize = 160;
 const FOLDED_FACTS_MAX_TOKENS: usize = 512;
 
 /// Token cap for the pinned goal block (audit 7.1). Same scale as
-/// `DEFAULT_RECALL_TOKEN_BUDGET` and `FOLDED_FACTS_MAX_TOKENS` — every pinned
+/// `DEFAULT_MEMORY_INDEX_BUDGET` and `FOLDED_FACTS_MAX_TOKENS` — every pinned
 /// block is budgeted. The full input stays in history; only the pin truncates.
 const GOAL_MAX_TOKENS: usize = 512;
 const GOAL_TRUNCATION_MARKER: &str =
@@ -824,7 +824,7 @@ mod tests {
         assert!(matches!(built[0].role, Role::System));
         assert_eq!(built[0].content, "SYS");
         assert_eq!(built[1].content, "Original goal: ship the feature");
-        assert!(built[2].content.starts_with("Relevant memories"));
+        assert!(built[2].content.starts_with(crate::context::MEMORY_HEADER));
         assert_eq!(built.last().unwrap().content, "hello");
     }
 
@@ -2150,8 +2150,8 @@ mod tests {
         // Existing pinned order preserved: system/goal/recall/summary identical.
         assert_eq!(built[0].content, base[0].content); // system
         assert_eq!(built[1].content, base[1].content); // goal
-        assert!(built[2].content.starts_with("Relevant memories")); // recall
-                                                                    // history tail unchanged
+        assert!(built[2].content.starts_with(crate::context::MEMORY_HEADER)); // recall
+                                                                              // history tail unchanged
         assert_eq!(built.last().unwrap().content, "hello");
     }
 

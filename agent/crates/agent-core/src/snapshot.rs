@@ -1,4 +1,4 @@
-use crate::context::{estimate_tokens, message_tokens, recall_block, recall_prefix_len};
+use crate::context::{estimate_tokens, memory_block, message_tokens};
 use agent_model::Message;
 use serde::{Deserialize, Serialize};
 
@@ -73,16 +73,22 @@ pub(crate) fn build_snapshot(
         });
     }
 
-    // The context injects only the capped `recall_block(recall, budget)` — a
-    // greedy prefix under the token cap — so the snapshot sizes the memory
-    // segment from that SAME block, never the raw line sum, or the dashboard
-    // over-reports memory pressure.
-    if let Some(block) = recall_block(recall, recall_budget) {
-        let kept = recall_prefix_len(recall, recall_budget);
+    // The context injects only the capped `memory_block(recall, budget)` — a
+    // greedy whole-entry prefix under the token cap — so the snapshot sizes
+    // the memory segment from that SAME block, never the raw line sum, or the
+    // dashboard over-reports memory pressure. `kept` is recovered by counting
+    // how many non-empty input lines survived as a prefix of the rendered
+    // entries (raw, one per line, after the fixed header+framing preamble).
+    if let Some(block) = memory_block(recall, recall_budget) {
+        let entries: Vec<&String> = recall.iter().filter(|l| !l.trim().is_empty()).collect();
+        let kept = entries
+            .iter()
+            .take_while(|l| block.content.contains(l.as_str()))
+            .count();
         segments.push(ContextSegment {
             category: "memory".into(),
             est_tokens: estimate_tokens(&block.content),
-            items: recall[..kept].iter().map(|l| preview(l, 100)).collect(),
+            items: entries[..kept].iter().map(|l| preview(l, 100)).collect(),
             count: kept,
         });
     }
@@ -130,7 +136,7 @@ pub(crate) fn build_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::DEFAULT_RECALL_TOKEN_BUDGET;
+    use crate::context::DEFAULT_MEMORY_INDEX_BUDGET;
     use agent_model::Message;
 
     #[test]
@@ -143,7 +149,7 @@ mod tests {
             None,
             &[],
             &[],
-            DEFAULT_RECALL_TOKEN_BUDGET,
+            DEFAULT_MEMORY_INDEX_BUDGET,
             None,
             &[Message::user("hello"), Message::assistant("hi", None)],
             &[],
@@ -177,7 +183,7 @@ mod tests {
             Some(&ledger),
             &facts,
             &[],
-            DEFAULT_RECALL_TOKEN_BUDGET,
+            DEFAULT_MEMORY_INDEX_BUDGET,
             None,
             &[],
             &[],
@@ -208,7 +214,7 @@ mod tests {
             None,
             &[],
             &[],
-            DEFAULT_RECALL_TOKEN_BUDGET,
+            DEFAULT_MEMORY_INDEX_BUDGET,
             None,
             &[],
             &[],
@@ -237,7 +243,7 @@ mod tests {
                 "user likes rust".to_string(),
                 "deploys on friday".to_string(),
             ],
-            DEFAULT_RECALL_TOKEN_BUDGET,
+            DEFAULT_MEMORY_INDEX_BUDGET,
             None,
             &[],
             &[],
@@ -252,11 +258,11 @@ mod tests {
     }
 
     #[test]
-    fn memory_segment_uses_capped_recall_block_not_raw_sum() {
+    fn memory_segment_uses_capped_memory_block_not_raw_sum() {
         // Many long recall lines vastly exceed a tiny budget. The context only
-        // injects the capped `recall_block` (a short prefix), so the snapshot's
-        // memory segment must be sized from that block — est ≤ the block's own
-        // estimate — never the raw sum of all lines.
+        // injects the capped `memory_block` (a short whole-entry prefix), so the
+        // snapshot's memory segment must be sized from that block — est ≤ the
+        // block's own estimate — never the raw sum of all lines.
         let budget = 32;
         let lines: Vec<String> = (0..40)
             .map(|i| format!("memory fact number {i} with a fair amount of padding text here"))
@@ -281,11 +287,15 @@ mod tests {
             .find(|s| s.category == "memory")
             .unwrap();
         // The capped block, not all 40 lines.
-        let kept = recall_prefix_len(&lines, budget);
+        let block = memory_block(&lines, budget).unwrap();
+        let kept = lines
+            .iter()
+            .take_while(|l| block.content.contains(l.as_str()))
+            .count();
         assert!(kept < lines.len(), "block must be capped below all lines");
         assert_eq!(mem.count, kept);
         assert_eq!(mem.items.len(), kept);
-        let block_est = estimate_tokens(&recall_block(&lines, budget).unwrap().content);
+        let block_est = estimate_tokens(&block.content);
         assert_eq!(mem.est_tokens, block_est);
         assert!(
             mem.est_tokens < raw_sum,
