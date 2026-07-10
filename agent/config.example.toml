@@ -21,6 +21,9 @@ memory = true            # default true; false disables load + discipline (mount
 # Auto-deny an unanswered approval after N seconds (headless/eval callers).
 # Unset (default): an unanswered approval parks durably — the run survives
 # frontend disconnect and daemon restart, and resumes when answered.
+# The CLI's own interactive prompt has a separate, always-on 300s timeout
+# that parks-and-exits rather than denying; reopen it with
+# `agent sessions reopen <id>`.
 # approval_auto_deny_secs = 300
 
 # Named sub-agents (Phase 3B-1). Each becomes a `subagent_type` the model can

@@ -1285,7 +1285,9 @@ mod tests {
         let cap = Arc::new(Captured::default());
         sess.set_event_out(cap.clone());
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // 15s, not the usual 5s: observed flaking at 5s under parallel `cargo
+        // test` package invocations (CPU/disk contention delays the re-emit).
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let ask_id = loop {
             let found = cap.0.lock().unwrap().iter().find_map(|ev| match ev {
                 ServerEvent::ApprovalRequest { id, .. } => Some(id.clone()),
@@ -1315,7 +1317,10 @@ mod tests {
         // Wait for the resumed run to finish (active cleared in start_resume's
         // spawned task) rather than for a specific event, since completion here
         // is budget exhaustion, not a Done the harness names distinctly.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // 15s, not the usual 5s: this test flaked 3x across task runs under
+        // parallel `cargo test` package invocations — the spawned resume task
+        // is contention-sensitive, so give it the file's tolerant-end budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             if sess.resuming.lock().unwrap().contains(prior_id)
                 && sess.active.lock().unwrap().is_none()

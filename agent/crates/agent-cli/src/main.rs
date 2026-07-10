@@ -19,6 +19,9 @@ use std::time::Duration;
 #[derive(clap::Subcommand)]
 enum Command {
     /// Inspect and reopen past sessions.
+    ///
+    /// Top-level flags (--base-url, --workspace, etc.) go BEFORE the
+    /// subcommand: `agent --base-url <url> sessions reopen <id>`.
     Sessions {
         #[command(subcommand)]
         cmd: SessionsCmd,

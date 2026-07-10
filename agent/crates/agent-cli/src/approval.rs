@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Default interactive approval window for the terminal front-end. The CLI keeps
-/// a fixed 300s auto-deny in 4B-1 (parks-and-exits is 4B-2); the *server* channel,
-/// by contrast, now parks indefinitely unless its `approval_auto_deny_secs` knob
-/// is set, so the two front-ends no longer share one constant.
+/// Default interactive approval window for the terminal front-end. On timeout the
+/// CLI parks-and-exits when a durable-park capability is wired (`ParkExit`, 4B-2)
+/// and denies otherwise (no `Checkpointer`, e.g. tests); the *server* channel, by
+/// contrast, parks indefinitely unless its `approval_auto_deny_secs` knob is set,
+/// so the two front-ends still don't share one constant.
 const DEFAULT_TERMINAL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 type BlockingPrompt = std::sync::Arc<dyn Fn(String) -> ApprovalResponse + Send + Sync>;
