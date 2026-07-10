@@ -459,8 +459,7 @@ mod tests {
         assert_eq!(back.reasoning, m.reasoning);
         assert_eq!(back.tool_calls.as_ref().unwrap()[0].id, "c1");
         // Lenient decode: absent optionals default (forward compat).
-        let sparse: Message =
-            serde_json::from_str(r#"{"role":"User","content":"hi"}"#).unwrap();
+        let sparse: Message = serde_json::from_str(r#"{"role":"User","content":"hi"}"#).unwrap();
         assert_eq!(sparse.content, "hi");
         assert!(sparse.tool_calls.is_none());
     }
