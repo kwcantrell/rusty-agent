@@ -214,12 +214,15 @@ async fn run_sessions_reopen(session_id: &str, cli: &Cli) {
     // skips Drop — a leaked trace tail-loss is a real audit gap, same
     // rationale as ParkExit::trace's doc comment).
     let trace = agent_runtime_config::build_trace(&rt, &descriptor.session_id);
-    let approval = TerminalApproval::with_park_exit(Some(ParkExit {
-        session_id: descriptor.session_id.clone(),
-        trace: trace.clone(),
-        release_lock: Some(parked.root_dir.clone()),
-        exit: Box::new(|code| std::process::exit(code)),
-    }));
+    let approval = TerminalApproval::with_park_exit(
+        Some(ParkExit {
+            session_id: descriptor.session_id.clone(),
+            trace: trace.clone(),
+            release_lock: Some(parked.root_dir.clone()),
+            exit: Box::new(|code| std::process::exit(code)),
+        }),
+        std::time::Duration::from_secs(cli.approval_timeout_secs),
+    );
     let model = build_model(
         &cli.backend,
         &cli.base_url,
@@ -462,6 +465,10 @@ struct Cli {
     /// Idle timeout (seconds) for model-stream consumption before a stalled turn fails
     #[arg(long, default_value_t = 120)]
     stream_timeout_secs: u64,
+    /// Interactive approval window in seconds; on expiry the run parks-and-exits
+    /// (durable park wired) or denies. E2 knob.
+    #[arg(long, default_value_t = 300)]
+    approval_timeout_secs: u64,
     /// Optional MCP server config (mcp.json shape). If absent, MCP is disabled.
     #[arg(long)]
     mcp_config: Option<std::path::PathBuf>,
@@ -650,12 +657,15 @@ async fn main() {
                 session_id.clone(),
             ))
         });
-    let approval = TerminalApproval::with_park_exit(checkpoint.as_ref().map(|_| ParkExit {
-        session_id: session_id.clone(),
-        trace: trace.clone(),
-        release_lock: None, // ordinary runs hold no resume lock
-        exit: Box::new(|code| std::process::exit(code)),
-    }));
+    let approval = TerminalApproval::with_park_exit(
+        checkpoint.as_ref().map(|_| ParkExit {
+            session_id: session_id.clone(),
+            trace: trace.clone(),
+            release_lock: None, // ordinary runs hold no resume lock
+            exit: Box::new(|code| std::process::exit(code)),
+        }),
+        std::time::Duration::from_secs(cli.approval_timeout_secs),
+    );
     let built = assemble_loop(
         &rt,
         LoopParts {
