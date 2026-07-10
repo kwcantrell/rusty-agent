@@ -9,6 +9,7 @@ agent-model = { path = "../agent-model" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 futures.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
