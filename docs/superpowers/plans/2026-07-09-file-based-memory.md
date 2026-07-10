@@ -59,8 +59,14 @@ Vite (`web/`), tokio, serde_json config.
 - Modify: `agent/crates/agent-skills/src/registry.rs:21-41` (+ its tests ~299/307)
 - Modify: `agent/crates/agent-runtime-config/src/trace.rs:496-501`
 - Modify: `agent/crates/agent-server/src/session.rs:440` (test literal)
+- Modify: `agent/crates/agent-server/src/runtime.rs:654,740,741` (test `.agent/skills` joins — plan-review add)
+- Modify: `agent/crates/agent-runtime-config/src/runtime_config.rs:1509,1515` (`"/ws/.agent/skills"` test literals — plan-review add)
+- Modify: `agent/crates/agent-runtime-config/tests/e2e_auto_retrieval.rs:51` (doc comment `~/.agent/memory.db` — plan-review add; file itself retires in 4A-1, but the R2 guard leg must be green at the 4A-0 tip)
 - Modify: `agent/crates/agent-cli/src/main.rs:269` (+ any `~/.agent` doc comments in that file)
 - Modify: `agent/crates/agent-memory/src/config.rs:22-27` (`default_db_path` — crate retires in 4A-1, but 4A-0 leaves no `.agent` literal behind)
+
+Grand total at review time: 17 `.agent` hits across these files — Step 4's
+grep-zero is the completeness check, not this list.
 
 **Interfaces:**
 - Consumes: nothing.
@@ -120,6 +126,8 @@ Adapt to the actual assertion shapes found in the file — change only the
 
 ```bash
 # Renamed metadata root: no runtime code may reference the old ~/.agent root.
+# NOTE: would also trip on a hypothetical `foo.agent` identifier — acceptable;
+# rename such an identifier or narrow this pattern if that ever happens.
 if grep -rn '\.agent\b' agent/crates src-tauri/src --include='*.rs' | grep -v '\.agents'; then
   echo "ci: stale .agent literal (root renamed to .rusty-agent)" >&2; exit 1
 fi
@@ -147,13 +155,21 @@ fi
 ### Task A1: Atomic HostBackend writes
 
 **Files:**
-- Modify: `agent/crates/agent-tools/src/backend/host.rs` (`write`)
-- Modify: `agent/crates/agent-tools/src/backend/conformance.rs` (new check)
+- Modify: `agent/crates/agent-tools/src/backend/host.rs` (`write` + host-local test)
 
 **Interfaces:**
 - Consumes: `Backend::write(&self, path, content) -> Result<(), FsError>` (unchanged signature).
 - Produces: write = temp file + `rename` in the same directory (atomic on
   POSIX); a concurrent reader never observes partial content.
+
+**Placement decision (plan review, resolves a spec §6 over-specification —
+note to owner):** the atomicity test is HOST-LOCAL, not a conformance-suite
+addition. `assert_backend_conformance` is single-threaded/sequential and
+atomicity is a HostBackend/POSIX property (MemBackend is trivially atomic
+under its Mutex), so a generic check adds nothing. Accepted residuals:
+temp-name collision within one pid+nanosecond (negligible, single-user;
+lost-updates already accepted in spec §4) and temp files orphaned by a crash
+between write and rename (cosmetic).
 
 - [ ] **Step 1: Write the failing test** in `host.rs` tests:
 
@@ -200,9 +216,8 @@ async fn write(&self, path: &str, content: &str) -> Result<(), FsError> {
 }
 ```
 
-- [ ] **Step 4:** `cargo test -p agent-tools` → all pass (incl. the
-  conformance suite — whole-backend atomicity is conformance-visible; if the
-  suite pins the old behavior anywhere, update the pin with a comment).
+- [ ] **Step 4:** `cargo test -p agent-tools` → all pass (the conformance
+  suite is untouched — see the placement decision above).
 - [ ] **Step 5: Commit.** `git commit -am "fix(tools): atomic temp+rename HostBackend writes (4A-1 A1)"`
 
 ### Task A2: `project_key()` relocation + `memories_dir` config
@@ -393,9 +408,16 @@ pub(crate) fn memory_block(lines: &[String], budget: usize) -> Option<Message> {
   (locate `DEFAULT_RECALL_TOKEN_BUDGET` uses) to
   `DEFAULT_MEMORY_INDEX_BUDGET`. In `snapshot.rs`, size the memory segment
   from `memory_block(...)` tokens (replace the `recall_prefix_len`-based
-  sizing; segment stays in lockstep with the injected block — keep the
-  segment KEY unchanged until B3). `WindowContext` (the other `recall_block`
-  caller — locate by content) switches to `memory_block` identically.
+  sizing; segment stays in lockstep with the injected block). NOTE (plan
+  review): the snapshot segment category is ALREADY `"memory"`
+  (snapshot.rs:83) — there is no `"recall"` segment key; nothing renames
+  here or in B3 on the segment side. `WindowContext` (the other
+  `recall_block` caller, via `recall_message()` — locate by content)
+  switches to `memory_block` identically; WindowContext is TEST-ONLY
+  (production uses CuratedContext), so this changes no production behavior,
+  but its test bodies need shape updates beyond header strings (lines now
+  render RAW without the old `- ` re-bulleting, plus the trust-framing
+  line).
 - [ ] **Step 5:** `cargo test -p agent-core` → PASS, EXCEPT tests that pin
   the old recall header/budget — update those assertion strings to
   `MEMORY_HEADER`/1024 (they are rendering pins, not behavior changes; list
@@ -542,7 +564,9 @@ impl Middleware for MemoryFilesMiddleware {
         let writes_memory = matches!(call.name.as_str(), "write_file" | "edit_file")
             && call.args.get("path").and_then(|p| p.as_str())
                 .is_some_and(|p| p.starts_with("memories/"));
-        let shared = next.shared().clone_ref_for_hooks(); // see note below
+        // RunShared derives Clone (Arc<Mutex<..>> — cheap bump); clone BEFORE
+        // next.run(self) consumes `next`, set the flag AFTER on success.
+        let shared = next.shared().clone();
         let out = next.run(call.args.clone()).await;
         if writes_memory && matches!(out, crate::Executed::Ok(_)) {
             shared.with::<MemoryDirty, _>(|d| d.0 = true);
@@ -559,17 +583,14 @@ impl Middleware for MemoryFilesMiddleware {
 }
 ```
 
-**Implementation note (resolve at source):** `ToolNext::shared()` returns
-`&RunShared`; `next.run(...)` consumes `next`. Bind the flag BEFORE the run
-by copying what `with` needs — if `RunShared` is not cheaply clonable, set
-the flag in two phases: compute `writes_memory` first, call
-`let shared = next.shared() as *const _`—NO. Do it the simple safe way:
-`RunShared` lives on the loop; check how `GuardrailMiddleware`/`ToolCallLimit`
-uses `next.shared()` around `next.run` (3A built exactly this pattern) and
-copy that shape. If the existing pattern captures `shared` by reference
-before `run`, reuse it verbatim; `clone_ref_for_hooks` above is a
-placeholder-name for whatever the 3A pattern provides — DO NOT invent a new
-mechanism, mirror `ToolCallLimit::wrap_tool_call`.
+**Implementation note (plan-review resolved):** the code above is final.
+`ToolCallLimit::wrap_tool_call` is NOT the right shape to mirror — it
+mutates unconditionally BEFORE `next.run`; this middleware must record
+AFTER the run, conditional on `Executed::Ok`, hence the `next.shared()
+.clone()` (RunShared derives `Clone`, middleware.rs:90) before `run`
+consumes `next`. Concurrency is sound: the parallel executor fully joins
+(`buffer_unordered(..).collect().await`, loop_.rs:1063) before
+`fire_after_tools` runs (loop_.rs:1225), and RunShared is Mutex-guarded.
 
 - [ ] **Step 4: Middleware behavior tests.** Follow the harness the existing
   middleware tests use in `middleware.rs`/`dispatch.rs` (locate
@@ -582,9 +603,11 @@ mechanism, mirror `ToolCallLimit::wrap_tool_call`.
     contains no `MEMORY_HEADER`.
   - `memory_files_dirty_flag_refreshes`: scripted turn 1 calls `write_file`
     on `memories/project/index.md` (write succeeds via the mount from A5 —
-    if A5 isn't wired yet, drive `wrap_tool_call` + `after_tools` directly in
-    a unit test with a hand-built RunCx per the rig) → next turn's prompt
-    reflects the new index.
+    A5 isn't wired yet, so drive `wrap_tool_call` + `after_tools` directly
+    in a unit test using the existing in-crate `RunCx` test helper
+    (middleware.rs ~823-860, the `test_run_cx`-style rig — locate by
+    content; RunCx fields are `pub(crate)`, constructible in-crate)) → next
+    render reflects the new index.
   - `memory_files_clean_turn_does_not_reread`: counting MemBackend wrapper
     (increment on `read`) → a turn with no memory write leaves the read
     count at 1 (the run-start load).
@@ -594,19 +617,31 @@ mechanism, mirror `ToolCallLimit::wrap_tool_call`.
 ### Task A5: Wiring — mounts, assembly, dispatch, policy pins
 
 **Files:**
-- Modify: `agent/crates/agent-runtime-config/src/assemble.rs` (stack swap, parent mount, warn list, LoopParts fields)
-- Modify: `agent/crates/agent-core/src/dispatch.rs` (DispatchDeps field, child ro mount, quarantine test)
-- Modify: callers of `LoopParts` (compile-driven): `agent-cli/src/main.rs`, `agent-server/src/{session,daemon,setup}.rs`, `agent-runtime-config/tests/{eval_context,soak_live}.rs`
+- Modify: `agent/crates/agent-runtime-config/src/assemble.rs` (stack swap, parent mount, warn list, LoopParts fields, `parts()` test helper ~601-623)
+- Modify: `agent/crates/agent-core/src/dispatch.rs` (DispatchDeps field, child ro mount, quarantine test, `exec_deps` helper ~1393-1426)
+- Modify: LoopParts construction sites (plan-review-verified TRUE list, 9
+  literals; compile-driven): `assemble.rs::parts()` helper,
+  `agent-cli/src/main.rs`, `agent-server/src/runtime.rs` (**`build_loop()`
+  ~384-402 takes memory_tools/memory_retriever as PARAMETERS stored on
+  `RuntimeState` fields ~34-35 and re-passed on every `rebuild()` — delete
+  the params, the fields, and their uses in `new()`/`rebuild()`**),
+  `agent-runtime-config/tests/eval_context.rs`, `tests/soak_live.rs` (×2),
+  `tests/e2e_auto_retrieval.rs` (×3), `tests/e2e_robustness.rs`
+  (`assemble_test()` helper ~74-92). (session/daemon/setup construct zero
+  LoopParts — earlier draft was wrong.)
 - Modify: `agent/crates/agent-policy/src/engine.rs` (tests only — decision pins)
 
 **Interfaces:**
 - Consumes: `MemoryFilesMiddleware::new(Arc<dyn Backend>)` (A4),
   `project_key` + `memories_dir` (A2).
-- Produces: `LoopParts` WITHOUT `memory_tools`/`memory_retriever`, WITH
-  `pub memories: Arc<dyn agent_tools::backend::Backend>` (the project-scope
-  Host backend, built by the frontend helper below);
-  `DispatchDeps.memories: Option<Arc<dyn Backend>>` (assembly always Some;
-  test rigs None);
+- Produces: `LoopParts` WITHOUT `memory_tools`/`memory_retriever` and WITH
+  **no new field** — PINNED at plan review (architecture MAJOR): the
+  memories backend is built INSIDE `assemble_loop` from `cfg` +
+  `parts.workspace`; eval/soak test isolation flows through
+  `cfg.memories_dir` (A2), not a LoopParts field.
+  `DispatchDeps.memories: Option<Arc<dyn Backend>>` — a FRESH field (no
+  3B-1 Option precedent exists; `subagents` is a bare Arc): assembly always
+  passes `Some`, test rigs `None`.
   `pub fn build_memories_backend(cfg: &RuntimeConfig, workspace: &Path) ->
   Arc<dyn Backend>` in `agent-runtime-config/src/lib.rs`:
 
@@ -642,11 +677,7 @@ fn memory_off_pinned_assembly_byte_identical() { /* cfg.memory=false: render
 
 - [ ] **Step 2: Implement assembly.** In `assemble_loop`:
   1. Build `let memories = build_memories_backend(cfg, &parts.workspace);`
-     — REPLACE the `LoopParts.memories` interface above if you instead pass
-     it via LoopParts; pick ONE: build it INSIDE assemble (preferred — no
-     LoopParts field at all; callers untouched beyond field deletions) and
-     delete the `memories` field from the Interfaces block. Record the
-     choice in the commit body.
+     (inside assemble — PINNED, see Interfaces).
   2. Swap the stack slot:
 
 ```rust
@@ -656,9 +687,16 @@ if cfg.memory {
 ```
 
   3. Delete `memory_tools`/`memory_retriever` from `LoopParts` and fix every
-     construction site by deleting those two field initializers
-     (compile-driven; the sites also call `build_memory`/`build_memory_full` —
-     delete those calls; the fns themselves die in B2).
+     construction site in the Files list above (compile-driven). Beyond
+     field deletions: `agent-server/src/runtime.rs` loses the `build_loop`
+     params + `RuntimeState` fields + `new()`/`rebuild()` plumbing;
+     `agent-cli/src/main.rs` loses its `build_memory_full` import, the
+     `--memory-db`/`--memory-model-dir` CLI flags (~168-176), and
+     `.with_recall_budget(memory.recall_token_budget)` (~308 — the budget is
+     now the A3 const); `eval_context.rs` loses its real
+     `FastEmbedEmbedder`/`MemoryRetriever` construction (~9-11, 200,
+     237-264). The `build_memory`/`build_memory_full` fns themselves die in
+     B2.
   4. Parent composite: add to the mounts vec (UNWRAPPED — first
      tool-writable mount, spec §2.6):
 
@@ -667,10 +705,16 @@ if cfg.memory {
 ```
 
   and extend the shadow-warn loop list to
-  `["large_tool_results", "conversation_history", "memories"]`.
+  `["large_tool_results", "conversation_history", "memories"]`. (Known
+  coarseness, accepted at plan review: only `memories/project/*` is actually
+  shadowed, so a workspace `memories/` dir without a `project/` subdir
+  over-warns — directionally safe.)
 - [ ] **Step 3: Dispatch.** Add `pub memories: Option<Arc<dyn Backend>>` to
-  `DispatchDeps`; assembly passes `Some(memories.clone())`. In the child
-  backend construction, append when Some (read-only — quarantine posture):
+  `DispatchDeps`; assembly passes `Some(memories.clone())`. The child
+  backend mounts are a `vec![...]` LITERAL passed to
+  `CompositeBackend::new(vec, default)` (dispatch.rs ~850-869, locate by
+  content) — since a conditional entry doesn't fit a literal, build the vec
+  as a `let mut mounts = vec![ /* the two artifact tuples */ ];` then:
 
 ```rust
 if let Some(mem) = &self.deps.memories {
@@ -681,9 +725,9 @@ if let Some(mem) = &self.deps.memories {
 }
 ```
 
-  (Adapt to the literal vec shape at the site; keep the two artifact mounts
-  first.) Update the dispatch test-rig `exec_deps` helper (locate by
-  content) with `memories: None` so every existing test compiles unchanged.
+  (Keep the two artifact mounts first.) Update the dispatch test-rig
+  `exec_deps` helper (~1393-1426, locate by content) with `memories: None`
+  so every existing test compiles unchanged.
 - [ ] **Step 4: Quarantine + mount tests** (dispatch.rs tests):
   - Update the existing child-quarantine assertion (keys on the header
     string "Relevant memories from past sessions" — locate by content) to
@@ -693,9 +737,16 @@ if let Some(mem) = &self.deps.memories {
     `memories/project/x.md` returns the read-only error
     (`ARTIFACTS_READONLY_MSG` family); child `read_file` of
     `memories/project/index.md` succeeds.
-- [ ] **Step 5: Policy decision pins** (engine.rs tests — the spec §2.6
-  required behavior, delivered by the existing gates because mount paths are
-  workspace-relative):
+- [ ] **Step 5: Policy decision pins** (engine.rs tests — **no engine.rs
+  CODE change**: `memories/project/...` resolves as a workspace-relative
+  path, so the existing Read-Allow/Write-Ask gates already yield the §2.6
+  decisions; this step only pins them. Plan-review verified every
+  policy-vs-routing disagreement on other path shapes fails CLOSED —
+  absolute `/memories/...` and `../` escapes get Ask/Deny, never a silent
+  grant. Flag to the whole-branch reviewer: policy validates a notional
+  `<workspace>/memories/project/...` path while execution routes to
+  `<memories_dir>/projects/<key>/` — harmless today, load-bearing if a real
+  `memories/` dir ever exists in a workspace):
 
 ```rust
 #[test]
@@ -709,6 +760,17 @@ fn memory_mount_read_auto_allows() {
 fn memory_mount_write_asks() {
     assert!(matches!(
         policy().check(&intent(Access::Write, vec!["memories/project/index.md"], None)),
+        Decision::Ask
+    ));
+}
+#[test]
+fn memory_absolute_form_asks() {
+    // Auto-allow depends on the workspace-relative rendering — a leading
+    // slash must NOT be silently allowed (regression guard: every rendered
+    // memory path in headers/pointers/discipline is slash-less on purpose;
+    // reintroducing a leading slash would cause per-read approval fatigue).
+    assert!(matches!(
+        policy().check(&intent(Access::Read, vec!["/memories/project/index.md"], None)),
         Decision::Ask
     ));
 }
@@ -785,7 +847,7 @@ if memory {
 - Modify: `src-tauri/src/bridge.rs` (delete memory helpers — locate `agent_memory` by content)
 - Modify: `src-tauri/Cargo.toml` (drop `agent-memory` dep)
 - Delete: `web/src/explorer/MemorySection.tsx`, `web/src/explorer/MemorySection.test.tsx`
-- Modify: `web/src/explorer/ContextExplorer.tsx` (remove MemorySection import/render; ~87), `web/src/explorer/api.ts` (remove memory fns; ~6-11), `web/src/explorer/types.ts` (remove `MemoryRow`/`ScoredRow`; ~3), `web/src/**/SettingsForm.tsx` (label ~183: replace "remember/recall across sessions" with "project memory files (memories/project/)")
+- Modify: `web/src/explorer/ContextExplorer.tsx` (remove MemorySection import/render; ~87), `web/src/explorer/ContextExplorer.test.tsx` (remove the `recallPreview` mock ~11 — plan-review add), `web/src/explorer/api.ts` (remove memory fns; ~6-11), `web/src/explorer/types.ts` (remove `MemoryRow`/`ScoredRow`; ~3), `web/src/**/SettingsForm.tsx` (label ~183: replace "remember/recall across sessions" with "project memory files (memories/project/)"), `web/src/components/SettingsPanel.test.tsx` (~64 asserts the exact old label string — plan-review add)
 
 **Interfaces:**
 - Consumes: nothing new. Produces: src-tauri compiles without agent-memory.
@@ -809,7 +871,8 @@ if memory {
 - Modify: `agent/crates/agent-runtime-config/src/lib.rs` (delete `build_memory`, `build_memory_full`, `MemoryBuild`, their tests, `agent-memory` imports) + `Cargo.toml` dep
 - Modify: `agent/crates/agent-core/src/{recall.rs,lib.rs,middleware.rs}` (delete `Retriever` trait + `MemoryRecallMiddleware` + re-exports)
 - Modify: `agent/crates/agent-server/` (drop dep + any residual imports; `runtime.rs` tool-kind `"memory"` arm — locate `memory` by content and remove the classification)
-- Modify: `agent/crates/agent-tools/src/contract.rs` (`CONFUSABLE_TOOLS`: remove the `"recall"` pair + update its enforcement test)
+- Modify: `agent/crates/agent-tools/src/contract.rs` (`CONFUSABLE_TOOLS`: remove the `"recall"` pair AND prune the recall clause from the ~L9-17 doc comment; NO enforcement test to update — the enforcing test lives in agent-memory and dies with the crate; the assemble.rs absent-set check ~1049-1064 goes green once the pair is removed)
+- Modify: `web/src/components/design/architecture.ts` (~5: remove `"memory"` from the tool-kind union — it pairs with the runtime.rs tool-kind arm removed below)
 - Modify: `agent/crates/agent-tools/src/fs/search.rs` (`when_not_to_call`: drop the "use recall" clause; keep the `large_tool_results/` guidance)
 - Modify: `agent/crates/agent-runtime-config/tests/{eval_context.rs,soak_live.rs}` (delete `MemoryParts`/`MemoryConfig` minting; fields already gone from LoopParts in A5)
 
@@ -847,10 +910,16 @@ fn memory_tools_absent_from_registry_and_child_base() {
 - Modify (compile-driven, agent/ workspace): `ContextManager::set_recall` →
   `set_memory_index`; `CuratedContext.recall` field → `memory_index`;
   `recall_budget` → `memory_index_budget`; `with_recall_budget` →
-  `with_memory_index_budget`; snapshot segment key `recall`/`recall_budget`
-  → `memory`/`memory_index_budget` (locate in `snapshot.rs` by content)
-- Modify: `web/src/**` fixtures referencing the old segment/field
-  (`ArchDetail`, `archFixture` — locate `recall_budget` by content)
+  `with_memory_index_budget`. (NO snapshot segment-key rename — the
+  category is already `"memory"`, see A3.)
+- Modify — the WIRE field (plan-review add; PINNED decision: rename it —
+  both wire ends are in-repo, no external consumer): `agent-server/src/
+  wire.rs` (~224-225 `pub recall_budget: usize` → `memory_index_budget`),
+  `agent-server/src/runtime.rs` (`architecture(&self, recall_budget)` ~244
+  + ~328-329), `web/src/components/design/architecture.ts` (~16
+  `recall_budget: number`), `web/src/components/design/ArchDetail.tsx`
+  (~89 `recall budget ${...}` render), `web/src/**/archFixture*` (locate
+  `recall_budget` by content)
 
 **Interfaces:**
 - Produces: no behavior change; `cargo test` + web tests green with new
@@ -859,10 +928,9 @@ fn memory_tools_absent_from_registry_and_child_base() {
 
 - [ ] **Step 1:** Rename in agent-core (trait + impls + callers), compile-
   driven; update test names/strings that embed the old symbols.
-- [ ] **Step 2:** Snapshot segment key: change the emitted segment name and
-  update the web fixture + any web test strings (web renders segments
-  generically with a color fallback — 3A-S5 verified — so only fixtures/
-  tests need edits).
+- [ ] **Step 2:** Wire-field rename per the Files list (wire.rs +
+  runtime.rs architecture() + web architecture.ts/ArchDetail/fixtures in
+  lockstep — the render string becomes "memory index budget").
 - [ ] **Step 3:** `cargo test` (agent/) + `cd web && npm run typecheck && npx vitest run` → green.
 - [ ] **Step 4: Commit.** `git commit -am "refactor(core): rename recall machinery to memory-index (4A-1 B3, mechanical)"`
 
@@ -918,16 +986,50 @@ async fn memory_survives_across_runs() { /* build two assemble_loop sessions
   §2.5 discipline → A6; §2.6 mounts/policy/quarantine → A5; §2.7 retirement/
   config/sweep → A2/B1/B2/B3; E1 → B1; E2 → A4; E3 → slice split; §6 tests
   distributed per task; live soak → B4. Gaps: none found.
-- **Known judgment calls to surface in review:** (1) `MEMORY_INDEX_MAX_BYTES`
-  caps post-read (Backend::read is whole-document) — bounds context, not
-  read RAM; same exposure class as the read tool; noted in code comment.
-  (2) `DispatchDeps.memories` is `Option` so test rigs stay unchanged;
+- **Judgment calls (resolved at plan review, see log below):**
+  (1) `MEMORY_INDEX_MAX_BYTES` caps post-read (Backend::read is
+  whole-document) — bounds context, not read RAM; same exposure class as
+  the read tool; noted in code comment.
+  (2) `DispatchDeps.memories` is a FRESH `Option` field (no precedent);
   assembly always passes `Some` (spec's "unconditional mount" refers to the
   cfg.memory flag, which gates neither mount).
-  (3) A5 offers building the memories backend inside `assemble_loop` vs a
-  LoopParts field — implementer picks one and records it.
+  (3) PINNED: memories backend built inside `assemble_loop` (no LoopParts
+  field); test isolation via `cfg.memories_dir`.
+  (4) PINNED: the wire field `recall_budget` renames (B3) — both ends
+  in-repo.
+  (5) A1 atomicity test is host-local, not conformance (spec §6 wording
+  over-specified; note to owner).
 - **Type consistency check:** `memory_block(lines,budget)`,
   `MemoryFilesMiddleware::new(Arc<dyn Backend>)`, `project_key(&Path) ->
   String`, `build_memories_backend(cfg,ws) -> Arc<dyn Backend>`,
   `compose_system_prompt(base,reg,presets,memory)` — names match across
   tasks A2–A6/B2–B3.
+
+## Plan review log — 2026-07-10, 2 reviewers (opus), all findings folded
+
+**Coverage/buildability: APPROVE-WITH-FIXES.** M1 true LoopParts site list
+(9 literals; server plumbing = runtime.rs build_loop/RuntimeState, NOT
+session/daemon/setup; CLI flags + with_recall_budget; eval_context real
+embedder rip-out) → folded into A5/B2. M2 `recall_budget` is wire-serialized
+to the web arch view; snapshot segment already `"memory"` (false rename
+premise deleted) → folded into A3/B1/B3. M3 RunShared idiom =
+`next.shared().clone()` before run, flag after on `Executed::Ok` → folded
+into A4. M4 atomicity test host-local → folded into A1. Minors: DispatchDeps
+fresh-field framing, vec-literal mount shape, exec_deps anchor,
+CONFUSABLE_TOOLS doc-comment note, engine.rs no-code-change statement →
+all folded.
+
+**Adversarial architecture: SOUND-WITH-NOTES.** M1 three more `.agent`
+literals would red the 4A-0 guard at its own tip (runtime.rs tests,
+runtime_config test literals, e2e_auto_retrieval doc comment) → folded into
+R1. M2 assembly choice-point pinned to build-inside-assemble_loop → folded.
+M3 **accepted residual (surface to owner + whole-branch reviewer): a
+desktop workspace SWITCH does not re-scope the memories backend until the
+loop is rebuilt** — `Session::set_workspace` rebuilds only the
+CuratedContext by design; memory follows the construction workspace. No
+worse than today's retriever (also assembly-scoped); CLI unaffected
+(single-workspace per invocation). Minors: shadow-warn coarseness accepted;
+absolute-form policy pin added; WindowContext is test-only (render-shape
+test churn noted); grep `\b` verified; B1/B3 web files disjoint; task
+granularity confirmed. Verified safe: policy-vs-routing disagreements all
+fail closed; dirty-flag join-before-after_tools sound.
