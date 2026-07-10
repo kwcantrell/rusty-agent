@@ -232,6 +232,8 @@ pub struct RuntimeConfig {
     pub trace_dir: Option<String>,
     #[serde(default = "default_trace_max_mb")]
     pub trace_max_mb: u64,
+    #[serde(default)]
+    pub memories_dir: Option<String>,
     /// When set, replaces the built-in base system prompt. Active skills and
     /// preset text still append on top. Blank strings normalize to None.
     #[serde(default)]
@@ -292,6 +294,7 @@ struct PartialRuntimeConfig {
     trace_dir: Option<String>,
     trace_max_mb: Option<u64>,
     system_prompt_override: Option<String>,
+    memories_dir: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -405,6 +408,7 @@ impl RuntimeConfig {
             trace_dir: None,
             trace_max_mb: default_trace_max_mb(),
             system_prompt_override: None,
+            memories_dir: None,
         }
     }
 
@@ -842,6 +846,9 @@ impl RuntimeConfig {
         if let Some(v) = p.system_prompt_override {
             self.system_prompt_override = Some(v);
         }
+        if let Some(v) = p.memories_dir {
+            self.memories_dir = Some(v);
+        }
         self
     }
 
@@ -1198,6 +1205,17 @@ mod tests {
     }
 
     #[test]
+    fn memories_dir_partial_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.json");
+        std::fs::write(&path, r#"{"memories_dir": "/tmp/mems"}"#).unwrap();
+        let b = base();
+        let loaded = RuntimeConfig::load_over(b.clone(), &path);
+        assert_eq!(loaded.memories_dir.as_deref(), Some("/tmp/mems"));
+        assert_eq!(loaded.model, b.model); // absent fields fall back to base
+    }
+
+    #[test]
     fn full_saved_file_overrides_every_field_via_partial_merge() {
         // Structural guard: every RuntimeConfig field needs a PartialRuntimeConfig
         // mirror + merge arm. Every field here is flipped away from the launch
@@ -1275,6 +1293,7 @@ mod tests {
             trace_dir: Some("/tmp/traces".into()),
             trace_max_mb: 8,
             system_prompt_override: Some("DESIGN ASSISTANT".into()),
+            memories_dir: Some("/tmp/mems".into()),
         };
         c.save(&path).unwrap();
         let loaded = RuntimeConfig::load_over(base(), &path);

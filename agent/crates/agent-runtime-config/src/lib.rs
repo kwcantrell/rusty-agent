@@ -7,6 +7,9 @@ pub use runtime_config::{
     HARD_FLOOR_DENYLIST,
 };
 
+mod project_key;
+pub use project_key::project_key;
+
 mod assemble;
 pub use assemble::{assemble_loop, loop_config_from, BuiltLoop, LoopParts};
 

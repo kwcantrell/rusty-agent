@@ -14,6 +14,7 @@ agent-memory = { path = "../agent-memory" }
 agent-policy = { path = "../agent-policy" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+sha2 = "0.10"
 tracing.workspace = true
 
 [dev-dependencies]
