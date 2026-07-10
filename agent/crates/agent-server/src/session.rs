@@ -263,6 +263,8 @@ impl Session {
                 let Ok(resp) = rx.await else {
                     return;
                 };
+                // 4B-2 Task 2 threads feedback: Deny { feedback } is collapsed
+                // to a bool here and any feedback text is discarded.
                 let approve = matches!(
                     resp,
                     agent_policy::ApprovalResponse::Approve

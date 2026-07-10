@@ -284,7 +284,8 @@ impl From<Decision> for ApprovalResponse {
         match d {
             Decision::Approve => ApprovalResponse::Approve,
             Decision::ApproveAlways => ApprovalResponse::ApproveAlways,
-            Decision::Deny => ApprovalResponse::Deny,
+            // Task 3 reshapes the wire side to carry feedback.
+            Decision::Deny => ApprovalResponse::Deny { feedback: None },
         }
     }
 }

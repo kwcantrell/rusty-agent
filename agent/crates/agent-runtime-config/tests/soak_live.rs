@@ -69,7 +69,7 @@ impl ApprovalChannel for SafeApproval {
                 .lock()
                 .unwrap()
                 .push(format!("{}:{:?}", r.intent.tool, r.intent.command));
-            ApprovalResponse::Deny
+            ApprovalResponse::Deny { feedback: None }
         }
     }
 }

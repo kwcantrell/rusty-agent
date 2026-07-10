@@ -1316,10 +1316,8 @@ impl AgentLoop {
                         GateOutcome::Rejected {
                             id: call.id,
                             name: call.name,
-                            content: format!(
-                                "ERROR: {}",
-                                ToolError::Denied("user declined".into())
-                            ),
+                            // Task 2 threads the stored feedback in.
+                            content: denial_content(None),
                         }
                     }
                 }
@@ -1406,13 +1404,14 @@ impl AgentLoop {
                     // Race the approval wait against cancellation: Ctrl-C during a
                     // pending prompt must end the run promptly rather than wedge until
                     // the prompt is answered. Cancel-during-prompt counts as a deny.
-                    let allowed = tokio::select! {
-                        _ = cancel.cancelled() => false,
-                        resp = self.approval.request(req) => matches!(
-                            resp,
-                            ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
-                        ),
+                    let resp = tokio::select! {
+                        _ = cancel.cancelled() => ApprovalResponse::Deny { feedback: None },
+                        resp = self.approval.request(req) => resp,
                     };
+                    let allowed = matches!(
+                        resp,
+                        ApprovalResponse::Approve | ApprovalResponse::ApproveAlways
+                    );
                     // Answer commit (spec §2.3): delete the park before
                     // proceeding. Auto-deny (E5 knob) and cancel-deny commit
                     // the same way.
@@ -1427,12 +1426,15 @@ impl AgentLoop {
                     } else {
                         // Distinguish a cancel-driven denial (the run is ending) from
                         // an explicit user "no" so the tool result reads correctly.
-                        let reason = if cancel.is_cancelled() {
-                            "run cancelled"
+                        let content = if cancel.is_cancelled() {
+                            format!("ERROR: {}", ToolError::Denied("run cancelled".into()))
                         } else {
-                            "user declined"
+                            let feedback = match &resp {
+                                ApprovalResponse::Deny { feedback } => feedback.as_deref(),
+                                _ => None,
+                            };
+                            denial_content(feedback)
                         };
-                        let content = format!("ERROR: {}", ToolError::Denied(reason.into()));
                         records.push(crate::GateRecord::Rejected {
                             content: content.clone(),
                         });
@@ -1895,6 +1897,19 @@ struct ReadyCall {
     /// The gated call's declared access tier — carried through execution so the
     /// turn loop can tell a mutating turn (Write/Destroy) from a read-only one.
     access: agent_tools::Access,
+}
+
+/// The ONE renderer for human-decline tool results (live NeedsApproval arm,
+/// resume splice, dispatch rebind all call it). Cancel-driven denial keeps
+/// its own "run cancelled" message — this covers explicit human declines only.
+pub(crate) fn denial_content(feedback: Option<&str>) -> String {
+    match feedback {
+        Some(f) => format!(
+            "ERROR: {}",
+            ToolError::Denied(format!("user declined — {f}"))
+        ),
+        None => format!("ERROR: {}", ToolError::Denied("user declined".into())),
+    }
 }
 
 /// Outcome of gating a single call before execution.
@@ -3590,6 +3605,127 @@ mod tests {
         assert_eq!(events.last().unwrap(), "done");
     }
 
+    #[test]
+    fn denial_content_no_feedback_is_byte_identical_to_today() {
+        // Pins the pre-4B-2 literal exactly (ToolError::Denied display is
+        // "denied: {0}"):
+        assert_eq!(denial_content(None), "ERROR: denied: user declined");
+    }
+
+    #[test]
+    fn denial_content_with_feedback_appends_the_text() {
+        assert_eq!(
+            denial_content(Some("use the staging DB instead")),
+            "ERROR: denied: user declined — use the staging DB instead"
+        );
+    }
+
+    /// Approval channel returning one scripted `ApprovalResponse`, wired to
+    /// the AskAll policy so every tool call hits the live NeedsApproval arm.
+    struct ScriptedApproval(ApprovalResponse);
+    #[async_trait::async_trait]
+    impl ApprovalChannel for ScriptedApproval {
+        async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
+            self.0.clone()
+        }
+    }
+
+    /// Captures the full `ToolResult` (status + content) the string-label
+    /// `CollectingSink` can't — needed to assert the exact denial text.
+    #[derive(Default)]
+    struct ToolResultSink {
+        results: Mutex<Vec<(ToolStatus, String)>>,
+    }
+    impl EventSink for ToolResultSink {
+        fn emit(&self, event: AgentEvent) {
+            if let AgentEvent::ToolResult { status, output, .. } = event {
+                self.results.lock().unwrap().push((status, output.content));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_deny_with_feedback_reaches_the_tool_result() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
+            Scripted::Text("Understood.".into()),
+        ]));
+        let sink = Arc::new(ToolResultSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            Arc::new(AskAll),
+            Arc::new(ScriptedApproval(ApprovalResponse::Deny {
+                feedback: Some("wrong host".into()),
+            })),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let results = sink.results.lock().unwrap();
+        let (status, content) = results.first().expect("the gated call gets a result");
+        assert_eq!(*status, ToolStatus::Denied);
+        assert_eq!(content, &denial_content(Some("wrong host")));
+    }
+
+    #[tokio::test]
+    async fn live_deny_without_feedback_matches_pre_4b2_content() {
+        let ws = std::env::temp_dir();
+        let model = Arc::new(ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "read_file".into(),
+                r#"{"path":"a.txt"}"#.into(),
+            ),
+            Scripted::Text("Understood.".into()),
+        ]));
+        let sink = Arc::new(ToolResultSink::default());
+        let agent = AgentLoop::new(
+            model,
+            Arc::new(PassthroughProtocol),
+            registry(),
+            Arc::new(AskAll),
+            Arc::new(ScriptedApproval(ApprovalResponse::Deny { feedback: None })),
+            sink.clone(),
+            LoopConfig {
+                model_limit: 100_000,
+                max_turns: 10,
+                max_retries: 1,
+                temperature: 0.0,
+                max_tokens: None,
+                workspace: ws,
+                tool_timeout: std::time::Duration::from_secs(5),
+                stream_idle_timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let mut ctx = WindowContext::new(Message::system("sys"));
+        agent.run(&mut ctx, "go".into()).await.unwrap();
+
+        let results = sink.results.lock().unwrap();
+        let (status, content) = results.first().expect("the gated call gets a result");
+        assert_eq!(*status, ToolStatus::Denied);
+        assert_eq!(content, "ERROR: denied: user declined");
+    }
+
     /// Ctrl-C during a pending approval prompt must end the run promptly as
     /// Cancelled — not wedge until the prompt is answered (audit Component 4).
     #[tokio::test(start_paused = true)]
@@ -4352,7 +4488,7 @@ mod tests {
         impl ApprovalChannel for RecordingApproval {
             async fn request(&self, req: ApprovalRequest) -> ApprovalResponse {
                 *self.captured.lock().unwrap() = Some(req.intent.summary.clone());
-                ApprovalResponse::Deny
+                ApprovalResponse::Deny { feedback: None }
             }
         }
 
@@ -4452,7 +4588,7 @@ mod tests {
         impl ApprovalChannel for RecordingApproval {
             async fn request(&self, req: ApprovalRequest) -> ApprovalResponse {
                 *self.captured.lock().unwrap() = Some(req.intent.summary.clone());
-                ApprovalResponse::Deny
+                ApprovalResponse::Deny { feedback: None }
             }
         }
 
@@ -8716,7 +8852,7 @@ mod tests {
         async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
             self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.parked_at_ask.lock().unwrap() = Some(crate::checkpoint::has_park(&self.park_dir));
-            self.resp
+            self.resp.clone()
         }
     }
 
@@ -8810,7 +8946,7 @@ mod tests {
         let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let parked_at_ask = Arc::new(std::sync::Mutex::new(None));
         let approval = Arc::new(ParkApproval {
-            resp: ApprovalResponse::Deny,
+            resp: ApprovalResponse::Deny { feedback: None },
             asks: asks.clone(),
             parked_at_ask: parked_at_ask.clone(),
             park_dir: ck_dir.clone(),
@@ -8890,7 +9026,7 @@ mod tests {
             async fn request(&self, _req: ApprovalRequest) -> ApprovalResponse {
                 *self.stash.lock().unwrap() =
                     crate::checkpoint::load_checkpoint(&self.ck_dir, &self.key).unwrap();
-                ApprovalResponse::Deny
+                ApprovalResponse::Deny { feedback: None }
             }
         }
 
@@ -9197,7 +9333,7 @@ mod tests {
             if let Some(d) = &self.park_dir {
                 *self.parked_at_ask.lock().unwrap() = Some(crate::checkpoint::has_park(d));
             }
-            self.resp
+            self.resp.clone()
         }
     }
 

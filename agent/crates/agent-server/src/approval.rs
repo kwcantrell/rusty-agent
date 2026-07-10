@@ -170,9 +170,11 @@ impl ApprovalChannel for IpcApprovalChannel {
         match self.timeout {
             Some(t) => match tokio::time::timeout(t, orx).await {
                 Ok(Ok(resp)) => resp,
-                _ => ApprovalResponse::Deny,
+                _ => ApprovalResponse::Deny { feedback: None },
             },
-            None => orx.await.unwrap_or(ApprovalResponse::Deny),
+            None => orx
+                .await
+                .unwrap_or(ApprovalResponse::Deny { feedback: None }),
         }
     }
 }
@@ -277,7 +279,7 @@ mod tests {
         let h = tokio::spawn(async move { ch2.request(req()).await });
         wait_for_ask(&cap).await;
         tokio::time::advance(Duration::from_secs(3)).await;
-        assert_eq!(h.await.unwrap(), ApprovalResponse::Deny);
+        assert_eq!(h.await.unwrap(), ApprovalResponse::Deny { feedback: None });
         // The pending map is drained on timeout (PendingGuard on drop).
         assert!(ch.pending.lock().unwrap().is_empty());
         assert!(ch.pending_frames.lock().unwrap().is_empty());

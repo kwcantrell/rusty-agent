@@ -24,12 +24,12 @@ fn stdin_prompt(summary: String) -> ApprovalResponse {
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
-        return ApprovalResponse::Deny;
+        return ApprovalResponse::Deny { feedback: None };
     }
     match line.trim().to_lowercase().as_str() {
         "y" | "yes" => ApprovalResponse::Approve,
         "a" | "always" => ApprovalResponse::ApproveAlways,
-        _ => ApprovalResponse::Deny,
+        _ => ApprovalResponse::Deny { feedback: None },
     }
 }
 
@@ -85,10 +85,10 @@ impl ApprovalChannel for TerminalApproval {
         let handle = tokio::task::spawn_blocking(move || prompt(summary));
         match tokio::time::timeout(self.timeout, handle).await {
             Ok(Ok(resp)) => resp,
-            Ok(Err(_join_err)) => ApprovalResponse::Deny,
+            Ok(Err(_join_err)) => ApprovalResponse::Deny { feedback: None },
             Err(_elapsed) => {
                 eprintln!("\nApproval timed out; denying.");
-                ApprovalResponse::Deny
+                ApprovalResponse::Deny { feedback: None }
             }
         }
     }
@@ -131,7 +131,7 @@ mod tests {
             }),
         );
         let resp = ch.request(req()).await;
-        assert!(matches!(resp, ApprovalResponse::Deny));
+        assert!(matches!(resp, ApprovalResponse::Deny { .. }));
     }
 
     #[tokio::test]
