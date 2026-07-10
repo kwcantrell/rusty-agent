@@ -241,8 +241,6 @@ async fn soak_all_components_live() {
             approval: approval.clone(),
             workspace: ws.clone(),
             mcp_tools: vec![],
-            memory_tools: vec![],
-            memory_retriever: None,
             stream_idle_timeout: Duration::from_secs(120),
             base_system_prompt:
                 "You are a coding agent operating in a sandboxed workspace. Use the \
@@ -524,8 +522,6 @@ async fn response_format_valid_rate_live() {
                 approval: approval.clone(),
                 workspace: ws.clone(),
                 mcp_tools: vec![],
-                memory_tools: vec![],
-                memory_retriever: None,
                 stream_idle_timeout: Duration::from_secs(120),
                 base_system_prompt: "You dispatch to sub-agents. For each task, call \
                     dispatch_agent with subagent_type=\"triager\" and the failure text as \

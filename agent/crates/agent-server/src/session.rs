@@ -61,8 +61,6 @@ impl Session {
             params.claude_binary.clone(),
             params.config_path.clone(),
             params.mcp_tools.clone(),
-            params.memory_tools.clone(),
-            params.memory_retriever.clone(),
             params.system_prompt.clone(),
         ));
         let ctx = Arc::new(AsyncMutex::new(

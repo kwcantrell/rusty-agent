@@ -432,6 +432,10 @@ pub struct DispatchDeps {
     /// Named sub-agent registry (spec §2.2). Empty ⇒ only `general-purpose`
     /// exists and the tool schema is byte-identical to 3A.
     pub subagents: Arc<SubAgentRegistry>,
+    /// Project-scope memory backend (spec §2.6); assembly always passes
+    /// `Some`, test rigs `None`. Mounted read-only at `memories/project/` in
+    /// the child composite when present — a child never gets write access.
+    pub memories: Option<Arc<dyn agent_tools::backend::Backend>>,
 }
 
 pub struct DispatchAgentTool {
@@ -847,22 +851,30 @@ impl Tool for DispatchAgentTool {
         // parent's) is just as correct and keeps ownership uniform.
         // Child tools see the guarded composite: the two artifact mounts
         // (read-only) over a HostBackend at the parent workspace root (spec §5.6).
+        let mut child_mounts: Vec<(String, Arc<dyn agent_tools::backend::Backend>)> = vec![
+            (
+                "large_tool_results/".into(),
+                Arc::new(agent_tools::backend::ReadOnlyToTools(
+                    artifacts.results.clone(),
+                )) as Arc<dyn agent_tools::backend::Backend>,
+            ),
+            (
+                "conversation_history/".into(),
+                Arc::new(agent_tools::backend::ReadOnlyToTools(
+                    artifacts.history.clone(),
+                )) as Arc<dyn agent_tools::backend::Backend>,
+            ),
+        ];
+        if let Some(mem) = &self.deps.memories {
+            child_mounts.push((
+                "memories/project/".into(),
+                Arc::new(agent_tools::backend::ReadOnlyToTools(mem.clone()))
+                    as Arc<dyn agent_tools::backend::Backend>,
+            ));
+        }
         let child_backend: Arc<dyn agent_tools::backend::Backend> =
             Arc::new(agent_tools::backend::CompositeBackend::new(
-                vec![
-                    (
-                        "large_tool_results/".into(),
-                        Arc::new(agent_tools::backend::ReadOnlyToTools(
-                            artifacts.results.clone(),
-                        )) as Arc<dyn agent_tools::backend::Backend>,
-                    ),
-                    (
-                        "conversation_history/".into(),
-                        Arc::new(agent_tools::backend::ReadOnlyToTools(
-                            artifacts.history.clone(),
-                        )) as Arc<dyn agent_tools::backend::Backend>,
-                    ),
-                ],
+                child_mounts,
                 Arc::new(agent_tools::backend::HostBackend::new(
                     self.deps.loop_config.workspace.clone(),
                 )),
@@ -1422,6 +1434,7 @@ mod tests {
             id_prefix: String::new(),
             description_overrides: Default::default(),
             subagents: Arc::new(SubAgentRegistry::default()),
+            memories: None,
         }
     }
 
@@ -2057,9 +2070,9 @@ mod tests {
     ///     nudge inside the child's own turn loop (only reachable if
     ///     `StuckDetectionMiddleware` is actually in the child's stack).
     /// (c) memory-recall is ABSENT: even with a memory tool visible, nothing
-    ///     injects a "Relevant memories" recall block into the child's own
-    ///     completion requests (`MemoryRecallMiddleware::on_run_start` is the
-    ///     only source of that block, and it is never constructed in
+    ///     injects a memory recall block into the child's own completion
+    ///     requests (`MemoryFilesMiddleware::on_run_start` is the only source
+    ///     of that block, and it is never constructed in
     ///     `DispatchAgentTool::execute`) — the strongest observable proxy for
     ///     "never memory-recall" without a #[cfg(test)] stack accessor.
     #[tokio::test]
@@ -2151,11 +2164,90 @@ mod tests {
         // even though a memory tool was visible and callable.
         for (i, text) in model.request_texts.lock().unwrap().iter().enumerate() {
             assert!(
-                !text.contains("Relevant memories from past sessions"),
-                "request {i} must carry no memory-recall block — MemoryRecallMiddleware \
+                !text.contains(crate::context::MEMORY_HEADER),
+                "request {i} must carry no memory-recall block — MemoryFilesMiddleware \
                  is never installed on a dispatch child: {text}"
             );
         }
+    }
+
+    // --- Task A5: memories/project/ child mount is read-only -----------------
+
+    /// When `DispatchDeps.memories` is set, the child composite gains a
+    /// `memories/project/` mount wrapped in `ReadOnlyToTools` (spec §2.6): a
+    /// child may READ the project memory index but never WRITE it — only the
+    /// parent's unwrapped mount is tool-writable.
+    #[tokio::test]
+    async fn child_memories_mount_is_read_only() {
+        /// Captures every `ToolResult`'s (name, content) pair.
+        #[derive(Default)]
+        struct ResultCapturingSink {
+            results: std::sync::Mutex<Vec<(String, String)>>,
+        }
+        impl EventSink for ResultCapturingSink {
+            fn emit(&self, event: crate::AgentEvent) {
+                if let crate::AgentEvent::ToolResult { name, output, .. } = event {
+                    self.results.lock().unwrap().push((name, output.content));
+                }
+            }
+        }
+
+        let mem: Arc<dyn agent_tools::backend::Backend> =
+            Arc::new(agent_tools::backend::MemBackend::new());
+        mem.write("index.md", "* [A](a.md) - hook a\n")
+            .await
+            .unwrap();
+
+        let model = ScriptedModel::new(vec![
+            Scripted::Call(
+                "c1".into(),
+                "write_file".into(),
+                r#"{"path":"memories/project/x.md","content":"nope"}"#.into(),
+            ),
+            Scripted::Call(
+                "c2".into(),
+                "read_file".into(),
+                r#"{"path":"memories/project/index.md"}"#.into(),
+            ),
+            Scripted::Text("done".into()),
+        ]);
+        let sink = Arc::new(ResultCapturingSink::default());
+        let mut d = exec_deps(ScriptedModel::new(vec![]), 10);
+        d.model = Arc::new(model);
+        d.sink = sink.clone();
+        d.base_tools = vec![
+            Arc::new(agent_tools::fs::WriteFile),
+            Arc::new(agent_tools::fs::ReadFile {
+                max_bytes: 16 * 1024,
+            }),
+        ];
+        d.memories = Some(mem);
+        let tool = DispatchAgentTool::new(d);
+        tool.execute(serde_json::json!({"prompt": "p"}), &exec_ctx())
+            .await
+            .unwrap();
+
+        // SubagentSink forwards child tool events under a "sub:{name}" alias
+        // (spec D9/E9 — kept off the raw parent stream).
+        let results = sink.results.lock().unwrap();
+        let write_result = results
+            .iter()
+            .find(|(n, _)| n == "sub:write_file")
+            .expect("write_file must have run");
+        assert!(
+            write_result
+                .1
+                .contains(agent_tools::backend::ARTIFACTS_READONLY_MSG),
+            "write to the child memories mount must be denied: {write_result:?}"
+        );
+        let read_result = results
+            .iter()
+            .find(|(n, _)| n == "sub:read_file")
+            .expect("read_file must have run");
+        assert!(
+            read_result.1.contains("hook a"),
+            "read from the child memories mount must succeed: {read_result:?}"
+        );
     }
 
     // --- Task B4: per-child write_todos isolation ----------------------------
@@ -2929,6 +3021,7 @@ mod tests {
             id_prefix: String::new(),
             description_overrides: Default::default(),
             subagents: Arc::new(SubAgentRegistry::default()),
+            memories: None,
         };
         let tool = DispatchAgentTool::new(deps);
 

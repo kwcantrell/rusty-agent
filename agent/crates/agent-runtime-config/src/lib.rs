@@ -30,6 +30,7 @@ use agent_model::{
 };
 use agent_sandbox::{validate_mount, DockerSandbox, SandboxPolicy};
 use agent_skills::{CreateSkill, ListSkills, ReadSkillFile, SkillRegistry, UseSkill};
+use agent_tools::backend::{Backend, HostBackend};
 use agent_tools::fs::{EditFile, GrepTool, ListDirectory, ReadFile, WriteFile};
 use agent_tools::{
     git::{GitCommit, GitDiff, GitStatus},
@@ -236,6 +237,25 @@ pub fn build_memory_full(
             }
         }
     }
+}
+
+/// Project-scope memory store root: <memories_dir>/projects/<project_key>.
+/// The mount is UNCONDITIONAL (cfg.memory gates only middleware+prompt, §2.7).
+pub fn build_memories_backend(cfg: &RuntimeConfig, workspace: &Path) -> Arc<dyn Backend> {
+    let base = cfg
+        .memories_dir
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".rusty-agent")
+                .join("memories")
+        });
+    Arc::new(HostBackend::new(
+        base.join("projects").join(project_key(workspace)),
+    ))
 }
 
 pub fn default_allowlist() -> Vec<String> {

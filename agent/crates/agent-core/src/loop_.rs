@@ -2950,7 +2950,7 @@ mod tests {
         let built = ctx.build(100_000);
         assert!(!built
             .iter()
-            .any(|m| m.content.contains("Relevant memories")));
+            .any(|m| m.content.contains(crate::context::MEMORY_HEADER)));
         assert!(sink.events.lock().unwrap().last().unwrap() == "done");
     }
 

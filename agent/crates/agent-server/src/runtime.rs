@@ -4,9 +4,7 @@ use crate::wire::{
     redact_base_url, ArchitectureSnapshot, ContextInfo, DiscoveredSkill, LoopInfo, ModelInfo,
     PolicyInfo, PromptInfo, SandboxInfo, SettingsState, ToolEntry,
 };
-use agent_core::{
-    estimate_tokens, AgentLoop, Retriever, SessionArtifacts, DEFAULT_STREAM_IDLE_TIMEOUT,
-};
+use agent_core::{estimate_tokens, AgentLoop, SessionArtifacts, DEFAULT_STREAM_IDLE_TIMEOUT};
 use agent_runtime_config::{
     assemble_loop, build_model, build_sandbox, claude_cli_opts, BuiltLoop, LoopParts,
     RuntimeConfig, HARD_FLOOR_DENYLIST,
@@ -31,8 +29,6 @@ pub struct RuntimeState {
     claude_binary: String,
     config_path: PathBuf,
     mcp_tools: Arc<[Arc<dyn Tool>]>,
-    memory_tools: Arc<[Arc<dyn Tool>]>,
-    memory_retriever: Option<Arc<dyn Retriever>>,
     base_system_prompt: String,
     system_prompt: Mutex<String>,
     /// Conversation-stable context-management handles. Reused across loop rebuilds
@@ -64,8 +60,6 @@ impl RuntimeState {
         claude_binary: String,
         config_path: PathBuf,
         mcp_tools: Arc<[Arc<dyn Tool>]>,
-        memory_tools: Arc<[Arc<dyn Tool>]>,
-        memory_retriever: Option<Arc<dyn Retriever>>,
         base_system_prompt: String,
     ) -> Self {
         let config = config.normalized();
@@ -89,8 +83,6 @@ impl RuntimeState {
             &api_key,
             &claude_binary,
             &mcp_tools,
-            &memory_tools,
-            memory_retriever.as_ref(),
             &base_system_prompt,
             &artifacts,
             &compact_flag,
@@ -111,8 +103,6 @@ impl RuntimeState {
             claude_binary,
             config_path,
             mcp_tools,
-            memory_tools,
-            memory_retriever,
             base_system_prompt,
             artifacts,
             compact_flag,
@@ -178,8 +168,6 @@ impl RuntimeState {
             &self.api_key,
             &self.claude_binary,
             &self.mcp_tools,
-            &self.memory_tools,
-            self.memory_retriever.as_ref(),
             &self.base_system_prompt,
             &self.artifacts,
             &self.compact_flag,
@@ -256,19 +244,12 @@ impl RuntimeState {
             .iter()
             .map(|t| t.name().to_string())
             .collect();
-        let mem: HashSet<String> = self
-            .memory_tools
-            .iter()
-            .map(|t| t.name().to_string())
-            .collect();
         let tools = loop_
             .tool_schemas()
             .into_iter()
             .map(|s| {
                 let kind = if mcp.contains(&s.name) {
                     "mcp"
-                } else if mem.contains(&s.name) {
-                    "memory"
                 } else if CONTEXT_TOOLS.contains(&s.name.as_str()) {
                     "context"
                 } else if SKILL_TOOLS.contains(&s.name.as_str()) {
@@ -362,8 +343,6 @@ fn build_loop(
     api_key: &Option<String>,
     claude_binary: &str,
     mcp_tools: &[Arc<dyn Tool>],
-    memory_tools: &[Arc<dyn Tool>],
-    memory_retriever: Option<&Arc<dyn Retriever>>,
     base_system_prompt: &str,
     artifacts: &Arc<SessionArtifacts>,
     compact_flag: &Arc<AtomicBool>,
@@ -387,8 +366,6 @@ fn build_loop(
             approval: approval.clone(),
             workspace: workspace.to_path_buf(),
             mcp_tools: mcp_tools.to_vec(),
-            memory_tools: memory_tools.to_vec(),
-            memory_retriever: memory_retriever.cloned(),
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             base_system_prompt: base_system_prompt.to_string(),
             artifacts: artifacts.clone(),
@@ -463,7 +440,7 @@ mod tests {
         }
     }
 
-    /// Like `make()` but injects one MCP tool (`mcp_x`) and one memory tool (`remember`).
+    /// Like `make()` but injects one MCP tool (`mcp_x`).
     fn make_with_tools() -> (RuntimeState, tempfile::TempDir) {
         let (sink, approval) = parts();
         let dir = tempfile::tempdir().unwrap();
@@ -476,7 +453,6 @@ mod tests {
             8192,
         );
         let mcp_tool: Arc<dyn Tool> = Arc::new(NamedTool("mcp_x".into()));
-        let memory_tool: Arc<dyn Tool> = Arc::new(NamedTool("remember".into()));
         let rs = RuntimeState::new(
             cfg,
             sink,
@@ -486,8 +462,6 @@ mod tests {
             "claude".into(),
             path,
             Arc::from(vec![mcp_tool]),
-            Arc::from(vec![memory_tool]),
-            None,
             crate::daemon::SYSTEM_PROMPT.to_string(),
         );
         (rs, dir)
@@ -508,7 +482,6 @@ mod tests {
                 .clone()
         };
         assert_eq!(kind_of("mcp_x"), "mcp");
-        assert_eq!(kind_of("remember"), "memory");
         // Only context_compact is classified "context" now that context_recall
         // is retired (offload recovery moved to the ordinary file tools).
         assert_eq!(kind_of("context_compact"), "context");
@@ -593,8 +566,6 @@ mod tests {
             "claude".into(),
             path,
             Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            None,
             crate::daemon::SYSTEM_PROMPT.to_string(),
         );
         (rs, dir)
@@ -727,8 +698,6 @@ mod tests {
             "claude".into(),
             path,
             Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            None,
             crate::daemon::SYSTEM_PROMPT.to_string(),
         );
         // Booted: base prompt present, the ghost preset silently dropped.
@@ -770,8 +739,6 @@ mod tests {
             "claude".into(),
             path,
             Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            Arc::from(Vec::<Arc<dyn Tool>>::new()),
-            None,
             crate::daemon::SYSTEM_PROMPT.to_string(),
         );
         let st = rs.settings_state();
@@ -806,8 +773,6 @@ mod tests {
             &None,
             "claude",
             &[],
-            &[],
-            None,
             crate::daemon::SYSTEM_PROMPT,
             &artifacts,
             &flag,
@@ -864,8 +829,6 @@ mod tests {
             &None,
             "claude",
             &[],
-            &[],
-            None,
             crate::daemon::SYSTEM_PROMPT,
             &artifacts,
             &flag,

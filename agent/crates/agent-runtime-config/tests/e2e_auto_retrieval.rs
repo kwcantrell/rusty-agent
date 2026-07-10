@@ -94,7 +94,14 @@ async fn auto_retrieval_feeds_a_seeded_fact_to_the_real_model() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tempfile::tempdir().unwrap(); // DB lives OUTSIDE the workspace, unreadable by file tools
     let workspace = tmp.path().to_path_buf();
-    let (mem_tools, retriever) = seed_memory(
+    // NOTE (4A-1 A5): seed_memory's tools/retriever no longer reach the loop —
+    // MemoryRecallMiddleware is retired from assemble_loop's stack slot in
+    // favor of MemoryFilesMiddleware (index.md, not vector auto-retrieval).
+    // This test's premise (auto-retrieval surfaces a seeded fact) is dead
+    // until it is rewritten against the file-based mechanism; kept compiling
+    // (still #[ignore]d, opt-in) rather than deleted here — the vector fork
+    // and its test surface retire together in a later task (spec Slice 4A-1 B2).
+    let _ = seed_memory(
         &workspace,
         db.path(),
         "The project's secret deploy codeword is BANANA-7.",
@@ -118,8 +125,6 @@ async fn auto_retrieval_feeds_a_seeded_fact_to_the_real_model() {
             approval: Arc::new(AutoApprove),
             workspace: workspace.clone(),
             mcp_tools: vec![],
-            memory_tools: mem_tools,
-            memory_retriever: Some(retriever),
             stream_idle_timeout: Duration::from_secs(120),
             base_system_prompt: "You are a helpful assistant. Use any relevant memories provided."
                 .into(),
@@ -161,7 +166,9 @@ async fn memory_off_suppresses_recall() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tempfile::tempdir().unwrap(); // DB outside the workspace: only auto-retrieval can surface it
     let workspace = tmp.path().to_path_buf();
-    let (mem_tools, retriever) = seed_memory(
+    // NOTE (4A-1 A5): see the sibling test above — seed_memory's tools/retriever
+    // no longer reach the loop post-swap; kept compiling for the same reason.
+    let _ = seed_memory(
         &workspace,
         db.path(),
         "The project's secret deploy codeword is BANANA-7.",
@@ -175,7 +182,7 @@ async fn memory_off_suppresses_recall() {
         "native".into(),
         262_144,
     );
-    cfg.memory = false; // gate OFF — tools/retriever are passed but must be ignored
+    cfg.memory = false; // gate OFF — the memory-files middleware must not install
     let sink = Arc::new(Capture::default());
     let built = assemble_loop(
         &cfg,
@@ -185,8 +192,6 @@ async fn memory_off_suppresses_recall() {
             approval: Arc::new(AutoApprove),
             workspace: workspace.clone(),
             mcp_tools: vec![],
-            memory_tools: mem_tools,
-            memory_retriever: Some(retriever),
             stream_idle_timeout: Duration::from_secs(120),
             base_system_prompt: "You are a helpful assistant. Use any relevant memories provided."
                 .into(),
@@ -249,8 +254,6 @@ async fn assemble_loop_drives_a_real_tool_call() {
             approval: Arc::new(AutoApprove),
             workspace: workspace.clone(),
             mcp_tools: vec![],
-            memory_tools: vec![],
-            memory_retriever: None,
             stream_idle_timeout: Duration::from_secs(120),
             base_system_prompt:
                 "You are a coding agent. Use the provided tools to inspect the workspace.".into(),
