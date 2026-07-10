@@ -318,7 +318,13 @@ pub fn take_answer(dir: &Path, key: &[u8; 32]) -> Option<bool> {
 pub fn sanitize_dir_key(call_id: &str) -> String {
     let out: String = call_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     // ".." would escape the tree even without '/' once joined recursively;
     // a leading dot also hides the dir. Neutralize both.
@@ -883,7 +889,9 @@ mod tests {
             .await
             .unwrap();
         // grandchild park lands two levels down; BOTH ancestors flushed
-        assert!(has_park(&root.dir().join("children/call_a/children/call_b")));
+        assert!(has_park(
+            &root.dir().join("children/call_a/children/call_b")
+        ));
         assert!(has_park(&root.dir().join("children").join("call_a")));
         assert!(has_park(root.dir()));
     }
