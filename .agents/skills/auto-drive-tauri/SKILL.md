@@ -28,7 +28,9 @@ For UX / rendering assertions that require the real webview, use WebDriver
 (§Pixel fallback).
 
 **Do not** use this skill for: generic Tauri v2 development (→ `tauri` skill);
-automating GUI apps outside this repo on Wayland (→ `wayland` skill); or
+"what's the right Tauri practice" lookups (→ `tauri-okf` skill, verified bundle
+at `docs/okf/tauri/`); automating GUI apps outside this repo on Wayland
+(→ `wayland` skill); or
 pixel-driving when a WS-bridge or WebDriver rung is available — the bridge and
 WebDriver are the point.
 
@@ -114,13 +116,25 @@ Verified 2026-07-06: `tauri-driver` + WebKitGTK WebDriver drives the real app's
 DOM — CSS selectors, real key events, `execute_script`, focus-independent
 screenshots. No coordinates, no KWin consent dialog, no xclip, no focus click.
 
+**Route choice (deliberate):** Tauri's first-party recommendation for e2e is
+WebdriverIO + `@wdio/tauri-service`. This repo takes the documented
+*direct-driver* route instead — a custom Rust harness (thirtyfour) plus
+Selenium one-offs, Linux-only, no Node test runner — exactly the case Tauri
+supports it for. Don't "upgrade" it to the service; reconsider if e2e ever
+needs capabilities the direct route lacks (current delta:
+`docs/okf/tauri/practices/webdriver-e2e-testing.md`).
+
 **Bring-up (order matters):**
 1. Vite on :5173 (`curl -s -o /dev/null -w '%{http_code}' localhost:5173` → 200,
    else `setsid npm --prefix web run dev` and wait).
 2. Debug binary built (`cd src-tauri && cargo build`).
 3. `setsid ~/.cargo/bin/tauri-driver --port 4444 --native-port 4445 >/tmp/td.log 2>&1 &`
    then `curl -s 127.0.0.1:4444/status` → `"ready":true`. Do NOT launch the app
-   yourself — the WebDriver session launches (and owns) it.
+   yourself — the WebDriver session launches (and owns) it. (If the binary is
+   missing: `cargo install tauri-driver --locked`; it proxies to
+   `/usr/bin/WebKitWebDriver` — on this machine from the `webkitgtk-webdriver`
+   package. `webkit2gtk-driver` is the older Debian/Ubuntu name upstream docs
+   use; it has no install candidate on this release.)
 
 **Drive with `/usr/bin/python3` (the PATH python is a uv shim without selenium):**
 
@@ -177,6 +191,10 @@ group, never by pattern-match, to avoid the pkill self-match footgun.
 
 **Preflight if the driver misbehaves:** `dpkg -l libwebkit2gtk-4.1-0
 webkitgtk-webdriver | grep ^ii` — the two versions must match.
+
+**If gui_smoke ever moves into CI:** recipe in
+`docs/okf/tauri/practices/webdriver-ci.md` (xvfb fake display + the WebKit
+driver package — package name varies by distro release, see preflight above).
 
 ## Pixel fallback (native GTK chrome only)
 
