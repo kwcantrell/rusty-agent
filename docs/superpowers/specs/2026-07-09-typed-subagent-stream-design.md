@@ -84,7 +84,11 @@ pub enum SubagentEvent {
     },
     /// Child assistant text delta.
     Text { id: String, text: String },
-    /// Child reasoning delta.
+    /// Child reasoning delta. NOTE: this is a genuinely NEW egress path —
+    /// child reasoning is trace-file-only today. Streaming it to the local UI
+    /// was gate-approved (G5): same trust boundary as the parent's own
+    /// reasoning stream. The child's prompt, by contrast, was already on the
+    /// wire via the host row's ToolStart args.
     Reasoning { id: String, text: String },
     /// Child mid-stream retry retracted in-flight deltas: frontends trim the
     /// tail of THIS delegation's transcript (mirrors top-level StreamRetry).
@@ -326,8 +330,9 @@ MAJOR-4 / Scope BLOCKER-1).
   capture; nested dispatch emits fully qualified delegation ids (`sub{n}:`
   composition); SubagentSink never receives a Subagent event (absence pin).
 - **trace tests:** child token appears exactly once in the session JSONL;
-  Start/End produce trace records; session stats counters unmoved by
-  Subagent events.
+  Start/End produce trace records.
+- **stats test:** session stats counters unmoved by Subagent events (the
+  `stats.rs` no-edit pin from §2.6).
 - **wire.rs pins:** per-frame type tags, None-omission (`role`, `stop`,
   `detail`), outcome/stop strings.
 - **web tests:** reducer — card assembly on the dispatch row, parallel
@@ -391,7 +396,8 @@ MAJOR-4 / Scope BLOCKER-1).
     of "full card" (flat siblings vs DOM containment); G3 reconnect posture;
     G4 child-approval attribution; G5 child-reasoning egress.
   - *Accepted residual minors:* CLI silent child-text burn (pre-existing,
-    quantified by End stats); web card is live-only (named in Non-goals).
+    quantified by End stats); web card is live-only (named in Non-goals;
+    formally decided at Gate G3 below).
 - **2026-07-09 — owner gate (all five escalations decided, each per the
   panel-synthesized recommendation):**
   - **G1 KEEP** `SubagentEvent::StreamRetry` — dropping it would re-introduce
@@ -405,6 +411,7 @@ MAJOR-4 / Scope BLOCKER-1).
   - **G4 child-approval attribution DEFERRED** — named gap in Non-goals; the
     global modal remains actionable, just unattributed.
   - **G5 child reasoning STREAMS to the UI, accepted residual** — local-first
-    app, same trust boundary as the parent's own reasoning stream; recorded
-    here as the explicit justification (the "no new exposure" wording the
-    panel caught was corrected in §2.1/§2.3).
+    app, same trust boundary as the parent's own reasoning stream; the
+    justification is recorded on the `Reasoning` variant's doc note in §2.1
+    (the pre-panel spec's blanket "no new exposure" claim was removed with
+    the `prompt` field it annotated).
