@@ -72,6 +72,7 @@ mod tests {
                 summary: "s".into(),
             },
             display: None,
+            origin: None,
         }));
         assert!(cap.0.lock().unwrap().is_empty());
     }

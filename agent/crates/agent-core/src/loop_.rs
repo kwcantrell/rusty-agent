@@ -1373,6 +1373,7 @@ impl AgentLoop {
                 let req = ApprovalRequest {
                     intent,
                     display: None,
+                    origin: None,
                 };
                 self.sink.emit(AgentEvent::Approval(req.clone()));
                 // Race the approval wait against cancellation: Ctrl-C during a

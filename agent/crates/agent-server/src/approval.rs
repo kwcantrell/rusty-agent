@@ -92,6 +92,7 @@ mod tests {
                 summary: "run touch x".into(),
             },
             display: None,
+            origin: None,
         }
     }
 

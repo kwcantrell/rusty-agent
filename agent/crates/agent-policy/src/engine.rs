@@ -14,10 +14,22 @@ pub trait PolicyEngine: Send + Sync {
     fn check(&self, intent: &ToolIntent) -> Decision;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalOrigin {
+    /// The dispatch call's on-wire id (`id_prefix + call_id`) — the 3B-2
+    /// delegation id the subagent stream joins on.
+    pub delegation_id: String,
+    /// Registered sub-agent name, or "general-purpose".
+    pub subagent_name: String,
+    /// Dispatching tool's depth; top-level dispatch = 1.
+    pub depth: usize,
+}
+
 #[derive(Clone)]
 pub struct ApprovalRequest {
     pub intent: ToolIntent,
     pub display: Option<Display>,
+    pub origin: Option<ApprovalOrigin>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +42,27 @@ pub enum ApprovalResponse {
 #[async_trait]
 pub trait ApprovalChannel: Send + Sync {
     async fn request(&self, req: ApprovalRequest) -> ApprovalResponse;
+}
+
+/// Wrap-at-dispatch decorator (spec §2.6): stamps origin onto every request
+/// a child issues. The `sub{n}:` sink rewrite never touches approvals.
+pub struct AttributingApprovalChannel {
+    inner: std::sync::Arc<dyn ApprovalChannel>,
+    origin: ApprovalOrigin,
+}
+
+impl AttributingApprovalChannel {
+    pub fn new(inner: std::sync::Arc<dyn ApprovalChannel>, origin: ApprovalOrigin) -> Self {
+        Self { inner, origin }
+    }
+}
+
+#[async_trait]
+impl ApprovalChannel for AttributingApprovalChannel {
+    async fn request(&self, mut req: ApprovalRequest) -> ApprovalResponse {
+        req.origin = Some(self.origin.clone());
+        self.inner.request(req).await
+    }
 }
 
 pub struct RulePolicy {
@@ -328,5 +361,35 @@ mod tests {
             policy().check(&intent(Access::Destroy, vec![], Some("sudo reboot"))),
             Decision::Deny(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn attributing_channel_stamps_origin() {
+        use std::sync::{Arc, Mutex};
+        struct Capture(Mutex<Option<ApprovalRequest>>);
+        #[async_trait::async_trait]
+        impl ApprovalChannel for Capture {
+            async fn request(&self, req: ApprovalRequest) -> ApprovalResponse {
+                *self.0.lock().unwrap() = Some(req);
+                ApprovalResponse::Deny
+            }
+        }
+        let cap = Arc::new(Capture(Mutex::new(None)));
+        let ch = AttributingApprovalChannel::new(
+            cap.clone(),
+            ApprovalOrigin {
+                delegation_id: "c7".into(),
+                subagent_name: "explore".into(),
+                depth: 1,
+            },
+        );
+        let req = ApprovalRequest {
+            intent: intent(Access::Read, vec![], None),
+            display: None,
+            origin: None,
+        };
+        ch.request(req).await;
+        let seen = cap.0.lock().unwrap().take().unwrap();
+        assert_eq!(seen.origin.unwrap().delegation_id, "c7");
     }
 }

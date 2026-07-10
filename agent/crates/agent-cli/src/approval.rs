@@ -104,6 +104,7 @@ mod tests {
                 summary: "run echo".into(),
             },
             display: None,
+            origin: None,
         }
     }
 

@@ -675,6 +675,7 @@ mod tests {
                 summary: "s".into(),
             },
             display: None,
+            origin: None,
         };
         assert!(server_event_from(AgentEvent::Approval(req)).is_none());
         let ar = ServerEvent::ApprovalRequest {
