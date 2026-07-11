@@ -388,3 +388,11 @@ follow-up); dispositions recorded in §9 and folded into §1/§2.3/§5.
 plan-time verification of the ownership mechanism (#12); error-substring
 choices deferred to implementation under §2.4's style rule; Tier 2 config
 injection unresolved until plan (§8).
+
+**2026-07-10 — Task 13 implementation (scenarios 5-6, `agent-e2e/tests/crashkill.rs`):**
+§2.4 descope: scenario 6b's commit-window state (an answer committed but not
+yet consumed) is produced by the REAL writer, `agent_core::checkpoint::write_answer`
+(the same function `agent_server::resume::commit_answer` — and therefore
+`agent-cli`'s `run_sessions_reopen` — bottoms out into), standing in for a
+process killed between commit and consume; the window named is
+write_answer→take_answer in reopen. Owner sign-off requested at branch review.
