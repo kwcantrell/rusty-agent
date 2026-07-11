@@ -297,6 +297,28 @@ async fn s04_soak_alternating_deny_approve_across_surfaces() {
     // wait_for_ask_id always returns the FIRST ask in the capture; after the
     // deny above we need the ask that supersedes it, hence `_after`.
     let ask2 = agent_server::testkit::wait_for_ask_id_after(&cap, &ask, CAP).await;
+
+    // Capture the big-payload checkpoint BEFORE final approve (which cleans it up
+    // on Done). The parked.json after the deny contains the full retry tool call
+    // with the 2MB content inline (tool arguments live in the checkpoint, not in
+    // artifact backends). Read into memory now, before cleanup.
+    let checkpoint_with_big = {
+        let dirs = rig.session_dirs();
+        dirs.iter()
+            .find(|d| {
+                let parked_path = ckpt(d).join("parked.json");
+                if let Ok(bytes) = std::fs::read(&parked_path) {
+                    bytes.len() > 2_000_000
+                } else {
+                    false
+                }
+            })
+            .and_then(|d| {
+                let path = ckpt(d).join("parked.json");
+                std::fs::read(&path).ok()
+            })
+    };
+
     session.approve(&ask2, Decision::Approve);
     assert!(
         wait_until_async(CAP, || cap
@@ -310,8 +332,32 @@ async fn s04_soak_alternating_deny_approve_across_surfaces() {
     let soak_elapsed = soak_start.elapsed();
     eprintln!("s04 soak wall time: {soak_elapsed:?}");
 
+    // Big-payload proof: verify the ~2MB tool call payload was carried in the
+    // checkpoint. The checkpoint_with_big was captured before the final
+    // approve, so it's a snapshot of the run after deny+retry with the full
+    // retry tool call containing 2MB args inline (tool arguments are stored in
+    // the checkpoint, not offloaded to an artifact backend).
+    let parked_bytes =
+        checkpoint_with_big.expect("no checkpoint with 2MB payload found after deny+retry");
+    assert!(
+        parked_bytes.len() > 2_000_000,
+        "parked.json must carry the ~2MB tool-call payload; got {} bytes, expected > 2,000,000",
+        parked_bytes.len()
+    );
+    // Strong test: the big content (2_000_000 B's) must be present in the
+    // serialized checkpoint.
+    let parked_str = String::from_utf8_lossy(&parked_bytes);
+    assert!(
+        parked_str.contains(&"B".repeat(2_000_000)),
+        "the ~2MB content must flow through to parked.json verbatim"
+    );
+
     // Tally monotonicity / no drift: the surviving session dirs verify clean —
-    // `sessions list` exits 0 and shows no corruption complaints.
+    // `sessions list` exits 0 and shows no corruption complaints. Note:
+    // the tally-floor (2fad367) regression is verified by the mid-test
+    // reopen/attach paths themselves — every reopen runs verify_tally_floor
+    // and hard-fails this test on violation. The list check below is a final
+    // wedge/corruption sweep, not the tally-floor proof site.
     let mut list = CliCmd::new(&rig, &stub.base_url())
         .sessions_sub(&["sessions", "list"])
         .spawn();
