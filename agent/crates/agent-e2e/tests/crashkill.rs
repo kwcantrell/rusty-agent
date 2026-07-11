@@ -90,6 +90,104 @@ async fn s05_sigint_mid_resume_cancels_clean_no_park_to_retain() {
     stub.assert_consumed();
 }
 
+/// Scenario 5b: the actual `76d81d5`/`01179d8` C-1 regression window — cancel
+/// while RE-PARKED AT A NEW ASK mid-resume. Unlike s05 (whose delayed step was
+/// plain text, so the approved `write_file` had already executed and there was
+/// no new Ask left to re-park at), this script's resume issues a SECOND gated
+/// tool call after the first approval, so the resumed run genuinely re-parks
+/// and re-prompts (Task 10 characterization: a reopen resume can loop through
+/// more than one live approval prompt in the SAME process). Cancelling while
+/// that second prompt is outstanding must retain the park — the opposite
+/// polarity of s05's "run cancelled": `resume_cleanup_decision` routes
+/// `Ok(()) + cancelled` to `Retain`, and the `Retain` arm's `has_park` check
+/// must find the re-park and print "run left parked" instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn s05b_sigint_while_reparked_at_new_ask_retains_park() {
+    let stub = ScriptedStub::start(vec![
+        gated_write("SQRL-5B go"),
+        // resume's first live request after the approval: a SECOND gated call.
+        gated_write("SQRL-5B go"),
+        // eventual completion after the second reopen approves it too.
+        text_step(None, "done"),
+    ])
+    .await;
+    let rig = Rig::new();
+    let (session, _cap) = rig.session(&stub.base_url());
+    session.send_input("SQRL-5B go".into());
+    assert!(wait_until_async(CAP, || !rig.session_dirs().is_empty()).await);
+    let dir = rig.only_session_dir();
+    assert!(wait_until_async(CAP, || ckpt(&dir).join("parked.json").exists()).await);
+    drop(session);
+    let sid = dir.file_name().unwrap().to_string_lossy().into_owned();
+
+    // approval_timeout_secs(60): the SECOND prompt must not time out under load
+    // while we drive the first answer + wait for the re-park to land.
+    let mut cli = CliCmd::new(&rig, &stub.base_url())
+        .approval_timeout_secs(60)
+        .sessions_sub(&["sessions", "reopen", &sid])
+        .spawn();
+    cli.wait_for_output("[y]es / [n]o / [a]lways:", CAP);
+    cli.write_line("y");
+    // The resume executes write#1, then the stub's 2nd script step (another
+    // gated write_file) lands as the resume's next model request -> re-parks
+    // and re-prompts in the SAME process. Wait for the SECOND prompt
+    // occurrence — the first prompt's text is still in the transcript, so
+    // count occurrences rather than just `contains`. `wait_until`'s poll
+    // closure is `Fn`, and `transcript()` takes `&mut self`, so drive the
+    // bounded loop by hand here instead.
+    {
+        let start = std::time::Instant::now();
+        loop {
+            let hits = cli.transcript().matches("[y]es / [n]o / [a]lways:").count();
+            if hits >= 2 {
+                break;
+            }
+            assert!(
+                start.elapsed() < CAP,
+                "deadline waiting for the second approval prompt; transcript:\n{}",
+                cli.transcript()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    // Positive-artifact check BEFORE the kill: the re-park actually landed on
+    // disk, not just in the transcript.
+    assert!(wait_until(CAP, || ckpt(&dir).join("parked.json").exists()));
+    // Do NOT answer the second prompt — cancel while it's outstanding.
+    cli.sigint();
+    let st = cli.wait_exit(CAP);
+    let t = cli.transcript();
+    assert!(st.success(), "{t}");
+    assert!(
+        t.contains("run left parked; answer later with"),
+        "expected the has_park-gated retain message, got:\n{t}"
+    );
+    assert!(
+        ckpt(&dir).join("parked.json").exists(),
+        "the re-park at the new ask must survive the cancel"
+    );
+    assert!(
+        wait_until(CAP, || !ckpt(&dir).join("resume.lock").exists()),
+        "resume.lock must be released on the retained-park cancel path"
+    );
+
+    // Second reopen: answer the still-outstanding (re-parked) ask, run to
+    // completion, and consume the final text step.
+    let mut cli2 = CliCmd::new(&rig, &stub.base_url())
+        .approval_timeout_secs(60)
+        .sessions_sub(&["sessions", "reopen", &sid])
+        .spawn();
+    cli2.wait_for_output("[y]es / [n]o / [a]lways:", CAP);
+    cli2.write_line("y");
+    let st2 = cli2.wait_exit(CAP);
+    assert!(st2.success(), "{}", cli2.transcript());
+    stub.assert_consumed();
+    assert!(
+        !ckpt(&dir).join("parked.json").exists(),
+        "park must be fully consumed after the second reopen completes"
+    );
+}
+
 /// Scenario 6a: reopen reaches the approval prompt (claims the resume lock),
 /// gets SIGKILL'd before answering -> park retained, lock leaked (documented
 /// stale-lock behavior). Clearing the lock the way the product's own error
