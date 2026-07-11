@@ -1,0 +1,20 @@
+[package]
+name = "agent-e2e"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+agent-server = { path = "../agent-server", features = ["testkit"] }
+agent-runtime-config = { path = "../agent-runtime-config" }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+nix = { version = "0.29", features = ["signal", "process"] }
+
+[[bin]]
+name = "e2e-daemon"
+path = "src/bin/e2e-daemon.rs"

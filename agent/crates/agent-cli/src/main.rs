@@ -158,7 +158,7 @@ async fn run_sessions_reopen(session_id: &str, cli: &Cli) {
         std::process::exit(2);
     }
 
-    let Some(meta_root) = agent_runtime_config::metadata_root() else {
+    let Some(meta_root) = agent_runtime_config::metadata_root_for(&rt) else {
         eprintln!("error: cannot determine metadata root (is $HOME set?)");
         std::process::exit(2);
     };
@@ -214,12 +214,15 @@ async fn run_sessions_reopen(session_id: &str, cli: &Cli) {
     // skips Drop — a leaked trace tail-loss is a real audit gap, same
     // rationale as ParkExit::trace's doc comment).
     let trace = agent_runtime_config::build_trace(&rt, &descriptor.session_id);
-    let approval = TerminalApproval::with_park_exit(Some(ParkExit {
-        session_id: descriptor.session_id.clone(),
-        trace: trace.clone(),
-        release_lock: Some(parked.root_dir.clone()),
-        exit: Box::new(|code| std::process::exit(code)),
-    }));
+    let approval = TerminalApproval::with_park_exit(
+        Some(ParkExit {
+            session_id: descriptor.session_id.clone(),
+            trace: trace.clone(),
+            release_lock: Some(parked.root_dir.clone()),
+            exit: Box::new(|code| std::process::exit(code)),
+        }),
+        std::time::Duration::from_secs(cli.approval_timeout_secs),
+    );
     let model = build_model(
         &cli.backend,
         &cli.base_url,
@@ -422,6 +425,8 @@ fn runtime_config_from_cli(cli: &Cli, protocol_name: &str) -> RuntimeConfig {
     c.memory = cli.memory;
     c.command_allowlist = default_allowlist();
     c.command_denylist = default_denylist();
+    c.trace_dir = cli.trace_dir.clone();
+    c.metadata_dir = cli.metadata_dir.clone();
     c
 }
 
@@ -448,12 +453,22 @@ struct Cli {
     /// Workspace directory the agent may operate in
     #[arg(long, default_value = ".")]
     workspace: String,
+    /// Session artifacts root override (default: ~/.rusty-agent/sessions)
+    #[arg(long)]
+    trace_dir: Option<String>,
+    /// Metadata root override — secret etc. (default: ~/.rusty-agent). E1 seam.
+    #[arg(long)]
+    metadata_dir: Option<String>,
     /// Approx context token limit
     #[arg(long, default_value_t = 8192)]
     context_limit: usize,
     /// Idle timeout (seconds) for model-stream consumption before a stalled turn fails
     #[arg(long, default_value_t = 120)]
     stream_timeout_secs: u64,
+    /// Interactive approval window in seconds; on expiry the run parks-and-exits
+    /// (durable park wired) or denies. E2 knob.
+    #[arg(long, default_value_t = 300)]
+    approval_timeout_secs: u64,
     /// Optional MCP server config (mcp.json shape). If absent, MCP is disabled.
     #[arg(long)]
     mcp_config: Option<std::path::PathBuf>,
@@ -632,7 +647,7 @@ async fn main() {
     }
     // Durable parks (4B-2): CLI runs park at Ask exactly like server runs.
     // Degrades to live-only (None) without HOME/secret — never fails boot.
-    let checkpoint = agent_runtime_config::metadata_root()
+    let checkpoint = agent_runtime_config::metadata_root_for(&rt)
         .and_then(|meta| agent_runtime_config::load_or_create_secret(&meta).ok())
         .and_then(|key| {
             let root = agent_runtime_config::sessions_root(&rt)?;
@@ -642,12 +657,15 @@ async fn main() {
                 session_id.clone(),
             ))
         });
-    let approval = TerminalApproval::with_park_exit(checkpoint.as_ref().map(|_| ParkExit {
-        session_id: session_id.clone(),
-        trace: trace.clone(),
-        release_lock: None, // ordinary runs hold no resume lock
-        exit: Box::new(|code| std::process::exit(code)),
-    }));
+    let approval = TerminalApproval::with_park_exit(
+        checkpoint.as_ref().map(|_| ParkExit {
+            session_id: session_id.clone(),
+            trace: trace.clone(),
+            release_lock: None, // ordinary runs hold no resume lock
+            exit: Box::new(|code| std::process::exit(code)),
+        }),
+        std::time::Duration::from_secs(cli.approval_timeout_secs),
+    );
     let built = assemble_loop(
         &rt,
         LoopParts {
@@ -1008,6 +1026,16 @@ mod tests {
             "native",
         ]);
         assert_eq!(select_protocol(&cli2), "prompted");
+    }
+
+    // ---- E1 (e2e lifecycle seam): --trace-dir/--metadata-dir map into RuntimeConfig ----
+
+    #[test]
+    fn cli_dirs_flags_map_into_runtime_config() {
+        let cli = Cli::parse_from(["agent", "--trace-dir", "/tmp/s", "--metadata-dir", "/tmp/m"]);
+        let rt = runtime_config_from_cli(&cli, "native");
+        assert_eq!(rt.trace_dir.as_deref(), Some("/tmp/s"));
+        assert_eq!(rt.metadata_dir.as_deref(), Some("/tmp/m"));
     }
 
     // ---- I-3 (4B-2 branch review): reopen consumes a pre-committed root answer ----

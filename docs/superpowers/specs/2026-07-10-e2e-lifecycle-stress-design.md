@@ -388,3 +388,96 @@ follow-up); dispositions recorded in §9 and folded into §1/§2.3/§5.
 plan-time verification of the ownership mechanism (#12); error-substring
 choices deferred to implementation under §2.4's style rule; Tier 2 config
 injection unresolved until plan (§8).
+
+**2026-07-10 — Task 13 implementation (scenarios 5-6, `agent-e2e/tests/crashkill.rs`):**
+§2.4 descope: scenario 6b's commit-window state (an answer committed but not
+yet consumed) is produced by the REAL writer, `agent_core::checkpoint::write_answer`
+(the same function `agent_server::resume::commit_answer` — and therefore
+`agent-cli`'s `run_sessions_reopen` — bottoms out into), standing in for a
+process killed between commit and consume; the window named is
+write_answer→take_answer in reopen. Owner sign-off requested at branch review.
+
+**2026-07-10 — Implementation notes (Task 22, whole-branch close-out):**
+
+(a) **Budget outcome.** Tier 1 (`cargo test -p agent-e2e`, non-ignored) is
+**33 tests across 6 binaries in ~32s wall** on this machine (`lifecycle.rs`
+8, `robustness.rs` 4, `crashkill.rs` 8, `concurrency.rs` 4, `adversarial.rs`
+2, `lib.rs`/`live_smoke.rs` 0+1-ignored) — comfortably inside §4's ~2min
+target. The soak (§5#4, N=4) was **not** split to `--ignored`; §4's
+pre-committed 90s trigger for a split was never reached.
+
+(b) **Characterize-then-pin divergences from the spec's assumed shapes**
+(§8's characterize-then-pin instruction for scenarios 7, 9, 13, 18, 21 —
+plus 5/20, discovered during implementation):
+- **Scenario 5** split into two tests, non-overlapping:
+  `s05_sigint_mid_resume_cancels_clean_no_park_to_retain` (SIGINT during a
+  plain-text resume step, no new ask — exits cleanly with "run cancelled",
+  no park/lock artifact left; this is the accepted single-execution
+  tradeoff, not the C-1 bug) and
+  `s05b_sigint_while_reparked_at_new_ask_retains_park` (SIGINT while a
+  *second* gated tool call has just re-parked at a genuinely new ask — the
+  `Retain` arm finds the park and prints "run left parked; answer later
+  with: agent sessions reopen `<id>`", the actual behavior `76d81d5`/
+  `01179d8` fixed). Both pinned; the spec's single scenario 5 undersold two
+  materially different outcomes depending on which resume step is
+  interrupted.
+- **Scenario 20** (mid-stream drop): production wiring hardcodes
+  `max_retries: 3` with no test-facing seam to lower it. `RawDropStub`'s
+  partial-SSE-then-close is classified `ModelError::Stream(_)` →
+  `ErrorClass::Retryable`, so `completion_with_retry` absorbs the drop
+  in-process — it emits `AgentEvent::StreamRetry`, retries, and the very
+  first `send_input` already reaches `Done` with no `Error` event ever
+  surfacing to the Session/GUI layer. `StreamRetry` is exercised and
+  pinned; the scenario is complementary to `e2e_robustness`'s existing T4
+  (which covers error-surfacing itself) rather than duplicating it, per
+  the spec's own note.
+- **Scenario 21** — the `MalformedJson` case was **not skipped**, but its
+  outcome is one layer earlier than assumed: `openai.rs`'s stream loop
+  treats a bad `data:` JSON line as transient corruption
+  (`Some(Err(ModelError::Decode(e))) => continue`), so the malformed line
+  is dropped and the following `data: [DONE]` still terminates cleanly —
+  turn 1 is a clean `Done{reason:"stop"}` with empty text, not a
+  session-level `Error` at all. Pinned as-is (`s21_malformed_and_bogus_tool`
+  turn 1); turns 2-3 (bogus tool name, then a normal turn) proceed as the
+  spec assumed.
+
+(c) **PRODUCT FINDINGS pinned with `PRODUCT-GAP` for owner follow-up**
+(none block this branch; all are asserted-current-behavior, not bugs
+introduced by this work):
+- **Scenario 7** (`s07_reopen_with_divergent_protocol_is_defined`):
+  `sessions reopen --protocol=prompted` against a park whose model backend
+  actually speaks native tool-calling **silently drops the second tool
+  call and exits 0** — no error, no approval prompt; the wire layer
+  believes the script was fully consumed. Confirmed via a positive/negative
+  disk-artifact pair (the first, pre-approved write lands; the
+  protocol-mismatched second write never does). Reopen accepts
+  protocol-divergent flags without validation.
+- **Scenario 15** (`s15_cli_holder_session_loser_then_cli_completes`):
+  double-resolution is **not structurally excluded**. The CLI's pre-prompt
+  `resume.lock` claim only blocks a second *resume attempt*
+  (`start_resume`'s own `claim_resume`) — it does not stop a second surface
+  from re-deriving the same parked ask and durably committing its own
+  `answer.json` (a real, valid, MAC-bound write, not a no-op). What
+  actually arbitrates is the lock: whichever process holds `resume.lock`
+  is the one whose `take_answer` reads `answer.json` and drives the loop;
+  the loser's `start_resume` call loses the lock race and surfaces
+  `ServerEvent::Error` ("is being resumed elsewhere") without ever
+  reaching `Done`. Net effect for the run itself: no panic, no
+  double-execution, only one process ever completes — but the
+  *answer-commit* race is real, and a future caller must not assume the
+  first writer's answer is the one that is acted on.
+- **Scenario 11** (stale `resume.lock`, no auto-recovery): already a known,
+  pre-documented gap (§6 lists it), not a new finding — reconfirmed as-is
+  by `s11_stale_lock_after_real_kill_refuses_contention`.
+
+(d) **Tier 2 and Tier 3 live runs.** Tier 2 (`src-tauri/tests/gui_lifecycle.rs`,
+T2.1/T2.2/T2.3) ran live against the real WebKitGTK webview, `tauri-driver`,
+and `llama-server` — **3/3 pass**, 32.22s serialized
+(`--test-threads=1`); state relocation via `HOME`/`XDG_*` env on the
+`tauri-driver` spawn worked with no product-code seam needed, so **no
+descope** (§3's contingency did not trigger). Tier 3
+(`agent-e2e/tests/live_smoke.rs`) ran live against the real model twice
+back-to-back — **2/2 pass**, ~11-14s each, first-attempt park both times
+(the one allowed retry never fired). Both are recorded here as run at
+least once on this machine per the branch-finish criterion; neither is
+part of the `ci.sh` gate (Tier 1 only, per §3/§7).

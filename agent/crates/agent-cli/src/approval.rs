@@ -74,11 +74,12 @@ impl TerminalApproval {
     }
 
     /// Production constructor: wires the durable-park capability (4B-2).
-    /// `park_exit: None` degrades to today's timeout-denies behavior.
-    pub fn with_park_exit(park_exit: Option<ParkExit>) -> Self {
+    /// `park_exit: None` degrades to timeout-denies. `timeout` is the interactive
+    /// approval window (E2 knob; CLI default is DEFAULT_TERMINAL_APPROVAL_TIMEOUT).
+    pub fn with_park_exit(park_exit: Option<ParkExit>, timeout: Duration) -> Self {
         Self {
             park_exit,
-            ..Self::new(DEFAULT_TERMINAL_APPROVAL_TIMEOUT)
+            ..Self::new(timeout)
         }
     }
 
@@ -332,5 +333,16 @@ mod tests {
         assert!(matches!(b, ApprovalResponse::Approve));
         // Two children prompting at once must never overlap on stdin (spec D12).
         assert_eq!(max.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn with_park_exit_honors_custom_timeout() {
+        // Same-module test may read the private field — no stdin involvement
+        // (plan-review F6: the public request() path would park an orphan
+        // blocking read_line on real process stdin).
+        let ch = TerminalApproval::with_park_exit(None, Duration::from_secs(7));
+        assert_eq!(ch.timeout, Duration::from_secs(7));
+        let d = TerminalApproval::with_park_exit(None, DEFAULT_TERMINAL_APPROVAL_TIMEOUT);
+        assert_eq!(d.timeout, Duration::from_secs(300));
     }
 }

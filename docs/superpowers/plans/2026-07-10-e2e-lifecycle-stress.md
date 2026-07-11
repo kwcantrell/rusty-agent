@@ -1475,7 +1475,9 @@ Run: `cd agent && cargo test -p agent-e2e -- --format terse 2>&1 | tail -5` and 
 
 - [ ] **Step 2: Extrapolate and record.** ~6 tests exist (2 smoke + 4 scenarios). Tier 1 will have ~24. If `measured_total × 4 > 90s`, decide NOW which tests move behind `#[ignore]` + a `soak` name prefix (the §5#4 soak is the pre-committed first candidate). Record the measurement and the decision as a dated note in `docs/superpowers/plans/2026-07-10-e2e-lifecycle-stress.md` itself (append under this task) and in the commit message.
 
-- [ ] **Step 3: Commit** (even if no split): `git commit -am "chore(e2e): budget checkpoint — <N>s measured, <decision>"`
+- [x] **Step 3: Commit** (even if no split): `git commit -am "chore(e2e): budget checkpoint — <N>s measured, <decision>"`
+
+> **Measured 2026-07-10 (after Task 10, 11 tests):** 15.0s wall warm — 7 infra/unit tests 14.4s (dominated by in-test `cargo build` freshness probes + the 3s REPL-marker wait, a fixed per-binary cost), 4 lifecycle scenarios **1.34s combined**. Extrapolation: ~18 remaining scenarios ≈ +18s worst case + ~4 more test-binary build probes ≈ well under 60s total. **Decision: no soak split; N=4 soak proceeds in-gate. Re-measure at Task 19.**
 
 ---
 

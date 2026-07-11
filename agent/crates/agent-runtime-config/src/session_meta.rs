@@ -72,6 +72,16 @@ pub fn metadata_root() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("HOME")?).join(".rusty-agent"))
 }
 
+/// Metadata root honoring the `metadata_dir` override (E1); falls back to
+/// the real $HOME/.rusty-agent. The secret, and anything else under the
+/// metadata root, follows this — both surfaces must resolve it the same way.
+pub fn metadata_root_for(cfg: &crate::RuntimeConfig) -> Option<PathBuf> {
+    match &cfg.metadata_dir {
+        Some(d) => Some(PathBuf::from(d)),
+        None => metadata_root(),
+    }
+}
+
 /// Where session artifacts (trace jsonl, descriptor dirs) live. Honors the
 /// `trace_dir` override so tests and custom setups stay self-contained —
 /// but is NOT gated on `cfg.trace`: identity exists even with tracing off.
@@ -431,5 +441,16 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         // silent regeneration would invalidate every existing checkpoint MAC
         assert_eq!(std::fs::read(root.path().join("secret")).unwrap(), b"short");
+    }
+
+    #[test]
+    fn metadata_root_for_honors_override_else_home() {
+        let cfg = crate::RuntimeConfig {
+            metadata_dir: Some("/tmp/x-meta".into()),
+            ..Default::default()
+        };
+        assert_eq!(metadata_root_for(&cfg), Some(PathBuf::from("/tmp/x-meta")));
+        let cfg = crate::RuntimeConfig::default();
+        assert_eq!(metadata_root_for(&cfg), metadata_root());
     }
 }

@@ -238,6 +238,10 @@ pub struct RuntimeConfig {
     pub trace_max_mb: u64,
     #[serde(default)]
     pub memories_dir: Option<String>,
+    /// E1 seam (e2e spec 2026-07-10): override for the metadata root
+    /// ($HOME/.rusty-agent) so tests/custom setups never touch the real one.
+    #[serde(default)]
+    pub metadata_dir: Option<String>,
     /// When set, replaces the built-in base system prompt. Active skills and
     /// preset text still append on top. Blank strings normalize to None.
     #[serde(default)]
@@ -300,6 +304,7 @@ struct PartialRuntimeConfig {
     trace_max_mb: Option<u64>,
     system_prompt_override: Option<String>,
     memories_dir: Option<String>,
+    metadata_dir: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -415,6 +420,7 @@ impl RuntimeConfig {
             trace_max_mb: default_trace_max_mb(),
             system_prompt_override: None,
             memories_dir: None,
+            metadata_dir: None,
         }
     }
 
@@ -857,6 +863,9 @@ impl RuntimeConfig {
         }
         if let Some(v) = p.memories_dir {
             self.memories_dir = Some(v);
+        }
+        if let Some(v) = p.metadata_dir {
+            self.metadata_dir = Some(v);
         }
         self
     }
@@ -1304,6 +1313,7 @@ mod tests {
             trace_max_mb: 8,
             system_prompt_override: Some("DESIGN ASSISTANT".into()),
             memories_dir: Some("/tmp/mems".into()),
+            metadata_dir: Some("/tmp/meta".into()),
         };
         c.save(&path).unwrap();
         let loaded = RuntimeConfig::load_over(base(), &path);
@@ -1911,6 +1921,16 @@ mod tests {
         std::fs::write(&path, r#"{"approval_auto_deny_secs": 30}"#).unwrap();
         let loaded = RuntimeConfig::load_over(base(), &path);
         assert_eq!(loaded.approval_auto_deny_secs, Some(30));
+    }
+
+    #[test]
+    fn metadata_dir_defaults_none_and_roundtrips() {
+        assert_eq!(RuntimeConfig::default().metadata_dir, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::write(&path, r#"{"metadata_dir": "/tmp/m"}"#).unwrap();
+        let loaded = RuntimeConfig::load_over(base(), &path);
+        assert_eq!(loaded.metadata_dir, Some("/tmp/m".into()));
     }
 
     #[test]

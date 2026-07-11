@@ -28,3 +28,4 @@ wiremock = "0.6"
 tempfile = "3"
 tauri = { version = "2", features = ["test"] }
 thirtyfour = "0.37.2"
+agent-server = { path = "../agent/crates/agent-server", features = ["testkit"] }
