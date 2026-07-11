@@ -445,10 +445,12 @@ mod tests {
 
     #[test]
     fn metadata_root_for_honors_override_else_home() {
-        let mut cfg = crate::RuntimeConfig::default();
-        cfg.metadata_dir = Some("/tmp/x-meta".into());
+        let cfg = crate::RuntimeConfig {
+            metadata_dir: Some("/tmp/x-meta".into()),
+            ..Default::default()
+        };
         assert_eq!(metadata_root_for(&cfg), Some(PathBuf::from("/tmp/x-meta")));
-        cfg.metadata_dir = None;
+        let cfg = crate::RuntimeConfig::default();
         assert_eq!(metadata_root_for(&cfg), metadata_root());
     }
 }
