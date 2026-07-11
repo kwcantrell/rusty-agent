@@ -175,3 +175,28 @@ pub async fn wait_for_ask_id(cap: &Captured, timeout: Duration) -> String {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+/// Polls `cap` until an `ApprovalRequest` event whose id differs from
+/// `prev_id` lands, returning its id — `wait_for_ask_id` always returns the
+/// FIRST ask in the capture, so a caller that already answered one ask and
+/// needs the NEXT one (e.g. after a deny that re-parks) needs skip-past
+/// semantics instead of a bare "any ask" scan, which would just return the
+/// stale id again.
+pub async fn wait_for_ask_id_after(cap: &Captured, prev_id: &str, timeout: Duration) -> String {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let found = cap.0.lock().unwrap().iter().find_map(|ev| match ev {
+            ServerEvent::ApprovalRequest { id, .. } if id != prev_id => Some(id.clone()),
+            _ => None,
+        });
+        if let Some(id) = found {
+            return id;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no ApprovalRequest after {prev_id:?} re-emitted; captured: {:#?}",
+            cap.0.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
