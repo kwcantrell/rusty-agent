@@ -300,7 +300,10 @@ fn build_agent_cli() -> PathBuf {
         .status()
         .expect("spawn cargo build -p agent-cli");
     assert!(status.success(), "cargo build -p agent-cli failed");
-    agent_dir.join("target/debug/agent")
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| agent_dir.join("target"));
+    target_dir.join("debug/agent")
 }
 
 #[tokio::test]

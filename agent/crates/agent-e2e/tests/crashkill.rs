@@ -35,9 +35,10 @@ const CAP: Duration = Duration::from_secs(30);
 /// `parked.json` and `resume.lock` are gone. This is scenario 5's actual,
 /// pinned behavior: SIGINT mid-model-call cancels cleanly with no resumable
 /// state, matching `resume_cleanup_decision`'s documented Ok+cancelled path.
-/// The final `text_step` is DELIBERATELY SPARE — the run never reaches a
-/// second model call, so the script's 3rd step is never consumed;
-/// `stub.recorded()` (not `assert_consumed()`) is the closing check here.
+/// This test deliberately uses exactly 2 steps: the initial gated request and
+/// the delayed text response. The run never reaches a 3rd request (cancelled
+/// first), so both steps are consumed; `assert_eq!(stub.recorded().len(), 2)`
+/// is the closing check.
 #[tokio::test(flavor = "multi_thread")]
 async fn s05_sigint_mid_resume_cancels_clean_no_park_to_retain() {
     let stub = ScriptedStub::start(vec![

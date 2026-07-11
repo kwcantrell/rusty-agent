@@ -127,8 +127,6 @@ real `~/.rusty-agent`). The Tier-1 deterministic lifecycle/stress matrix
 drives both the `agent_server::Session` API in-process and the real `agent`
 CLI binary against a scripted model stub.
 
-
-
 **Route choice (deliberate):** Tauri's first-party recommendation for e2e is
 WebdriverIO + `@wdio/tauri-service`. This repo takes the documented
 *direct-driver* route instead — a custom Rust harness (thirtyfour) plus

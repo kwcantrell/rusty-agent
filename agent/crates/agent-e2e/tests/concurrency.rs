@@ -78,6 +78,7 @@ async fn s14_inprocess_holder_cli_loser() {
 /// (write_answer) and then its own start_resume attempt loses the lock race
 /// and reports the Error above — the CLI's in-flight prompt, once answered,
 /// is the one that actually drives the resume to completion.
+/// // PRODUCT-GAP: double-resolution is not structurally excluded — answer.json commits race last-writer-wins while the lock only arbitrates who drives the resume (spec §5c#15 implementation log).
 #[tokio::test(flavor = "multi_thread")]
 async fn s15_cli_holder_session_loser_then_cli_completes() {
     let stub = ScriptedStub::start(vec![gated_write("SQRL-15 go"), text_step(None, "done")]).await;

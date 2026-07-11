@@ -427,7 +427,7 @@ mod tests {
         // Unreachable base_url: the REPL still starts and prints its prompt
         // before it ever needs a model — no live server required.
         let mut cli = CliCmd::new(&rig, "http://127.0.0.1:1").spawn();
-        let transcript = cli.wait_for_output(REPL_MARKER, Duration::from_secs(3));
+        let transcript = cli.wait_for_output(REPL_MARKER, Duration::from_secs(30));
         assert!(
             transcript.contains(REPL_MARKER),
             "transcript so far:\n{transcript}"

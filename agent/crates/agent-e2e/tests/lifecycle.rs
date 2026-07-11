@@ -117,13 +117,13 @@ async fn s02_cli_timeout_park_then_gui_attach_resumes() {
 /// `TerminalApproval` — same process, same stdin pipe, same
 /// `[y]es / [n]o / [a]lways:` prompt) -> approve -> completes.
 async fn deny_feedback_roundtrip(feedback: &str) {
-    // The request body is JSON: quotes/backslashes/control chars/non-ASCII in
+    // The request body is JSON: quotes/backslashes/control chars in
     // `feedback` are escaped by serde_json's string serializer (e.g. `"` ->
-    // `\"`, a CJK/emoji codepoint -> `\uXXXX`), so the wire-level needle is the
-    // JSON-*encoded* form of the feedback, not the raw string. For the plain
-    // (ASCII, no-quote/backslash) scenario-3 feedback the two forms are
-    // identical; for the hostile variant they differ, which is exactly the
-    // escaping this test wants to exercise. `wire_needle` strips the
+    // `\"`, newline -> `\n`); non-ASCII UTF-8 is passed through unchanged.
+    // The wire-level needle is the JSON-*encoded* form of the feedback, not the
+    // raw string. For the plain (ASCII, no-quote/backslash) scenario-3 feedback
+    // the two forms are identical; for the hostile variant they differ, which is
+    // exactly the escaping this test wants to exercise. `wire_needle` strips the
     // surrounding quotes serde_json adds so it stays a pure substring.
     let wire_needle = {
         let quoted = serde_json::to_string(feedback).expect("feedback is valid UTF-8");
