@@ -79,6 +79,14 @@ pub struct CliCmd {
     /// `None` for non-`agent-cli` commands (`DaemonCmd`, via `from_command`)
     /// that don't take this flag.
     approval_timeout_secs: Option<u64>,
+    /// Deferred the same way as `approval_timeout_secs`: `new()` seeds this
+    /// with `"stub-model"`, and `.model()` overwrites it before `spawn()`
+    /// pushes a single `--model` flag — avoids ever emitting the flag twice.
+    /// `None` for non-`agent-cli` commands (`from_command`).
+    model: Option<String>,
+    /// Same deferral shape as `model`, for `--stream-timeout-secs` (default
+    /// 10s, overridden by `.stream_timeout_secs()` for live-model runs).
+    stream_timeout_secs: Option<u64>,
     /// Deferred: a `sessions_sub` call is stashed here rather than appended
     /// immediately, so it always lands AFTER `approval_timeout_secs`'s flag
     /// pair regardless of builder call order — clap subcommands must come
@@ -96,6 +104,8 @@ impl CliCmd {
         CliCmd {
             cmd,
             approval_timeout_secs: None,
+            model: None,
+            stream_timeout_secs: None,
             subcommand: Vec::new(),
         }
     }
@@ -105,16 +115,12 @@ impl CliCmd {
         cmd.args([
             "--base-url",
             base_url,
-            "--model",
-            "stub-model",
             "--workspace",
             rig.workspace.path().to_str().unwrap(),
             "--trace-dir",
             rig.sessions.path().to_str().unwrap(),
             "--metadata-dir",
             rig.meta.path().to_str().unwrap(),
-            "--stream-timeout-secs",
-            "10",
         ]);
         cmd.env("HOME", rig.meta.path()) // belt-and-braces (spec §2.3)
             .stdin(Stdio::piped())
@@ -124,6 +130,8 @@ impl CliCmd {
         CliCmd {
             cmd,
             approval_timeout_secs: Some(20),
+            model: Some("stub-model".to_string()),
+            stream_timeout_secs: Some(10),
             subcommand: Vec::new(),
         }
     }
@@ -132,6 +140,20 @@ impl CliCmd {
     /// window (e.g. 1s) to deterministically drive a timeout park-and-exit.
     pub fn approval_timeout_secs(mut self, secs: u64) -> Self {
         self.approval_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Override the model name (default "stub-model") — for live-model runs
+    /// where the CLI should request the name actually loaded server-side.
+    pub fn model(mut self, model: &str) -> Self {
+        self.model = Some(model.to_string());
+        self
+    }
+
+    /// Override the model-stream idle timeout (default 10s) — live models
+    /// need a generous window (e.g. 120s) instead of the stub-server default.
+    pub fn stream_timeout_secs(mut self, secs: u64) -> Self {
+        self.stream_timeout_secs = Some(secs);
         self
     }
 
@@ -161,6 +183,12 @@ impl CliCmd {
         if let Some(secs) = self.approval_timeout_secs {
             self.cmd
                 .args(["--approval-timeout-secs", &secs.to_string()]);
+        }
+        if let Some(model) = &self.model {
+            self.cmd.args(["--model", model]);
+        }
+        if let Some(secs) = self.stream_timeout_secs {
+            self.cmd.args(["--stream-timeout-secs", &secs.to_string()]);
         }
         if !self.subcommand.is_empty() {
             self.cmd.args(&self.subcommand);

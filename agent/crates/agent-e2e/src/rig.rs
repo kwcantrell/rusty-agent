@@ -52,6 +52,13 @@ impl Rig {
     /// The GUI leg: a Session constructed exactly the way src-tauri's bridge
     /// does, pointed at this rig's roots, with a capturing sink attached.
     pub fn session(&self, base_url: &str) -> (Arc<Session>, Arc<Captured>) {
+        self.session_with_model(base_url, "stub-model")
+    }
+
+    /// Same as `session`, but with an explicit model name — for live-model
+    /// legs (`live_smoke.rs`) where the requested name should match what's
+    /// actually loaded rather than the stubbed scripts' fixed "stub-model".
+    pub fn session_with_model(&self, base_url: &str, model: &str) -> (Arc<Session>, Arc<Captured>) {
         let cfg_path = self.meta.path().join("agent-runtime.json");
         // File overlay carries the same overrides so an overlay can't undo them.
         std::fs::write(
@@ -67,7 +74,7 @@ impl Rig {
             self.workspace.path().to_path_buf(),
             cfg_path,
             base_url.into(),
-            "stub-model".into(),
+            model.into(),
         );
         params.config = self.runtime_config(base_url);
         let session = Session::from_params(params);
