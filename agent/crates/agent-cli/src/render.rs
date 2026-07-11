@@ -104,6 +104,7 @@ fn format_tool_result(
 
 /// Mirrors `wire.rs::stop_reason_str` — six variants, snake_case wire words
 /// (a `{:?}.to_lowercase()` shortcut is WRONG: BudgetExhausted != budget_exhausted).
+#[allow(dead_code)]
 fn stop_str(r: &StopReason) -> &'static str {
     match r {
         StopReason::Stop => "stop",
