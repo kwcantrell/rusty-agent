@@ -646,7 +646,7 @@ async fn live_window_stays_bounded_under_model_driven_volume() {
         assert!(
             first.contains("<<n=1>>") || first.contains("no offloaded entry"),
             "a recall result must be either the exact offloaded blob or a clean not-found, got: {}",
-            &first.chars().take(80).collect::<String>()
+            first.chars().take(80).collect::<String>()
         );
     }
 }
