@@ -18,6 +18,7 @@ The agent core. One of two Cargo workspaces in this repo (the other is
 | `agent-server` | library crate bridging the local agent to the desktop UI over Tauri IPC (transport-agnostic `Session`/`EventOut` core) |
 | `agent-cli` | terminal front-end binary |
 | `agent-runtime-config` | shared loop wiring (tool registry, protocol picker, command lists) |
+| `agent-e2e` | tests-only crate: deterministic cross-surface lifecycle/stress e2e suite (CLI + in-process `Session` driving against a scripted model stub) |
 
 ## Commands
 

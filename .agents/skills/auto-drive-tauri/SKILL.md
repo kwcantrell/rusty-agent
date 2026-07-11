@@ -116,6 +116,19 @@ Verified 2026-07-06: `tauri-driver` + WebKitGTK WebDriver drives the real app's
 DOM — CSS selectors, real key events, `execute_script`, focus-independent
 screenshots. No coordinates, no KWin consent dialog, no xclip, no focus click.
 
+**Tier-2/Tier-3 lifecycle pointer (2026-07-10):** Tier-2 GUI lifecycle tests
+(parked-run banner + DOM approve, deny-with-feedback, real cross-surface
+GUI→CLI switch) live at `src-tauri/tests/gui_lifecycle.rs` — run with
+`cd src-tauri && cargo test --test gui_lifecycle -- --ignored --test-threads=1`
+(needs Vite on :5173, `tauri-driver`, and `llama-server` on :8080; relocates
+app state via `HOME`/`XDG_*` env on the driver spawn so it never touches the
+real `~/.rusty-agent`). The Tier-1 deterministic lifecycle/stress matrix
+(no GUI, no model) lives in `agent/crates/agent-e2e` and joins `ci.sh`; it
+drives both the `agent_server::Session` API in-process and the real `agent`
+CLI binary against a scripted model stub.
+
+
+
 **Route choice (deliberate):** Tauri's first-party recommendation for e2e is
 WebdriverIO + `@wdio/tauri-service`. This repo takes the documented
 *direct-driver* route instead — a custom Rust harness (thirtyfour) plus
