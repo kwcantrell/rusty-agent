@@ -89,8 +89,10 @@ pub struct CliCmd {
 impl CliCmd {
     /// Bypasses the `agent-cli`-specific defaults below — used by `DaemonCmd`,
     /// which drives the unrelated `e2e-daemon` binary and has its own arg set
-    /// (no `--approval-timeout-secs`).
-    pub(crate) fn from_command(cmd: Command) -> Self {
+    /// (no `--approval-timeout-secs`), and by tests that need to build a
+    /// fully owned (`'static`) `Command` themselves (e.g. to move it across a
+    /// `spawn_blocking` boundary without borrowing a `Rig`).
+    pub fn from_command(cmd: Command) -> Self {
         CliCmd {
             cmd,
             approval_timeout_secs: None,
@@ -263,6 +265,15 @@ impl Cli {
 
     pub fn close_stdin(&mut self) {
         self.stdin.take();
+    }
+
+    /// Non-blocking peek: has the child already exited? Used by callers that
+    /// must tolerate EITHER a still-live prompt OR an already-occurred exit
+    /// (e.g. a genuine race where this process may lose before ever
+    /// prompting) without burning a full deadline on a `wait_for_output`
+    /// that will never see its needle.
+    pub fn has_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
     fn drain(&mut self) {
