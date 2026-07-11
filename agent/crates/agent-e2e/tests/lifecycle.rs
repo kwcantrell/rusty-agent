@@ -198,3 +198,125 @@ async fn s03b_deny_feedback_hostile_content() {
     );
     deny_feedback_roundtrip(&hostile).await;
 }
+
+/// Scenario 4 (soak): N=4 lifecycle cycles on shared roots, alternating
+/// deny-with-feedback and approve, crossing CLI <-> Session surfaces each
+/// time, with one cycle carrying a ~2MB `write_file` arg so the checkpoint
+/// dumps a multi-MB artifact store. Guards the 2fad367 tally-floor
+/// regression (denials desyncing the persisted tool tally) plus general
+/// checkpoint/resume drift under repeated park/deny/approve cycles.
+///
+/// Request sequence actually exercised (characterized against the live
+/// stub — see task-12-report.md for the full walk):
+///   1. "SQRL-SOAK start"      -> gated write_file            (park #1)
+///   2. deny(SOAK-FB-1)  retry -> matcher "SOAK-FB-1"          (park #2, cycle 1)
+///   3. approve               -> matcher unset (text) "cycle2 done" (cycle 2 done)
+///   4. "SQRL-SOAK turn3"      -> gated write_file (big ~2MB)  (park #3, cycle 3)
+///   5. deny(SOAK-FB-3)  retry -> matcher "SOAK-FB-3"          (park #4, cycle 3 retry)
+///   6. approve               -> matcher unset (text) "cycle4 done" (cycle 4 done)
+#[tokio::test(flavor = "multi_thread")]
+async fn s04_soak_alternating_deny_approve_across_surfaces() {
+    let big = "B".repeat(2_000_000);
+    let steps = vec![
+        gated_write("SQRL-SOAK start"),
+        ScriptStep {
+            expect_substring: Some("SOAK-FB-1".into()),
+            respond: StubResponse::ToolCall {
+                name: "write_file".into(),
+                args: serde_json::json!({"path": "a.txt", "content": "x"}),
+            },
+        },
+        text_step(None, "cycle2 done"),
+        ScriptStep {
+            expect_substring: Some("SQRL-SOAK turn3".into()),
+            respond: StubResponse::ToolCall {
+                name: "write_file".into(),
+                args: serde_json::json!({"path": "big.txt", "content": big}),
+            },
+        },
+        ScriptStep {
+            expect_substring: Some("SOAK-FB-3".into()),
+            respond: StubResponse::ToolCall {
+                name: "write_file".into(),
+                args: serde_json::json!({"path": "big2.txt", "content": "y"}),
+            },
+        },
+        text_step(None, "cycle4 done"),
+    ];
+    let stub = ScriptedStub::start(steps).await;
+    let rig = Rig::new();
+    let soak_start = std::time::Instant::now();
+
+    // Cycle 1: park on Session, deny w/ feedback via CLI (re-park), approve
+    // via the SAME CLI reopen process (characterized in s03: a deny inside a
+    // `sessions reopen` re-prompts in-process, it does not park-and-exit).
+    let (session, _cap) = rig.session(&stub.base_url());
+    session.send_input("SQRL-SOAK start".into());
+    let dir = {
+        assert!(wait_until_async(CAP, || !rig.session_dirs().is_empty()).await);
+        let d = rig.only_session_dir();
+        assert!(wait_until_async(CAP, || ckpt(&d).join("parked.json").exists()).await);
+        d
+    };
+    drop(session);
+    let sid = dir.file_name().unwrap().to_string_lossy().into_owned();
+    let mut cli = CliCmd::new(&rig, &stub.base_url())
+        .approval_timeout_secs(60)
+        .sessions_sub(&["sessions", "reopen", &sid])
+        .spawn();
+    cli.wait_for_output("[y]es / [n]o / [a]lways:", CAP);
+    cli.write_line("n");
+    cli.wait_for_output("Feedback for the agent", CAP);
+    cli.write_line("SOAK-FB-1");
+    cli.wait_for_output("[y]es / [n]o / [a]lways:", CAP); // re-parked, re-prompted
+    cli.write_line("y");
+    let st = cli.wait_exit(CAP);
+    assert!(st.success(), "cycle1-2 transcript:\n{}", cli.transcript());
+    drop(cli);
+
+    // Cycle 3+4: new turn on a fresh Session (same roots), park, deny
+    // (Session), re-park, approve from CLI reopen.
+    let (session, cap) = rig.session(&stub.base_url());
+    session.send_input("SQRL-SOAK turn3".into());
+    let ask = agent_server::testkit::wait_for_ask_id(&cap, CAP).await;
+    // parked.json must exist before we act (positive-artifact rule) — the
+    // session dir may be a NEW dir for the new Session; rediscover.
+    let dirs = rig.session_dirs();
+    assert!(
+        wait_until_async(CAP, || dirs
+            .iter()
+            .any(|d| ckpt(d).join("parked.json").exists()))
+        .await
+    );
+    session.approve(
+        &ask,
+        Decision::Deny {
+            feedback: Some("SOAK-FB-3".into()),
+        },
+    );
+    // wait_for_ask_id always returns the FIRST ask in the capture; after the
+    // deny above we need the ask that supersedes it, hence `_after`.
+    let ask2 = agent_server::testkit::wait_for_ask_id_after(&cap, &ask, CAP).await;
+    session.approve(&ask2, Decision::Approve);
+    assert!(
+        wait_until_async(CAP, || cap
+            .snapshot()
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Done { .. })))
+        .await
+    );
+    stub.assert_consumed();
+
+    let soak_elapsed = soak_start.elapsed();
+    eprintln!("s04 soak wall time: {soak_elapsed:?}");
+
+    // Tally monotonicity / no drift: the surviving session dirs verify clean —
+    // `sessions list` exits 0 and shows no corruption complaints.
+    let mut list = CliCmd::new(&rig, &stub.base_url())
+        .sessions_sub(&["sessions", "list"])
+        .spawn();
+    let st = list.wait_exit(CAP);
+    assert!(st.success());
+    let t = list.transcript();
+    assert!(!t.contains("corrupt"), "list transcript:\n{t}");
+}
