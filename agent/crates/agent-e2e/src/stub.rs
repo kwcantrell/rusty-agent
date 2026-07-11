@@ -1,6 +1,7 @@
 //! Scripted OpenAI-compatible model stub (wiremock) + a raw mid-stream-drop
 //! stub, both used by the e2e lifecycle/stress scenarios to drive a real
 //! `Session` through a real `OpenAiCompatClient` without a live model.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -37,6 +38,7 @@ pub struct ScriptedStub {
     server: MockServer,
     steps_len: usize,
     state: Arc<Mutex<StubState>>,
+    checked: AtomicBool,
 }
 
 fn sse_text(text: &str) -> String {
@@ -125,6 +127,7 @@ impl ScriptedStub {
             server,
             steps_len,
             state,
+            checked: AtomicBool::new(false),
         }
     }
 
@@ -138,6 +141,7 @@ impl ScriptedStub {
 
     /// Call at the end of every test that used the stub.
     pub fn assert_consumed(&self) {
+        self.checked.store(true, Ordering::SeqCst);
         let st = self.state.lock().unwrap();
         assert!(
             st.poison.is_none(),
@@ -145,6 +149,25 @@ impl ScriptedStub {
             st.poison.as_deref().unwrap()
         );
         assert_eq!(st.cursor, self.steps_len, "script not fully consumed");
+    }
+}
+
+impl Drop for ScriptedStub {
+    fn drop(&mut self) {
+        // Only panic if: (1) assert_consumed() was never called, (2) poison exists,
+        // and (3) we're not already unwinding (don't panic during unwind).
+        if !self.checked.load(Ordering::SeqCst) {
+            let st = self.state.lock().unwrap();
+            if let Some(ref poison_msg) = st.poison {
+                if !std::thread::panicking() {
+                    panic!(
+                        "ScriptedStub dropped with poison but assert_consumed() was never called. \
+                         Poison: {}. Call assert_consumed() at test end.",
+                        poison_msg
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -277,5 +300,53 @@ mod tests {
             "run did not reach Done after approving the gated write"
         );
         stub.assert_consumed();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn poison_enforced_at_drop_when_assert_consumed_skipped() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Start a stub with empty script so any request poisons it.
+        let stub = ScriptedStub::start(vec![]).await;
+        let base_url = stub.base_url();
+
+        // Send a raw HTTP request to poison the stub (no reqwest dep needed).
+        tokio::spawn(async move {
+            if let Ok(mut stream) =
+                tokio::net::TcpStream::connect(base_url.replace("http://", "")).await
+            {
+                let req =
+                    "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
+                let _ = stream.write_all(req.as_bytes()).await;
+                let mut buf = [0u8; 256];
+                let _ = stream.read(&mut buf).await;
+            }
+        });
+
+        // Give the request time to arrive and poison the stub.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Now drop the stub WITHOUT calling assert_consumed() and verify the panic.
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(stub)));
+        assert!(
+            panic_result.is_err(),
+            "expected panic when dropping poisoned stub without assert_consumed()"
+        );
+
+        // Verify the panic message mentions both "stray request" (the poison) and "assert_consumed".
+        if let Err(e) = panic_result {
+            if let Some(msg) = e.downcast_ref::<String>() {
+                assert!(
+                    msg.contains("stray request") || msg.contains("Poison"),
+                    "panic message should contain poison details: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("assert_consumed"),
+                    "panic message should mention assert_consumed(): {}",
+                    msg
+                );
+            }
+        }
     }
 }
