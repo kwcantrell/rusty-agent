@@ -116,6 +116,14 @@ async fn wait_http(url: &str, timeout: Duration, what: &str) {
 
 impl Gui {
     pub async fn launch() -> Gui {
+        Self::launch_with_envs(&[]).await
+    }
+
+    /// Like `launch()`, but applies `envs` to the tauri-driver `Command` —
+    /// tauri-driver execs WebKitWebDriver, which execs the app, so the app
+    /// inherits them. Used to relocate the app's `$HOME` / XDG dirs onto a
+    /// tempdir for state-isolated GUI tests (gui_lifecycle.rs).
+    pub async fn launch_with_envs(envs: &[(&str, &str)]) -> Gui {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let web_dir = manifest.parent().unwrap().join("web");
         let app_bin = manifest.join("target/debug/rust-agent-runtime-desktop");
@@ -149,6 +157,9 @@ impl Gui {
             .process_group(0)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
         if let Ok(native) = std::env::var("WEBKIT_WEBDRIVER") {
             cmd.args(["--native-driver", &native]);
         }
