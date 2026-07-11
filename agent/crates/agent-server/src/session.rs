@@ -1292,9 +1292,15 @@ mod tests {
         let cap = Arc::new(Captured::default());
         sess.set_event_out(cap.clone());
 
-        // 15s, not the usual 5s: observed flaking at 5s under parallel `cargo
-        // test` package invocations (CPU/disk contention delays the re-emit).
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        // 60s, not 5s or even the previous 15s: this is a bounded poll on real
+        // state (an ApprovalRequest event landing in `cap`), not a fixed-window
+        // race, so a generous deadline costs nothing when the condition is
+        // already true — it only matters when contention (e.g. this branch's
+        // full-workspace `cargo test` running the e2e crate's subprocess-heavy
+        // suites alongside this crate) delays scheduling. 15s still flaked
+        // under that load; widen decisively instead of chasing the load curve
+        // with more small bumps.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let ask_id = loop {
             let found = cap.0.lock().unwrap().iter().find_map(|ev| match ev {
                 ServerEvent::ApprovalRequest { id, .. } => Some(id.clone()),
@@ -1324,10 +1330,19 @@ mod tests {
         // Wait for the resumed run to finish (active cleared in start_resume's
         // spawned task) rather than for a specific event, since completion here
         // is budget exhaustion, not a Done the harness names distinctly.
-        // 15s, not the usual 5s: this test flaked 3x across task runs under
-        // parallel `cargo test` package invocations — the spawned resume task
-        // is contention-sensitive, so give it the file's tolerant-end budget.
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        // 60s, not 5s or the previous 15s: same reasoning as the ApprovalRequest
+        // wait above — bounded poll on real state, contention-sensitive under
+        // full-workspace load, so widen decisively rather than re-bump. NOTE:
+        // no extra post-loop sleep is needed here — `resume_with_cancel`'s
+        // completion path (loop_.rs's budget-exhaustion epilogue) emits
+        // `Done(BudgetExhausted)` BEFORE returning, and trace.rs's
+        // `write_record` flushes synchronously on every `Done`/`Error` event
+        // (the `flush` local at trace.rs ~131) — so by the time this loop
+        // observes `active.is_none()` (set immediately after `resume_with_cancel`
+        // returns, session.rs's `start_resume`), every trace line for this run
+        // is already durable on disk. A trailing sleep here was papering over
+        // nothing real; removed rather than widened.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             if sess.resuming.lock().unwrap().contains(prior_id)
                 && sess.active.lock().unwrap().is_none()
@@ -1340,8 +1355,6 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // Give the trace writer's fs write a beat past the active-flag clear.
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let prior_lines_after = std::fs::read_to_string(&prior_trace)
             .map(|s| s.lines().count())
@@ -1594,13 +1607,18 @@ mod tests {
         let root_dir =
             agent_runtime_config::session_dir(sessions.path(), prior_id).join("checkpoint");
 
-        let ask_id = wait_for_ask_id(&cap, Duration::from_secs(5)).await;
+        // 60s, not 5s: same flake family as `resumed_run_traces_into_its_own_
+        // session_file` — attach's re-emit is a bounded poll on a real
+        // ApprovalRequest event, contention-sensitive under full-workspace load
+        // (this branch's e2e crate adds subprocess-spawning parallel load).
+        let ask_id = wait_for_ask_id(&cap, Duration::from_secs(60)).await;
         sess.approve(&ask_id, Decision::Approve);
 
         // The resumed run's model call fails fast (nothing listens on
         // 127.0.0.1:1), then exhausts the configured retries (with backoff)
-        // before `start_resume`'s Err arm fires — allow generous headroom.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // before `start_resume`'s Err arm fires — allow generous headroom,
+        // widened 30s -> 60s for the same full-workspace contention reason.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             let saw_failure = cap.0.lock().unwrap().iter().any(|ev| {
                 matches!(ev, ServerEvent::Error { message } if message.contains("resumed run failed"))
