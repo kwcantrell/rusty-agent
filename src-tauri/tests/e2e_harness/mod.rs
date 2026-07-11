@@ -6,6 +6,11 @@
 //! `.set(key, value)` (serialises via serde) rather than `.insert(key, value)`.
 //! The public surface — `Gui::launch()`, `gui.driver`, `gui.shutdown()` — is
 //! unchanged.
+//!
+//! Compiled independently into EACH test binary that declares `mod e2e_harness`
+//! (gui_smoke, gui_lifecycle, …); each binary uses a subset of the API, so
+//! per-binary dead-code lint is expected noise, not rot.
+#![allow(dead_code)]
 
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
