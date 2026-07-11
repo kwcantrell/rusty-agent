@@ -2,7 +2,7 @@
 //! Spec: docs/superpowers/specs/2026-07-10-e2e-lifecycle-stress-design.md.
 use agent_e2e::cli::{CliCmd, REPL_MARKER};
 use agent_e2e::rig::{ckpt, wait_until_async, Rig};
-use agent_e2e::stub::{gated_write, text_step, ScriptedStub};
+use agent_e2e::stub::{gated_write, text_step, ScriptStep, ScriptedStub, StubResponse};
 use agent_server::wire::{Decision, ServerEvent};
 use std::time::Duration;
 
@@ -106,4 +106,95 @@ async fn s02_cli_timeout_park_then_gui_attach_resumes() {
         .await
     );
     stub.assert_consumed();
+}
+
+/// Scenario 3: park via Session -> CLI `sessions reopen` -> deny with
+/// feedback -> the model retries the gated call (feedback text must reach
+/// the retried request verbatim) -> re-park -> SAME reopen process re-prompts
+/// (characterized: `run_sessions_reopen` prompts the root ask once via
+/// `prompt_for_answer_with_reader`, then hands the whole resumed turn to
+/// `resume_with_cancel`; a fresh Ask inside that turn is served by the same
+/// `TerminalApproval` — same process, same stdin pipe, same
+/// `[y]es / [n]o / [a]lways:` prompt) -> approve -> completes.
+async fn deny_feedback_roundtrip(feedback: &str) {
+    // The request body is JSON: quotes/backslashes/control chars/non-ASCII in
+    // `feedback` are escaped by serde_json's string serializer (e.g. `"` ->
+    // `\"`, a CJK/emoji codepoint -> `\uXXXX`), so the wire-level needle is the
+    // JSON-*encoded* form of the feedback, not the raw string. For the plain
+    // (ASCII, no-quote/backslash) scenario-3 feedback the two forms are
+    // identical; for the hostile variant they differ, which is exactly the
+    // escaping this test wants to exercise. `wire_needle` strips the
+    // surrounding quotes serde_json adds so it stays a pure substring.
+    let wire_needle = {
+        let quoted = serde_json::to_string(feedback).expect("feedback is valid UTF-8");
+        quoted[1..quoted.len() - 1].to_string()
+    };
+    let stub = ScriptedStub::start(vec![
+        gated_write("SQRL-3 write it"),
+        // After a deny, the tool message carrying the feedback goes back to the
+        // model: the matcher REQUIRES the feedback text (wire-encoded) in the
+        // request body.
+        ScriptStep {
+            expect_substring: Some(wire_needle.clone()),
+            respond: StubResponse::ToolCall {
+                name: "write_file".into(),
+                args: serde_json::json!({"path": "out2.txt", "content": "retry"}),
+            },
+        },
+        text_step(None, "done"),
+    ])
+    .await;
+    let rig = Rig::new();
+    // Park on the Session leg.
+    let (session, _cap) = rig.session(&stub.base_url());
+    session.send_input("SQRL-3 write it".into());
+    let dir_ready = wait_until_async(CAP, || !rig.session_dirs().is_empty()).await;
+    assert!(dir_ready);
+    let dir = rig.only_session_dir();
+    assert!(wait_until_async(CAP, || ckpt(&dir).join("parked.json").exists()).await);
+    drop(session);
+    let sid = dir.file_name().unwrap().to_string_lossy().into_owned();
+
+    // Deny with feedback from the CLI (two stdin lines, pipe stays open).
+    // approval_timeout_secs(60): the deny -> retry -> re-park cycle happens
+    // while THIS reopen's TerminalApproval is waiting on the second prompt;
+    // the resumed turn hits the stub near-instantly, so 60s is ample headroom
+    // over the 20s CliCmd default (bump kept in case of CI slowness).
+    let mut cli = CliCmd::new(&rig, &stub.base_url())
+        .approval_timeout_secs(60)
+        .sessions_sub(&["sessions", "reopen", &sid])
+        .spawn();
+    cli.wait_for_output("[y]es / [n]o / [a]lways:", CAP);
+    cli.write_line("n");
+    cli.wait_for_output("Feedback for the agent", CAP);
+    cli.write_line(feedback);
+    // Deny -> model retries the gated call -> run re-parks; characterized above:
+    // the CLI re-prompts in the SAME reopen process (not park-and-exit).
+    cli.wait_for_output("[y]es / [n]o / [a]lways:", CAP);
+    cli.write_line("y");
+    let st = cli.wait_exit(CAP);
+    assert!(st.success(), "transcript:\n{}", cli.transcript());
+    stub.assert_consumed();
+    // The strong assertion: feedback text reached the model verbatim (modulo
+    // the JSON string-escaping the wire format requires — see `wire_needle`).
+    assert!(stub.recorded().iter().any(|r| r.contains(&wire_needle)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s03_deny_feedback_travels_to_model() {
+    deny_feedback_roundtrip("SQRL-FEEDBACK use path out2.txt instead").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s03b_deny_feedback_hostile_content() {
+    // multibyte + control chars + JSON-meta + long tail (~10KB). Newline-free:
+    // stdin is line-based (Cli::write_line writes one line), so the feedback
+    // line itself cannot contain a raw '\n' — JSON-escaping of everything else
+    // (quotes, backslash, brace, tab, emoji, CJK) happens in the
+    // checkpoint/request layers, which is exactly what's under test.
+    let hostile = format!(
+        "SQRL-HOSTILE \u{65e5}\u{672c}\u{8a9e} \u{1F980} quote\" backslash\\ brace}} tab\tnewline-free {}",
+        "x".repeat(10_000)
+    );
+    deny_feedback_roundtrip(&hostile).await;
 }
