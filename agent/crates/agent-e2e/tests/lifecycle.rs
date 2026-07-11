@@ -366,3 +366,203 @@ async fn s04_soak_alternating_deny_approve_across_surfaces() {
     let t = list.transcript();
     assert!(!t.contains("corrupt"), "list transcript:\n{t}");
 }
+
+/// Scenario 7: park under native (default) reopen with `--protocol=prompted`.
+/// CHARACTERIZED (two live drives; see task-14-report.md):
+///
+/// 1. Script `[gated_write, text_step(None, "done")]`: the parked call was
+///    already parsed+approved under native BEFORE the protocol switch, so
+///    resume executes it directly from `ParkedTurn` without re-parsing (no
+///    model round-trip for the approved call itself — see
+///    `resume_with_cancel`/`start_resume`). Only the FOLLOWING model request
+///    goes out under prompted, and the stub's reply there is plain text —
+///    which `PromptedJsonProtocol::parse` handles fine either way (no fence
+///    found -> whole text is the visible reply). Net: completes cleanly,
+///    exit 0, "done" in the transcript.
+/// 2. Script `[gated_write, gated_write(second)]` (second step ALSO a
+///    native-shaped tool_call SSE, no text content): resume executes the
+///    first (pre-parsed) call as above, then the SECOND model request goes
+///    out under prompted and comes back as a `tool_calls` delta with empty
+///    `content`. `PromptedJsonProtocol::parse` only inspects `raw.text` for
+///    a ` ```tool_call ` fence; with empty text it finds none and returns
+///    `ParsedTurn { text: "", tool_calls: [], invalid: [] }` — i.e. an
+///    ordinary text-only turn with empty text. The run then ends via
+///    `Done(Stop)`: exit 0, script fully consumed at the wire (stub got the
+///    request and replied 200), but the intended `write_file` NEVER
+///    executes and no error is surfaced anywhere (confirmed: the target
+///    file the second call would have created does not exist on disk).
+///
+/// PRODUCT-GAP: reopen accepts protocol-divergent flags without validation
+/// (spec §5#7). Case 2 is the sharper finding — a prompted-protocol reopen
+/// against a native-encoded model response silently drops a tool call and
+/// reports success, rather than failing cleanly or refusing the mismatched
+/// flag combination. This test pins case 2 (the load-bearing, non-trivial
+/// characterization) since case 1 never actually exercises the divergence
+/// (the approved call bypasses re-parsing entirely).
+#[tokio::test(flavor = "multi_thread")]
+async fn s07_reopen_with_divergent_protocol_is_defined() {
+    let stub = ScriptedStub::start(vec![
+        gated_write("SQRL-7 go"),
+        // Second turn: a native-shaped tool_call SSE (no text content) --
+        // the shape that actually exercises the protocol mismatch. Its
+        // args target a file whose non-existence after the run is the
+        // strongest evidence the call was silently dropped, not executed.
+        ScriptStep {
+            expect_substring: None,
+            respond: StubResponse::ToolCall {
+                name: "write_file".into(),
+                args: serde_json::json!({"path": "s07_second.txt", "content": "should-not-land"}),
+            },
+        },
+    ])
+    .await;
+    let rig = Rig::new();
+    let (session, _cap) = rig.session(&stub.base_url());
+    session.send_input("SQRL-7 go".into());
+    assert!(wait_until_async(CAP, || !rig.session_dirs().is_empty()).await);
+    let dir = rig.only_session_dir();
+    assert!(wait_until_async(CAP, || ckpt(&dir).join("parked.json").exists()).await);
+    drop(session);
+    let sid = dir.file_name().unwrap().to_string_lossy().into_owned();
+    let mut cli = CliCmd::new(&rig, &stub.base_url())
+        .arg("--protocol=prompted")
+        .sessions_sub(&["sessions", "reopen", &sid])
+        .spawn();
+    cli.wait_for_output("[y]es / [n]o / [a]lways:", CAP);
+    cli.write_line("y");
+    // PRODUCT-GAP: divergence is accepted silently; this pins "no crash, run
+    // completes, second tool call dropped without error" as the current
+    // contract (characterized above). If a future fix makes prompted-mode
+    // parsing recognize a native-shaped delta, or reopen validates/rejects
+    // the divergent flag, this assertion (and the on-disk check below) is
+    // exactly what must be revisited.
+    let st = cli.wait_exit(CAP);
+    assert!(
+        st.success() || cli.transcript().contains("error"),
+        "must complete or fail CLEANLY, transcript:\n{}",
+        cli.transcript()
+    );
+    // Positive-artifact / negative-artifact pair: the FIRST (native-parsed,
+    // pre-approved) write landed; the SECOND (prompted-mismatched) did not --
+    // this is the concrete, disk-level evidence for the silent-drop finding.
+    assert!(rig.workspace.path().join("out.txt").exists());
+    assert!(!rig.workspace.path().join("s07_second.txt").exists());
+    // The wire-level divergence marker: the reopened request carries the
+    // prompted-protocol system preamble (tool schemas moved into prose),
+    // never present under native.
+    let recorded = stub.recorded();
+    assert!(
+        recorded.len() >= 2,
+        "expected both script steps to reach the wire, got {}",
+        recorded.len()
+    );
+    assert!(
+        recorded[1].contains("You can call tools"),
+        "reopened request must carry the prompted-protocol preamble: {:.200}",
+        recorded[1]
+    );
+    stub.assert_consumed();
+}
+
+/// Scenario 8: ApproveAlways does not survive a process restart. Turn 1:
+/// gated write -> `Decision::ApproveAlways` (in-memory cache) -> Done. Drop
+/// the Session ("restart"). Turn 2, a FRESH Session over the SAME roots: an
+/// identical gated write must park again and require a fresh ApprovalRequest
+/// -- if it auto-approves, that is a CRITICAL security finding (an
+/// in-process cache leaking across a supposed restart boundary).
+#[tokio::test(flavor = "multi_thread")]
+async fn s08_approve_always_does_not_survive_restart() {
+    let stub = ScriptedStub::start(vec![
+        gated_write("SQRL-8 first"),
+        text_step(None, "done1"),
+        // post-restart: the SAME command must ask again
+        gated_write("SQRL-8 second"),
+        text_step(None, "done2"),
+    ])
+    .await;
+    let rig = Rig::new();
+    let (session, cap) = rig.session(&stub.base_url());
+    session.send_input("SQRL-8 first".into());
+    let ask = agent_server::testkit::wait_for_ask_id(&cap, CAP).await;
+    session.approve(&ask, Decision::ApproveAlways);
+    assert!(
+        wait_until_async(CAP, || cap
+            .snapshot()
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Done { .. })))
+        .await
+    );
+    drop(session); // restart
+
+    let (session2, cap2) = rig.session(&stub.base_url());
+    session2.send_input("SQRL-8 second".into());
+    // SECURITY-RELEVANT: an identical gated call post-restart must PARK
+    // again. `wait_for_ask_id` itself asserts (with the full capture printed)
+    // if no ApprovalRequest ever lands within CAP -- that failure mode IS the
+    // auto-approve-without-asking finding this test guards against.
+    let ask2 = agent_server::testkit::wait_for_ask_id(&cap2, CAP).await;
+    let dir2 = rig
+        .session_dirs()
+        .into_iter()
+        .find(|d| ckpt(d).join("parked.json").exists())
+        .expect("second gated call must park to disk before being answered");
+    rig.assert_parked(&dir2);
+    session2.approve(&ask2, Decision::Approve);
+    assert!(
+        wait_until_async(CAP, || cap2
+            .snapshot()
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Done { .. })))
+        .await
+    );
+    stub.assert_consumed();
+}
+
+/// Scenario 9: a parked prior session must survive an unrelated, completed
+/// turn run on a fresh `Session` over the same roots (spec §5#9) -- new
+/// input on a session holding a park must not clobber that park.
+#[tokio::test(flavor = "multi_thread")]
+async fn s09_new_turn_does_not_clobber_existing_park() {
+    let rig = Rig::new();
+    let (planted_sess, _cap, _key) = agent_server::testkit::plant_parked_session(
+        rig.workspace.path(),
+        rig.sessions.path(),
+        rig.meta.path(),
+        "0-e2eprior",
+    )
+    .await;
+    drop(planted_sess);
+    let parked_dir = rig
+        .session_dirs()
+        .into_iter()
+        .find(|d| ckpt(d).join("parked.json").exists())
+        .expect("planted park");
+
+    let stub = ScriptedStub::start(vec![text_step(Some("SQRL-9 new task"), "ok")]).await;
+    let (session, cap) = rig.session(&stub.base_url());
+    session.send_input("SQRL-9 new task".into());
+    assert!(
+        wait_until_async(CAP, || cap
+            .snapshot()
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Done { .. })))
+        .await
+    );
+    stub.assert_consumed();
+    // The park must survive an unrelated completed turn (spec §5#9). If this
+    // fails, it is a PRODUCT FINDING (banner-ignoring input clobbers parks) --
+    // escalate, do not weaken.
+    rig.assert_parked(&parked_dir);
+    // Also check the CLI surfaces the planted session as parked -- a second,
+    // independent read path (not just the on-disk file).
+    let mut list = CliCmd::new(&rig, &stub.base_url())
+        .sessions_sub(&["sessions", "list"])
+        .spawn();
+    let st = list.wait_exit(CAP);
+    assert!(st.success());
+    let t = list.transcript();
+    assert!(
+        t.contains("0-e2eprior"),
+        "sessions list must show the planted parked session id, transcript:\n{t}"
+    );
+}
