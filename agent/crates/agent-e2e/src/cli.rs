@@ -2,6 +2,7 @@
 //! against a `Rig`-isolated workspace/sessions/metadata root, and drives it
 //! over stdin/stdout/stderr like a human would.
 use crate::rig::Rig;
+use agent_server::wire::ServerEvent;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -48,6 +49,26 @@ fn workspace_root() -> PathBuf {
         .parent()
         .unwrap()
         .to_path_buf()
+}
+
+/// Own crate's bin: cargo sets `CARGO_BIN_EXE_e2e-daemon` when the test binary
+/// is built via `cargo test` in this crate (hyphens in the bin name are
+/// literal in that env var — this is NOT `CARGO_BIN_EXE_e2e_daemon`). Fall
+/// back to an explicit build for callers that don't get that env var (e.g. a
+/// doctest harness or a differently-invoked test runner).
+pub fn e2e_daemon_bin() -> PathBuf {
+    option_env!("CARGO_BIN_EXE_e2e-daemon")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let ws = workspace_root();
+            let status = Command::new("cargo")
+                .args(["build", "-p", "agent-e2e", "--bin", "e2e-daemon", "--quiet"])
+                .current_dir(&ws)
+                .status()
+                .expect("build e2e-daemon");
+            assert!(status.success(), "e2e-daemon build failed");
+            target_dir(&ws).join("debug/e2e-daemon")
+        })
 }
 
 pub struct CliCmd {
@@ -138,6 +159,51 @@ impl CliCmd {
     }
 }
 
+/// Driver for `e2e-daemon`'s `run`/`hold-lock` modes — same builder/waiter
+/// reuse as `CliCmd`, but against the daemon binary instead of `agent-cli`.
+pub struct DaemonCmd;
+
+impl DaemonCmd {
+    /// Spawn `e2e-daemon run` against `rig`'s isolated roots, optionally
+    /// sending `--task` up front.
+    pub fn run(rig: &Rig, base_url: &str, task: Option<&str>) -> Cli {
+        let mut cmd = Command::new(e2e_daemon_bin());
+        cmd.args([
+            "run",
+            "--workspace",
+            rig.workspace.path().to_str().unwrap(),
+            "--sessions",
+            rig.sessions.path().to_str().unwrap(),
+            "--meta",
+            rig.meta.path().to_str().unwrap(),
+            "--base-url",
+            base_url,
+        ]);
+        if let Some(t) = task {
+            cmd.args(["--task", t]);
+        }
+        cmd.env("HOME", rig.meta.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        CliCmd { cmd }.spawn()
+    }
+
+    /// Spawn `e2e-daemon hold-lock --dir <dir>` — `dir` must be the
+    /// CHECKPOINT dir (`rig::ckpt(&session_dir)`), not the session dir.
+    pub fn hold_lock(rig: &Rig, dir: &std::path::Path) -> Cli {
+        let mut cmd = Command::new(e2e_daemon_bin());
+        cmd.args(["hold-lock", "--dir", dir.to_str().unwrap()]);
+        cmd.env("HOME", rig.meta.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        CliCmd { cmd }.spawn()
+    }
+}
+
 pub struct Cli {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -184,6 +250,37 @@ impl Cli {
             assert!(
                 start.elapsed() < cap,
                 "deadline waiting for {needle:?}; transcript so far:\n{}",
+                self.transcript
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Wait for a `ServerEvent` (from `EV `-prefixed lines emitted by
+    /// `e2e-daemon run`) matching `pred`. EV lines are newline-terminated
+    /// (`out()` in the daemon uses `println!`), so scanning `transcript.lines()`
+    /// on the raw-chunk transcript is safe even though `Cli` otherwise never
+    /// assumes line framing.
+    pub fn wait_for_event(
+        &mut self,
+        cap: Duration,
+        pred: impl Fn(&ServerEvent) -> bool,
+    ) -> ServerEvent {
+        let start = Instant::now();
+        loop {
+            self.drain();
+            for line in self.transcript.lines() {
+                if let Some(json) = line.strip_prefix("EV ") {
+                    if let Ok(ev) = serde_json::from_str::<ServerEvent>(json) {
+                        if pred(&ev) {
+                            return ev;
+                        }
+                    }
+                }
+            }
+            assert!(
+                start.elapsed() < cap,
+                "deadline waiting for event; transcript:\n{}",
                 self.transcript
             );
             std::thread::sleep(Duration::from_millis(10));
@@ -258,5 +355,18 @@ mod tests {
             "transcript so far:\n{transcript}"
         );
         cli.close_stdin();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_runs_one_turn_and_streams_events() {
+        let stub =
+            crate::stub::ScriptedStub::start(vec![crate::stub::text_step(Some("hi"), "yo")]).await;
+        let rig = Rig::new();
+        let mut d = DaemonCmd::run(&rig, &stub.base_url(), Some("hi"));
+        d.wait_for_output("READY", Duration::from_secs(30));
+        d.wait_for_event(Duration::from_secs(30), |e| {
+            matches!(e, ServerEvent::Done { .. })
+        });
+        stub.assert_consumed();
     }
 }
