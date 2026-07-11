@@ -73,9 +73,31 @@ pub fn e2e_daemon_bin() -> PathBuf {
 
 pub struct CliCmd {
     pub(crate) cmd: Command,
+    /// Deferred: pushed onto `cmd` only in `spawn()` (before `subcommand`, see
+    /// below) so `approval_timeout_secs` can override the default without clap
+    /// rejecting a duplicate single-value `--approval-timeout-secs` flag.
+    /// `None` for non-`agent-cli` commands (`DaemonCmd`, via `from_command`)
+    /// that don't take this flag.
+    approval_timeout_secs: Option<u64>,
+    /// Deferred: a `sessions_sub` call is stashed here rather than appended
+    /// immediately, so it always lands AFTER `approval_timeout_secs`'s flag
+    /// pair regardless of builder call order — clap subcommands must come
+    /// after top-level flags.
+    subcommand: Vec<String>,
 }
 
 impl CliCmd {
+    /// Bypasses the `agent-cli`-specific defaults below — used by `DaemonCmd`,
+    /// which drives the unrelated `e2e-daemon` binary and has its own arg set
+    /// (no `--approval-timeout-secs`).
+    pub(crate) fn from_command(cmd: Command) -> Self {
+        CliCmd {
+            cmd,
+            approval_timeout_secs: None,
+            subcommand: Vec::new(),
+        }
+    }
+
     pub fn new(rig: &Rig, base_url: &str) -> Self {
         let mut cmd = Command::new(agent_bin());
         cmd.args([
@@ -91,25 +113,35 @@ impl CliCmd {
             rig.meta.path().to_str().unwrap(),
             "--stream-timeout-secs",
             "10",
-            "--approval-timeout-secs",
-            "20",
         ]);
         cmd.env("HOME", rig.meta.path()) // belt-and-braces (spec §2.3)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0); // own group → group-kill can't touch the test
-        CliCmd { cmd }
+        CliCmd {
+            cmd,
+            approval_timeout_secs: Some(20),
+            subcommand: Vec::new(),
+        }
+    }
+
+    /// Override the interactive approval window (default 20s). Use a short
+    /// window (e.g. 1s) to deterministically drive a timeout park-and-exit.
+    pub fn approval_timeout_secs(mut self, secs: u64) -> Self {
+        self.approval_timeout_secs = Some(secs);
+        self
     }
 
     /// Subcommand form, e.g. `sessions_sub(&["sessions","reopen","<id>"])` —
     /// clap subcommands must come AFTER top-level flags (`Cli`'s `command`
     /// field is parsed alongside the flags; agent-cli's own doc comment on
     /// `Command::Sessions` says as much: "Top-level flags (--base-url,
-    /// --workspace, etc.) go BEFORE the subcommand"). `CliCmd::new` already
-    /// puts flags first, so `sessions_sub` only needs to append.
+    /// --workspace, etc.) go BEFORE the subcommand"). Stashed rather than
+    /// appended immediately so it lands after `spawn()`'s deferred
+    /// `--approval-timeout-secs` push regardless of call order.
     pub fn sessions_sub(mut self, sub: &[&str]) -> Self {
-        self.cmd.args(sub);
+        self.subcommand = sub.iter().map(|s| s.to_string()).collect();
         self
     }
 
@@ -124,6 +156,13 @@ impl CliCmd {
     }
 
     pub fn spawn(mut self) -> Cli {
+        if let Some(secs) = self.approval_timeout_secs {
+            self.cmd
+                .args(["--approval-timeout-secs", &secs.to_string()]);
+        }
+        if !self.subcommand.is_empty() {
+            self.cmd.args(&self.subcommand);
+        }
         let mut child = self.cmd.spawn().expect("spawn agent");
         let stdin = child.stdin.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -187,7 +226,7 @@ impl DaemonCmd {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
-        CliCmd { cmd }.spawn()
+        CliCmd::from_command(cmd).spawn()
     }
 
     /// Spawn `e2e-daemon hold-lock --dir <dir>` — `dir` must be the
@@ -200,7 +239,7 @@ impl DaemonCmd {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
-        CliCmd { cmd }.spawn()
+        CliCmd::from_command(cmd).spawn()
     }
 }
 
